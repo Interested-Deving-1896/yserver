@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, ErrorKind};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -11,11 +11,11 @@ use yserver_protocol::x11::{
     self, AtomId, ClientByteOrder, ClientId, RequestHeader, ResourceId, SequenceNumber,
 };
 
-use crate::host_x11::HostX11;
+use crate::host_x11::{HostKeyboard, HostX11};
+use crate::resources::{
+    Font, MapState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW, ResourceTable, Window,
+};
 
-const ROOT_WINDOW: ResourceId = ResourceId(0x100);
-const ROOT_COLORMAP: ResourceId = ResourceId(0x101);
-const ROOT_VISUAL: ResourceId = ResourceId(0x102);
 const RESOURCE_ID_BASE: u32 = 0x0020_0000;
 const RESOURCE_ID_MASK: u32 = 0x001f_ffff;
 
@@ -48,14 +48,18 @@ pub fn run(display: u16) -> io::Result<()> {
     if let Some(host) = host.as_ref() {
         let _ = host.lock().map(|mut host| host.ping());
     }
+    let host_window_id = host
+        .as_ref()
+        .and_then(|host| host.lock().ok().map(|host| host.window_id()));
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let client_id = ClientId(NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed));
                 let host = host.clone();
+                let host_window_id = host_window_id;
                 thread::spawn(move || {
-                    if let Err(err) = handle_client(client_id, stream, host) {
+                    if let Err(err) = handle_client(client_id, stream, host, host_window_id) {
                         eprintln!("client {} disconnected: {err}", client_id.0);
                     }
                 });
@@ -71,6 +75,7 @@ fn handle_client(
     client_id: ClientId,
     mut stream: UnixStream,
     host: Option<Arc<Mutex<HostX11>>>,
+    host_window_id: Option<u32>,
 ) -> io::Result<()> {
     let setup = x11::read_setup_request(&mut stream)?;
     if setup.byte_order != ClientByteOrder::LittleEndian {
@@ -126,18 +131,40 @@ fn handle_client(
         },
     )?;
 
+    let mut reader = stream.try_clone()?;
+    let writer = Arc::new(Mutex::new(stream));
+    let focused_window = Arc::new(Mutex::new(ROOT_WINDOW));
+    let last_sequence = Arc::new(AtomicU16::new(0));
+    if let Some(host_window_id) = host_window_id {
+        match HostKeyboard::open_from_env(host_window_id) {
+            Ok(keyboard) => spawn_keyboard_forwarder(
+                client_id,
+                keyboard,
+                writer.clone(),
+                focused_window.clone(),
+                last_sequence.clone(),
+            ),
+            Err(err) => eprintln!("client {} keyboard forwarding disabled: {err}", client_id.0),
+        }
+    }
+
     let mut state = ClientState::new();
     let mut sequence = SequenceNumber(0);
     loop {
-        let Some((header, body)) = x11::read_request(&mut stream)? else {
+        let Some((header, body)) = x11::read_request(&mut reader)? else {
             return Ok(());
         };
         sequence = sequence.next();
+        last_sequence.store(sequence.0, Ordering::Relaxed);
+        let mut writer = writer
+            .lock()
+            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "client writer mutex poisoned"))?;
         handle_request(
             client_id,
             &mut state,
             host.as_ref(),
-            &mut stream,
+            &mut *writer,
+            &focused_window,
             sequence,
             header,
             &body,
@@ -145,17 +172,124 @@ fn handle_client(
     }
 }
 
+fn spawn_keyboard_forwarder(
+    client_id: ClientId,
+    mut keyboard: HostKeyboard,
+    writer: Arc<Mutex<UnixStream>>,
+    focused_window: Arc<Mutex<ResourceId>>,
+    last_sequence: Arc<AtomicU16>,
+) {
+    thread::spawn(move || {
+        loop {
+            let event = match keyboard.read_key_event() {
+                Ok(event) => event,
+                Err(err) => {
+                    eprintln!("client {} keyboard forwarding stopped: {err}", client_id.0);
+                    return;
+                }
+            };
+            let focus = focused_window
+                .lock()
+                .map(|focus| *focus)
+                .unwrap_or(ROOT_WINDOW);
+            if focus == ROOT_WINDOW {
+                continue;
+            }
+
+            println!(
+                "client {} key {} {} -> 0x{:x}",
+                client_id.0,
+                if event.pressed { "press" } else { "release" },
+                event.keycode,
+                focus.0
+            );
+            let Some(mut writer) = writer.lock().ok() else {
+                return;
+            };
+            if let Err(err) = x11::write_key_event(
+                &mut *writer,
+                x11::KeyEvent {
+                    pressed: event.pressed,
+                    keycode: event.keycode,
+                    sequence: SequenceNumber(last_sequence.load(Ordering::Relaxed)),
+                    time: event.time,
+                    root: ROOT_WINDOW,
+                    event: focus,
+                    root_x: event.root_x,
+                    root_y: event.root_y,
+                    event_x: event.event_x,
+                    event_y: event.event_y,
+                    state: event.state & 0x004d,
+                },
+            ) {
+                eprintln!("client {} keyboard forwarding stopped: {err}", client_id.0);
+                return;
+            }
+        }
+    });
+}
+
+fn set_focused_window(
+    focused_window: &Arc<Mutex<ResourceId>>,
+    stream: &mut UnixStream,
+    sequence: SequenceNumber,
+    window: ResourceId,
+) -> io::Result<()> {
+    if window == ResourceId(0) {
+        return Ok(());
+    }
+
+    let Ok(mut focused_window) = focused_window.lock() else {
+        return Ok(());
+    };
+    if *focused_window == window {
+        return Ok(());
+    }
+
+    if *focused_window != ROOT_WINDOW {
+        x11::write_focus_event(stream, sequence, false, *focused_window)?;
+    }
+    *focused_window = window;
+    x11::write_focus_event(stream, sequence, true, window)
+}
+
+fn focus_if_window_wants_keys(
+    focused_window: &Arc<Mutex<ResourceId>>,
+    state: &ClientState,
+    stream: &mut UnixStream,
+    sequence: SequenceNumber,
+    window: ResourceId,
+) -> io::Result<()> {
+    const KEY_PRESS_MASK: u32 = 1 << 0;
+    const KEY_RELEASE_MASK: u32 = 1 << 1;
+
+    if state.resources.window(window).is_some_and(|window| {
+        window.map_state == MapState::Viewable
+            && window.event_mask & (KEY_PRESS_MASK | KEY_RELEASE_MASK) != 0
+    }) {
+        println!("focus key window 0x{:x}", window.0);
+        set_focused_window(focused_window, stream, sequence, window)?;
+    }
+    Ok(())
+}
+
+fn clear_extent(requested: u16, offset: i16, window_extent: u16) -> u16 {
+    if requested != 0 {
+        return requested;
+    }
+
+    if offset <= 0 {
+        window_extent
+    } else {
+        window_extent.saturating_sub(offset as u16)
+    }
+}
+
 struct ClientState {
     atoms_by_name: HashMap<String, AtomId>,
     atom_names: HashMap<u32, String>,
-    window_children: HashMap<u32, Vec<ResourceId>>,
-    gcs: HashMap<u32, GuestGc>,
+    resources: ResourceTable,
     next_atom_id: u32,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct GuestGc {
-    foreground: u32,
 }
 
 impl ClientState {
@@ -163,8 +297,7 @@ impl ClientState {
         Self {
             atoms_by_name: HashMap::new(),
             atom_names: HashMap::new(),
-            window_children: HashMap::new(),
-            gcs: HashMap::new(),
+            resources: ResourceTable::new(),
             next_atom_id: 69,
         }
     }
@@ -192,50 +325,6 @@ impl ClientState {
     fn atom_name(&self, atom: AtomId) -> Option<&str> {
         x11::well_known_atom_name(atom).or_else(|| self.atom_names.get(&atom.0).map(String::as_str))
     }
-
-    fn create_window(&mut self, body: &[u8]) {
-        let Some((window, parent)) = x11::create_window_ids(body) else {
-            return;
-        };
-        self.window_children
-            .entry(parent.0)
-            .or_default()
-            .push(window);
-    }
-
-    fn child_windows(&self, parent: ResourceId) -> &[ResourceId] {
-        self.window_children
-            .get(&parent.0)
-            .map_or(&[], Vec::as_slice)
-    }
-
-    fn create_gc(&mut self, body: &[u8]) {
-        let Some(gc_id) = x11::create_gc_id(body) else {
-            return;
-        };
-        let foreground = x11::gc_foreground_from_create(body).unwrap_or(0);
-        self.gcs.insert(gc_id, GuestGc { foreground });
-    }
-
-    fn change_gc(&mut self, body: &[u8]) {
-        let Some(gc_id) = x11::change_gc_id(body) else {
-            return;
-        };
-        let gc = self.gcs.entry(gc_id).or_insert(GuestGc { foreground: 0 });
-        if let Some(foreground) = x11::gc_foreground_from_change(body) {
-            gc.foreground = foreground;
-        }
-    }
-
-    fn free_gc(&mut self, body: &[u8]) {
-        if let Some(gc_id) = x11::free_gc_id(body) {
-            self.gcs.remove(&gc_id);
-        }
-    }
-
-    fn gc_foreground(&self, gc_id: u32) -> u32 {
-        self.gcs.get(&gc_id).map_or(0, |gc| gc.foreground)
-    }
 }
 
 fn handle_request(
@@ -243,45 +332,155 @@ fn handle_request(
     state: &mut ClientState,
     host: Option<&Arc<Mutex<HostX11>>>,
     stream: &mut UnixStream,
+    focused_window: &Arc<Mutex<ResourceId>>,
     sequence: SequenceNumber,
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<()> {
     match header.opcode {
         1 => {
-            state.create_window(body);
+            if let Some(request) = x11::create_window_request(header.data, body) {
+                println!(
+                    "client {} create window 0x{:x} parent=0x{:x} mask=0x{:x}",
+                    client_id.0,
+                    request.window.0,
+                    request.parent.0,
+                    request.event_mask.unwrap_or(0)
+                );
+                state.resources.create_window(request);
+            }
             log_void(client_id, sequence, "CreateWindow")
         }
-        2 => log_void(client_id, sequence, "ChangeWindowAttributes"),
+        2 => {
+            if let Some(request) = x11::change_window_attributes_request(body) {
+                if let Some(event_mask) = request.event_mask {
+                    println!(
+                        "client {} attrs window 0x{:x} mask=0x{:x}",
+                        client_id.0, request.window.0, event_mask
+                    );
+                }
+                state.resources.change_window_attributes(request);
+                focus_if_window_wants_keys(
+                    focused_window,
+                    state,
+                    stream,
+                    sequence,
+                    request.window,
+                )?;
+            }
+            log_void(client_id, sequence, "ChangeWindowAttributes")
+        }
         3 => {
             log_reply(client_id, sequence, "GetWindowAttributes");
-            x11::write_get_window_attributes_reply(stream, sequence)
+            let window = x11::drawable_request_id(body)
+                .and_then(|id| state.resources.window(id))
+                .or_else(|| state.resources.window(ROOT_WINDOW));
+            x11::write_get_window_attributes_reply(stream, sequence, window_attributes(window))
         }
-        4 => log_void(client_id, sequence, "DestroyWindow"),
+        4 => {
+            if let Some(window) = x11::free_resource_id(body) {
+                state.resources.destroy_window(window);
+            }
+            log_void(client_id, sequence, "DestroyWindow")
+        }
         7 => log_void(client_id, sequence, "ReparentWindow"),
         8 => {
             if let Some(window) = x11::map_window_id(body) {
-                x11::write_expose_event(stream, sequence, window)?;
+                state.resources.map_window(window);
+                focus_if_window_wants_keys(focused_window, state, stream, sequence, window)?;
+                if let Some(window_state) = state.resources.window(window) {
+                    x11::write_map_notify_event(
+                        stream,
+                        sequence,
+                        window_state.parent,
+                        window,
+                        window_state.override_redirect,
+                    )?;
+                    x11::write_expose_event(
+                        stream,
+                        sequence,
+                        window,
+                        window_state.width,
+                        window_state.height,
+                    )?;
+                }
             }
             log_void(client_id, sequence, "MapWindow")
         }
         9 => {
             if let Some(parent) = x11::map_window_id(body) {
-                for child in state.child_windows(parent) {
-                    x11::write_expose_event(stream, sequence, *child)?;
+                let children = state.resources.children(parent).to_vec();
+                for child in children {
+                    state.resources.map_window(child);
+                    focus_if_window_wants_keys(focused_window, state, stream, sequence, child)?;
+                    if let Some(window_state) = state.resources.window(child) {
+                        x11::write_expose_event(
+                            stream,
+                            sequence,
+                            child,
+                            window_state.width,
+                            window_state.height,
+                        )?;
+                    }
                 }
             }
             log_void(client_id, sequence, "MapSubwindows")
         }
-        10 => log_void(client_id, sequence, "UnmapWindow"),
-        12 => log_void(client_id, sequence, "ConfigureWindow"),
+        10 => {
+            if let Some(window) = x11::map_window_id(body) {
+                state.resources.unmap_window(window);
+            }
+            log_void(client_id, sequence, "UnmapWindow")
+        }
+        12 => {
+            if let Some(request) = x11::configure_window_request(body) {
+                if let Some(window_state) = state.resources.configure_window(request) {
+                    let geometry = window_geometry(window_state);
+                    x11::write_configure_notify_event(
+                        stream,
+                        sequence,
+                        window_state.id,
+                        window_state.id,
+                        geometry,
+                        window_state.override_redirect,
+                    )?;
+                }
+            }
+            log_void(client_id, sequence, "ConfigureWindow")
+        }
         14 => {
             log_reply(client_id, sequence, "GetGeometry");
-            x11::write_get_geometry_reply(stream, sequence, ROOT_WINDOW, 0, 0, 800, 600, 0, 24)
+            let drawable = x11::drawable_request_id(body).unwrap_or(ROOT_WINDOW);
+            let geometry = state
+                .resources
+                .window(drawable)
+                .map(window_geometry)
+                .or_else(|| state.resources.pixmap(drawable).map(pixmap_geometry))
+                .unwrap_or_else(|| {
+                    window_geometry(
+                        state
+                            .resources
+                            .window(ROOT_WINDOW)
+                            .expect("root window exists"),
+                    )
+                });
+            x11::write_get_geometry_reply(stream, sequence, geometry)
         }
         15 => {
             log_reply(client_id, sequence, "QueryTree");
-            x11::write_query_tree_reply(stream, sequence, ROOT_WINDOW, ROOT_WINDOW, &[])
+            let window = x11::drawable_request_id(body).unwrap_or(ROOT_WINDOW);
+            let window_state = state
+                .resources
+                .window(window)
+                .or_else(|| state.resources.window(ROOT_WINDOW))
+                .expect("root window exists");
+            x11::write_query_tree_reply(
+                stream,
+                sequence,
+                ROOT_WINDOW,
+                window_state.parent,
+                &window_state.children,
+            )
         }
         16 => {
             let name = x11::intern_atom_name(body);
@@ -364,47 +563,121 @@ fn handle_request(
             log_reply(client_id, sequence, "TranslateCoordinates");
             x11::write_translate_coordinates_reply(stream, sequence, ResourceId(0), 0, 0)
         }
-        42 => log_void(client_id, sequence, "SetInputFocus"),
+        42 => {
+            if let Some(window) = x11::input_focus_window(body) {
+                set_focused_window(focused_window, stream, sequence, window)?;
+            }
+            log_void(client_id, sequence, "SetInputFocus")
+        }
         43 => {
             log_reply(client_id, sequence, "GetInputFocus");
-            x11::write_get_input_focus_reply(stream, sequence, ROOT_WINDOW)
+            let focus = focused_window
+                .lock()
+                .map(|focus| *focus)
+                .unwrap_or(ROOT_WINDOW);
+            x11::write_get_input_focus_reply(stream, sequence, focus)
         }
         44 => {
             log_reply(client_id, sequence, "QueryKeymap");
             x11::write_query_keymap_reply(stream, sequence)
         }
-        45 => log_void(client_id, sequence, "OpenFont"),
-        46 => log_void(client_id, sequence, "CloseFont"),
-        53 => log_void(client_id, sequence, "CreatePixmap"),
-        54 => log_void(client_id, sequence, "FreePixmap"),
+        45 => {
+            if let Some(request) = x11::open_font_request(body) {
+                println!(
+                    "client {} #{} OpenFont {:?}",
+                    client_id.0, sequence.0, request.name
+                );
+                state.resources.open_font(request);
+                Ok(())
+            } else {
+                log_void(client_id, sequence, "OpenFont")
+            }
+        }
+        46 => {
+            if let Some(font) = x11::free_resource_id(body) {
+                state.resources.close_font(font);
+            }
+            log_void(client_id, sequence, "CloseFont")
+        }
+        47 => {
+            log_reply(client_id, sequence, "QueryFont");
+            let info = x11::drawable_request_id(body)
+                .and_then(|id| state.resources.font(id))
+                .map(font_info)
+                .unwrap_or_else(default_font_info);
+            x11::write_query_font_reply(stream, sequence, info)
+        }
+        53 => {
+            if let Some(request) = x11::create_pixmap_request(header.data, body) {
+                state.resources.create_pixmap(request);
+            }
+            log_void(client_id, sequence, "CreatePixmap")
+        }
+        54 => {
+            if let Some(pixmap) = x11::free_resource_id(body) {
+                state.resources.free_pixmap(pixmap);
+            }
+            log_void(client_id, sequence, "FreePixmap")
+        }
         55 => {
-            state.create_gc(body);
+            if let Some(request) = x11::create_gc_request(body) {
+                state.resources.create_gc(request);
+            }
             log_void(client_id, sequence, "CreateGC")
         }
         56 => {
-            state.change_gc(body);
+            if let Some(request) = x11::change_gc_request(body) {
+                state.resources.change_gc(request);
+            }
             log_void(client_id, sequence, "ChangeGC")
         }
+        59 => log_void(client_id, sequence, "SetClipRectangles"),
         60 => {
-            state.free_gc(body);
+            if let Some(gc) = x11::free_resource_id(body) {
+                state.resources.free_gc(gc);
+            }
             log_void(client_id, sequence, "FreeGC")
         }
         61 => {
-            if let Some(host) = host {
-                if let Ok(mut host) = host.lock() {
-                    host.clear()?;
+            if let Some(request) = x11::clear_area_request(body) {
+                if let Some(window) = state.resources.window(request.window) {
+                    let width = clear_extent(request.width, request.x, window.width);
+                    let height = clear_extent(request.height, request.y, window.height);
+                    if width != 0
+                        && height != 0
+                        && let Some(host) = host
+                        && let Ok(mut host) = host.lock()
+                    {
+                        host.fill_rectangle(
+                            window.background_pixel,
+                            request.x,
+                            request.y,
+                            width,
+                            height,
+                        )?;
+                    }
                 }
             }
             log_void(client_id, sequence, "ClearArea")
         }
         62 => log_void(client_id, sequence, "CopyArea"),
         64 => log_void(client_id, sequence, "PolyPoint"),
-        65 => log_void(client_id, sequence, "PolyLine"),
+        65 => {
+            if let Some((gc_id, points)) = x11::poly_line_data(body) {
+                let foreground = state.resources.gc_foreground(ResourceId(gc_id));
+                if let Some(host) = host {
+                    if let Ok(mut host) = host.lock() {
+                        host.poly_line(foreground, header.data, points)?;
+                    }
+                }
+            }
+            log_void(client_id, sequence, "PolyLine")
+        }
         66 => log_void(client_id, sequence, "PolySegment"),
         67 => log_void(client_id, sequence, "PolyRectangle"),
         68 => {
             if let Some((gc_id, arcs)) = x11::poly_arc_data(body) {
-                let foreground = state.gc_foreground(gc_id);
+                let foreground = state.resources.gc_foreground(ResourceId(gc_id));
                 if let Some(host) = host {
                     if let Ok(mut host) = host.lock() {
                         host.poly_arc(foreground, arcs)?;
@@ -416,7 +689,7 @@ fn handle_request(
         69 => log_void(client_id, sequence, "FillPoly"),
         70 => {
             if let Some((gc_id, rectangles)) = x11::poly_fill_rectangle_data(body) {
-                let foreground = state.gc_foreground(gc_id);
+                let foreground = state.resources.gc_foreground(ResourceId(gc_id));
                 if let Some(host) = host {
                     if let Ok(mut host) = host.lock() {
                         host.poly_fill_rectangle(foreground, rectangles)?;
@@ -427,7 +700,7 @@ fn handle_request(
         }
         71 => {
             if let Some((gc_id, arcs)) = x11::poly_fill_arc_data(body) {
-                let foreground = state.gc_foreground(gc_id);
+                let foreground = state.resources.gc_foreground(ResourceId(gc_id));
                 if let Some(host) = host {
                     if let Ok(mut host) = host.lock() {
                         host.poly_fill_arc(foreground, arcs)?;
@@ -437,11 +710,37 @@ fn handle_request(
             log_void(client_id, sequence, "PolyFillArc")
         }
         72 => log_void(client_id, sequence, "PutImage"),
-        76 => log_void(client_id, sequence, "ImageText8"),
+        74 => {
+            if let Some((_drawable, gc_id, text_body)) = x11::poly_text_data(body) {
+                let foreground = state.resources.gc_foreground(ResourceId(gc_id));
+                if let Some(host) = host {
+                    if let Ok(mut host) = host.lock() {
+                        host.poly_text8(foreground, text_body)?;
+                    }
+                }
+            }
+            log_void(client_id, sequence, "PolyText8")
+        }
+        76 => {
+            if let Some((drawable, gc_id, text_body)) = x11::image_text8_data(body) {
+                println!("focus text drawable 0x{drawable:x}");
+                set_focused_window(focused_window, stream, sequence, ResourceId(drawable))?;
+                let gc = ResourceId(gc_id);
+                let foreground = state.resources.gc_foreground(gc);
+                let background = state.resources.gc_background(gc);
+                if let Some(host) = host {
+                    if let Ok(mut host) = host.lock() {
+                        host.image_text8(foreground, background, header.data, text_body)?;
+                    }
+                }
+            }
+            log_void(client_id, sequence, "ImageText8")
+        }
         78 => log_void(client_id, sequence, "CreateColormap"),
         84 => {
             log_reply(client_id, sequence, "AllocColor");
-            x11::write_alloc_color_reply(stream, sequence)
+            let color = x11::alloc_color_request(body).unwrap_or_default();
+            x11::write_alloc_color_reply(stream, sequence, color)
         }
         91 => {
             let pixels = x11::query_colors_pixels(body);
@@ -453,6 +752,23 @@ fn handle_request(
             );
             x11::write_query_colors_reply(stream, sequence, &pixels)
         }
+        92 => {
+            log_void(client_id, sequence, "StoreColors")?;
+            x11::write_error(stream, sequence, 10, 0, 0, 92)
+        }
+        94 => {
+            if let Some(cursor) = x11::create_glyph_cursor_id(body) {
+                state.resources.create_glyph_cursor(cursor);
+            }
+            log_void(client_id, sequence, "CreateGlyphCursor")
+        }
+        95 => {
+            if let Some(cursor) = x11::free_resource_id(body) {
+                state.resources.free_cursor(cursor);
+            }
+            log_void(client_id, sequence, "FreeCursor")
+        }
+        96 => log_void(client_id, sequence, "RecolorCursor"),
         98 => {
             let name = x11::query_extension_name(body);
             println!(
@@ -467,7 +783,15 @@ fn handle_request(
         }
         101 => {
             log_reply(client_id, sequence, "GetKeyboardMapping");
-            x11::write_get_keyboard_mapping_reply(stream, sequence, 1)
+            let first_keycode = body.first().copied().unwrap_or(0);
+            let keycode_count = body.get(1).copied().unwrap_or(0);
+            x11::write_get_keyboard_mapping_reply(
+                stream,
+                sequence,
+                first_keycode,
+                keycode_count,
+                4,
+            )
         }
         103 => log_void(client_id, sequence, "Bell"),
         104 => log_void(client_id, sequence, "ChangeKeyboardControl"),
@@ -511,4 +835,66 @@ fn log_void(client_id: ClientId, sequence: SequenceNumber, name: &str) -> io::Re
 
 fn log_reply(client_id: ClientId, sequence: SequenceNumber, name: &str) {
     println!("client {} #{} {name}", client_id.0, sequence.0);
+}
+
+fn window_attributes(window: Option<&Window>) -> x11::WindowAttributes {
+    let window = window.expect("root window exists");
+    x11::WindowAttributes {
+        visual: window.visual,
+        class: window.class.protocol_value(),
+        bit_gravity: 1,
+        win_gravity: 1,
+        backing_planes: u32::MAX,
+        backing_pixel: window.background_pixel,
+        save_under: false,
+        map_is_installed: true,
+        map_state: window.map_state.protocol_value(),
+        override_redirect: window.override_redirect,
+        colormap: ROOT_COLORMAP,
+        all_event_masks: window.event_mask,
+        your_event_mask: window.event_mask,
+        do_not_propagate_mask: 0,
+    }
+}
+
+fn window_geometry(window: &Window) -> x11::Geometry {
+    x11::Geometry {
+        root: ROOT_WINDOW,
+        x: window.x,
+        y: window.y,
+        width: window.width,
+        height: window.height,
+        border_width: window.border_width,
+        depth: window.depth,
+    }
+}
+
+fn pixmap_geometry(pixmap: &Pixmap) -> x11::Geometry {
+    x11::Geometry {
+        root: ROOT_WINDOW,
+        x: 0,
+        y: 0,
+        width: pixmap.width,
+        height: pixmap.height,
+        border_width: 0,
+        depth: pixmap.depth,
+    }
+}
+
+fn font_info(font: &Font) -> x11::FontInfo {
+    x11::FontInfo {
+        ascent: font.ascent,
+        descent: font.descent,
+        min_bounds_width: font.min_bounds_width,
+        max_bounds_width: font.max_bounds_width,
+    }
+}
+
+fn default_font_info() -> x11::FontInfo {
+    x11::FontInfo {
+        ascent: 10,
+        descent: 3,
+        min_bounds_width: 6,
+        max_bounds_width: 8,
+    }
 }

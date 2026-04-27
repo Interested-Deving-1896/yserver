@@ -9,10 +9,10 @@ pub enum ClientByteOrder {
 #[derive(Clone, Copy, Debug)]
 pub struct ClientId(pub u32);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ResourceId(pub u32);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct AtomId(pub u32);
 
 #[derive(Clone, Copy, Debug)]
@@ -22,6 +22,13 @@ impl SequenceNumber {
     pub fn next(self) -> Self {
         Self(self.0.wrapping_add(1))
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Rgb16 {
+    pub red: u16,
+    pub green: u16,
+    pub blue: u16,
 }
 
 #[derive(Debug)]
@@ -76,6 +83,134 @@ pub struct RequestHeader {
     pub length_units: u16,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct KeyEvent {
+    pub pressed: bool,
+    pub keycode: u8,
+    pub sequence: SequenceNumber,
+    pub time: u32,
+    pub root: ResourceId,
+    pub event: ResourceId,
+    pub root_x: i16,
+    pub root_y: i16,
+    pub event_x: i16,
+    pub event_y: i16,
+    pub state: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CreateWindowRequest {
+    pub depth: u8,
+    pub window: ResourceId,
+    pub parent: ResourceId,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+    pub border_width: u16,
+    pub class: u16,
+    pub visual: ResourceId,
+    pub background_pixel: Option<u32>,
+    pub event_mask: Option<u32>,
+    pub override_redirect: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ChangeWindowAttributesRequest {
+    pub window: ResourceId,
+    pub background_pixel: Option<u32>,
+    pub event_mask: Option<u32>,
+    pub cursor: Option<ResourceId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ConfigureWindowRequest {
+    pub window: ResourceId,
+    pub x: Option<i16>,
+    pub y: Option<i16>,
+    pub width: Option<u16>,
+    pub height: Option<u16>,
+    pub border_width: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CreatePixmapRequest {
+    pub depth: u8,
+    pub pixmap: ResourceId,
+    pub drawable: ResourceId,
+    pub width: u16,
+    pub height: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CreateGcRequest {
+    pub gc: ResourceId,
+    pub drawable: ResourceId,
+    pub foreground: Option<u32>,
+    pub background: Option<u32>,
+    pub line_width: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GcChange {
+    pub gc: ResourceId,
+    pub foreground: Option<u32>,
+    pub background: Option<u32>,
+    pub line_width: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClearAreaRequest {
+    pub window: ResourceId,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+}
+
+#[derive(Clone, Debug)]
+pub struct OpenFontRequest {
+    pub font: ResourceId,
+    pub name: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FontInfo {
+    pub ascent: i16,
+    pub descent: i16,
+    pub min_bounds_width: i16,
+    pub max_bounds_width: i16,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct WindowAttributes {
+    pub visual: ResourceId,
+    pub class: u16,
+    pub bit_gravity: u8,
+    pub win_gravity: u8,
+    pub backing_planes: u32,
+    pub backing_pixel: u32,
+    pub save_under: bool,
+    pub map_is_installed: bool,
+    pub map_state: u8,
+    pub override_redirect: bool,
+    pub colormap: ResourceId,
+    pub all_event_masks: u32,
+    pub your_event_mask: u32,
+    pub do_not_propagate_mask: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Geometry {
+    pub root: ResourceId,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+    pub border_width: u16,
+    pub depth: u8,
+}
+
 pub fn read_setup_request(reader: &mut impl Read) -> io::Result<SetupRequest> {
     let mut header = [0; 12];
     reader.read_exact(&mut header)?;
@@ -127,6 +262,25 @@ pub fn write_setup_failed(
     body.extend_from_slice(&reason.as_bytes()[..reason_len]);
     pad_vec4(&mut body);
     writer.write_all(&body)
+}
+
+pub fn write_error(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    error_code: u8,
+    bad_value: u32,
+    minor_opcode: u16,
+    major_opcode: u8,
+) -> io::Result<()> {
+    let mut error = Vec::with_capacity(32);
+    error.push(0);
+    error.push(error_code);
+    write_u16(ClientByteOrder::LittleEndian, &mut error, sequence.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut error, bad_value);
+    write_u16(ClientByteOrder::LittleEndian, &mut error, minor_opcode);
+    error.push(major_opcode);
+    error.extend_from_slice(&[0; 21]);
+    writer.write_all(&error)
 }
 
 pub fn write_setup_success(writer: &mut impl Write, setup: SetupSuccess<'_>) -> io::Result<()> {
@@ -308,33 +462,114 @@ pub fn request_atom(body: &[u8]) -> AtomId {
     AtomId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
 }
 
-pub fn create_window_ids(body: &[u8]) -> Option<(ResourceId, ResourceId)> {
-    Some((
-        ResourceId(read_u32_le(body.get(0..4)?)),
-        ResourceId(read_u32_le(body.get(4..8)?)),
-    ))
+pub fn create_window_request(depth: u8, body: &[u8]) -> Option<CreateWindowRequest> {
+    let value_mask = read_u32_le(body.get(24..28)?);
+    let values = value_list(value_mask, body.get(28..)?);
+    Some(CreateWindowRequest {
+        depth,
+        window: ResourceId(read_u32_le(body.get(0..4)?)),
+        parent: ResourceId(read_u32_le(body.get(4..8)?)),
+        x: read_i16_le(body.get(8..10)?),
+        y: read_i16_le(body.get(10..12)?),
+        width: read_u16_le(body.get(12..14)?),
+        height: read_u16_le(body.get(14..16)?),
+        border_width: read_u16_le(body.get(16..18)?),
+        class: read_u16_le(body.get(18..20)?),
+        visual: ResourceId(read_u32_le(body.get(20..24)?)),
+        background_pixel: values.value(1),
+        event_mask: values.value(11),
+        override_redirect: values.value(9).map(|value| value != 0),
+    })
 }
 
-pub fn create_gc_id(body: &[u8]) -> Option<u32> {
-    Some(read_u32_le(body.get(0..4)?))
-}
-
-pub fn change_gc_id(body: &[u8]) -> Option<u32> {
-    Some(read_u32_le(body.get(0..4)?))
-}
-
-pub fn free_gc_id(body: &[u8]) -> Option<u32> {
-    Some(read_u32_le(body.get(0..4)?))
-}
-
-pub fn gc_foreground_from_create(body: &[u8]) -> Option<u32> {
-    let value_mask = read_u32_le(body.get(8..12)?);
-    gc_foreground_from_values(value_mask, body.get(12..)?)
-}
-
-pub fn gc_foreground_from_change(body: &[u8]) -> Option<u32> {
+pub fn change_window_attributes_request(body: &[u8]) -> Option<ChangeWindowAttributesRequest> {
     let value_mask = read_u32_le(body.get(4..8)?);
-    gc_foreground_from_values(value_mask, body.get(8..)?)
+    let values = value_list(value_mask, body.get(8..)?);
+    Some(ChangeWindowAttributesRequest {
+        window: ResourceId(read_u32_le(body.get(0..4)?)),
+        background_pixel: values.value(1),
+        event_mask: values.value(11),
+        cursor: values.value(14).map(ResourceId),
+    })
+}
+
+pub fn configure_window_request(body: &[u8]) -> Option<ConfigureWindowRequest> {
+    let window = ResourceId(read_u32_le(body.get(0..4)?));
+    let value_mask = read_u16_le(body.get(4..6)?) as u32;
+    let values = value_list(value_mask, body.get(8..)?);
+    Some(ConfigureWindowRequest {
+        window,
+        x: values.value(0).map(|value| value as i16),
+        y: values.value(1).map(|value| value as i16),
+        width: values.value(2).map(|value| value as u16),
+        height: values.value(3).map(|value| value as u16),
+        border_width: values.value(4).map(|value| value as u16),
+    })
+}
+
+pub fn create_pixmap_request(depth: u8, body: &[u8]) -> Option<CreatePixmapRequest> {
+    Some(CreatePixmapRequest {
+        depth,
+        pixmap: ResourceId(read_u32_le(body.get(0..4)?)),
+        drawable: ResourceId(read_u32_le(body.get(4..8)?)),
+        width: read_u16_le(body.get(8..10)?),
+        height: read_u16_le(body.get(10..12)?),
+    })
+}
+
+pub fn free_resource_id(body: &[u8]) -> Option<ResourceId> {
+    Some(ResourceId(read_u32_le(body.get(0..4)?)))
+}
+
+pub fn create_gc_request(body: &[u8]) -> Option<CreateGcRequest> {
+    let value_mask = read_u32_le(body.get(8..12)?);
+    let values = value_list(value_mask, body.get(12..)?);
+    Some(CreateGcRequest {
+        gc: ResourceId(read_u32_le(body.get(0..4)?)),
+        drawable: ResourceId(read_u32_le(body.get(4..8)?)),
+        foreground: values.value(2),
+        background: values.value(3),
+        line_width: values.value(4).map(|value| value as u16),
+    })
+}
+
+pub fn change_gc_request(body: &[u8]) -> Option<GcChange> {
+    let value_mask = read_u32_le(body.get(4..8)?);
+    let values = value_list(value_mask, body.get(8..)?);
+    Some(GcChange {
+        gc: ResourceId(read_u32_le(body.get(0..4)?)),
+        foreground: values.value(2),
+        background: values.value(3),
+        line_width: values.value(4).map(|value| value as u16),
+    })
+}
+
+pub fn drawable_request_id(body: &[u8]) -> Option<ResourceId> {
+    Some(ResourceId(read_u32_le(body.get(0..4)?)))
+}
+
+pub fn clear_area_request(body: &[u8]) -> Option<ClearAreaRequest> {
+    Some(ClearAreaRequest {
+        window: ResourceId(read_u32_le(body.get(0..4)?)),
+        x: read_i16_le(body.get(4..6)?),
+        y: read_i16_le(body.get(6..8)?),
+        width: read_u16_le(body.get(8..10)?),
+        height: read_u16_le(body.get(10..12)?),
+    })
+}
+
+pub fn open_font_request(body: &[u8]) -> Option<OpenFontRequest> {
+    let font = ResourceId(read_u32_le(body.get(0..4)?));
+    let name_len = read_u16_le(body.get(4..6)?) as usize;
+    let name = body.get(8..8 + name_len)?;
+    Some(OpenFontRequest {
+        font,
+        name: String::from_utf8_lossy(name).into_owned(),
+    })
+}
+
+pub fn create_glyph_cursor_id(body: &[u8]) -> Option<ResourceId> {
+    Some(ResourceId(read_u32_le(body.get(0..4)?)))
 }
 
 pub fn poly_fill_arc_data(body: &[u8]) -> Option<(u32, &[u8])> {
@@ -354,14 +589,76 @@ pub fn poly_fill_rectangle_data(body: &[u8]) -> Option<(u32, &[u8])> {
     Some((gc_id, rectangles))
 }
 
+pub fn poly_line_data(body: &[u8]) -> Option<(u32, &[u8])> {
+    let gc_id = read_u32_le(body.get(4..8)?);
+    let points = body.get(8..)?;
+    if points.len() % 4 != 0 {
+        return None;
+    }
+    Some((gc_id, points))
+}
+
+pub fn image_text8_data(body: &[u8]) -> Option<(u32, u32, &[u8])> {
+    let drawable = read_u32_le(body.get(0..4)?);
+    let gc_id = read_u32_le(body.get(4..8)?);
+    Some((drawable, gc_id, body))
+}
+
+pub fn poly_text_data(body: &[u8]) -> Option<(u32, u32, &[u8])> {
+    let drawable = read_u32_le(body.get(0..4)?);
+    let gc_id = read_u32_le(body.get(4..8)?);
+    Some((drawable, gc_id, body))
+}
+
 pub fn map_window_id(body: &[u8]) -> Option<ResourceId> {
     Some(ResourceId(read_u32_le(body.get(0..4)?)))
+}
+
+pub fn input_focus_window(body: &[u8]) -> Option<ResourceId> {
+    Some(ResourceId(read_u32_le(body.get(0..4)?)))
+}
+
+pub fn write_key_event(writer: &mut impl Write, event: KeyEvent) -> io::Result<()> {
+    let mut out = Vec::with_capacity(32);
+    out.push(if event.pressed { 2 } else { 3 });
+    out.push(event.keycode);
+    write_u16(ClientByteOrder::LittleEndian, &mut out, event.sequence.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, event.time);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, event.root.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, event.event.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // child
+    write_i16(ClientByteOrder::LittleEndian, &mut out, event.root_x);
+    write_i16(ClientByteOrder::LittleEndian, &mut out, event.root_y);
+    write_i16(ClientByteOrder::LittleEndian, &mut out, event.event_x);
+    write_i16(ClientByteOrder::LittleEndian, &mut out, event.event_y);
+    write_u16(ClientByteOrder::LittleEndian, &mut out, event.state);
+    out.push(1); // same-screen
+    out.push(0);
+    writer.write_all(&out)
+}
+
+pub fn write_focus_event(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    focus_in: bool,
+    window: ResourceId,
+) -> io::Result<()> {
+    let mut event = Vec::with_capacity(32);
+    event.push(if focus_in { 9 } else { 10 });
+    event.push(0); // NotifyAncestor
+    write_u16(ClientByteOrder::LittleEndian, &mut event, sequence.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut event, window.0);
+    event.push(0); // NotifyNormal
+    event.extend_from_slice(&[0; 23]);
+    writer.write_all(&event)
 }
 
 pub fn write_expose_event(
     writer: &mut impl Write,
     sequence: SequenceNumber,
     window: ResourceId,
+    width: u16,
+    height: u16,
 ) -> io::Result<()> {
     let mut event = Vec::with_capacity(32);
     event.push(12); // Expose
@@ -370,10 +667,57 @@ pub fn write_expose_event(
     write_u32(ClientByteOrder::LittleEndian, &mut event, window.0);
     write_u16(ClientByteOrder::LittleEndian, &mut event, 0);
     write_u16(ClientByteOrder::LittleEndian, &mut event, 0);
-    write_u16(ClientByteOrder::LittleEndian, &mut event, 800);
-    write_u16(ClientByteOrder::LittleEndian, &mut event, 600);
+    write_u16(ClientByteOrder::LittleEndian, &mut event, width);
+    write_u16(ClientByteOrder::LittleEndian, &mut event, height);
     write_u16(ClientByteOrder::LittleEndian, &mut event, 0); // count
     event.extend_from_slice(&[0; 14]);
+    writer.write_all(&event)
+}
+
+pub fn write_map_notify_event(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    event_window: ResourceId,
+    window: ResourceId,
+    override_redirect: bool,
+) -> io::Result<()> {
+    let mut event = Vec::with_capacity(32);
+    event.push(19); // MapNotify
+    event.push(0);
+    write_u16(ClientByteOrder::LittleEndian, &mut event, sequence.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut event, event_window.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut event, window.0);
+    event.push(u8::from(override_redirect));
+    event.extend_from_slice(&[0; 19]);
+    writer.write_all(&event)
+}
+
+pub fn write_configure_notify_event(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    event_window: ResourceId,
+    window: ResourceId,
+    geometry: Geometry,
+    override_redirect: bool,
+) -> io::Result<()> {
+    let mut event = Vec::with_capacity(32);
+    event.push(22); // ConfigureNotify
+    event.push(0);
+    write_u16(ClientByteOrder::LittleEndian, &mut event, sequence.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut event, event_window.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut event, window.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut event, 0); // above-sibling
+    write_i16(ClientByteOrder::LittleEndian, &mut event, geometry.x);
+    write_i16(ClientByteOrder::LittleEndian, &mut event, geometry.y);
+    write_u16(ClientByteOrder::LittleEndian, &mut event, geometry.width);
+    write_u16(ClientByteOrder::LittleEndian, &mut event, geometry.height);
+    write_u16(
+        ClientByteOrder::LittleEndian,
+        &mut event,
+        geometry.border_width,
+    );
+    event.push(u8::from(override_redirect));
+    event.extend_from_slice(&[0; 5]);
     writer.write_all(&event)
 }
 
@@ -397,20 +741,40 @@ pub fn query_colors_pixels(body: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-fn gc_foreground_from_values(value_mask: u32, values: &[u8]) -> Option<u32> {
-    let mut offset = 0;
-    for bit in 0..32 {
-        if value_mask & (1 << bit) == 0 {
-            continue;
-        }
+pub fn alloc_color_request(body: &[u8]) -> Option<Rgb16> {
+    Some(Rgb16 {
+        red: read_u16_le(body.get(4..6)?),
+        green: read_u16_le(body.get(6..8)?),
+        blue: read_u16_le(body.get(8..10)?),
+    })
+}
 
-        let value = read_u32_le(values.get(offset..offset + 4)?);
-        if bit == 2 {
-            return Some(value);
+#[derive(Clone, Copy, Debug)]
+struct ValueList<'a> {
+    value_mask: u32,
+    values: &'a [u8],
+}
+
+impl ValueList<'_> {
+    fn value(self, target_bit: u8) -> Option<u32> {
+        let mut offset = 0;
+        for bit in 0..32 {
+            if self.value_mask & (1 << bit) == 0 {
+                continue;
+            }
+
+            let value = read_u32_le(self.values.get(offset..offset + 4)?);
+            if bit == target_bit {
+                return Some(value);
+            }
+            offset += 4;
         }
-        offset += 4;
+        None
     }
-    None
+}
+
+fn value_list(value_mask: u32, values: &[u8]) -> ValueList<'_> {
+    ValueList { value_mask, values }
 }
 
 pub fn query_extension_name(body: &[u8]) -> String {
@@ -575,22 +939,51 @@ pub fn well_known_atom_name(atom: AtomId) -> Option<&'static str> {
 pub fn write_get_window_attributes_reply(
     writer: &mut impl Write,
     sequence: SequenceNumber,
+    attributes: WindowAttributes,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 3, 0);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // visual
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, 1); // class InputOutput
-    reply.push(1); // bit gravity NorthWest
-    reply.push(1); // win gravity NorthWest
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // backing planes
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // backing pixel
-    reply.push(0); // save under
-    reply.push(1); // map installed
-    reply.push(2); // map state viewable
-    reply.push(0); // override redirect
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // colormap
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // all event masks
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // your event mask
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, 0); // do not propagate
+    let mut reply = fixed_reply(sequence, 0, 3);
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        attributes.visual.0,
+    );
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, attributes.class);
+    reply.push(attributes.bit_gravity);
+    reply.push(attributes.win_gravity);
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        attributes.backing_planes,
+    );
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        attributes.backing_pixel,
+    );
+    reply.push(u8::from(attributes.save_under));
+    reply.push(u8::from(attributes.map_is_installed));
+    reply.push(attributes.map_state);
+    reply.push(u8::from(attributes.override_redirect));
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        attributes.colormap.0,
+    );
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        attributes.all_event_masks,
+    );
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        attributes.your_event_mask,
+    );
+    write_u16(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        attributes.do_not_propagate_mask,
+    );
     write_u16(ClientByteOrder::LittleEndian, &mut reply, 0);
     writer.write_all(&reply)
 }
@@ -598,22 +991,19 @@ pub fn write_get_window_attributes_reply(
 pub fn write_get_geometry_reply(
     writer: &mut impl Write,
     sequence: SequenceNumber,
-    root: ResourceId,
-    x: i16,
-    y: i16,
-    width: u16,
-    height: u16,
-    border_width: u16,
-    depth: u8,
+    geometry: Geometry,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, depth, 0);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, root.0);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, x);
-    write_i16(ClientByteOrder::LittleEndian, &mut reply, y);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, width);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, height);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, border_width);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, 0);
+    let mut reply = fixed_reply(sequence, geometry.depth, 0);
+    write_u32(ClientByteOrder::LittleEndian, &mut reply, geometry.root.0);
+    write_i16(ClientByteOrder::LittleEndian, &mut reply, geometry.x);
+    write_i16(ClientByteOrder::LittleEndian, &mut reply, geometry.y);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, geometry.width);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, geometry.height);
+    write_u16(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        geometry.border_width,
+    );
     reply.extend_from_slice(&[0; 10]);
     writer.write_all(&reply)
 }
@@ -633,7 +1023,6 @@ pub fn write_query_tree_reply(
         &mut reply,
         children.len() as u16,
     );
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, 0);
     reply.extend_from_slice(&[0; 14]);
     for child in children {
         write_u32(ClientByteOrder::LittleEndian, &mut reply, child.0);
@@ -759,15 +1148,26 @@ pub fn write_query_keymap_reply(
 pub fn write_alloc_color_reply(
     writer: &mut impl Write,
     sequence: SequenceNumber,
+    color: Rgb16,
 ) -> io::Result<()> {
     let mut reply = fixed_reply(sequence, 0, 0);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, 0xffff);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, 0xffff);
-    write_u16(ClientByteOrder::LittleEndian, &mut reply, 0xffff);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.red);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.green);
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, color.blue);
     write_u16(ClientByteOrder::LittleEndian, &mut reply, 0);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, 0x00ff_ffff);
+    write_u32(
+        ClientByteOrder::LittleEndian,
+        &mut reply,
+        rgb16_to_pixel(color),
+    );
     reply.extend_from_slice(&[0; 12]);
     writer.write_all(&reply)
+}
+
+fn rgb16_to_pixel(color: Rgb16) -> u32 {
+    ((u32::from(color.red) >> 8) << 16)
+        | ((u32::from(color.green) >> 8) << 8)
+        | (u32::from(color.blue) >> 8)
 }
 
 pub fn write_query_colors_reply(
@@ -824,10 +1224,123 @@ pub fn write_list_extensions_reply(
 pub fn write_get_keyboard_mapping_reply(
     writer: &mut impl Write,
     sequence: SequenceNumber,
+    first_keycode: u8,
+    keycode_count: u8,
     keysyms_per_keycode: u8,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, keysyms_per_keycode, 0);
+    let keysym_count = u32::from(keycode_count) * u32::from(keysyms_per_keycode);
+    let mut reply = fixed_reply(sequence, keysyms_per_keycode, keysyms_per_keycode as u32);
     reply.extend_from_slice(&[0; 24]);
+    reply.truncate(32);
+    reply[4..8].copy_from_slice(&keysym_count.to_le_bytes());
+
+    for offset in 0..keycode_count {
+        let keycode = first_keycode.wrapping_add(offset);
+        let (base, shifted) = keysyms_for_keycode(keycode);
+        write_u32(ClientByteOrder::LittleEndian, &mut reply, base);
+        if keysyms_per_keycode > 1 {
+            write_u32(ClientByteOrder::LittleEndian, &mut reply, shifted);
+        }
+        for _ in 2..keysyms_per_keycode {
+            write_u32(ClientByteOrder::LittleEndian, &mut reply, 0);
+        }
+    }
+    writer.write_all(&reply)
+}
+
+fn keysyms_for_keycode(keycode: u8) -> (u32, u32) {
+    match keycode {
+        9 => (0xff1b, 0xff1b), // Escape
+        10 => (b'1' as u32, b'!' as u32),
+        11 => (b'2' as u32, b'@' as u32),
+        12 => (b'3' as u32, b'#' as u32),
+        13 => (b'4' as u32, b'$' as u32),
+        14 => (b'5' as u32, b'%' as u32),
+        15 => (b'6' as u32, b'^' as u32),
+        16 => (b'7' as u32, b'&' as u32),
+        17 => (b'8' as u32, b'*' as u32),
+        18 => (b'9' as u32, b'(' as u32),
+        19 => (b'0' as u32, b')' as u32),
+        20 => (b'-' as u32, b'_' as u32),
+        21 => (b'=' as u32, b'+' as u32),
+        22 => (0xff08, 0xff08), // Backspace
+        23 => (0xff09, 0xff09), // Tab
+        24 => (b'q' as u32, b'Q' as u32),
+        25 => (b'w' as u32, b'W' as u32),
+        26 => (b'e' as u32, b'E' as u32),
+        27 => (b'r' as u32, b'R' as u32),
+        28 => (b't' as u32, b'T' as u32),
+        29 => (b'y' as u32, b'Y' as u32),
+        30 => (b'u' as u32, b'U' as u32),
+        31 => (b'i' as u32, b'I' as u32),
+        32 => (b'o' as u32, b'O' as u32),
+        33 => (b'p' as u32, b'P' as u32),
+        34 => (b'[' as u32, b'{' as u32),
+        35 => (b']' as u32, b'}' as u32),
+        36 => (0xff0d, 0xff0d), // Return
+        38 => (b'a' as u32, b'A' as u32),
+        39 => (b's' as u32, b'S' as u32),
+        40 => (b'd' as u32, b'D' as u32),
+        41 => (b'f' as u32, b'F' as u32),
+        42 => (b'g' as u32, b'G' as u32),
+        43 => (b'h' as u32, b'H' as u32),
+        44 => (b'j' as u32, b'J' as u32),
+        45 => (b'k' as u32, b'K' as u32),
+        46 => (b'l' as u32, b'L' as u32),
+        47 => (b';' as u32, b':' as u32),
+        48 => (b'\'' as u32, b'"' as u32),
+        49 => (b'`' as u32, b'~' as u32),
+        50 => (0xffe1, 0xffe1), // Shift_L
+        51 => (b'\\' as u32, b'|' as u32),
+        52 => (b'z' as u32, b'Z' as u32),
+        53 => (b'x' as u32, b'X' as u32),
+        54 => (b'c' as u32, b'C' as u32),
+        55 => (b'v' as u32, b'V' as u32),
+        56 => (b'b' as u32, b'B' as u32),
+        57 => (b'n' as u32, b'N' as u32),
+        58 => (b'm' as u32, b'M' as u32),
+        59 => (b',' as u32, b'<' as u32),
+        60 => (b'.' as u32, b'>' as u32),
+        61 => (b'/' as u32, b'?' as u32),
+        62 => (0xffe2, 0xffe2), // Shift_R
+        65 => (b' ' as u32, b' ' as u32),
+        66 => (0xffe5, 0xffe5),  // Caps_Lock
+        37 => (0xffe3, 0xffe3),  // Control_L
+        64 => (0xffe9, 0xffe9),  // Alt_L
+        105 => (0xffe4, 0xffe4), // Control_R
+        108 => (0xffea, 0xffea), // Alt_R
+        113 => (0xff51, 0xff51), // Left
+        114 => (0xff53, 0xff53), // Right
+        111 => (0xff52, 0xff52), // Up
+        116 => (0xff54, 0xff54), // Down
+        119 => (0xffff, 0xffff), // Delete
+        133 => (0xffeb, 0xffeb), // Super_L
+        134 => (0xffec, 0xffec), // Super_R
+        _ => (0, 0),
+    }
+}
+
+pub fn write_query_font_reply(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    info: FontInfo,
+) -> io::Result<()> {
+    let mut reply = fixed_reply(sequence, 0, 7);
+    write_char_info(&mut reply, info.min_bounds_width, info.ascent, info.descent);
+    reply.extend_from_slice(&[0; 4]); // min-bounds padding
+    write_char_info(&mut reply, info.max_bounds_width, info.ascent, info.descent);
+    reply.extend_from_slice(&[0; 4]); // max-bounds padding
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, 1); // min-char-or-byte2
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, 255); // max-char-or-byte2
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, 0); // default-char
+    write_u16(ClientByteOrder::LittleEndian, &mut reply, 0); // properties
+    reply.push(0); // draw-direction LeftToRight
+    reply.push(0); // min-byte1
+    reply.push(0); // max-byte1
+    reply.push(0); // all-chars-exist
+    write_i16(ClientByteOrder::LittleEndian, &mut reply, info.ascent);
+    write_i16(ClientByteOrder::LittleEndian, &mut reply, info.descent);
+    write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // char-infos
     writer.write_all(&reply)
 }
 
@@ -854,7 +1367,7 @@ pub fn write_get_modifier_mapping_reply(
 ) -> io::Result<()> {
     let mut reply = fixed_reply(sequence, 1, 2);
     reply.extend_from_slice(&[0; 24]);
-    reply.extend_from_slice(&[0; 8]);
+    reply.extend_from_slice(&[50, 66, 37, 64, 0, 0, 0, 133]);
     writer.write_all(&reply)
 }
 
@@ -893,6 +1406,14 @@ fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+fn read_u16_le(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+fn read_i16_le(bytes: &[u8]) -> i16 {
+    i16::from_le_bytes([bytes[0], bytes[1]])
+}
+
 fn write_u16(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: u16) {
     match byte_order {
         ClientByteOrder::LittleEndian => out.extend_from_slice(&value.to_le_bytes()),
@@ -905,6 +1426,15 @@ fn write_i16(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: i16) {
         ClientByteOrder::LittleEndian => out.extend_from_slice(&value.to_le_bytes()),
         ClientByteOrder::BigEndian => out.extend_from_slice(&value.to_be_bytes()),
     }
+}
+
+fn write_char_info(out: &mut Vec<u8>, width: i16, ascent: i16, descent: i16) {
+    write_i16(ClientByteOrder::LittleEndian, out, 0); // left-side-bearing
+    write_i16(ClientByteOrder::LittleEndian, out, width); // right-side-bearing
+    write_i16(ClientByteOrder::LittleEndian, out, width); // character-width
+    write_i16(ClientByteOrder::LittleEndian, out, ascent);
+    write_i16(ClientByteOrder::LittleEndian, out, descent);
+    write_u16(ClientByteOrder::LittleEndian, out, 0); // attributes
 }
 
 fn write_u32(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: u32) {

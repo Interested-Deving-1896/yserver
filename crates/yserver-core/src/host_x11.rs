@@ -11,29 +11,31 @@ pub struct HostX11 {
     window_id: u32,
     gc_id: u32,
     current_foreground: u32,
+    current_background: u32,
     sequence: u16,
+}
+
+pub struct HostKeyboard {
+    stream: UnixStream,
 }
 
 impl HostX11 {
     pub fn open_from_env() -> io::Result<Self> {
-        let display = env::var("DISPLAY").map_err(|_| {
-            io::Error::new(
-                ErrorKind::NotFound,
-                "DISPLAY is not set for host X11 backend",
-            )
-        })?;
-        let display_number = parse_display_number(&display)?;
-        let socket_path = format!("/tmp/.X11-unix/X{display_number}");
-
-        let auth = XAuthority::load(display_number).unwrap_or_default();
-        let mut stream = UnixStream::connect(socket_path)?;
-        write_setup_request(&mut stream, auth.as_ref())?;
-
+        let mut stream = connect_to_host()?;
         let setup = read_setup_reply(&mut stream)?;
         let window_id = setup.resource_id_base;
         let gc_id = setup.resource_id_base + 1;
+        let font_id = setup.resource_id_base + 2;
         create_window(&mut stream, &setup, window_id)?;
-        create_gc(&mut stream, window_id, gc_id, setup.black_pixel)?;
+        open_font(&mut stream, font_id, b"fixed")?;
+        create_gc(
+            &mut stream,
+            window_id,
+            gc_id,
+            setup.black_pixel,
+            setup.white_pixel,
+            font_id,
+        )?;
         map_window(&mut stream, window_id)?;
         stream.flush()?;
 
@@ -42,7 +44,8 @@ impl HostX11 {
             window_id,
             gc_id,
             current_foreground: setup.black_pixel,
-            sequence: 4,
+            current_background: setup.white_pixel,
+            sequence: 5,
         })
     }
 
@@ -67,7 +70,7 @@ impl HostX11 {
         self.stream.flush()?;
 
         let mut reply = [0; 32];
-        self.stream.read_exact(&mut reply)?;
+        self.read_fixed_reply(&mut reply)?;
         if reply[0] != 1 {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
@@ -83,21 +86,6 @@ impl HostX11 {
             win_y: read_i16(&reply[22..24]),
             mask: read_u16(&reply[24..26]),
         })
-    }
-
-    pub fn clear(&mut self) -> io::Result<()> {
-        self.sequence = self.sequence.wrapping_add(1);
-        let mut out = Vec::new();
-        out.push(61);
-        out.push(0);
-        write_u16(&mut out, 4);
-        write_u32(&mut out, self.window_id);
-        write_i16(&mut out, 0);
-        write_i16(&mut out, 0);
-        write_u16(&mut out, 0);
-        write_u16(&mut out, 0);
-        self.stream.write_all(&out)?;
-        self.stream.flush()
     }
 
     pub fn poly_fill_arc(&mut self, foreground: u32, arcs: &[u8]) -> io::Result<()> {
@@ -134,6 +122,101 @@ impl HostX11 {
         self.stream.flush()
     }
 
+    pub fn fill_rectangle(
+        &mut self,
+        foreground: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        let mut rectangle = Vec::with_capacity(8);
+        write_i16(&mut rectangle, x);
+        write_i16(&mut rectangle, y);
+        write_u16(&mut rectangle, width);
+        write_u16(&mut rectangle, height);
+        self.poly_fill_rectangle(foreground, &rectangle)
+    }
+
+    pub fn poly_line(
+        &mut self,
+        foreground: u32,
+        coordinate_mode: u8,
+        points: &[u8],
+    ) -> io::Result<()> {
+        if points.is_empty() {
+            return Ok(());
+        }
+        if self.current_foreground != foreground {
+            self.change_foreground(foreground)?;
+        }
+
+        let length_units = 3 + u16::try_from(points.len() / 4).map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "too many points for one X11 request",
+            )
+        })?;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(65);
+        out.push(coordinate_mode);
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, self.window_id);
+        write_u32(&mut out, self.gc_id);
+        out.extend_from_slice(points);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn image_text8(
+        &mut self,
+        foreground: u32,
+        background: u32,
+        text_len: u8,
+        body: &[u8],
+    ) -> io::Result<()> {
+        if body.len() < 12 {
+            return Ok(());
+        }
+        self.change_colors(foreground, background)?;
+
+        let text = &body[12..];
+        let length_units = 4 + u16::try_from(text.len() / 4)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "text request is too large"))?;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(76);
+        out.push(text_len);
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, self.window_id);
+        write_u32(&mut out, self.gc_id);
+        out.extend_from_slice(&body[8..12]);
+        out.extend_from_slice(text);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn poly_text8(&mut self, foreground: u32, body: &[u8]) -> io::Result<()> {
+        if body.len() < 12 {
+            return Ok(());
+        }
+        self.change_foreground(foreground)?;
+
+        let length_units = 1 + u16::try_from(body.len() / 4)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "text request is too large"))?;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(74);
+        out.push(0);
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, self.window_id);
+        write_u32(&mut out, self.gc_id);
+        out.extend_from_slice(&body[8..]);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
     fn draw_arcs(&mut self, opcode: u8, foreground: u32, arcs: &[u8]) -> io::Result<()> {
         if arcs.is_empty() {
             return Ok(());
@@ -158,6 +241,10 @@ impl HostX11 {
     }
 
     fn change_foreground(&mut self, foreground: u32) -> io::Result<()> {
+        if self.current_foreground == foreground {
+            return Ok(());
+        }
+
         self.sequence = self.sequence.wrapping_add(1);
         let mut out = Vec::new();
         out.push(56);
@@ -170,6 +257,95 @@ impl HostX11 {
         self.current_foreground = foreground;
         Ok(())
     }
+
+    fn change_colors(&mut self, foreground: u32, background: u32) -> io::Result<()> {
+        if self.current_foreground == foreground && self.current_background == background {
+            return Ok(());
+        }
+
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(56);
+        out.push(0);
+        write_u16(&mut out, 5);
+        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, (1 << 2) | (1 << 3));
+        write_u32(&mut out, foreground);
+        write_u32(&mut out, background);
+        self.stream.write_all(&out)?;
+        self.current_foreground = foreground;
+        self.current_background = background;
+        Ok(())
+    }
+
+    fn read_fixed_reply(&mut self, reply: &mut [u8; 32]) -> io::Result<()> {
+        loop {
+            self.stream.read_exact(reply)?;
+            if reply[0] == 1 {
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn connect_to_host() -> io::Result<UnixStream> {
+    let display = env::var("DISPLAY").map_err(|_| {
+        io::Error::new(
+            ErrorKind::NotFound,
+            "DISPLAY is not set for host X11 backend",
+        )
+    })?;
+    let display_number = parse_display_number(&display)?;
+    let socket_path = format!("/tmp/.X11-unix/X{display_number}");
+
+    let auth = XAuthority::load(display_number).unwrap_or_default();
+    let mut stream = UnixStream::connect(socket_path)?;
+    write_setup_request(&mut stream, auth.as_ref())?;
+    Ok(stream)
+}
+
+impl HostKeyboard {
+    pub fn open_from_env(window_id: u32) -> io::Result<Self> {
+        let mut stream = connect_to_host()?;
+        let _setup = read_setup_reply(&mut stream)?;
+        select_keyboard_events(&mut stream, window_id)?;
+        stream.flush()?;
+        Ok(Self { stream })
+    }
+
+    pub fn read_key_event(&mut self) -> io::Result<HostKeyEvent> {
+        loop {
+            let mut event = [0; 32];
+            self.stream.read_exact(&mut event)?;
+            let event_type = event[0] & 0x7f;
+            if event_type != 2 && event_type != 3 {
+                continue;
+            }
+
+            return Ok(HostKeyEvent {
+                pressed: event_type == 2,
+                keycode: event[1],
+                time: read_u32(&event[4..8]),
+                root_x: read_i16(&event[20..22]),
+                root_y: read_i16(&event[22..24]),
+                event_x: read_i16(&event[24..26]),
+                event_y: read_i16(&event[26..28]),
+                state: read_u16(&event[28..30]),
+            });
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HostKeyEvent {
+    pub pressed: bool,
+    pub keycode: u8,
+    pub time: u32,
+    pub root_x: i16,
+    pub root_y: i16,
+    pub event_x: i16,
+    pub event_y: i16,
+    pub state: u16,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -343,20 +519,56 @@ fn create_window(stream: &mut UnixStream, setup: &HostSetup, window_id: u32) -> 
     stream.write_all(&out)
 }
 
+fn select_keyboard_events(stream: &mut UnixStream, window_id: u32) -> io::Result<()> {
+    let mut out = Vec::new();
+    out.push(2);
+    out.push(0);
+    write_u16(&mut out, 4);
+    write_u32(&mut out, window_id);
+    write_u32(&mut out, 1 << 11);
+    write_u32(&mut out, (1 << 0) | (1 << 1));
+    stream.write_all(&out)
+}
+
 fn create_gc(
     stream: &mut UnixStream,
     drawable: u32,
     gc_id: u32,
     foreground: u32,
+    background: u32,
+    font_id: u32,
 ) -> io::Result<()> {
     let mut out = Vec::new();
     out.push(55);
     out.push(0);
-    write_u16(&mut out, 5);
+    write_u16(&mut out, 7);
     write_u32(&mut out, gc_id);
     write_u32(&mut out, drawable);
-    write_u32(&mut out, 1 << 2);
+    write_u32(&mut out, (1 << 2) | (1 << 3) | (1 << 14));
     write_u32(&mut out, foreground);
+    write_u32(&mut out, background);
+    write_u32(&mut out, font_id);
+    stream.write_all(&out)
+}
+
+fn open_font(stream: &mut UnixStream, font_id: u32, name: &[u8]) -> io::Result<()> {
+    let padded_name_len = padded_len(name.len());
+    let length_units = 3 + u16::try_from(padded_name_len / 4)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "font name is too long"))?;
+
+    let mut out = Vec::new();
+    out.push(45);
+    out.push(0);
+    write_u16(&mut out, length_units);
+    write_u32(&mut out, font_id);
+    write_u16(
+        &mut out,
+        u16::try_from(name.len())
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "font name is too long"))?,
+    );
+    write_u16(&mut out, 0);
+    out.extend_from_slice(name);
+    out.resize(12 + padded_name_len, 0);
     stream.write_all(&out)
 }
 
