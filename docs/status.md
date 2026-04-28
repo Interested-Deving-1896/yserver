@@ -50,11 +50,14 @@ In rough priority order:
       `ChangeProperty` / `DeleteProperty` / `GetProperty` and
       cross-client `PropertyNotify` fanout via per-(client, window)
       event masks.
+- [x] **`UnmapNotify`.** Fired on every mapped → unmapped transition,
+      both explicit (`UnmapWindow`) and implicit (`DestroyWindow` and
+      client-disconnect cleanup). Cross-client subscriber fanout via
+      the same per-(client, window) event masks; root window is
+      protected from unmap inside `ResourceTable::unmap_window`.
 - [ ] **Lifecycle / WM events.** Emit `ReparentNotify` and
       `ClientMessage` so window managers and toolkits behave.
-      (`DestroyNotify` shipped with property storage; `UnmapNotify`
-      shipped on both explicit `UnmapWindow` and implicit destroy/
-      disconnect paths.)
+      (`DestroyNotify` and `UnmapNotify` already shipped.)
 - [ ] **Per-window clipping in the ynest backend.** All nested top-level
       windows currently render into a single host window with no
       coordinate translation or clipping. Give each nested top-level its
