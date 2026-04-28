@@ -19,7 +19,7 @@ use yserver_protocol::x11::{
 use crate::{
     host_x11::{HostEvent, HostKeyboard, HostX11},
     resources::{MapState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW, Window},
-    server::{ClientHandle, ServerState},
+    server::{ClientHandle, ServerState, fanout_event},
 };
 
 static NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
@@ -258,9 +258,11 @@ fn handle_client(
         s.resources
             .collect_owned_window_roots(client_id, &mut owned_roots);
 
+        #[allow(clippy::type_complexity)]
         let mut pending: Vec<(
             ResourceId,
             ResourceId,
+            bool,
             Vec<crate::server::EventTarget>,
             Vec<crate::server::EventTarget>,
         )> = Vec::new();
@@ -269,10 +271,13 @@ fn handle_client(
             let mut order = Vec::new();
             collect_destroy_order(&s.resources, root, &mut order);
             for w in &order {
-                let parent = s.resources.window(*w).map_or(ROOT_WINDOW, |win| win.parent);
+                let (parent, was_mapped) =
+                    s.resources.window(*w).map_or((ROOT_WINDOW, false), |win| {
+                        (win.parent, win.map_state != MapState::Unmapped)
+                    });
                 let on_w = s.subscribers(*w, 0x0002_0000);
                 let on_p = s.subscribers(parent, 0x0008_0000);
-                pending.push((*w, parent, on_w, on_p));
+                pending.push((*w, parent, was_mapped, on_w, on_p));
             }
             let _ = s.resources.destroy_window(root);
             all_destroyed.extend(order);
@@ -282,23 +287,21 @@ fn handle_client(
         s.clients.remove(&client_id.0);
         (fonts, pending)
     };
-    for (w, parent, subs_w, subs_p) in pending_destroys {
-        for target in subs_w {
-            let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
-            let mut buf = Vec::with_capacity(32);
-            x11::encode_destroy_notify_event(&mut buf, seq, target.byte_order, w, w);
-            if let Ok(mut wr) = target.writer.lock() {
-                let _ = wr.write_all(&buf);
-            }
+    for (w, parent, was_mapped, subs_w, subs_p) in pending_destroys {
+        if was_mapped {
+            fanout_event(&subs_w, |buf, seq, order| {
+                x11::encode_unmap_notify_event(buf, seq, order, w, w, false);
+            });
+            fanout_event(&subs_p, |buf, seq, order| {
+                x11::encode_unmap_notify_event(buf, seq, order, parent, w, false);
+            });
         }
-        for target in subs_p {
-            let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
-            let mut buf = Vec::with_capacity(32);
-            x11::encode_destroy_notify_event(&mut buf, seq, target.byte_order, parent, w);
-            if let Ok(mut wr) = target.writer.lock() {
-                let _ = wr.write_all(&buf);
-            }
-        }
+        fanout_event(&subs_w, |buf, seq, order| {
+            x11::encode_destroy_notify_event(buf, seq, order, w, w);
+        });
+        fanout_event(&subs_p, |buf, seq, order| {
+            x11::encode_destroy_notify_event(buf, seq, order, parent, w);
+        });
     }
     if let Some(host) = host.as_ref()
         && let Ok(mut h) = host.lock()
@@ -581,45 +584,42 @@ fn handle_request(
                     let mut s = lock_server(server)?;
                     let mut order = Vec::new();
                     collect_destroy_order(&s.resources, window, &mut order);
+                    #[allow(clippy::type_complexity)]
                     let mut pending: Vec<(
                         ResourceId,
                         ResourceId,
+                        bool,
                         Vec<crate::server::EventTarget>,
                         Vec<crate::server::EventTarget>,
                     )> = Vec::new();
                     for w in &order {
-                        let parent = s.resources.window(*w).map_or(ROOT_WINDOW, |win| win.parent);
+                        let (parent, was_mapped) =
+                            s.resources.window(*w).map_or((ROOT_WINDOW, false), |win| {
+                                (win.parent, win.map_state != MapState::Unmapped)
+                            });
                         let on_window = s.subscribers(*w, 0x0002_0000); // StructureNotify
                         let on_parent = s.subscribers(parent, 0x0008_0000); // SubstructureNotify
-                        pending.push((*w, parent, on_window, on_parent));
+                        pending.push((*w, parent, was_mapped, on_window, on_parent));
                     }
                     let _ = s.resources.destroy_window(window);
                     s.drop_window_subscriptions(&order);
                     pending
                 };
-                for (w, parent, subs_w, subs_p) in pending {
-                    for target in subs_w {
-                        let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
-                        let mut buf = Vec::with_capacity(32);
-                        x11::encode_destroy_notify_event(&mut buf, seq, target.byte_order, w, w);
-                        if let Ok(mut wr) = target.writer.lock() {
-                            let _ = wr.write_all(&buf);
-                        }
+                for (w, parent, was_mapped, subs_w, subs_p) in pending {
+                    if was_mapped {
+                        fanout_event(&subs_w, |buf, seq, order| {
+                            x11::encode_unmap_notify_event(buf, seq, order, w, w, false);
+                        });
+                        fanout_event(&subs_p, |buf, seq, order| {
+                            x11::encode_unmap_notify_event(buf, seq, order, parent, w, false);
+                        });
                     }
-                    for target in subs_p {
-                        let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
-                        let mut buf = Vec::with_capacity(32);
-                        x11::encode_destroy_notify_event(
-                            &mut buf,
-                            seq,
-                            target.byte_order,
-                            parent,
-                            w,
-                        );
-                        if let Ok(mut wr) = target.writer.lock() {
-                            let _ = wr.write_all(&buf);
-                        }
-                    }
+                    fanout_event(&subs_w, |buf, seq, order| {
+                        x11::encode_destroy_notify_event(buf, seq, order, w, w);
+                    });
+                    fanout_event(&subs_p, |buf, seq, order| {
+                        x11::encode_destroy_notify_event(buf, seq, order, parent, w);
+                    });
                 }
             }
             log_void(client_id, sequence, "DestroyWindow")
@@ -724,8 +724,26 @@ fn handle_request(
         }
         10 => {
             if let Some(window) = x11::map_window_id(body) {
-                let mut s = lock_server(server)?;
-                s.resources.unmap_window(window);
+                let snapshot = {
+                    let mut s = lock_server(server)?;
+                    let was_mapped = s.resources.unmap_window(window);
+                    if was_mapped {
+                        let parent = s.resources.window(window).map_or(ROOT_WINDOW, |w| w.parent);
+                        let on_window = s.subscribers(window, 0x0002_0000); // StructureNotify
+                        let on_parent = s.subscribers(parent, 0x0008_0000); // SubstructureNotify
+                        Some((parent, on_window, on_parent))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((parent, on_window, on_parent)) = snapshot {
+                    fanout_event(&on_window, |buf, seq, order| {
+                        x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
+                    });
+                    fanout_event(&on_parent, |buf, seq, order| {
+                        x11::encode_unmap_notify_event(buf, seq, order, parent, window, false);
+                    });
+                }
             }
             log_void(client_id, sequence, "UnmapWindow")
         }

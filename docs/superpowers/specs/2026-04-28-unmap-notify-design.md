@@ -320,14 +320,13 @@ and is deferred.
 
 | Crate              | Before | After |
 |--------------------|--------|-------|
-| `yserver-core`     | 42     | 47    |
+| `yserver-core`     | 42     | 49    |
 | `yserver-protocol` | 7      | 9     |
-| **Total**          | **49** | **56** |
+| **Total**          | **49** | **58** |
 
-(Five unit + one proptest = 6 added in core; one unit + one proptest = 2
-added in protocol. Total 7 new tests, but one of the core tests
-(`unmap_notify_fanout_reaches_only_subscribed_clients`) lands in
-`server.rs::tests`, not `resources.rs::tests`.)
+(Five unit + one proptest = 6 in `resources.rs::tests`; one unit in
+`server.rs::tests`; one unit + one proptest = 2 in
+`yserver-protocol::x11::tests`. Total 9 new tests across both crates.)
 
 ---
 

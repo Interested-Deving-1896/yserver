@@ -178,6 +178,22 @@ impl ServerState {
     }
 }
 
+/// Like `emit_window_event` but operates on a pre-snapshotted target list (use when the lock has
+/// already been dropped — e.g. after `destroy_window`).
+pub fn fanout_event(
+    targets: &[EventTarget],
+    encode: impl Fn(&mut Vec<u8>, SequenceNumber, ClientByteOrder),
+) {
+    for target in targets {
+        let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
+        let mut buf = Vec::with_capacity(32);
+        encode(&mut buf, seq, target.byte_order);
+        if let Ok(mut w) = target.writer.lock() {
+            let _ = w.write_all(&buf);
+        }
+    }
+}
+
 pub fn emit_window_event(
     state: &Mutex<ServerState>,
     window: ResourceId,
@@ -188,14 +204,7 @@ pub fn emit_window_event(
         Ok(g) => g.subscribers(window, mask_bit),
         Err(_) => return,
     };
-    for target in targets {
-        let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
-        let mut buf = Vec::with_capacity(32);
-        encode(&mut buf, seq, target.byte_order);
-        if let Ok(mut w) = target.writer.lock() {
-            let _ = w.write_all(&buf);
-        }
-    }
+    fanout_event(&targets, encode);
 }
 
 #[cfg(test)]
@@ -354,6 +363,67 @@ mod tests {
     fn make_test_writer() -> Arc<Mutex<UnixStream>> {
         let (a, _b) = UnixStream::pair().expect("socketpair");
         Arc::new(Mutex::new(a))
+    }
+
+    #[test]
+    fn unmap_notify_fanout_reaches_only_subscribed_clients() {
+        use std::io::Read;
+        use yserver_protocol::x11::{SequenceNumber, encode_unmap_notify_event};
+
+        // Client A: StructureNotify on window 0x100.
+        let (a_writer_local, mut a_reader_remote) = UnixStream::pair().expect("socketpair");
+        // Client B: KeyPress only on window 0x100 (NOT StructureNotify).
+        let (b_writer_local, _b_reader_remote) = UnixStream::pair().expect("socketpair");
+
+        let mut state = ServerState::new();
+        state.clients.insert(
+            1,
+            ClientHandle {
+                writer: Arc::new(Mutex::new(a_writer_local)),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0x0010_0000,
+                resource_id_mask: 0x000F_FFFF,
+                event_masks: HashMap::from([(ResourceId(0x100), 0x0002_0000)]), // StructureNotify
+            },
+        );
+        state.clients.insert(
+            2,
+            ClientHandle {
+                writer: Arc::new(Mutex::new(b_writer_local)),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0x0020_0000,
+                resource_id_mask: 0x000F_FFFF,
+                event_masks: HashMap::from([(ResourceId(0x100), 0x0000_0001)]), // KeyPress
+            },
+        );
+
+        let subs = state.subscribers(ResourceId(0x100), 0x0002_0000);
+        assert_eq!(subs.len(), 1, "only client A should be subscribed");
+
+        let target = &subs[0];
+        let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
+        let mut buf = Vec::with_capacity(32);
+        encode_unmap_notify_event(
+            &mut buf,
+            seq,
+            target.byte_order,
+            ResourceId(0x100),
+            ResourceId(0x100),
+            false,
+        );
+        {
+            let mut w = target.writer.lock().unwrap();
+            w.write_all(&buf).unwrap();
+        }
+
+        let mut received = [0u8; 32];
+        a_reader_remote.read_exact(&mut received).unwrap();
+        assert_eq!(received[0], 18, "wire byte 0 is UnmapNotify");
+        assert_eq!(&received[4..8], &0x100u32.to_le_bytes());
+        assert_eq!(&received[8..12], &0x100u32.to_le_bytes());
+        assert_eq!(received[12], 0, "from_configure = false");
     }
 
     #[test]

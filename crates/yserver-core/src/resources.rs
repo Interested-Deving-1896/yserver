@@ -148,10 +148,17 @@ impl ResourceTable {
         }
     }
 
-    pub fn unmap_window(&mut self, id: ResourceId) {
-        if let Some(window) = self.windows.get_mut(&id.0) {
-            window.map_state = MapState::Unmapped;
+    #[must_use]
+    pub fn unmap_window(&mut self, id: ResourceId) -> bool {
+        if id == ROOT_WINDOW {
+            return false;
         }
+        let Some(window) = self.windows.get_mut(&id.0) else {
+            return false;
+        };
+        let was_mapped = window.map_state != MapState::Unmapped;
+        window.map_state = MapState::Unmapped;
+        was_mapped
     }
 
     pub fn window(&self, id: ResourceId) -> Option<&Window> {
@@ -469,4 +476,148 @@ pub struct Font {
 pub struct Cursor {
     pub id: ResourceId,
     pub owner: ClientId,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use yserver_protocol::x11::{ClientId, CreateWindowRequest};
+
+    fn make_window(table: &mut ResourceTable, id: u32) {
+        table.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(id),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                background_pixel: None,
+                event_mask: None,
+                override_redirect: None,
+            },
+        );
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum InitialState {
+        Viewable,
+        Unviewable,
+        Unmapped,
+    }
+
+    fn arb_initial() -> impl Strategy<Value = InitialState> {
+        prop_oneof![
+            Just(InitialState::Viewable),
+            Just(InitialState::Unviewable),
+            Just(InitialState::Unmapped),
+        ]
+    }
+
+    #[test]
+    fn unmap_window_returns_true_on_transition_from_viewable() {
+        let mut table = ResourceTable::new();
+        make_window(&mut table, 0x100002);
+        table.map_window(ResourceId(0x100002));
+        assert_eq!(
+            table.window(ResourceId(0x100002)).unwrap().map_state,
+            MapState::Viewable
+        );
+        let was_mapped = table.unmap_window(ResourceId(0x100002));
+        assert!(was_mapped);
+        assert_eq!(
+            table.window(ResourceId(0x100002)).unwrap().map_state,
+            MapState::Unmapped
+        );
+    }
+
+    #[test]
+    fn unmap_window_returns_true_on_transition_from_unviewable() {
+        let mut table = ResourceTable::new();
+        make_window(&mut table, 0x100002);
+        // Force Unviewable directly — no public setter, but the field is pub.
+        table.windows.get_mut(&0x100002).unwrap().map_state = MapState::Unviewable;
+        let was_mapped = table.unmap_window(ResourceId(0x100002));
+        assert!(was_mapped);
+        assert_eq!(
+            table.window(ResourceId(0x100002)).unwrap().map_state,
+            MapState::Unmapped
+        );
+    }
+
+    #[test]
+    fn unmap_window_returns_false_when_already_unmapped() {
+        let mut table = ResourceTable::new();
+        make_window(&mut table, 0x100002);
+        // create_window leaves new windows Unmapped.
+        assert_eq!(
+            table.window(ResourceId(0x100002)).unwrap().map_state,
+            MapState::Unmapped
+        );
+        let first = table.unmap_window(ResourceId(0x100002));
+        assert!(!first);
+        let second = table.unmap_window(ResourceId(0x100002));
+        assert!(!second);
+    }
+
+    #[test]
+    fn unmap_window_returns_false_for_unknown_window() {
+        let mut table = ResourceTable::new();
+        let was_mapped = table.unmap_window(ResourceId(0x9999_9999));
+        assert!(!was_mapped);
+    }
+
+    #[test]
+    fn unmap_window_no_ops_on_root() {
+        let mut table = ResourceTable::new();
+        assert_eq!(
+            table.window(ROOT_WINDOW).unwrap().map_state,
+            MapState::Viewable
+        );
+        let was_mapped = table.unmap_window(ROOT_WINDOW);
+        assert!(!was_mapped);
+        assert_eq!(
+            table.window(ROOT_WINDOW).unwrap().map_state,
+            MapState::Viewable
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn unmap_window_state_machine(
+            initial in arb_initial(),
+            n in 1usize..=5,
+        ) {
+            let mut table = ResourceTable::new();
+            make_window(&mut table, 0x100002);
+            let target = ResourceId(0x100002);
+            let initial_map_state = match initial {
+                InitialState::Viewable => MapState::Viewable,
+                InitialState::Unviewable => MapState::Unviewable,
+                InitialState::Unmapped => MapState::Unmapped,
+            };
+            table.windows.get_mut(&target.0).unwrap().map_state = initial_map_state;
+
+            let mut results = Vec::with_capacity(n);
+            for _ in 0..n {
+                results.push(table.unmap_window(target));
+            }
+
+            let expected_first = !matches!(initial, InitialState::Unmapped);
+            prop_assert_eq!(results[0], expected_first);
+            for r in results.iter().skip(1) {
+                prop_assert!(!*r, "subsequent calls must return false");
+            }
+            prop_assert_eq!(
+                table.window(target).unwrap().map_state,
+                MapState::Unmapped
+            );
+        }
+    }
 }

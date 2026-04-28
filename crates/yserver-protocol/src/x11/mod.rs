@@ -1670,6 +1670,23 @@ pub fn encode_destroy_notify_event(
     out.extend_from_slice(&[0; 20]);
 }
 
+pub fn encode_unmap_notify_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    order: ClientByteOrder,
+    event_window: ResourceId,
+    window: ResourceId,
+    from_configure: bool,
+) {
+    out.push(18); // UnmapNotify
+    out.push(0);
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, event_window.0);
+    write_u32(order, out, window.0);
+    out.push(u8::from(from_configure));
+    out.extend_from_slice(&[0; 19]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1870,6 +1887,84 @@ mod tests {
             assert_eq!(buf[0], 17);
             assert_eq!(&buf[4..8], &0x100u32.to_le_bytes());
             assert_eq!(&buf[8..12], &0x100002u32.to_le_bytes());
+        }
+    }
+
+    mod unmap_notify_tests {
+        use super::*;
+        use proptest::prelude::*;
+        #[test]
+        fn shape() {
+            let mut buf = Vec::new();
+            encode_unmap_notify_event(
+                &mut buf,
+                SequenceNumber(0x1234),
+                ClientByteOrder::LittleEndian,
+                ResourceId(0x100),
+                ResourceId(0x100002),
+                false,
+            );
+            assert_eq!(buf.len(), 32);
+            assert_eq!(buf[0], 18);
+            assert_eq!(buf[1], 0);
+            assert_eq!(&buf[2..4], &[0x34, 0x12]);
+            assert_eq!(&buf[4..8], &0x100u32.to_le_bytes());
+            assert_eq!(&buf[8..12], &0x100002u32.to_le_bytes());
+            assert_eq!(buf[12], 0);
+            assert!(buf[13..32].iter().all(|&b| b == 0));
+        }
+
+        proptest! {
+            #[test]
+            fn encoder_round_trip(
+                sequence in any::<u16>(),
+                event_window in any::<u32>(),
+                window in any::<u32>(),
+                from_configure: bool,
+                big_endian: bool,
+            ) {
+                let order = if big_endian {
+                    ClientByteOrder::BigEndian
+                } else {
+                    ClientByteOrder::LittleEndian
+                };
+                let mut buf = Vec::new();
+                encode_unmap_notify_event(
+                    &mut buf,
+                    SequenceNumber(sequence),
+                    order,
+                    ResourceId(event_window),
+                    ResourceId(window),
+                    from_configure,
+                );
+                prop_assert_eq!(buf.len(), 32);
+                prop_assert_eq!(buf[0], 18);
+                prop_assert_eq!(buf[1], 0);
+
+                let seq_bytes = if big_endian {
+                    sequence.to_be_bytes()
+                } else {
+                    sequence.to_le_bytes()
+                };
+                prop_assert_eq!(&buf[2..4], &seq_bytes[..]);
+
+                let ew_bytes = if big_endian {
+                    event_window.to_be_bytes()
+                } else {
+                    event_window.to_le_bytes()
+                };
+                prop_assert_eq!(&buf[4..8], &ew_bytes[..]);
+
+                let w_bytes = if big_endian {
+                    window.to_be_bytes()
+                } else {
+                    window.to_le_bytes()
+                };
+                prop_assert_eq!(&buf[8..12], &w_bytes[..]);
+
+                prop_assert_eq!(buf[12], u8::from(from_configure));
+                prop_assert!(buf[13..32].iter().all(|&b| b == 0));
+            }
         }
     }
 }
