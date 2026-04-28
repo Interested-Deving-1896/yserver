@@ -13,8 +13,11 @@ resource IDs, atoms, properties, windows, basic events, and errors. Run
 
 - Unix socket listener, per-client thread, setup handshake (little-endian
   clients only — by design).
-- Per-client resource ID space, per-client atom namespace with 68
-  predefined atoms.
+- Per-client resource ID space (allocated via `IdAllocator`),
+  server-global atom table with 68 predefined atoms, per-client
+  event_masks per window.
+- Property storage: `ChangeProperty`, `DeleteProperty`, `GetProperty`
+  with cross-client `PropertyNotify` fanout.
 - Window tree: `CreateWindow`, `DestroyWindow` (recursive), `MapWindow`,
   `UnmapWindow`, `ConfigureWindow`, `GetGeometry`, `QueryTree`,
   `ChangeWindowAttributes`, `GetWindowAttributes`.
@@ -23,7 +26,9 @@ resource IDs, atoms, properties, windows, basic events, and errors. Run
 - GC lifecycle: `CreateGC`, `ChangeGC`, `FreeGC`.
 - Pixmap/cursor lifecycle (allocation only).
 - Events emitted: `Expose`, `MapNotify`, `ConfigureNotify`, `KeyPress`,
-  `KeyRelease`, `FocusIn`, `FocusOut`.
+  `KeyRelease`, `FocusIn`, `FocusOut`, `PropertyNotify`,
+  `DestroyNotify` (cross-client subscriber fanout via per-window
+  event masks).
 - Keyboard forwarding from the host window to the focused nested client.
 - `xeyes`, `xclock`, and `xterm` come up; `xterm` accepts input.
 
@@ -41,13 +46,13 @@ In rough priority order:
 - [x] **`ListFonts` / `ListFontsWithInfo` (opcode 49 / 50).** Proxied
       to the host. `ListFontsWithInfo` forwards each per-font reply
       until the trailing sentinel reply.
-- [ ] **Property storage.** `ChangeProperty`, `DeleteProperty`, and
-      `GetProperty` are no-ops; `GetProperty` always returns `type=None`.
-      Implement real per-window property storage and emit
-      `PropertyNotify`.
-- [ ] **Lifecycle / WM events.** Emit `DestroyNotify`, `UnmapNotify`,
-      `ReparentNotify`, and `ClientMessage` so window managers and
-      toolkits behave.
+- [x] **Property storage.** Real per-window property storage with
+      `ChangeProperty` / `DeleteProperty` / `GetProperty` and
+      cross-client `PropertyNotify` fanout via per-(client, window)
+      event masks.
+- [ ] **Lifecycle / WM events.** Emit `UnmapNotify`, `ReparentNotify`,
+      and `ClientMessage` so window managers and toolkits behave.
+      (`DestroyNotify` shipped with property storage.)
 - [ ] **Per-window clipping in the ynest backend.** All nested top-level
       windows currently render into a single host window with no
       coordinate translation or clipping. Give each nested top-level its

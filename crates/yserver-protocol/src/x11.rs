@@ -6,7 +6,7 @@ pub enum ClientByteOrder {
     BigEndian,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClientId(pub u32);
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -626,6 +626,202 @@ pub fn create_pixmap_request(depth: u8, body: &[u8]) -> Option<CreatePixmapReque
     })
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChangePropertyRequest {
+    pub mode: u8,
+    pub window: ResourceId,
+    pub property: AtomId,
+    pub r#type: AtomId,
+    pub format: u8,
+    pub data: Vec<u8>,
+    pub length: u32,
+}
+
+#[must_use]
+pub fn change_property_request(header_data: u8, body: &[u8]) -> Option<ChangePropertyRequest> {
+    let window = ResourceId(read_u32_le(body.get(0..4)?));
+    let property = AtomId(read_u32_le(body.get(4..8)?));
+    let r#type = AtomId(read_u32_le(body.get(8..12)?));
+    let format = *body.get(12)?;
+    let length = read_u32_le(body.get(16..20)?);
+    // Tolerate invalid format here so the handler can emit BadValue.
+    // For valid formats, also validate body length against length * unit.
+    // For invalid formats, leave `data` as the remaining body bytes; the
+    // handler rejects before touching it.
+    let unit_opt = match format {
+        8 => Some(1usize),
+        16 => Some(2),
+        32 => Some(4),
+        _ => None,
+    };
+    let data = if let Some(unit) = unit_opt {
+        let data_bytes = (length as usize).checked_mul(unit)?;
+        body.get(20..20 + data_bytes)?.to_vec()
+    } else {
+        // Invalid format — capture whatever's there; handler rejects format
+        // before reading `data`.
+        body.get(20..)?.to_vec()
+    };
+    Some(ChangePropertyRequest {
+        mode: header_data,
+        window,
+        property,
+        r#type,
+        format,
+        data,
+        length,
+    })
+}
+
+#[cfg(test)]
+mod change_property_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn encode(req: &ChangePropertyRequest) -> (u8, Vec<u8>) {
+        let mut body = Vec::new();
+        write_u32(ClientByteOrder::LittleEndian, &mut body, req.window.0);
+        write_u32(ClientByteOrder::LittleEndian, &mut body, req.property.0);
+        write_u32(ClientByteOrder::LittleEndian, &mut body, req.r#type.0);
+        body.push(req.format);
+        body.extend_from_slice(&[0; 3]);
+        write_u32(ClientByteOrder::LittleEndian, &mut body, req.length);
+        body.extend_from_slice(&req.data);
+        pad_vec4(&mut body);
+        (req.mode, body)
+    }
+
+    proptest! {
+        #[test]
+        fn round_trip(
+            mode in 0u8..=2,
+            window in any::<u32>(),
+            property in 1u32..0xFFFF,
+            r#type in 1u32..0xFFFF,
+            format_choice in 0u8..3,
+            length in 0u32..256,
+        ) {
+            let format = [8u8, 16, 32][format_choice as usize];
+            let unit = match format { 8 => 1, 16 => 2, _ => 4 };
+            let data = vec![0xAB; (length as usize) * unit];
+            let req = ChangePropertyRequest {
+                mode,
+                window: ResourceId(window),
+                property: AtomId(property),
+                r#type: AtomId(r#type),
+                format,
+                data: data.clone(),
+                length,
+            };
+            let (header_data, body) = encode(&req);
+            let parsed = change_property_request(header_data, &body).unwrap();
+            prop_assert_eq!(parsed, req);
+        }
+    }
+
+    #[test]
+    fn invalid_format_passes_through_for_handler_to_reject() {
+        let mut body = Vec::new();
+        write_u32(ClientByteOrder::LittleEndian, &mut body, 0x100);
+        write_u32(ClientByteOrder::LittleEndian, &mut body, 31);
+        write_u32(ClientByteOrder::LittleEndian, &mut body, 31);
+        body.push(7); // invalid format byte
+        body.extend_from_slice(&[0; 3]);
+        write_u32(ClientByteOrder::LittleEndian, &mut body, 0); // length = 0
+        let req =
+            change_property_request(0, &body).expect("parser should pass through invalid format");
+        assert_eq!(req.format, 7);
+        assert_eq!(req.length, 0);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeletePropertyRequest {
+    pub window: ResourceId,
+    pub property: AtomId,
+}
+
+#[must_use]
+pub fn delete_property_request(body: &[u8]) -> Option<DeletePropertyRequest> {
+    Some(DeletePropertyRequest {
+        window: ResourceId(read_u32_le(body.get(0..4)?)),
+        property: AtomId(read_u32_le(body.get(4..8)?)),
+    })
+}
+
+#[cfg(test)]
+mod delete_property_tests {
+    use super::*;
+    use proptest::prelude::*;
+    proptest! {
+        #[test]
+        fn round_trip(window in any::<u32>(), property in any::<u32>()) {
+            let mut body = Vec::new();
+            write_u32(ClientByteOrder::LittleEndian, &mut body, window);
+            write_u32(ClientByteOrder::LittleEndian, &mut body, property);
+            let req = delete_property_request(&body).unwrap();
+            prop_assert_eq!(req, DeletePropertyRequest {
+                window: ResourceId(window), property: AtomId(property),
+            });
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GetPropertyRequest {
+    pub delete: bool,
+    pub window: ResourceId,
+    pub property: AtomId,
+    pub r#type: AtomId,
+    pub long_offset: u32,
+    pub long_length: u32,
+}
+
+#[must_use]
+pub fn get_property_request(header_data: u8, body: &[u8]) -> Option<GetPropertyRequest> {
+    Some(GetPropertyRequest {
+        delete: header_data != 0,
+        window: ResourceId(read_u32_le(body.get(0..4)?)),
+        property: AtomId(read_u32_le(body.get(4..8)?)),
+        r#type: AtomId(read_u32_le(body.get(8..12)?)),
+        long_offset: read_u32_le(body.get(12..16)?),
+        long_length: read_u32_le(body.get(16..20)?),
+    })
+}
+
+#[cfg(test)]
+mod get_property_tests {
+    use super::*;
+    use proptest::prelude::*;
+    proptest! {
+        #[test]
+        fn round_trip(
+            delete: bool,
+            window in any::<u32>(),
+            property in any::<u32>(),
+            r#type in any::<u32>(),
+            long_offset in any::<u32>(),
+            long_length in any::<u32>(),
+        ) {
+            let mut body = Vec::new();
+            write_u32(ClientByteOrder::LittleEndian, &mut body, window);
+            write_u32(ClientByteOrder::LittleEndian, &mut body, property);
+            write_u32(ClientByteOrder::LittleEndian, &mut body, r#type);
+            write_u32(ClientByteOrder::LittleEndian, &mut body, long_offset);
+            write_u32(ClientByteOrder::LittleEndian, &mut body, long_length);
+            let req = get_property_request(if delete { 1 } else { 0 }, &body).unwrap();
+            prop_assert_eq!(req, GetPropertyRequest {
+                delete,
+                window: ResourceId(window),
+                property: AtomId(property),
+                r#type: AtomId(r#type),
+                long_offset,
+                long_length,
+            });
+        }
+    }
+}
+
 pub fn free_resource_id(body: &[u8]) -> Option<ResourceId> {
     Some(ResourceId(read_u32_le(body.get(0..4)?)))
 }
@@ -796,88 +992,80 @@ pub fn write_key_event(writer: &mut impl Write, event: KeyEvent) -> io::Result<(
     writer.write_all(&out)
 }
 
-pub fn write_focus_event(
-    writer: &mut impl Write,
+pub fn encode_focus_event(
+    out: &mut Vec<u8>,
     sequence: SequenceNumber,
+    order: ClientByteOrder,
     focus_in: bool,
     window: ResourceId,
-) -> io::Result<()> {
-    let mut event = Vec::with_capacity(32);
-    event.push(if focus_in { 9 } else { 10 });
-    event.push(0); // NotifyAncestor
-    write_u16(ClientByteOrder::LittleEndian, &mut event, sequence.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut event, window.0);
-    event.push(0); // NotifyNormal
-    event.extend_from_slice(&[0; 23]);
-    writer.write_all(&event)
+) {
+    out.push(if focus_in { 9 } else { 10 });
+    out.push(0); // NotifyAncestor
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, window.0);
+    out.push(0); // NotifyNormal
+    out.extend_from_slice(&[0; 23]);
 }
 
-pub fn write_expose_event(
-    writer: &mut impl Write,
+pub fn encode_expose_event(
+    out: &mut Vec<u8>,
     sequence: SequenceNumber,
+    order: ClientByteOrder,
     window: ResourceId,
     width: u16,
     height: u16,
-) -> io::Result<()> {
-    let mut event = Vec::with_capacity(32);
-    event.push(12); // Expose
-    event.push(0);
-    write_u16(ClientByteOrder::LittleEndian, &mut event, sequence.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut event, window.0);
-    write_u16(ClientByteOrder::LittleEndian, &mut event, 0);
-    write_u16(ClientByteOrder::LittleEndian, &mut event, 0);
-    write_u16(ClientByteOrder::LittleEndian, &mut event, width);
-    write_u16(ClientByteOrder::LittleEndian, &mut event, height);
-    write_u16(ClientByteOrder::LittleEndian, &mut event, 0); // count
-    event.extend_from_slice(&[0; 14]);
-    writer.write_all(&event)
+) {
+    out.push(12); // Expose
+    out.push(0);
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, window.0);
+    write_u16(order, out, 0);
+    write_u16(order, out, 0);
+    write_u16(order, out, width);
+    write_u16(order, out, height);
+    write_u16(order, out, 0); // count
+    out.extend_from_slice(&[0; 14]);
 }
 
-pub fn write_map_notify_event(
-    writer: &mut impl Write,
+pub fn encode_map_notify_event(
+    out: &mut Vec<u8>,
     sequence: SequenceNumber,
+    order: ClientByteOrder,
     event_window: ResourceId,
     window: ResourceId,
     override_redirect: bool,
-) -> io::Result<()> {
-    let mut event = Vec::with_capacity(32);
-    event.push(19); // MapNotify
-    event.push(0);
-    write_u16(ClientByteOrder::LittleEndian, &mut event, sequence.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut event, event_window.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut event, window.0);
-    event.push(u8::from(override_redirect));
-    event.extend_from_slice(&[0; 19]);
-    writer.write_all(&event)
+) {
+    out.push(19); // MapNotify
+    out.push(0);
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, event_window.0);
+    write_u32(order, out, window.0);
+    out.push(u8::from(override_redirect));
+    out.extend_from_slice(&[0; 19]);
 }
 
-pub fn write_configure_notify_event(
-    writer: &mut impl Write,
+pub fn encode_configure_notify_event(
+    out: &mut Vec<u8>,
     sequence: SequenceNumber,
+    order: ClientByteOrder,
     event_window: ResourceId,
     window: ResourceId,
     geometry: Geometry,
     override_redirect: bool,
-) -> io::Result<()> {
-    let mut event = Vec::with_capacity(32);
-    event.push(22); // ConfigureNotify
-    event.push(0);
-    write_u16(ClientByteOrder::LittleEndian, &mut event, sequence.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut event, event_window.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut event, window.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut event, 0); // above-sibling
-    write_i16(ClientByteOrder::LittleEndian, &mut event, geometry.x);
-    write_i16(ClientByteOrder::LittleEndian, &mut event, geometry.y);
-    write_u16(ClientByteOrder::LittleEndian, &mut event, geometry.width);
-    write_u16(ClientByteOrder::LittleEndian, &mut event, geometry.height);
-    write_u16(
-        ClientByteOrder::LittleEndian,
-        &mut event,
-        geometry.border_width,
-    );
-    event.push(u8::from(override_redirect));
-    event.extend_from_slice(&[0; 5]);
-    writer.write_all(&event)
+) {
+    out.push(22); // ConfigureNotify
+    out.push(0);
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, event_window.0);
+    write_u32(order, out, window.0);
+    write_u32(order, out, 0); // above-sibling
+    write_i16(order, out, geometry.x);
+    write_i16(order, out, geometry.y);
+    write_u16(order, out, geometry.width);
+    write_u16(order, out, geometry.height);
+    write_u16(order, out, geometry.border_width);
+    out.push(u8::from(override_redirect));
+    out.extend_from_slice(&[0; 5]);
 }
 
 fn arc_request_data(body: &[u8]) -> Option<(u32, &[u8])> {
@@ -1291,16 +1479,77 @@ pub fn write_get_atom_name_reply(
     writer.write_all(&reply)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct GetPropertyReply<'a> {
+    pub format: u8,
+    pub r#type: AtomId,
+    pub bytes_after: u32,
+    pub value_len: u32,  // in format units
+    pub value: &'a [u8], // padded to 4 bytes here
+}
+
 pub fn write_get_property_reply(
     writer: &mut impl Write,
     sequence: SequenceNumber,
+    reply: GetPropertyReply<'_>,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(sequence, 8, 0);
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // type None
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // bytes after
-    write_u32(ClientByteOrder::LittleEndian, &mut reply, 0); // value len
-    reply.extend_from_slice(&[0; 12]);
-    writer.write_all(&reply)
+    let mut padded = reply.value.to_vec();
+    pad_vec4(&mut padded);
+    let length_units = u32::from(checked_units(padded.len())?);
+    let mut out = fixed_reply(sequence, reply.format, length_units);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, reply.r#type.0);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, reply.bytes_after);
+    write_u32(ClientByteOrder::LittleEndian, &mut out, reply.value_len);
+    out.extend_from_slice(&[0; 12]);
+    out.extend_from_slice(&padded);
+    writer.write_all(&out)
+}
+
+#[cfg(test)]
+mod get_property_reply_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn shape(
+            format_choice in 0u8..3,
+            r#type in any::<u32>(),
+            bytes_after in any::<u32>(),
+            len_units in 0u32..256,
+        ) {
+            let format = [8u8, 16, 32][format_choice as usize];
+            let unit = match format { 8 => 1, 16 => 2, _ => 4 };
+            let value: Vec<u8> = (0..len_units as usize * unit)
+                .map(|i| (i & 0xff) as u8)
+                .collect();
+            let value_len = len_units;
+
+            let mut buf = Vec::new();
+            write_get_property_reply(
+                &mut buf,
+                SequenceNumber(0xdead),
+                GetPropertyReply {
+                    format,
+                    r#type: AtomId(r#type),
+                    bytes_after,
+                    value_len,
+                    value: &value,
+                },
+            )
+            .unwrap();
+
+            let pad = (4 - value.len() % 4) % 4;
+            let payload = value.len() + pad;
+            prop_assert_eq!(buf.len(), 32 + payload);
+            // wire length field (4..8) equals payload/4
+            let wire_len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            prop_assert_eq!(wire_len as usize * 4, payload);
+            // value_len field (16..20) is in format units
+            let wire_value_len = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+            prop_assert_eq!(wire_value_len, value_len);
+        }
+    }
 }
 
 pub fn write_get_selection_owner_reply(
@@ -1884,4 +2133,115 @@ fn pad_vec4(out: &mut Vec<u8>) {
     while !out.len().is_multiple_of(4) {
         out.push(0);
     }
+}
+
+pub fn encode_property_notify_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    order: ClientByteOrder,
+    window: ResourceId,
+    atom: AtomId,
+    timestamp: u32,
+    deleted: bool,
+) {
+    out.push(28); // PropertyNotify
+    out.push(0);
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, window.0);
+    write_u32(order, out, atom.0);
+    write_u32(order, out, timestamp);
+    out.push(u8::from(deleted));
+    out.extend_from_slice(&[0; 15]);
+}
+
+pub fn write_property_notify_event(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    window: ResourceId,
+    atom: AtomId,
+    timestamp: u32,
+    deleted: bool,
+) -> io::Result<()> {
+    let mut out = Vec::with_capacity(32);
+    encode_property_notify_event(
+        &mut out,
+        sequence,
+        ClientByteOrder::LittleEndian,
+        window,
+        atom,
+        timestamp,
+        deleted,
+    );
+    writer.write_all(&out)
+}
+
+#[cfg(test)]
+mod property_notify_tests {
+    use super::*;
+    #[test]
+    fn shape() {
+        let mut buf = Vec::new();
+        encode_property_notify_event(
+            &mut buf,
+            SequenceNumber(0x1234),
+            ClientByteOrder::LittleEndian,
+            ResourceId(0x100002),
+            AtomId(0x42),
+            0xdead_beef,
+            true,
+        );
+        assert_eq!(buf.len(), 32);
+        assert_eq!(buf[0], 28);
+        assert_eq!(&buf[2..4], &[0x34, 0x12]);
+        assert_eq!(&buf[4..8], &0x100002u32.to_le_bytes());
+        assert_eq!(&buf[8..12], &0x42u32.to_le_bytes());
+        assert_eq!(&buf[12..16], &0xdead_beefu32.to_le_bytes());
+        assert_eq!(buf[16], 1);
+    }
+}
+
+pub fn encode_destroy_notify_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    order: ClientByteOrder,
+    event_window: ResourceId,
+    window: ResourceId,
+) {
+    out.push(17); // DestroyNotify
+    out.push(0);
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, event_window.0);
+    write_u32(order, out, window.0);
+    out.extend_from_slice(&[0; 20]);
+}
+
+#[cfg(test)]
+mod destroy_notify_tests {
+    use super::*;
+    #[test]
+    fn shape() {
+        let mut buf = Vec::new();
+        encode_destroy_notify_event(
+            &mut buf,
+            SequenceNumber(0x1234),
+            ClientByteOrder::LittleEndian,
+            ResourceId(0x100),
+            ResourceId(0x100002),
+        );
+        assert_eq!(buf.len(), 32);
+        assert_eq!(buf[0], 17);
+        assert_eq!(&buf[4..8], &0x100u32.to_le_bytes());
+        assert_eq!(&buf[8..12], &0x100002u32.to_le_bytes());
+    }
+}
+
+pub mod error {
+    pub const BAD_REQUEST: u8 = 1;
+    pub const BAD_VALUE: u8 = 2;
+    pub const BAD_WINDOW: u8 = 3;
+    pub const BAD_ATOM: u8 = 5;
+    pub const BAD_MATCH: u8 = 8;
+    pub const BAD_ALLOC: u8 = 11;
+    pub const BAD_ID_CHOICE: u8 = 14;
+    pub const BAD_LENGTH: u8 = 16;
 }

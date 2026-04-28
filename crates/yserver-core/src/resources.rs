@@ -3,9 +3,13 @@
 use std::collections::HashMap;
 
 use yserver_protocol::x11::{
-    ChangeWindowAttributesRequest, ConfigureWindowRequest, CreateGcRequest, CreatePixmapRequest,
-    CreateWindowRequest, FontMetrics, GcChange, ResourceId,
+    AtomId, ChangeWindowAttributesRequest, ClientId, ConfigureWindowRequest, CreateGcRequest,
+    CreatePixmapRequest, CreateWindowRequest, FontMetrics, GcChange, ResourceId,
 };
+
+use crate::properties::PropertyValue;
+
+pub const SERVER_OWNER: ClientId = ClientId(0);
 
 pub const ROOT_WINDOW: ResourceId = ResourceId(0x100);
 pub const ROOT_COLORMAP: ResourceId = ResourceId(0x101);
@@ -38,10 +42,11 @@ impl ResourceTable {
                 visual: ROOT_VISUAL,
                 class: WindowClass::InputOutput,
                 map_state: MapState::Viewable,
-                event_mask: 0,
                 background_pixel: 0x00ff_ffff,
                 override_redirect: false,
                 cursor: None,
+                owner: SERVER_OWNER,
+                properties: HashMap::new(),
             },
         );
 
@@ -54,7 +59,7 @@ impl ResourceTable {
         }
     }
 
-    pub fn create_window(&mut self, request: CreateWindowRequest) {
+    pub fn create_window(&mut self, owner: ClientId, request: CreateWindowRequest) {
         let window = Window {
             id: request.window,
             parent: request.parent,
@@ -72,10 +77,11 @@ impl ResourceTable {
             },
             class: WindowClass::from_protocol(request.class),
             map_state: MapState::Unmapped,
-            event_mask: request.event_mask.unwrap_or(0),
             background_pixel: request.background_pixel.unwrap_or(0x00ff_ffff),
             override_redirect: request.override_redirect.unwrap_or(false),
             cursor: None,
+            owner,
+            properties: HashMap::new(),
         };
 
         self.windows
@@ -86,15 +92,22 @@ impl ResourceTable {
         self.windows.insert(request.window.0, window);
     }
 
-    pub fn destroy_window(&mut self, id: ResourceId) {
+    pub fn destroy_window(&mut self, id: ResourceId) -> Vec<ResourceId> {
+        let mut destroyed = Vec::new();
+        self.destroy_window_inner(id, &mut destroyed);
+        destroyed
+    }
+
+    fn destroy_window_inner(&mut self, id: ResourceId, destroyed: &mut Vec<ResourceId>) {
         let Some(window) = self.windows.remove(&id.0) else {
             return;
         };
         if let Some(parent) = self.windows.get_mut(&window.parent.0) {
             parent.children.retain(|child| *child != id);
         }
+        destroyed.push(id);
         for child in window.children {
-            self.destroy_window(child);
+            self.destroy_window_inner(child, destroyed);
         }
     }
 
@@ -102,9 +115,6 @@ impl ResourceTable {
         if let Some(window) = self.windows.get_mut(&request.window.0) {
             if let Some(background_pixel) = request.background_pixel {
                 window.background_pixel = background_pixel;
-            }
-            if let Some(event_mask) = request.event_mask {
-                window.event_mask = event_mask;
             }
             if let Some(cursor) = request.cursor {
                 window.cursor = Some(cursor);
@@ -154,7 +164,22 @@ impl ResourceTable {
             .map_or(&[], |window| window.children.as_slice())
     }
 
-    pub fn create_pixmap(&mut self, request: CreatePixmapRequest) {
+    #[must_use]
+    pub fn window_property(&self, w: ResourceId, atom: AtomId) -> Option<&PropertyValue> {
+        self.windows.get(&w.0)?.properties.get(&atom)
+    }
+
+    pub fn set_window_property(&mut self, w: ResourceId, atom: AtomId, value: PropertyValue) {
+        if let Some(window) = self.windows.get_mut(&w.0) {
+            window.properties.insert(atom, value);
+        }
+    }
+
+    pub fn delete_window_property(&mut self, w: ResourceId, atom: AtomId) -> Option<PropertyValue> {
+        self.windows.get_mut(&w.0)?.properties.remove(&atom)
+    }
+
+    pub fn create_pixmap(&mut self, owner: ClientId, request: CreatePixmapRequest) {
         self.pixmaps.insert(
             request.pixmap.0,
             Pixmap {
@@ -163,6 +188,7 @@ impl ResourceTable {
                 width: request.width,
                 height: request.height,
                 depth: request.depth,
+                owner,
             },
         );
     }
@@ -175,7 +201,7 @@ impl ResourceTable {
         self.pixmaps.get(&id.0)
     }
 
-    pub fn create_gc(&mut self, request: CreateGcRequest) {
+    pub fn create_gc(&mut self, owner: ClientId, request: CreateGcRequest) {
         self.gcs.insert(
             request.gc.0,
             Gc {
@@ -185,6 +211,7 @@ impl ResourceTable {
                 background: request.background.unwrap_or(0x00ff_ffff),
                 line_width: request.line_width.unwrap_or(0),
                 font: request.font,
+                owner,
             },
         );
     }
@@ -197,6 +224,7 @@ impl ResourceTable {
             background: 0x00ff_ffff,
             line_width: 0,
             font: None,
+            owner: SERVER_OWNER,
         });
         if let Some(foreground) = request.foreground {
             gc.foreground = foreground;
@@ -230,6 +258,7 @@ impl ResourceTable {
 
     pub fn install_font(
         &mut self,
+        owner: ClientId,
         id: ResourceId,
         name: String,
         host_xid: u32,
@@ -242,6 +271,7 @@ impl ResourceTable {
                 name,
                 host_xid,
                 metrics,
+                owner,
             },
         );
     }
@@ -263,12 +293,55 @@ impl ResourceTable {
         self.fonts.get(&gc_font.0)
     }
 
-    pub fn create_glyph_cursor(&mut self, id: ResourceId) {
-        self.cursors.insert(id.0, Cursor { id });
+    pub fn create_glyph_cursor(&mut self, owner: ClientId, id: ResourceId) {
+        self.cursors.insert(id.0, Cursor { id, owner });
     }
 
     pub fn free_cursor(&mut self, id: ResourceId) {
         self.cursors.remove(&id.0);
+    }
+
+    /// Top-level windows owned by `client`: windows whose parent is *not*
+    /// owned by the same client. Reachable descendants (regardless of
+    /// owner) get destroyed transitively when each root is destroyed.
+    pub fn collect_owned_window_roots(&self, client: ClientId, out: &mut Vec<ResourceId>) {
+        for (raw_id, w) in &self.windows {
+            if w.owner != client {
+                continue;
+            }
+            let parent_owner = self.windows.get(&w.parent.0).map(|p| p.owner);
+            if parent_owner != Some(client) {
+                out.push(ResourceId(*raw_id));
+            }
+        }
+    }
+
+    /// Remove every non-window resource owned by `client`. Returns the
+    /// `host_xid` of every removed font so the caller can issue host-side
+    /// `CloseFont` after dropping the `ServerState` lock.
+    pub fn remove_non_window_resources_owned_by(&mut self, client: ClientId) -> Vec<u32> {
+        self.pixmaps.retain(|_, p| p.owner != client);
+        self.gcs.retain(|_, g| g.owner != client);
+        self.cursors.retain(|_, c| c.owner != client);
+        let mut closed_fonts = Vec::new();
+        self.fonts.retain(|_, f| {
+            if f.owner == client {
+                closed_fonts.push(f.host_xid);
+                false
+            } else {
+                true
+            }
+        });
+        closed_fonts
+    }
+
+    #[must_use]
+    pub fn any_resource_exists(&self, id: ResourceId) -> bool {
+        self.windows.contains_key(&id.0)
+            || self.pixmaps.contains_key(&id.0)
+            || self.gcs.contains_key(&id.0)
+            || self.fonts.contains_key(&id.0)
+            || self.cursors.contains_key(&id.0)
     }
 }
 
@@ -286,10 +359,11 @@ pub struct Window {
     pub visual: ResourceId,
     pub class: WindowClass,
     pub map_state: MapState,
-    pub event_mask: u32,
     pub background_pixel: u32,
     pub override_redirect: bool,
     pub cursor: Option<ResourceId>,
+    pub owner: ClientId,
+    pub properties: HashMap<AtomId, PropertyValue>,
 }
 
 impl Window {
@@ -307,10 +381,11 @@ impl Window {
             visual: ROOT_VISUAL,
             class: WindowClass::InputOutput,
             map_state: MapState::Unmapped,
-            event_mask: 0,
             background_pixel: 0x00ff_ffff,
             override_redirect: false,
             cursor: None,
+            owner: SERVER_OWNER,
+            properties: HashMap::new(),
         }
     }
 }
@@ -367,6 +442,7 @@ pub struct Pixmap {
     pub width: u16,
     pub height: u16,
     pub depth: u8,
+    pub owner: ClientId,
 }
 
 #[derive(Clone, Debug)]
@@ -377,6 +453,7 @@ pub struct Gc {
     pub background: u32,
     pub line_width: u16,
     pub font: Option<ResourceId>,
+    pub owner: ClientId,
 }
 
 #[derive(Clone, Debug)]
@@ -385,9 +462,11 @@ pub struct Font {
     pub name: String,
     pub host_xid: u32,
     pub metrics: FontMetrics,
+    pub owner: ClientId,
 }
 
 #[derive(Clone, Debug)]
 pub struct Cursor {
     pub id: ResourceId,
+    pub owner: ClientId,
 }

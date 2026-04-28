@@ -8,3 +8,6 @@ repository.workspace = true
 [dependencies]
 yserver-protocol.workspace = true
 log.workspace = true
+
+[dev-dependencies]
+proptest = "1"
