@@ -27,8 +27,8 @@ resource IDs, atoms, properties, windows, basic events, and errors. Run
 - Pixmap/cursor lifecycle (allocation only).
 - Events emitted: `Expose`, `MapNotify`, `ConfigureNotify`, `KeyPress`,
   `KeyRelease`, `FocusIn`, `FocusOut`, `PropertyNotify`,
-  `DestroyNotify` (cross-client subscriber fanout via per-window
-  event masks).
+  `DestroyNotify`, `UnmapNotify` (cross-client subscriber fanout via
+  per-window event masks).
 - Keyboard forwarding from the host window to the focused nested client.
 - `xeyes`, `xclock`, and `xterm` come up; `xterm` accepts input.
 
@@ -50,9 +50,11 @@ In rough priority order:
       `ChangeProperty` / `DeleteProperty` / `GetProperty` and
       cross-client `PropertyNotify` fanout via per-(client, window)
       event masks.
-- [ ] **Lifecycle / WM events.** Emit `UnmapNotify`, `ReparentNotify`,
-      and `ClientMessage` so window managers and toolkits behave.
-      (`DestroyNotify` shipped with property storage.)
+- [ ] **Lifecycle / WM events.** Emit `ReparentNotify` and
+      `ClientMessage` so window managers and toolkits behave.
+      (`DestroyNotify` shipped with property storage; `UnmapNotify`
+      shipped on both explicit `UnmapWindow` and implicit destroy/
+      disconnect paths.)
 - [ ] **Per-window clipping in the ynest backend.** All nested top-level
       windows currently render into a single host window with no
       coordinate translation or clipping. Give each nested top-level its
