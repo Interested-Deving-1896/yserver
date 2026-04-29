@@ -197,7 +197,6 @@ impl HostX11 {
         self.render.as_ref().map(|r| r.opcode)
     }
 
-    #[allow(dead_code)]
     pub fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32> {
         let r = self.render.as_ref()?;
         match ynest_fmt {

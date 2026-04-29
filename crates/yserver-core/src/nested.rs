@@ -652,17 +652,20 @@ fn handle_render_request(
                     None => (None, 0, 0),
                 }
             };
-            if let Some(host_drawable) = host_drawable_xid {
-                let host_pic = req.picture.0;
-                if let Some(mut h) = lock_host() {
+            let host_pic = host_drawable_xid.and_then(|host_drawable| {
+                lock_host().map(|mut h| {
+                    let xid = h.allocate_xid();
                     let _ = h.render_create_picture(
-                        host_pic,
+                        xid,
                         host_drawable,
                         req.format,
                         req.value_mask,
                         &req.values,
                     );
-                }
+                    xid
+                })
+            });
+            if let Some(host_pic) = host_pic {
                 let mut s = lock_server(server)?;
                 s.resources.create_picture(
                     req.picture,
@@ -715,18 +718,21 @@ fn handle_render_request(
                 "client {} #{} RENDER::CreateGlyphSet gs=0x{:x} fmt={}",
                 client_id.0, sequence.0, gs_id.0, fmt
             );
-            let host_gs = gs_id.0;
-            if let Some(mut h) = lock_host() {
-                let _ = h.render_create_glyphset(host_gs, fmt);
+            let host_gs = lock_host().map(|mut h| {
+                let xid = h.allocate_xid();
+                let _ = h.render_create_glyphset(xid, fmt);
+                xid
+            });
+            if let Some(host_gs) = host_gs {
+                let mut s = lock_server(server)?;
+                s.resources.create_glyphset(
+                    gs_id,
+                    GlyphSetState {
+                        client: client_id,
+                        host_glyphset_xid: host_gs,
+                    },
+                );
             }
-            let mut s = lock_server(server)?;
-            s.resources.create_glyphset(
-                gs_id,
-                GlyphSetState {
-                    client: client_id,
-                    host_glyphset_xid: host_gs,
-                },
-            );
             Ok(())
         }
         // ReferenceGlyphSet (minor=18) — stub
@@ -797,7 +803,7 @@ fn handle_render_request(
                 },
                 req.dst.0
             );
-            let (host_src, host_dst, host_gs, x_off, y_off, mask_fmt) = {
+            let (host_src, host_dst, host_gs, x_off, y_off) = {
                 let s = lock_server(server)?;
                 let host_src = s.resources.picture(req.src).map(|p| p.host_picture_xid);
                 let (host_dst, x_off, y_off) =
@@ -808,18 +814,17 @@ fn handle_render_request(
                     .resources
                     .glyphset(req.glyphset)
                     .map(|g| g.host_glyphset_xid);
-                let mask_fmt = if req.mask_format == 0 {
-                    0
-                } else {
-                    s.resources
-                        .picture(ResourceId(req.mask_format))
-                        .map_or(req.mask_format, |p| p.host_picture_xid)
-                };
-                (host_src, host_dst, host_gs, x_off, y_off, mask_fmt)
+                (host_src, host_dst, host_gs, x_off, y_off)
             };
             if let (Some(host_src), Some(host_dst), Some(host_gs), Some(mut h)) =
                 (host_src, host_dst, host_gs, lock_host())
             {
+                // mask_format is a PICTFORMAT id (1-4 in ynest), not a picture resource id
+                let mask_fmt = if req.mask_format == 0 {
+                    0
+                } else {
+                    h.render_format_for_ynest_id(req.mask_format).unwrap_or(0)
+                };
                 let _ = h.render_composite_glyphs(
                     minor, req.op, host_src, host_dst, mask_fmt, host_gs, req.src_x, req.src_y,
                     &req.items, x_off, y_off,
@@ -857,21 +862,24 @@ fn handle_render_request(
                 "client {} #{} RENDER::CreateSolidFill pic=0x{:x}",
                 client_id.0, sequence.0, pic_id.0
             );
-            let host_pic = pic_id.0;
-            if let Some(mut h) = lock_host() {
-                let _ = h.render_create_solid_fill(host_pic, color);
+            let host_pic = lock_host().map(|mut h| {
+                let xid = h.allocate_xid();
+                let _ = h.render_create_solid_fill(xid, color);
+                xid
+            });
+            if let Some(host_pic) = host_pic {
+                let mut s = lock_server(server)?;
+                s.resources.create_picture(
+                    pic_id,
+                    PictureState {
+                        client: client_id,
+                        host_picture_xid: host_pic,
+                        host_owned_pixmap: None,
+                        x_offset: 0,
+                        y_offset: 0,
+                    },
+                );
             }
-            let mut s = lock_server(server)?;
-            s.resources.create_picture(
-                pic_id,
-                PictureState {
-                    client: client_id,
-                    host_picture_xid: host_pic,
-                    host_owned_pixmap: None,
-                    x_offset: 0,
-                    y_offset: 0,
-                },
-            );
             Ok(())
         }
         _ => {
