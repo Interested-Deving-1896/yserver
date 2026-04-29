@@ -1554,6 +1554,54 @@ fn rgb16_to_pixel(color: Rgb16) -> u32 {
         | (u32::from(color.blue) >> 8)
 }
 
+pub struct GetImageRequest {
+    pub format: u8,
+    pub drawable: ResourceId,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+    pub plane_mask: u32,
+}
+
+pub fn get_image_request(format: u8, body: &[u8]) -> Option<GetImageRequest> {
+    Some(GetImageRequest {
+        format,
+        drawable: ResourceId(read_u32_le(body.get(0..4)?)),
+        x: read_i16_le(body.get(4..6)?),
+        y: read_i16_le(body.get(6..8)?),
+        width: read_u16_le(body.get(8..10)?),
+        height: read_u16_le(body.get(10..12)?),
+        plane_mask: read_u32_le(body.get(12..16)?),
+    })
+}
+
+/// Return a blank (zeroed) image of the requested size.
+/// ZPixmap at 32 bpp is the common case; other formats get 0 bytes of data.
+pub fn write_get_image_reply(
+    writer: &mut impl Write,
+    sequence: SequenceNumber,
+    order: ClientByteOrder,
+    request: &GetImageRequest,
+    visual_id: u32,
+) -> io::Result<()> {
+    const DEPTH: u8 = 24;
+    let data_bytes: u32 = if request.format == 2 {
+        // ZPixmap: 32 bits per pixel at depth 24
+        let raw = u32::from(request.width)
+            .saturating_mul(u32::from(request.height))
+            .saturating_mul(4);
+        (raw + 3) & !3 // round up to 4-byte boundary
+    } else {
+        0
+    };
+    let mut reply = fixed_reply(sequence, DEPTH, data_bytes / 4);
+    write_u32(order, &mut reply, visual_id);
+    reply.extend_from_slice(&[0u8; 20]);
+    reply.extend(std::iter::repeat_n(0u8, data_bytes as usize));
+    writer.write_all(&reply)
+}
+
 pub fn write_query_colors_reply(
     writer: &mut impl Write,
     sequence: SequenceNumber,

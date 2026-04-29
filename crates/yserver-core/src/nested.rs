@@ -2598,6 +2598,27 @@ fn handle_request(
             }
             log_void(client_id, sequence, "PutImage")
         }
+        73 => {
+            log_reply(client_id, sequence, "GetImage");
+            let request = x11::get_image_request(header.data, body);
+            let order = {
+                let s = lock_server(server)?;
+                s.clients
+                    .get(&client_id.0)
+                    .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order)
+            };
+            if let Some(req) = request {
+                x11::write_get_image_reply(
+                    &mut *lock_writer()?,
+                    sequence,
+                    order,
+                    &req,
+                    crate::resources::ROOT_VISUAL.0,
+                )
+            } else {
+                Ok(())
+            }
+        }
         74 => {
             if let Some((drawable_raw, gc_id, text_body)) = x11::poly_text_data(body) {
                 let drawable = ResourceId(drawable_raw);
