@@ -143,6 +143,7 @@ impl ResourceTable {
                 map_state: MapState::Viewable,
                 background_pixel: 0x00ff_ffff,
                 background_pixmap: None,
+                background_pixmap_host_xid: None,
                 override_redirect: false,
                 cursor: None,
                 owner: SERVER_OWNER,
@@ -186,6 +187,7 @@ impl ResourceTable {
             map_state: MapState::Unmapped,
             background_pixel: request.background_pixel.unwrap_or(0x00ff_ffff),
             background_pixmap: None,
+            background_pixmap_host_xid: None,
             override_redirect: request.override_redirect.unwrap_or(false),
             cursor: None,
             owner,
@@ -220,14 +222,39 @@ impl ResourceTable {
         }
     }
 
-    pub fn change_window_attributes(&mut self, request: ChangeWindowAttributesRequest) {
+    /// Apply attribute changes. Returns the previous bg-pixmap host XID if it
+    /// was replaced — the caller should free it on the host since the X server
+    /// no longer needs it.
+    pub fn change_window_attributes(
+        &mut self,
+        request: ChangeWindowAttributesRequest,
+    ) -> Option<u32> {
+        let mut previous_bg_host_xid: Option<u32> = None;
+        let new_bg_host_xid = if let Some(bg_pixmap) = request.background_pixmap {
+            if bg_pixmap.0 == 0 {
+                Some(None)
+            } else {
+                let host = self.pixmaps.get(&bg_pixmap.0).and_then(|p| p.host_xid);
+                Some(host)
+            }
+        } else {
+            None
+        };
+
         if let Some(window) = self.windows.get_mut(&request.window.0) {
             if let Some(bg_pixmap) = request.background_pixmap {
-                window.background_pixmap = if bg_pixmap.0 == 0 {
+                let new_resource_id = if bg_pixmap.0 == 0 {
                     None
                 } else {
                     Some(bg_pixmap)
                 };
+                if window.background_pixmap_host_xid != new_bg_host_xid.flatten() {
+                    previous_bg_host_xid = window.background_pixmap_host_xid;
+                }
+                window.background_pixmap = new_resource_id;
+                if let Some(host) = new_bg_host_xid {
+                    window.background_pixmap_host_xid = host;
+                }
             }
             if let Some(background_pixel) = request.background_pixel {
                 window.background_pixel = background_pixel;
@@ -236,6 +263,8 @@ impl ResourceTable {
                 window.cursor = Some(cursor);
             }
         }
+
+        previous_bg_host_xid
     }
 
     pub fn configure_window(&mut self, request: ConfigureWindowRequest) -> Option<&Window> {
@@ -515,8 +544,18 @@ impl ResourceTable {
     }
 
     pub fn window_background_pixmap_host_xid(&self, window_id: ResourceId) -> Option<u32> {
-        let bg_pixmap_id = self.windows.get(&window_id.0)?.background_pixmap?;
-        self.pixmaps.get(&bg_pixmap_id.0)?.host_xid
+        // Use the snapshotted host XID rather than re-resolving the pixmap, so
+        // it remains valid after the client frees the original pixmap (X11
+        // semantics: the server retains the bg pixmap independent of refs).
+        self.windows.get(&window_id.0)?.background_pixmap_host_xid
+    }
+
+    /// Returns true if any window currently uses `host_xid` as its background.
+    /// Used by FreePixmap to skip releasing host pixmaps still owned by a window.
+    pub fn host_xid_referenced_by_window_bg(&self, host_xid: u32) -> bool {
+        self.windows
+            .values()
+            .any(|w| w.background_pixmap_host_xid == Some(host_xid))
     }
 
     #[must_use]
@@ -904,6 +943,10 @@ pub struct Window {
     pub map_state: MapState,
     pub background_pixel: u32,
     pub background_pixmap: Option<ResourceId>,
+    /// Host XID of the bg pixmap, snapshotted at attrs-change time so
+    /// it survives FreePixmap (X11 servers retain bg pixmaps independent
+    /// of client refs).
+    pub background_pixmap_host_xid: Option<u32>,
     pub override_redirect: bool,
     pub cursor: Option<ResourceId>,
     pub owner: ClientId,
@@ -928,6 +971,7 @@ impl Window {
             map_state: MapState::Unmapped,
             background_pixel: 0x00ff_ffff,
             background_pixmap: None,
+            background_pixmap_host_xid: None,
             override_redirect: false,
             cursor: None,
             owner: SERVER_OWNER,

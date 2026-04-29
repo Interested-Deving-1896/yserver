@@ -654,6 +654,12 @@ fn handle_render_request(
                     None => (None, 0, 0),
                 }
             };
+            if host_drawable_xid.is_none() {
+                debug!(
+                    "client {} #{} RENDER::CreatePicture: drawable 0x{:x} has no host backing — picture pic=0x{:x} dropped",
+                    client_id.0, sequence.0, req.drawable.0, req.picture.0
+                );
+            }
             let host_pic = host_drawable_xid.and_then(|host_drawable| {
                 lock_host().map(|mut h| {
                     let xid = h.allocate_xid();
@@ -1331,7 +1337,14 @@ fn handle_request(
                             entry.event_masks.insert(target_window, event_mask);
                         }
                     }
-                    s.resources.change_window_attributes(request);
+                    let previous_bg_host_xid = s.resources.change_window_attributes(request);
+                    if let Some(old_host_xid) = previous_bg_host_xid
+                        && !s.resources.host_xid_referenced_by_window_bg(old_host_xid)
+                        && let Some(host) = host
+                        && let Ok(mut h) = host.lock()
+                    {
+                        let _ = h.free_pixmap(old_host_xid);
+                    }
                     want_focus_check = s
                         .clients
                         .get(&client_id.0)
@@ -2821,12 +2834,18 @@ fn handle_request(
         }
         54 => {
             if let Some(pixmap) = x11::free_resource_id(body) {
-                let removed = {
+                let (removed, still_referenced) = {
                     let mut s = lock_server(server)?;
-                    s.resources.free_pixmap(pixmap)
+                    let removed = s.resources.free_pixmap(pixmap);
+                    let still_referenced = removed
+                        .as_ref()
+                        .and_then(|p| p.host_xid)
+                        .is_some_and(|xid| s.resources.host_xid_referenced_by_window_bg(xid));
+                    (removed, still_referenced)
                 };
                 if let Some(removed_pixmap) = removed
                     && let Some(xid) = removed_pixmap.host_xid
+                    && !still_referenced
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
