@@ -1,11 +1,13 @@
 use std::{
+    collections::HashMap,
     env, fs,
     io::{self, ErrorKind, Read, Write},
     os::unix::net::UnixStream,
     path::PathBuf,
+    sync::{Arc, Mutex},
 };
 
-use yserver_protocol::x11::{self, FontMetrics};
+use yserver_protocol::x11::{self, FontMetrics, ResourceId};
 
 const MIT_MAGIC_COOKIE: &str = "MIT-MAGIC-COOKIE-1";
 
@@ -19,8 +21,17 @@ pub struct HostX11 {
     next_xid: u32,
 }
 
-pub struct HostKeyboard {
-    stream: UnixStream,
+pub type HostXidMap = Arc<Mutex<HashMap<u32, ResourceId>>>;
+
+pub struct HostInputPump {
+    read_stream: UnixStream,
+    handle: HostInputPumpHandle,
+}
+
+#[derive(Clone)]
+pub struct HostInputPumpHandle {
+    write_stream: Arc<Mutex<UnixStream>>,
+    xid_map: HostXidMap,
 }
 
 impl HostX11 {
@@ -54,7 +65,7 @@ impl HostX11 {
         })
     }
 
-    fn allocate_xid(&mut self) -> u32 {
+    pub fn allocate_xid(&mut self) -> u32 {
         let xid = self.next_xid;
         self.next_xid = self.next_xid.wrapping_add(1);
         xid
@@ -194,15 +205,160 @@ impl HostX11 {
         })
     }
 
-    pub fn poly_fill_arc(&mut self, foreground: u32, arcs: &[u8]) -> io::Result<()> {
-        self.draw_arcs(71, foreground, arcs)
+    pub fn create_subwindow(
+        &mut self,
+        host_xid: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        // 1. CreateWindow request — parent is the container (self.window_id).
+        let mut out = Vec::new();
+        out.push(1); // CreateWindow opcode
+        out.push(0); // depth = CopyFromParent
+        write_u16(&mut out, 8); // length: 8 units * 4 = 32 bytes
+        write_u32(&mut out, host_xid);
+        write_u32(&mut out, self.window_id); // parent = container
+        write_i16(&mut out, x);
+        write_i16(&mut out, y);
+        let safe_width = width.max(1);
+        let safe_height = height.max(1);
+        write_u16(&mut out, safe_width);
+        write_u16(&mut out, safe_height);
+        write_u16(&mut out, 0); // border_width
+        write_u16(&mut out, 0); // class = CopyFromParent
+        write_u32(&mut out, 0); // visual = CopyFromParent
+        write_u32(&mut out, 0); // value-mask = 0
+        self.stream.write_all(&out)?;
+        self.sequence = self.sequence.wrapping_add(1);
+
+        // 2. GetGeometry round-trip — forces the host to commit CreateWindow
+        //    before any later request (e.g. ChangeWindowAttributes from the
+        //    pump's connection) can be processed. See spec §"Cross-connection
+        //    ordering hazard".
+        let geom_seq = self.sequence;
+        let mut geom = Vec::new();
+        geom.push(14); // GetGeometry opcode
+        geom.push(0);
+        write_u16(&mut geom, 2);
+        write_u32(&mut geom, host_xid);
+        self.stream.write_all(&geom)?;
+        self.sequence = self.sequence.wrapping_add(1);
+        self.stream.flush()?;
+
+        // Drain replies/errors until we see geom_seq.
+        loop {
+            let resp = read_response(&mut self.stream)?;
+            if resp.sequence == geom_seq {
+                return Ok(());
+            }
+            // Ignore any earlier responses (e.g. an error on CreateWindow);
+            // GetGeometry will then also fail and we'll see its reply here.
+        }
     }
 
-    pub fn poly_arc(&mut self, foreground: u32, arcs: &[u8]) -> io::Result<()> {
-        self.draw_arcs(68, foreground, arcs)
+    pub fn destroy_subwindow(&mut self, host_xid: u32) -> io::Result<()> {
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(4); // DestroyWindow
+        out.push(0);
+        write_u16(&mut out, 2);
+        write_u32(&mut out, host_xid);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
     }
 
-    pub fn poly_fill_rectangle(&mut self, foreground: u32, rectangles: &[u8]) -> io::Result<()> {
+    #[allow(
+        dead_code,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::cast_lossless
+    )]
+    // Sign-extension of i16 → u32 is intentional per X11 wire format (INT16
+    // in a CARD32 slot must be sign-extended).
+    pub fn configure_subwindow(
+        &mut self,
+        host_xid: u32,
+        x: Option<i16>,
+        y: Option<i16>,
+        width: Option<u16>,
+        height: Option<u16>,
+    ) -> io::Result<()> {
+        let mut value_mask: u16 = 0;
+        let mut values: Vec<u8> = Vec::new();
+        if let Some(x) = x {
+            value_mask |= 1 << 0;
+            write_u32(&mut values, x as i32 as u32);
+        }
+        if let Some(y) = y {
+            value_mask |= 1 << 1;
+            write_u32(&mut values, y as i32 as u32);
+        }
+        if let Some(width) = width {
+            value_mask |= 1 << 2;
+            write_u32(&mut values, u32::from(width.max(1)));
+        }
+        if let Some(height) = height {
+            value_mask |= 1 << 3;
+            write_u32(&mut values, u32::from(height.max(1)));
+        }
+        if value_mask == 0 {
+            return Ok(());
+        }
+
+        let length_units = 3 + u16::try_from(values.len() / 4).map_err(|_| {
+            io::Error::new(ErrorKind::InvalidInput, "too many ConfigureWindow values")
+        })?;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(12); // ConfigureWindow
+        out.push(0);
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, host_xid);
+        write_u16(&mut out, value_mask);
+        write_u16(&mut out, 0); // pad
+        out.extend_from_slice(&values);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn map_subwindow(&mut self, host_xid: u32) -> io::Result<()> {
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(8); // MapWindow
+        out.push(0);
+        write_u16(&mut out, 2);
+        write_u32(&mut out, host_xid);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn unmap_subwindow(&mut self, host_xid: u32) -> io::Result<()> {
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::new();
+        out.push(10); // UnmapWindow
+        out.push(0);
+        write_u16(&mut out, 2);
+        write_u32(&mut out, host_xid);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
+    pub fn poly_fill_arc(&mut self, host_xid: u32, foreground: u32, arcs: &[u8]) -> io::Result<()> {
+        self.draw_arcs(host_xid, 71, foreground, arcs)
+    }
+
+    pub fn poly_arc(&mut self, host_xid: u32, foreground: u32, arcs: &[u8]) -> io::Result<()> {
+        self.draw_arcs(host_xid, 68, foreground, arcs)
+    }
+
+    pub fn poly_fill_rectangle(
+        &mut self,
+        host_xid: u32,
+        foreground: u32,
+        rectangles: &[u8],
+    ) -> io::Result<()> {
         if rectangles.is_empty() {
             return Ok(());
         }
@@ -221,7 +377,7 @@ impl HostX11 {
         out.push(70);
         out.push(0);
         write_u16(&mut out, length_units);
-        write_u32(&mut out, self.window_id);
+        write_u32(&mut out, host_xid);
         write_u32(&mut out, self.gc_id);
         out.extend_from_slice(rectangles);
         self.stream.write_all(&out)?;
@@ -230,6 +386,7 @@ impl HostX11 {
 
     pub fn fill_rectangle(
         &mut self,
+        host_xid: u32,
         foreground: u32,
         x: i16,
         y: i16,
@@ -241,11 +398,12 @@ impl HostX11 {
         write_i16(&mut rectangle, y);
         write_u16(&mut rectangle, width);
         write_u16(&mut rectangle, height);
-        self.poly_fill_rectangle(foreground, &rectangle)
+        self.poly_fill_rectangle(host_xid, foreground, &rectangle)
     }
 
     pub fn poly_line(
         &mut self,
+        host_xid: u32,
         foreground: u32,
         coordinate_mode: u8,
         points: &[u8],
@@ -268,7 +426,7 @@ impl HostX11 {
         out.push(65);
         out.push(coordinate_mode);
         write_u16(&mut out, length_units);
-        write_u32(&mut out, self.window_id);
+        write_u32(&mut out, host_xid);
         write_u32(&mut out, self.gc_id);
         out.extend_from_slice(points);
         self.stream.write_all(&out)?;
@@ -277,6 +435,7 @@ impl HostX11 {
 
     pub fn image_text8(
         &mut self,
+        host_xid: u32,
         foreground: u32,
         background: u32,
         text_len: u8,
@@ -295,7 +454,7 @@ impl HostX11 {
         out.push(76);
         out.push(text_len);
         write_u16(&mut out, length_units);
-        write_u32(&mut out, self.window_id);
+        write_u32(&mut out, host_xid);
         write_u32(&mut out, self.gc_id);
         out.extend_from_slice(&body[8..12]);
         out.extend_from_slice(text);
@@ -303,7 +462,7 @@ impl HostX11 {
         self.stream.flush()
     }
 
-    pub fn poly_text8(&mut self, foreground: u32, body: &[u8]) -> io::Result<()> {
+    pub fn poly_text8(&mut self, host_xid: u32, foreground: u32, body: &[u8]) -> io::Result<()> {
         if body.len() < 12 {
             return Ok(());
         }
@@ -316,14 +475,20 @@ impl HostX11 {
         out.push(74);
         out.push(0);
         write_u16(&mut out, length_units);
-        write_u32(&mut out, self.window_id);
+        write_u32(&mut out, host_xid);
         write_u32(&mut out, self.gc_id);
         out.extend_from_slice(&body[8..]);
         self.stream.write_all(&out)?;
         self.stream.flush()
     }
 
-    fn draw_arcs(&mut self, opcode: u8, foreground: u32, arcs: &[u8]) -> io::Result<()> {
+    fn draw_arcs(
+        &mut self,
+        host_xid: u32,
+        opcode: u8,
+        foreground: u32,
+        arcs: &[u8],
+    ) -> io::Result<()> {
         if arcs.is_empty() {
             return Ok(());
         }
@@ -339,7 +504,7 @@ impl HostX11 {
         out.push(opcode);
         out.push(0);
         write_u16(&mut out, length_units);
-        write_u32(&mut out, self.window_id);
+        write_u32(&mut out, host_xid);
         write_u32(&mut out, self.gc_id);
         out.extend_from_slice(arcs);
         self.stream.write_all(&out)?;
@@ -410,19 +575,32 @@ fn connect_to_host() -> io::Result<UnixStream> {
     Ok(stream)
 }
 
-impl HostKeyboard {
+impl HostInputPump {
     pub fn open_from_env(window_id: u32) -> io::Result<Self> {
         let mut stream = connect_to_host()?;
         let _setup = read_setup_reply(&mut stream)?;
         select_keyboard_events(&mut stream, window_id)?;
         stream.flush()?;
-        Ok(Self { stream })
+        let read_stream = stream.try_clone()?;
+        let handle = HostInputPumpHandle {
+            write_stream: Arc::new(Mutex::new(stream)),
+            xid_map: Arc::new(Mutex::new(HashMap::new())),
+        };
+        Ok(Self {
+            read_stream,
+            handle,
+        })
+    }
+
+    #[must_use]
+    pub fn handle(&self) -> HostInputPumpHandle {
+        self.handle.clone()
     }
 
     pub fn read_event(&mut self) -> io::Result<HostEvent> {
         loop {
             let mut event = [0; 32];
-            self.stream.read_exact(&mut event)?;
+            self.read_stream.read_exact(&mut event)?;
             let event_type = event[0] & 0x7f;
             match event_type {
                 2 | 3 => {
@@ -437,17 +615,118 @@ impl HostKeyboard {
                         state: read_u16(&event[28..30]),
                     }));
                 }
+                4..=6 => {
+                    let kind = match event_type {
+                        4 => PointerEventKind::ButtonPress,
+                        5 => PointerEventKind::ButtonRelease,
+                        _ => PointerEventKind::MotionNotify,
+                    };
+                    return Ok(HostEvent::Pointer(HostPointerEvent {
+                        kind,
+                        host_xid: read_u32(&event[12..16]), // event window
+                        detail: event[1],
+                        time: read_u32(&event[4..8]),
+                        root_x: read_i16(&event[20..22]),
+                        root_y: read_i16(&event[22..24]),
+                        event_x: read_i16(&event[24..26]),
+                        event_y: read_i16(&event[26..28]),
+                        state: read_u16(&event[28..30]),
+                    }));
+                }
+                7 | 8 => {
+                    let kind = if event_type == 7 {
+                        PointerEventKind::EnterNotify
+                    } else {
+                        PointerEventKind::LeaveNotify
+                    };
+                    return Ok(HostEvent::Pointer(HostPointerEvent {
+                        kind,
+                        host_xid: read_u32(&event[12..16]),
+                        detail: 0,
+                        time: read_u32(&event[4..8]),
+                        root_x: read_i16(&event[20..22]),
+                        root_y: read_i16(&event[22..24]),
+                        event_x: read_i16(&event[24..26]),
+                        event_y: read_i16(&event[26..28]),
+                        state: read_u16(&event[28..30]),
+                    }));
+                }
                 17 => return Ok(HostEvent::Closed),
-                _ => continue,
+                _ => {}
             }
         }
+    }
+}
+
+const POINTER_EVENT_MASK: u32 = 0x0000_0004 // ButtonPress
+    | 0x0000_0008 // ButtonRelease
+    | 0x0000_0010 // EnterWindow
+    | 0x0000_0020 // LeaveWindow
+    | 0x0000_0040; // PointerMotion
+
+impl HostInputPumpHandle {
+    pub fn register_top_level(&self, nested_id: ResourceId, host_xid: u32) -> io::Result<()> {
+        // Insert into the map *before* writing to X11 so that any pointer
+        // events arriving on this subwindow after ChangeWindowAttributes are
+        // sent can be resolved to a nested window id immediately.
+        if let Ok(mut map) = self.xid_map.lock() {
+            map.insert(host_xid, nested_id);
+        }
+        // ChangeWindowAttributes — value-mask = (1<<11) (event-mask), value = pointer mask.
+        let mut out = Vec::new();
+        out.push(2); // ChangeWindowAttributes
+        out.push(0);
+        write_u16(&mut out, 4);
+        write_u32(&mut out, host_xid);
+        write_u32(&mut out, 1 << 11);
+        write_u32(&mut out, POINTER_EVENT_MASK);
+        let mut stream = self
+            .write_stream
+            .lock()
+            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "host pump stream poisoned"))?;
+        stream.write_all(&out)?;
+        stream.flush()
+    }
+
+    pub fn unregister_top_level(&self, host_xid: u32) {
+        if let Ok(mut map) = self.xid_map.lock() {
+            map.remove(&host_xid);
+        }
+    }
+
+    #[must_use]
+    pub fn xid_map(&self) -> HostXidMap {
+        self.xid_map.clone()
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum HostEvent {
     Key(HostKeyEvent),
+    Pointer(HostPointerEvent),
     Closed,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PointerEventKind {
+    ButtonPress,
+    ButtonRelease,
+    MotionNotify,
+    EnterNotify,
+    LeaveNotify,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HostPointerEvent {
+    pub kind: PointerEventKind,
+    pub host_xid: u32,
+    pub detail: u8,
+    pub time: u32,
+    pub root_x: i16,
+    pub root_y: i16,
+    pub event_x: i16,
+    pub event_y: i16,
+    pub state: u16,
 }
 
 #[derive(Clone, Copy, Debug)]

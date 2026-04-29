@@ -17,7 +17,7 @@ use yserver_protocol::x11::{
 };
 
 use crate::{
-    host_x11::{HostEvent, HostKeyboard, HostX11},
+    host_x11::{HostEvent, HostInputPump, HostInputPumpHandle, HostX11},
     resources::{MapState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW, Window},
     server::{ClientHandle, ServerState, fanout_event},
 };
@@ -69,15 +69,60 @@ pub fn run(display: u16) -> io::Result<()> {
 
     let server = Arc::new(Mutex::new(ServerState::new()));
 
+    let input_pump_handle: Option<HostInputPumpHandle> = match host_window_id {
+        Some(window_id) => match HostInputPump::open_from_env(window_id) {
+            Ok(mut pump) => {
+                let handle = pump.handle();
+                let server_for_thread = server.clone();
+                let xid_map = handle.xid_map();
+                thread::spawn(move || {
+                    loop {
+                        match pump.read_event() {
+                            Ok(HostEvent::Key(_)) => {}
+                            Ok(HostEvent::Pointer(event)) => {
+                                crate::server::pointer_event_fanout(
+                                    &server_for_thread,
+                                    &xid_map,
+                                    event,
+                                );
+                            }
+                            Ok(HostEvent::Closed) => {
+                                info!("host pump: window closed, exiting");
+                                std::process::exit(0);
+                            }
+                            Err(err) => {
+                                info!("host pump: connection lost ({err}), exiting");
+                                std::process::exit(0);
+                            }
+                        }
+                    }
+                });
+                Some(handle)
+            }
+            Err(err) => {
+                warn!("could not start host input pump: {err}");
+                None
+            }
+        },
+        None => None,
+    };
+
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let client_id = ClientId(NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed));
                 let host = host.clone();
                 let server = server.clone();
+                let input_handle = input_pump_handle.clone();
                 thread::spawn(move || {
-                    if let Err(err) = handle_client(client_id, stream, server, host, host_window_id)
-                    {
+                    if let Err(err) = handle_client(
+                        client_id,
+                        stream,
+                        server,
+                        host,
+                        host_window_id,
+                        input_handle,
+                    ) {
                         info!("client {} disconnected: {err}", client_id.0);
                     }
                 });
@@ -122,12 +167,18 @@ fn collect_destroy_order(
     out.push(root);
 }
 
+// `server` and `host` are Arc clones that are logically "owned" by this
+// thread; `input_handle` holds a shared handle we keep alive for the session.
+// Clippy pedantic flags these as needless_pass_by_value but they cannot be
+// references because they are moved into the thread.
+#[allow(clippy::needless_pass_by_value)]
 fn handle_client(
     client_id: ClientId,
     mut stream: UnixStream,
     server: Arc<Mutex<ServerState>>,
     host: Option<Arc<Mutex<HostX11>>>,
     host_window_id: Option<u32>,
+    input_handle: Option<HostInputPumpHandle>,
 ) -> io::Result<()> {
     let setup = x11::read_setup_request(&mut stream)?;
     if setup.byte_order != ClientByteOrder::LittleEndian {
@@ -218,7 +269,7 @@ fn handle_client(
     }
 
     if let Some(host_window_id) = host_window_id {
-        match HostKeyboard::open_from_env(host_window_id) {
+        match HostInputPump::open_from_env(host_window_id) {
             Ok(keyboard) => spawn_keyboard_forwarder(
                 client_id,
                 keyboard,
@@ -243,6 +294,7 @@ fn handle_client(
                 client_id,
                 &server,
                 host.as_ref(),
+                input_handle.as_ref(),
                 &writer,
                 &focused_window,
                 sequence,
@@ -263,6 +315,7 @@ fn handle_client(
             ResourceId,
             ResourceId,
             bool,
+            Option<u32>,
             Vec<crate::server::EventTarget>,
             Vec<crate::server::EventTarget>,
         )> = Vec::new();
@@ -271,13 +324,19 @@ fn handle_client(
             let mut order = Vec::new();
             collect_destroy_order(&s.resources, root, &mut order);
             for w in &order {
-                let (parent, was_mapped) =
-                    s.resources.window(*w).map_or((ROOT_WINDOW, false), |win| {
-                        (win.parent, win.map_state != MapState::Unmapped)
-                    });
+                let (parent, was_mapped, host_xid) =
+                    s.resources
+                        .window(*w)
+                        .map_or((ROOT_WINDOW, false, None), |win| {
+                            (
+                                win.parent,
+                                win.map_state != MapState::Unmapped,
+                                win.host_xid,
+                            )
+                        });
                 let on_w = s.subscribers(*w, 0x0002_0000);
                 let on_p = s.subscribers(parent, 0x0008_0000);
-                pending.push((*w, parent, was_mapped, on_w, on_p));
+                pending.push((*w, parent, was_mapped, host_xid, on_w, on_p));
             }
             let _ = s.resources.destroy_window(root);
             all_destroyed.extend(order);
@@ -287,7 +346,17 @@ fn handle_client(
         s.clients.remove(&client_id.0);
         (fonts, pending)
     };
-    for (w, parent, was_mapped, subs_w, subs_p) in pending_destroys {
+    for (w, parent, was_mapped, host_xid, subs_w, subs_p) in pending_destroys {
+        if let Some(xid) = host_xid {
+            if let Some(host) = host.as_ref()
+                && let Ok(mut h) = host.lock()
+            {
+                let _ = h.destroy_subwindow(xid);
+            }
+            if let Some(input_handle) = input_handle.as_ref() {
+                input_handle.unregister_top_level(xid);
+            }
+        }
         if was_mapped {
             fanout_event(&subs_w, |buf, seq, order| {
                 x11::encode_unmap_notify_event(buf, seq, order, w, w, false);
@@ -316,7 +385,7 @@ fn handle_client(
 fn spawn_window_close_watcher(window_id: u32) {
     thread::spawn(move || {
         debug!("window-close watcher starting for 0x{window_id:x}");
-        let mut watcher = match HostKeyboard::open_from_env(window_id) {
+        let mut watcher = match HostInputPump::open_from_env(window_id) {
             Ok(w) => w,
             Err(err) => {
                 error!("could not start window-close watcher: {err}");
@@ -326,7 +395,7 @@ fn spawn_window_close_watcher(window_id: u32) {
         debug!("window-close watcher ready");
         loop {
             match watcher.read_event() {
-                Ok(HostEvent::Key(_)) => {}
+                Ok(HostEvent::Key(_) | HostEvent::Pointer(_)) => {}
                 Ok(HostEvent::Closed) => {
                     info!("host window closed, exiting");
                     std::process::exit(0);
@@ -342,22 +411,25 @@ fn spawn_window_close_watcher(window_id: u32) {
 
 fn spawn_keyboard_forwarder(
     client_id: ClientId,
-    mut keyboard: HostKeyboard,
+    mut keyboard: HostInputPump,
     writer: Arc<Mutex<UnixStream>>,
     focused_window: Arc<Mutex<ResourceId>>,
     last_sequence: Arc<AtomicU16>,
 ) {
     thread::spawn(move || {
         loop {
-            let event = match keyboard.read_event() {
-                Ok(HostEvent::Key(event)) => event,
-                Ok(HostEvent::Closed) => {
-                    info!("host window closed, exiting");
-                    std::process::exit(0);
-                }
-                Err(err) => {
-                    info!("host connection lost ({err}), exiting");
-                    std::process::exit(0);
+            let event = loop {
+                match keyboard.read_event() {
+                    Ok(HostEvent::Key(event)) => break event,
+                    Ok(HostEvent::Pointer(_)) => continue,
+                    Ok(HostEvent::Closed) => {
+                        info!("host window closed, exiting");
+                        std::process::exit(0);
+                    }
+                    Err(err) => {
+                        info!("host connection lost ({err}), exiting");
+                        std::process::exit(0);
+                    }
                 }
             };
             let focus = focused_window
@@ -448,6 +520,7 @@ fn handle_request(
     client_id: ClientId,
     server: &Arc<Mutex<ServerState>>,
     host: Option<&Arc<Mutex<HostX11>>>,
+    input_handle: Option<&HostInputPumpHandle>,
     writer: &Arc<Mutex<UnixStream>>,
     focused_window: &Arc<Mutex<ResourceId>>,
     sequence: SequenceNumber,
@@ -472,6 +545,8 @@ fn handle_request(
                 let new_id = request.window.0;
                 let mask = request.event_mask.unwrap_or(0);
                 let window_id = request.window;
+                let parent = request.parent;
+                let geometry = (request.x, request.y, request.width, request.height);
                 let validation_failed = {
                     let s = lock_server(server)?;
                     let handle = s.clients.get(&client_id.0).expect("client registered");
@@ -495,6 +570,41 @@ fn handle_request(
                             .expect("client registered")
                             .event_masks
                             .insert(window_id, mask);
+                    }
+                }
+                // Top-level only: allocate host xid + create host subwindow + register.
+                if parent == ROOT_WINDOW
+                    && let Some(host) = host
+                {
+                    let allocated_xid: Option<u32> = host.lock().ok().and_then(|mut h| {
+                        let xid = h.allocate_xid();
+                        if let Err(err) =
+                            h.create_subwindow(xid, geometry.0, geometry.1, geometry.2, geometry.3)
+                        {
+                            warn!(
+                                "client {} create_subwindow for 0x{:x} failed: {err}",
+                                client_id.0, new_id
+                            );
+                            return None;
+                        }
+                        Some(xid)
+                    });
+
+                    if let Some(host_xid) = allocated_xid {
+                        {
+                            let mut s = lock_server(server)?;
+                            if let Some(w) = s.resources.window_mut(window_id) {
+                                w.host_xid = Some(host_xid);
+                            }
+                        }
+                        if let Some(input_handle) = input_handle
+                            && let Err(err) = input_handle.register_top_level(window_id, host_xid)
+                        {
+                            warn!(
+                                "client {} register_top_level for 0x{:x} failed: {err}",
+                                client_id.0, new_id
+                            );
+                        }
                     }
                 }
                 let wants_focus = {
@@ -589,23 +699,40 @@ fn handle_request(
                         ResourceId,
                         ResourceId,
                         bool,
+                        Option<u32>,
                         Vec<crate::server::EventTarget>,
                         Vec<crate::server::EventTarget>,
                     )> = Vec::new();
                     for w in &order {
-                        let (parent, was_mapped) =
-                            s.resources.window(*w).map_or((ROOT_WINDOW, false), |win| {
-                                (win.parent, win.map_state != MapState::Unmapped)
-                            });
+                        let (parent, was_mapped, host_xid) =
+                            s.resources
+                                .window(*w)
+                                .map_or((ROOT_WINDOW, false, None), |win| {
+                                    (
+                                        win.parent,
+                                        win.map_state != MapState::Unmapped,
+                                        win.host_xid,
+                                    )
+                                });
                         let on_window = s.subscribers(*w, 0x0002_0000); // StructureNotify
                         let on_parent = s.subscribers(parent, 0x0008_0000); // SubstructureNotify
-                        pending.push((*w, parent, was_mapped, on_window, on_parent));
+                        pending.push((*w, parent, was_mapped, host_xid, on_window, on_parent));
                     }
                     let _ = s.resources.destroy_window(window);
                     s.drop_window_subscriptions(&order);
                     pending
                 };
-                for (w, parent, was_mapped, subs_w, subs_p) in pending {
+                for (w, parent, was_mapped, host_xid, subs_w, subs_p) in pending {
+                    if let Some(xid) = host_xid {
+                        if let Some(host) = host
+                            && let Ok(mut h) = host.lock()
+                        {
+                            let _ = h.destroy_subwindow(xid);
+                        }
+                        if let Some(input_handle) = input_handle {
+                            input_handle.unregister_top_level(xid);
+                        }
+                    }
                     if was_mapped {
                         fanout_event(&subs_w, |buf, seq, order| {
                             x11::encode_unmap_notify_event(buf, seq, order, w, w, false);
@@ -627,13 +754,22 @@ fn handle_request(
         7 => log_void(client_id, sequence, "ReparentWindow"),
         8 => {
             if let Some(window) = x11::map_window_id(body) {
-                let map_info = {
+                let (map_info, host_xid) = {
                     let mut s = lock_server(server)?;
                     s.resources.map_window(window);
-                    s.resources
+                    let host_xid = s.resources.window(window).and_then(|w| w.host_xid);
+                    let map_info = s
+                        .resources
                         .window(window)
-                        .map(|w| (w.parent, w.override_redirect, w.width, w.height))
+                        .map(|w| (w.parent, w.override_redirect, w.width, w.height));
+                    (map_info, host_xid)
                 };
+                if let Some(xid) = host_xid
+                    && let Some(host) = host
+                    && let Ok(mut h) = host.lock()
+                {
+                    let _ = h.map_subwindow(xid);
+                }
                 let wants_focus = {
                     let s = lock_server(server)?;
                     let mask = s
@@ -686,11 +822,19 @@ fn handle_request(
                     s.resources.children(parent).to_vec()
                 };
                 for child in children {
-                    let extents = {
+                    let (extents, host_xid) = {
                         let mut s = lock_server(server)?;
                         s.resources.map_window(child);
-                        s.resources.window(child).map(|w| (w.width, w.height))
+                        let host_xid = s.resources.window(child).and_then(|w| w.host_xid);
+                        let extents = s.resources.window(child).map(|w| (w.width, w.height));
+                        (extents, host_xid)
                     };
+                    if let Some(xid) = host_xid
+                        && let Some(host) = host
+                        && let Ok(mut h) = host.lock()
+                    {
+                        let _ = h.map_subwindow(xid);
+                    }
                     let wants_focus = {
                         let s = lock_server(server)?;
                         let mask = s
@@ -724,18 +868,26 @@ fn handle_request(
         }
         10 => {
             if let Some(window) = x11::map_window_id(body) {
-                let snapshot = {
+                let (snapshot, host_xid) = {
                     let mut s = lock_server(server)?;
+                    let host_xid = s.resources.window(window).and_then(|w| w.host_xid);
                     let was_mapped = s.resources.unmap_window(window);
-                    if was_mapped {
+                    let snapshot = if was_mapped {
                         let parent = s.resources.window(window).map_or(ROOT_WINDOW, |w| w.parent);
                         let on_window = s.subscribers(window, 0x0002_0000); // StructureNotify
                         let on_parent = s.subscribers(parent, 0x0008_0000); // SubstructureNotify
                         Some((parent, on_window, on_parent))
                     } else {
                         None
-                    }
+                    };
+                    (snapshot, host_xid)
                 };
+                if let Some(xid) = host_xid
+                    && let Some(host) = host
+                    && let Ok(mut h) = host.lock()
+                {
+                    let _ = h.unmap_subwindow(xid);
+                }
                 if let Some((parent, on_window, on_parent)) = snapshot {
                     fanout_event(&on_window, |buf, seq, order| {
                         x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
@@ -749,12 +901,29 @@ fn handle_request(
         }
         12 => {
             if let Some(request) = x11::configure_window_request(body) {
-                let configure = {
+                let (configure, host_xid) = {
                     let mut s = lock_server(server)?;
-                    s.resources
+                    let configure = s
+                        .resources
                         .configure_window(request)
-                        .map(|w| (w.id, window_geometry(w), w.override_redirect))
+                        .map(|w| (w.id, window_geometry(w), w.override_redirect));
+                    let host_xid = configure
+                        .as_ref()
+                        .and_then(|(id, _, _)| s.resources.window(*id).and_then(|w| w.host_xid));
+                    (configure, host_xid)
                 };
+                if let Some(xid) = host_xid
+                    && let Some(host) = host
+                    && let Ok(mut h) = host.lock()
+                {
+                    let _ = h.configure_subwindow(
+                        xid,
+                        request.x,
+                        request.y,
+                        request.width,
+                        request.height,
+                    );
+                }
                 if let Some((window_id, geometry, override_redirect)) = configure {
                     crate::server::emit_window_event(
                         server,
@@ -1392,13 +1561,22 @@ fn handle_request(
         }
         61 => {
             if let Some(request) = x11::clear_area_request(body) {
-                let extents = {
+                let (extents, target) = {
                     let s = lock_server(server)?;
-                    s.resources
+                    let extents = s
+                        .resources
                         .window(request.window)
-                        .map(|w| (w.background_pixel, w.width, w.height))
+                        .map(|w| (w.background_pixel, w.width, w.height));
+                    let target = s.resources.top_level_host_target(request.window);
+                    (extents, target)
                 };
-                if let Some((background_pixel, w_width, w_height)) = extents {
+                // Phase 1: only route to top-level drawables (no coordinate
+                // translation for child windows).
+                if let Some((background_pixel, w_width, w_height)) = extents
+                    && let Some(target) = target
+                    && target.x_offset == 0
+                    && target.y_offset == 0
+                {
                     let width = clear_extent(request.width, request.x, w_width);
                     let height = clear_extent(request.height, request.y, w_height);
                     if width != 0
@@ -1406,7 +1584,14 @@ fn handle_request(
                         && let Some(host) = host
                         && let Ok(mut host) = host.lock()
                     {
-                        host.fill_rectangle(background_pixel, request.x, request.y, width, height)?;
+                        host.fill_rectangle(
+                            target.host_xid,
+                            background_pixel,
+                            request.x,
+                            request.y,
+                            width,
+                            height,
+                        )?;
                     }
                 }
             }
@@ -1415,15 +1600,25 @@ fn handle_request(
         62 => log_void(client_id, sequence, "CopyArea"),
         64 => log_void(client_id, sequence, "PolyPoint"),
         65 => {
-            if let Some((gc_id, points)) = x11::poly_line_data(body) {
-                let foreground = {
+            if let Some((gc_id, points)) = x11::poly_line_data(body)
+                && let Some(drawable) = x11::drawable_request_id(body)
+            {
+                let (foreground, target) = {
                     let s = lock_server(server)?;
-                    s.resources.gc_foreground(ResourceId(gc_id))
+                    (
+                        s.resources.gc_foreground(ResourceId(gc_id)),
+                        s.resources.top_level_host_target(drawable),
+                    )
                 };
-                if let Some(host) = host
+                // Phase 1: only route to top-level drawables (no coordinate
+                // translation for child windows).
+                if let Some(target) = target
+                    && target.x_offset == 0
+                    && target.y_offset == 0
+                    && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.poly_line(foreground, header.data, points)?;
+                    host.poly_line(target.host_xid, foreground, header.data, points)?;
                 }
             }
             log_void(client_id, sequence, "PolyLine")
@@ -1431,59 +1626,98 @@ fn handle_request(
         66 => log_void(client_id, sequence, "PolySegment"),
         67 => log_void(client_id, sequence, "PolyRectangle"),
         68 => {
-            if let Some((gc_id, arcs)) = x11::poly_arc_data(body) {
-                let foreground = {
+            if let Some((gc_id, arcs)) = x11::poly_arc_data(body)
+                && let Some(drawable) = x11::drawable_request_id(body)
+            {
+                let (foreground, target) = {
                     let s = lock_server(server)?;
-                    s.resources.gc_foreground(ResourceId(gc_id))
+                    (
+                        s.resources.gc_foreground(ResourceId(gc_id)),
+                        s.resources.top_level_host_target(drawable),
+                    )
                 };
-                if let Some(host) = host
+                // Phase 1: only route to top-level drawables (no coordinate
+                // translation for child windows).
+                if let Some(target) = target
+                    && target.x_offset == 0
+                    && target.y_offset == 0
+                    && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.poly_arc(foreground, arcs)?;
+                    host.poly_arc(target.host_xid, foreground, arcs)?;
                 }
             }
             log_void(client_id, sequence, "PolyArc")
         }
         69 => log_void(client_id, sequence, "FillPoly"),
         70 => {
-            if let Some((gc_id, rectangles)) = x11::poly_fill_rectangle_data(body) {
-                let foreground = {
+            if let Some((gc_id, rectangles)) = x11::poly_fill_rectangle_data(body)
+                && let Some(drawable) = x11::drawable_request_id(body)
+            {
+                let (foreground, target) = {
                     let s = lock_server(server)?;
-                    s.resources.gc_foreground(ResourceId(gc_id))
+                    (
+                        s.resources.gc_foreground(ResourceId(gc_id)),
+                        s.resources.top_level_host_target(drawable),
+                    )
                 };
-                if let Some(host) = host
+                // Phase 1: only route to top-level drawables (no coordinate
+                // translation for child windows).
+                if let Some(target) = target
+                    && target.x_offset == 0
+                    && target.y_offset == 0
+                    && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.poly_fill_rectangle(foreground, rectangles)?;
+                    host.poly_fill_rectangle(target.host_xid, foreground, rectangles)?;
                 }
             }
             log_void(client_id, sequence, "PolyFillRectangle")
         }
         71 => {
-            if let Some((gc_id, arcs)) = x11::poly_fill_arc_data(body) {
-                let foreground = {
+            if let Some((gc_id, arcs)) = x11::poly_fill_arc_data(body)
+                && let Some(drawable) = x11::drawable_request_id(body)
+            {
+                let (foreground, target) = {
                     let s = lock_server(server)?;
-                    s.resources.gc_foreground(ResourceId(gc_id))
+                    (
+                        s.resources.gc_foreground(ResourceId(gc_id)),
+                        s.resources.top_level_host_target(drawable),
+                    )
                 };
-                if let Some(host) = host
+                // Phase 1: only route to top-level drawables (no coordinate
+                // translation for child windows).
+                if let Some(target) = target
+                    && target.x_offset == 0
+                    && target.y_offset == 0
+                    && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.poly_fill_arc(foreground, arcs)?;
+                    host.poly_fill_arc(target.host_xid, foreground, arcs)?;
                 }
             }
             log_void(client_id, sequence, "PolyFillArc")
         }
         72 => log_void(client_id, sequence, "PutImage"),
         74 => {
-            if let Some((_drawable, gc_id, text_body)) = x11::poly_text_data(body) {
-                let foreground = {
+            if let Some((drawable_raw, gc_id, text_body)) = x11::poly_text_data(body) {
+                let drawable = ResourceId(drawable_raw);
+                let (foreground, target) = {
                     let s = lock_server(server)?;
-                    s.resources.gc_foreground(ResourceId(gc_id))
+                    (
+                        s.resources.gc_foreground(ResourceId(gc_id)),
+                        s.resources.top_level_host_target(drawable),
+                    )
                 };
-                if let Some(host) = host
+                // Phase 1: only route to top-level drawables (no coordinate
+                // translation for child windows).
+                if let Some(target) = target
+                    && target.x_offset == 0
+                    && target.y_offset == 0
+                    && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.poly_text8(foreground, text_body)?;
+                    host.poly_text8(target.host_xid, foreground, text_body)?;
                 }
             }
             log_void(client_id, sequence, "PolyText8")
@@ -1493,14 +1727,29 @@ fn handle_request(
                 debug!("focus text drawable 0x{drawable:x}");
                 set_focused_window(focused_window, server, ResourceId(drawable))?;
                 let gc = ResourceId(gc_id);
-                let (foreground, background) = {
+                let (foreground, background, target) = {
                     let s = lock_server(server)?;
-                    (s.resources.gc_foreground(gc), s.resources.gc_background(gc))
+                    (
+                        s.resources.gc_foreground(gc),
+                        s.resources.gc_background(gc),
+                        s.resources.top_level_host_target(ResourceId(drawable)),
+                    )
                 };
-                if let Some(host) = host
+                // Phase 1: only route to top-level drawables (no coordinate
+                // translation for child windows).
+                if let Some(target) = target
+                    && target.x_offset == 0
+                    && target.y_offset == 0
+                    && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.image_text8(foreground, background, header.data, text_body)?;
+                    host.image_text8(
+                        target.host_xid,
+                        foreground,
+                        background,
+                        header.data,
+                        text_body,
+                    )?;
                 }
             }
             log_void(client_id, sequence, "ImageText8")

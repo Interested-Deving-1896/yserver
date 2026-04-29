@@ -15,6 +15,14 @@ pub const ROOT_WINDOW: ResourceId = ResourceId(0x100);
 pub const ROOT_COLORMAP: ResourceId = ResourceId(0x101);
 pub const ROOT_VISUAL: ResourceId = ResourceId(0x102);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TopLevelTarget {
+    pub top_level: ResourceId,
+    pub host_xid: u32,
+    pub x_offset: i16,
+    pub y_offset: i16,
+}
+
 #[derive(Debug)]
 pub struct ResourceTable {
     windows: HashMap<u32, Window>,
@@ -47,6 +55,7 @@ impl ResourceTable {
                 cursor: None,
                 owner: SERVER_OWNER,
                 properties: HashMap::new(),
+                host_xid: None,
             },
         );
 
@@ -82,6 +91,7 @@ impl ResourceTable {
             cursor: None,
             owner,
             properties: HashMap::new(),
+            host_xid: None,
         };
 
         self.windows
@@ -161,8 +171,40 @@ impl ResourceTable {
         was_mapped
     }
 
+    #[must_use]
+    pub fn top_level_host_target(&self, id: ResourceId) -> Option<TopLevelTarget> {
+        let mut current = self.windows.get(&id.0)?;
+        if current.id == ROOT_WINDOW {
+            return None;
+        }
+        let mut x_offset: i16 = 0;
+        let mut y_offset: i16 = 0;
+        while current.parent != ROOT_WINDOW {
+            x_offset = x_offset.wrapping_add(current.x);
+            y_offset = y_offset.wrapping_add(current.y);
+            let next = self.windows.get(&current.parent.0)?;
+            if next.id == ROOT_WINDOW {
+                // Parent chain points at root through a missing or self-loop entry.
+                return None;
+            }
+            current = next;
+        }
+        // current is now the top-level (parent == ROOT_WINDOW).
+        let host_xid = current.host_xid?;
+        Some(TopLevelTarget {
+            top_level: current.id,
+            host_xid,
+            x_offset,
+            y_offset,
+        })
+    }
+
     pub fn window(&self, id: ResourceId) -> Option<&Window> {
         self.windows.get(&id.0)
+    }
+
+    pub fn window_mut(&mut self, id: ResourceId) -> Option<&mut Window> {
+        self.windows.get_mut(&id.0)
     }
 
     pub fn children(&self, parent: ResourceId) -> &[ResourceId] {
@@ -371,6 +413,7 @@ pub struct Window {
     pub cursor: Option<ResourceId>,
     pub owner: ClientId,
     pub properties: HashMap<AtomId, PropertyValue>,
+    pub host_xid: Option<u32>,
 }
 
 impl Window {
@@ -393,6 +436,7 @@ impl Window {
             cursor: None,
             owner: SERVER_OWNER,
             properties: HashMap::new(),
+            host_xid: None,
         }
     }
 }
@@ -505,6 +549,32 @@ mod tests {
         );
     }
 
+    fn make_top_level_with_host_xid(table: &mut ResourceTable, id: u32, host_xid: u32) {
+        make_window(table, id);
+        table.windows.get_mut(&id).unwrap().host_xid = Some(host_xid);
+    }
+
+    fn make_child(table: &mut ResourceTable, id: u32, parent: u32, x: i16, y: i16) {
+        table.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(id),
+                parent: ResourceId(parent),
+                x,
+                y,
+                width: 50,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                background_pixel: None,
+                event_mask: None,
+                override_redirect: None,
+            },
+        );
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum InitialState {
         Viewable,
@@ -588,6 +658,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn top_level_host_target_for_top_level_returns_self() {
+        let mut table = ResourceTable::new();
+        make_top_level_with_host_xid(&mut table, 0x0010_0002, 0xAA);
+        let target = table.top_level_host_target(ResourceId(0x0010_0002));
+        assert_eq!(
+            target,
+            Some(TopLevelTarget {
+                top_level: ResourceId(0x0010_0002),
+                host_xid: 0xAA,
+                x_offset: 0,
+                y_offset: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn top_level_host_target_for_child_accumulates_offset() {
+        let mut table = ResourceTable::new();
+        make_top_level_with_host_xid(&mut table, 0x0010_0002, 0xAA);
+        make_child(&mut table, 0x0010_0003, 0x0010_0002, 10, 20);
+        let target = table.top_level_host_target(ResourceId(0x0010_0003));
+        assert_eq!(
+            target,
+            Some(TopLevelTarget {
+                top_level: ResourceId(0x0010_0002),
+                host_xid: 0xAA,
+                x_offset: 10,
+                y_offset: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn top_level_host_target_for_grandchild_sums_offsets() {
+        let mut table = ResourceTable::new();
+        make_top_level_with_host_xid(&mut table, 0x0010_0002, 0xAA);
+        make_child(&mut table, 0x0010_0003, 0x0010_0002, 10, 20);
+        make_child(&mut table, 0x0010_0004, 0x0010_0003, 5, 5);
+        let target = table.top_level_host_target(ResourceId(0x0010_0004));
+        assert_eq!(
+            target,
+            Some(TopLevelTarget {
+                top_level: ResourceId(0x0010_0002),
+                host_xid: 0xAA,
+                x_offset: 15,
+                y_offset: 25,
+            })
+        );
+    }
+
+    #[test]
+    fn top_level_host_target_returns_none_for_root() {
+        let table = ResourceTable::new();
+        assert_eq!(table.top_level_host_target(ROOT_WINDOW), None);
+    }
+
+    #[test]
+    fn top_level_host_target_returns_none_when_top_level_has_no_host_xid() {
+        let mut table = ResourceTable::new();
+        make_window(&mut table, 0x0010_0002); // no host_xid set
+        make_child(&mut table, 0x0010_0003, 0x0010_0002, 10, 20);
+        assert_eq!(table.top_level_host_target(ResourceId(0x0010_0002)), None);
+        assert_eq!(table.top_level_host_target(ResourceId(0x0010_0003)), None);
+    }
+
+    #[test]
+    fn top_level_host_target_returns_none_for_orphaned_window() {
+        let mut table = ResourceTable::new();
+        // Build a child whose parent is a non-existent window (chain breaks).
+        make_child(&mut table, 0x0010_0003, 0x9999_9999, 10, 20);
+        assert_eq!(table.top_level_host_target(ResourceId(0x0010_0003)), None);
+    }
+
     proptest! {
         #[test]
         fn unmap_window_state_machine(
@@ -618,6 +762,45 @@ mod tests {
                 table.window(target).unwrap().map_state,
                 MapState::Unmapped
             );
+        }
+
+        #[test]
+        fn top_level_host_target_offset_proptest(
+            n in 1usize..=8,
+            offsets in proptest::collection::vec((any::<i16>(), any::<i16>()), 1..=8),
+        ) {
+            let depth = n.min(offsets.len());
+            let mut table = ResourceTable::new();
+            let top_level_id: u32 = 0x0010_0000;
+            let host_xid: u32 = 0xCAFE;
+            make_top_level_with_host_xid(&mut table, top_level_id, host_xid);
+
+            let mut parent = top_level_id;
+            let mut expected_x: i16 = 0;
+            let mut expected_y: i16 = 0;
+            let mut leaf = top_level_id;
+            for (i, (x, y)) in offsets.iter().take(depth).enumerate() {
+                let id: u32 = 0x0010_0001 + u32::try_from(i).unwrap();
+                make_child(&mut table, id, parent, *x, *y);
+                // The child contributes its own (x, y) to the offset only on the
+                // way *up* — the helper walks from leaf to top-level and skips the
+                // top-level's own (x, y), matching the spec.
+                expected_x = expected_x.wrapping_add(*x);
+                expected_y = expected_y.wrapping_add(*y);
+                leaf = id;
+                parent = id;
+            }
+            // The helper accumulates only ancestor offsets up to (but not
+            // including) the top-level. So the leaf's own (x, y) is included
+            // only if there is at least one intermediate ancestor between it
+            // and the top-level — i.e., depth >= 2. For depth == 1, the leaf
+            // is a direct child of the top-level and its (x, y) is the
+            // accumulated offset.
+            let target = table.top_level_host_target(ResourceId(leaf)).unwrap();
+            prop_assert_eq!(target.top_level, ResourceId(top_level_id));
+            prop_assert_eq!(target.host_xid, host_xid);
+            prop_assert_eq!(target.x_offset, expected_x);
+            prop_assert_eq!(target.y_offset, expected_y);
         }
     }
 }

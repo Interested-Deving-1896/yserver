@@ -1,10 +1,13 @@
-use std::collections::HashMap;
-use std::io::Write;
-use std::os::unix::net::UnixStream;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::Instant;
+use std::{
+    collections::HashMap,
+    io::Write,
+    os::unix::net::UnixStream,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU16, Ordering},
+    },
+    time::Instant,
+};
 
 use yserver_protocol::x11::{self, AtomId, ClientByteOrder, ResourceId, SequenceNumber};
 
@@ -205,6 +208,120 @@ pub fn emit_window_event(
         Err(_) => return,
     };
     fanout_event(&targets, encode);
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn pointer_event_fanout(
+    state: &Mutex<ServerState>,
+    xid_map: &crate::host_x11::HostXidMap,
+    event: crate::host_x11::HostPointerEvent,
+) {
+    use crate::host_x11::PointerEventKind;
+    let nested_id = match xid_map.lock() {
+        Ok(map) => match map.get(&event.host_xid).copied() {
+            Some(id) => id,
+            None => return,
+        },
+        Err(_) => return,
+    };
+    let mask_bit: u32 = match event.kind {
+        PointerEventKind::ButtonPress => 0x0000_0004,
+        PointerEventKind::ButtonRelease => 0x0000_0008,
+        PointerEventKind::MotionNotify => 0x0000_0040,
+        PointerEventKind::EnterNotify => 0x0000_0010,
+        PointerEventKind::LeaveNotify => 0x0000_0020,
+    };
+    let targets = match state.lock() {
+        Ok(g) => g.subscribers(nested_id, mask_bit),
+        Err(_) => return,
+    };
+    for target in targets {
+        let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
+        let mut buf = Vec::with_capacity(32);
+        match event.kind {
+            PointerEventKind::ButtonPress => x11::encode_button_press_event(
+                &mut buf,
+                target.byte_order,
+                x11::PointerEvent {
+                    sequence: seq,
+                    detail: event.detail,
+                    time: event.time,
+                    root: crate::resources::ROOT_WINDOW,
+                    event: nested_id,
+                    root_x: event.root_x,
+                    root_y: event.root_y,
+                    event_x: event.event_x,
+                    event_y: event.event_y,
+                    state: event.state,
+                },
+            ),
+            PointerEventKind::ButtonRelease => x11::encode_button_release_event(
+                &mut buf,
+                target.byte_order,
+                x11::PointerEvent {
+                    sequence: seq,
+                    detail: event.detail,
+                    time: event.time,
+                    root: crate::resources::ROOT_WINDOW,
+                    event: nested_id,
+                    root_x: event.root_x,
+                    root_y: event.root_y,
+                    event_x: event.event_x,
+                    event_y: event.event_y,
+                    state: event.state,
+                },
+            ),
+            PointerEventKind::MotionNotify => x11::encode_motion_notify_event(
+                &mut buf,
+                target.byte_order,
+                x11::PointerEvent {
+                    sequence: seq,
+                    detail: 0,
+                    time: event.time,
+                    root: crate::resources::ROOT_WINDOW,
+                    event: nested_id,
+                    root_x: event.root_x,
+                    root_y: event.root_y,
+                    event_x: event.event_x,
+                    event_y: event.event_y,
+                    state: event.state,
+                },
+            ),
+            PointerEventKind::EnterNotify => x11::encode_enter_notify_event(
+                &mut buf,
+                target.byte_order,
+                x11::CrossingEvent {
+                    sequence: seq,
+                    time: event.time,
+                    root: crate::resources::ROOT_WINDOW,
+                    event: nested_id,
+                    root_x: event.root_x,
+                    root_y: event.root_y,
+                    event_x: event.event_x,
+                    event_y: event.event_y,
+                    state: event.state,
+                },
+            ),
+            PointerEventKind::LeaveNotify => x11::encode_leave_notify_event(
+                &mut buf,
+                target.byte_order,
+                x11::CrossingEvent {
+                    sequence: seq,
+                    time: event.time,
+                    root: crate::resources::ROOT_WINDOW,
+                    event: nested_id,
+                    root_x: event.root_x,
+                    root_y: event.root_y,
+                    event_x: event.event_x,
+                    event_y: event.event_y,
+                    state: event.state,
+                },
+            ),
+        }
+        if let Ok(mut w) = target.writer.lock() {
+            let _ = w.write_all(&buf);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -448,5 +565,145 @@ mod tests {
         assert!(state.subscribers(ResourceId(0x100), 0x0040_0000).is_empty());
         // Surviving window's subscription stays.
         assert_eq!(state.subscribers(ResourceId(0x200), 0x0040_0000).len(), 1);
+    }
+
+    #[test]
+    fn pointer_event_fanout_filters_by_mask() {
+        use std::{collections::HashMap as StdHashMap, io::Read, sync::Mutex as StdMutex};
+
+        use crate::host_x11::{HostPointerEvent, PointerEventKind};
+
+        // Client A: ButtonPress on window 0x0010_0002.
+        let (a_writer_local, mut a_reader_remote) = UnixStream::pair().expect("socketpair");
+        // Client B: MotionNotify on window 0x0010_0002.
+        let (b_writer_local, mut b_reader_remote) = UnixStream::pair().expect("socketpair");
+        // Client C: no pointer events at all.
+        let (c_writer_local, _c_reader_remote) = UnixStream::pair().expect("socketpair");
+
+        let state = StdMutex::new(ServerState::new());
+        {
+            let mut s = state.lock().unwrap();
+            s.clients.insert(
+                1,
+                ClientHandle {
+                    writer: Arc::new(Mutex::new(a_writer_local)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0x0010_0000,
+                    resource_id_mask: 0x000F_FFFF,
+                    event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_0004)]), // ButtonPress
+                },
+            );
+            s.clients.insert(
+                2,
+                ClientHandle {
+                    writer: Arc::new(Mutex::new(b_writer_local)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0x0020_0000,
+                    resource_id_mask: 0x000F_FFFF,
+                    event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_0040)]), // PointerMotion
+                },
+            );
+            s.clients.insert(
+                3,
+                ClientHandle {
+                    writer: Arc::new(Mutex::new(c_writer_local)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0x0030_0000,
+                    resource_id_mask: 0x000F_FFFF,
+                    event_masks: HashMap::new(),
+                },
+            );
+        }
+
+        let mut map = StdHashMap::new();
+        map.insert(0xCAFE_u32, ResourceId(0x0010_0002));
+        let xid_map = Arc::new(StdMutex::new(map));
+
+        pointer_event_fanout(
+            &state,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::ButtonPress,
+                host_xid: 0xCAFE,
+                detail: 1,
+                time: 0,
+                root_x: 1,
+                root_y: 2,
+                event_x: 3,
+                event_y: 4,
+                state: 0,
+            },
+        );
+
+        let mut received = [0u8; 32];
+        a_reader_remote.read_exact(&mut received).unwrap();
+        assert_eq!(received[0], 4, "client A should receive ButtonPress");
+        assert_eq!(received[1], 1, "detail = 1");
+        assert_eq!(&received[12..16], &0x0010_0002u32.to_le_bytes());
+
+        // Client B should not have received anything.
+        b_reader_remote.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        let result = b_reader_remote.read(&mut buf);
+        assert!(
+            matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+                || matches!(&result, Ok(0)),
+            "client B should not have received any pointer event, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn pointer_event_fanout_drops_unknown_host_xid() {
+        use std::{collections::HashMap as StdHashMap, io::Read, sync::Mutex as StdMutex};
+
+        use crate::host_x11::{HostPointerEvent, PointerEventKind};
+
+        let (a_writer_local, mut a_reader_remote) = UnixStream::pair().expect("socketpair");
+
+        let state = StdMutex::new(ServerState::new());
+        {
+            let mut s = state.lock().unwrap();
+            s.clients.insert(
+                1,
+                ClientHandle {
+                    writer: Arc::new(Mutex::new(a_writer_local)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0x0010_0000,
+                    resource_id_mask: 0x000F_FFFF,
+                    event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_0004)]),
+                },
+            );
+        }
+
+        let xid_map: crate::host_x11::HostXidMap = Arc::new(StdMutex::new(StdHashMap::new())); // empty
+
+        pointer_event_fanout(
+            &state,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::ButtonPress,
+                host_xid: 0xCAFE, // not in map
+                detail: 1,
+                time: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            },
+        );
+
+        a_reader_remote.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        let result = a_reader_remote.read(&mut buf);
+        assert!(
+            matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+                || matches!(&result, Ok(0)),
+            "no client should have received anything, got {result:?}",
+        );
     }
 }

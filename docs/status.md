@@ -58,13 +58,14 @@ In rough priority order:
 - [ ] **Lifecycle / WM events.** Emit `ReparentNotify` and
       `ClientMessage` so window managers and toolkits behave.
       (`DestroyNotify` and `UnmapNotify` already shipped.)
-- [ ] **Per-window clipping in the ynest backend.** All nested top-level
-      windows currently render into a single host window with no
-      coordinate translation or clipping. Give each nested top-level its
-      own host subwindow.
-- [ ] **Pointer events.** `ButtonPress` / `ButtonRelease`,
-      `MotionNotify`, `EnterNotify` / `LeaveNotify`. Today xeyes only
-      animates because it polls `QueryPointer`.
+- [x] **Per-window clipping in the ynest backend.** Each nested
+      top-level now gets its own host subwindow; drawing is routed via
+      `top_level_host_target`. Child-window drawing offset translation
+      is a known follow-up (Phase 1 only routes when offsets are zero).
+- [x] **Pointer events.** `ButtonPress` / `ButtonRelease`,
+      `MotionNotify`, `EnterNotify` / `LeaveNotify` delivered via
+      `HostInputPump` + `xid_map` fanout. `xeyes` now tracks cursor
+      via real `MotionNotify` events.
 - [ ] **`CopyArea` and `PutImage`.** Both are stubs; xterm uses them for
       scrolling and some text paths.
 

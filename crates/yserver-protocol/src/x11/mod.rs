@@ -111,6 +111,33 @@ pub struct KeyEvent {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct PointerEvent {
+    pub sequence: SequenceNumber,
+    pub detail: u8,
+    pub time: u32,
+    pub root: ResourceId,
+    pub event: ResourceId,
+    pub root_x: i16,
+    pub root_y: i16,
+    pub event_x: i16,
+    pub event_y: i16,
+    pub state: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CrossingEvent {
+    pub sequence: SequenceNumber,
+    pub time: u32,
+    pub root: ResourceId,
+    pub event: ResourceId,
+    pub root_x: i16,
+    pub root_y: i16,
+    pub event_x: i16,
+    pub event_y: i16,
+    pub state: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct CreateWindowRequest {
     pub depth: u8,
     pub window: ResourceId,
@@ -1687,6 +1714,70 @@ pub fn encode_unmap_notify_event(
     out.extend_from_slice(&[0; 19]);
 }
 
+fn encode_pointer_event(
+    out: &mut Vec<u8>,
+    event_code: u8,
+    order: ClientByteOrder,
+    event: PointerEvent,
+) {
+    out.push(event_code);
+    out.push(event.detail);
+    write_u16(order, out, event.sequence.0);
+    write_u32(order, out, event.time);
+    write_u32(order, out, event.root.0);
+    write_u32(order, out, event.event.0);
+    write_u32(order, out, 0); // child — descendant hit-testing not implemented
+    write_i16(order, out, event.root_x);
+    write_i16(order, out, event.root_y);
+    write_i16(order, out, event.event_x);
+    write_i16(order, out, event.event_y);
+    write_u16(order, out, event.state);
+    out.push(1); // same_screen
+    out.push(0); // pad
+}
+
+pub fn encode_button_press_event(out: &mut Vec<u8>, order: ClientByteOrder, event: PointerEvent) {
+    encode_pointer_event(out, 4, order, event);
+}
+
+pub fn encode_button_release_event(out: &mut Vec<u8>, order: ClientByteOrder, event: PointerEvent) {
+    encode_pointer_event(out, 5, order, event);
+}
+
+pub fn encode_motion_notify_event(out: &mut Vec<u8>, order: ClientByteOrder, event: PointerEvent) {
+    encode_pointer_event(out, 6, order, event);
+}
+
+fn encode_crossing_event(
+    out: &mut Vec<u8>,
+    event_code: u8,
+    order: ClientByteOrder,
+    event: CrossingEvent,
+) {
+    out.push(event_code);
+    out.push(0); // detail = NotifyAncestor
+    write_u16(order, out, event.sequence.0);
+    write_u32(order, out, event.time);
+    write_u32(order, out, event.root.0);
+    write_u32(order, out, event.event.0);
+    write_u32(order, out, 0); // child — descendant hit-testing not implemented
+    write_i16(order, out, event.root_x);
+    write_i16(order, out, event.root_y);
+    write_i16(order, out, event.event_x);
+    write_i16(order, out, event.event_y);
+    write_u16(order, out, event.state);
+    out.push(0); // mode = NotifyNormal
+    out.push(0x03); // same_screen + focus
+}
+
+pub fn encode_enter_notify_event(out: &mut Vec<u8>, order: ClientByteOrder, event: CrossingEvent) {
+    encode_crossing_event(out, 7, order, event);
+}
+
+pub fn encode_leave_notify_event(out: &mut Vec<u8>, order: ClientByteOrder, event: CrossingEvent) {
+    encode_crossing_event(out, 8, order, event);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1964,6 +2055,331 @@ mod tests {
 
                 prop_assert_eq!(buf[12], u8::from(from_configure));
                 prop_assert!(buf[13..32].iter().all(|&b| b == 0));
+            }
+        }
+    }
+
+    mod pointer_event_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        #[test]
+        fn button_press_event_shape() {
+            let mut buf = Vec::new();
+            encode_button_press_event(
+                &mut buf,
+                ClientByteOrder::LittleEndian,
+                PointerEvent {
+                    sequence: SequenceNumber(0x1234),
+                    detail: 1,
+                    time: 0xdead_beef,
+                    root: ResourceId(0x100),
+                    event: ResourceId(0x0010_0002),
+                    root_x: 100,
+                    root_y: 200,
+                    event_x: 10,
+                    event_y: 20,
+                    state: 0x0010,
+                },
+            );
+            assert_eq!(buf.len(), 32);
+            assert_eq!(buf[0], 4); // ButtonPress
+            assert_eq!(buf[1], 1); // detail
+            assert_eq!(&buf[2..4], &0x1234u16.to_le_bytes());
+            assert_eq!(&buf[4..8], &0xdead_beefu32.to_le_bytes());
+            assert_eq!(&buf[8..12], &0x100u32.to_le_bytes());
+            assert_eq!(&buf[12..16], &0x0010_0002u32.to_le_bytes());
+            assert_eq!(&buf[16..20], &0u32.to_le_bytes()); // child = 0
+            assert_eq!(&buf[20..22], &100i16.to_le_bytes());
+            assert_eq!(&buf[22..24], &200i16.to_le_bytes());
+            assert_eq!(&buf[24..26], &10i16.to_le_bytes());
+            assert_eq!(&buf[26..28], &20i16.to_le_bytes());
+            assert_eq!(&buf[28..30], &0x0010u16.to_le_bytes());
+            assert_eq!(buf[30], 1); // same_screen
+            assert_eq!(buf[31], 0); // pad
+        }
+
+        #[test]
+        fn button_release_event_shape() {
+            let mut buf = Vec::new();
+            encode_button_release_event(
+                &mut buf,
+                ClientByteOrder::LittleEndian,
+                PointerEvent {
+                    sequence: SequenceNumber(0),
+                    detail: 2,
+                    time: 0,
+                    root: ResourceId(0x100),
+                    event: ResourceId(0x0010_0002),
+                    root_x: 0,
+                    root_y: 0,
+                    event_x: 0,
+                    event_y: 0,
+                    state: 0,
+                },
+            );
+            assert_eq!(buf.len(), 32);
+            assert_eq!(buf[0], 5); // ButtonRelease
+            assert_eq!(buf[1], 2); // detail
+            assert_eq!(buf[30], 1); // same_screen
+        }
+
+        #[test]
+        fn motion_notify_event_shape() {
+            let mut buf = Vec::new();
+            encode_motion_notify_event(
+                &mut buf,
+                ClientByteOrder::LittleEndian,
+                PointerEvent {
+                    sequence: SequenceNumber(0),
+                    detail: 0,
+                    time: 0,
+                    root: ResourceId(0x100),
+                    event: ResourceId(0x0010_0002),
+                    root_x: 0,
+                    root_y: 0,
+                    event_x: 0,
+                    event_y: 0,
+                    state: 0,
+                },
+            );
+            assert_eq!(buf.len(), 32);
+            assert_eq!(buf[0], 6); // MotionNotify
+            assert_eq!(buf[1], 0); // detail = 0 for motion
+            assert_eq!(buf[30], 1); // same_screen
+        }
+
+        #[test]
+        fn enter_notify_event_shape() {
+            let mut buf = Vec::new();
+            encode_enter_notify_event(
+                &mut buf,
+                ClientByteOrder::LittleEndian,
+                CrossingEvent {
+                    sequence: SequenceNumber(0x1234),
+                    time: 0xdead_beef,
+                    root: ResourceId(0x100),
+                    event: ResourceId(0x0010_0002),
+                    root_x: 100,
+                    root_y: 200,
+                    event_x: 10,
+                    event_y: 20,
+                    state: 0,
+                },
+            );
+            assert_eq!(buf.len(), 32);
+            assert_eq!(buf[0], 7); // EnterNotify
+            assert_eq!(buf[1], 0); // detail = NotifyAncestor
+            assert_eq!(&buf[2..4], &0x1234u16.to_le_bytes());
+            assert_eq!(&buf[4..8], &0xdead_beefu32.to_le_bytes());
+            assert_eq!(&buf[8..12], &0x100u32.to_le_bytes());
+            assert_eq!(&buf[12..16], &0x0010_0002u32.to_le_bytes());
+            assert_eq!(&buf[16..20], &0u32.to_le_bytes()); // child = 0
+            assert_eq!(&buf[20..22], &100i16.to_le_bytes());
+            assert_eq!(&buf[22..24], &200i16.to_le_bytes());
+            assert_eq!(&buf[24..26], &10i16.to_le_bytes());
+            assert_eq!(&buf[26..28], &20i16.to_le_bytes());
+            assert_eq!(&buf[28..30], &0u16.to_le_bytes());
+            assert_eq!(buf[30], 0); // mode = NotifyNormal
+            assert_eq!(buf[31], 0x03); // same_screen,focus = 0x01 | 0x02
+        }
+
+        #[test]
+        fn leave_notify_event_shape() {
+            let mut buf = Vec::new();
+            encode_leave_notify_event(
+                &mut buf,
+                ClientByteOrder::LittleEndian,
+                CrossingEvent {
+                    sequence: SequenceNumber(0),
+                    time: 0,
+                    root: ResourceId(0x100),
+                    event: ResourceId(0x0010_0002),
+                    root_x: 0,
+                    root_y: 0,
+                    event_x: 0,
+                    event_y: 0,
+                    state: 0,
+                },
+            );
+            assert_eq!(buf.len(), 32);
+            assert_eq!(buf[0], 8); // LeaveNotify
+            assert_eq!(buf[1], 0); // detail = NotifyAncestor
+            assert_eq!(buf[30], 0); // mode = NotifyNormal
+            assert_eq!(buf[31], 0x03); // same_screen,focus
+        }
+
+        proptest! {
+            #[test]
+            fn pointer_encoder_round_trip(
+                sequence in any::<u16>(),
+                detail in any::<u8>(),
+                time in any::<u32>(),
+                root in any::<u32>(),
+                event_window in any::<u32>(),
+                root_x in any::<i16>(),
+                root_y in any::<i16>(),
+                event_x in any::<i16>(),
+                event_y in any::<i16>(),
+                state in any::<u16>(),
+                big_endian: bool,
+                encoder_choice in 0u8..5,
+            ) {
+                let order = if big_endian {
+                    ClientByteOrder::BigEndian
+                } else {
+                    ClientByteOrder::LittleEndian
+                };
+                let mut buf = Vec::new();
+                let expected_code: u8;
+                let expected_detail: u8;
+                let expected_state_offset: usize = 28;
+                match encoder_choice {
+                    0 => {
+                        expected_code = 4;
+                        expected_detail = detail;
+                        encode_button_press_event(
+                            &mut buf,
+                            order,
+                            PointerEvent {
+                                sequence: SequenceNumber(sequence),
+                                detail,
+                                time,
+                                root: ResourceId(root),
+                                event: ResourceId(event_window),
+                                root_x,
+                                root_y,
+                                event_x,
+                                event_y,
+                                state,
+                            },
+                        );
+                    }
+                    1 => {
+                        expected_code = 5;
+                        expected_detail = detail;
+                        encode_button_release_event(
+                            &mut buf,
+                            order,
+                            PointerEvent {
+                                sequence: SequenceNumber(sequence),
+                                detail,
+                                time,
+                                root: ResourceId(root),
+                                event: ResourceId(event_window),
+                                root_x,
+                                root_y,
+                                event_x,
+                                event_y,
+                                state,
+                            },
+                        );
+                    }
+                    2 => {
+                        expected_code = 6;
+                        expected_detail = detail;
+                        encode_motion_notify_event(
+                            &mut buf,
+                            order,
+                            PointerEvent {
+                                sequence: SequenceNumber(sequence),
+                                detail,
+                                time,
+                                root: ResourceId(root),
+                                event: ResourceId(event_window),
+                                root_x,
+                                root_y,
+                                event_x,
+                                event_y,
+                                state,
+                            },
+                        );
+                    }
+                    3 => {
+                        expected_code = 7;
+                        expected_detail = 0;
+                        encode_enter_notify_event(
+                            &mut buf,
+                            order,
+                            CrossingEvent {
+                                sequence: SequenceNumber(sequence),
+                                time,
+                                root: ResourceId(root),
+                                event: ResourceId(event_window),
+                                root_x,
+                                root_y,
+                                event_x,
+                                event_y,
+                                state,
+                            },
+                        );
+                    }
+                    _ => {
+                        expected_code = 8;
+                        expected_detail = 0;
+                        encode_leave_notify_event(
+                            &mut buf,
+                            order,
+                            CrossingEvent {
+                                sequence: SequenceNumber(sequence),
+                                time,
+                                root: ResourceId(root),
+                                event: ResourceId(event_window),
+                                root_x,
+                                root_y,
+                                event_x,
+                                event_y,
+                                state,
+                            },
+                        );
+                    }
+                }
+
+                prop_assert_eq!(buf.len(), 32);
+                prop_assert_eq!(buf[0], expected_code);
+                prop_assert_eq!(buf[1], expected_detail);
+
+                let seq_bytes = if big_endian {
+                    sequence.to_be_bytes()
+                } else {
+                    sequence.to_le_bytes()
+                };
+                prop_assert_eq!(&buf[2..4], &seq_bytes[..]);
+
+                let time_bytes = if big_endian { time.to_be_bytes() } else { time.to_le_bytes() };
+                prop_assert_eq!(&buf[4..8], &time_bytes[..]);
+
+                let root_bytes = if big_endian { root.to_be_bytes() } else { root.to_le_bytes() };
+                prop_assert_eq!(&buf[8..12], &root_bytes[..]);
+
+                let event_bytes = if big_endian { event_window.to_be_bytes() } else { event_window.to_le_bytes() };
+                prop_assert_eq!(&buf[12..16], &event_bytes[..]);
+
+                prop_assert_eq!(&buf[16..20], &[0u8; 4][..]); // child = 0
+
+                let rx = if big_endian { root_x.to_be_bytes() } else { root_x.to_le_bytes() };
+                prop_assert_eq!(&buf[20..22], &rx[..]);
+                let ry = if big_endian { root_y.to_be_bytes() } else { root_y.to_le_bytes() };
+                prop_assert_eq!(&buf[22..24], &ry[..]);
+                let ex = if big_endian { event_x.to_be_bytes() } else { event_x.to_le_bytes() };
+                prop_assert_eq!(&buf[24..26], &ex[..]);
+                let ey = if big_endian { event_y.to_be_bytes() } else { event_y.to_le_bytes() };
+                prop_assert_eq!(&buf[26..28], &ey[..]);
+
+                let state_bytes = if big_endian { state.to_be_bytes() } else { state.to_le_bytes() };
+                prop_assert_eq!(&buf[expected_state_offset..expected_state_offset + 2], &state_bytes[..]);
+
+                match expected_code {
+                    4..=6 => {
+                        prop_assert_eq!(buf[30], 1); // same_screen
+                        prop_assert_eq!(buf[31], 0); // pad
+                    }
+                    7 | 8 => {
+                        prop_assert_eq!(buf[30], 0); // mode = NotifyNormal
+                        prop_assert_eq!(buf[31], 0x03); // same_screen + focus
+                    }
+                    _ => unreachable!(),
+                }
             }
         }
     }
