@@ -2600,14 +2600,65 @@ fn handle_request(
         }
         73 => {
             log_reply(client_id, sequence, "GetImage");
-            let request = x11::get_image_request(header.data, body);
-            let order = {
-                let s = lock_server(server)?;
-                s.clients
-                    .get(&client_id.0)
-                    .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order)
+            let Some(req) = x11::get_image_request(header.data, body) else {
+                return Ok(());
             };
-            if let Some(req) = request {
+            let (order, host_xid, x_off, y_off) = {
+                let s = lock_server(server)?;
+                let order = s
+                    .clients
+                    .get(&client_id.0)
+                    .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
+                let (host_xid, x_off, y_off) = match s.resources.host_drawable_target(req.drawable)
+                {
+                    Some(crate::resources::HostDrawableTarget::Window {
+                        host_xid,
+                        x_offset,
+                        y_offset,
+                        ..
+                    }) => (Some(host_xid), x_offset, y_offset),
+                    Some(crate::resources::HostDrawableTarget::Pixmap { host_xid, .. }) => {
+                        (Some(host_xid), 0, 0)
+                    }
+                    None => (None, 0, 0),
+                };
+                (order, host_xid, x_off, y_off)
+            };
+            // Try to proxy to the host; fall back to a blank image on any error.
+            let host_reply = host_xid.and_then(|xid| {
+                host.as_ref().and_then(|h| {
+                    h.lock().ok().and_then(|mut h| {
+                        h.get_image(
+                            xid,
+                            req.format,
+                            req.x.saturating_add(x_off),
+                            req.y.saturating_add(y_off),
+                            req.width.max(1),
+                            req.height.max(1),
+                            req.plane_mask,
+                        )
+                        .ok()
+                        .flatten()
+                    })
+                })
+            });
+            if let Some(mut bytes) = host_reply {
+                // Patch in the client's sequence number and our visual ID.
+                if bytes.len() >= 4 {
+                    let s = sequence.0.to_le_bytes();
+                    bytes[2] = s[0];
+                    bytes[3] = s[1];
+                }
+                if bytes.len() >= 12 {
+                    let v = crate::resources::ROOT_VISUAL.0.to_le_bytes();
+                    bytes[8] = v[0];
+                    bytes[9] = v[1];
+                    bytes[10] = v[2];
+                    bytes[11] = v[3];
+                }
+                lock_writer()?.write_all(&bytes)?;
+                Ok(())
+            } else {
                 x11::write_get_image_reply(
                     &mut *lock_writer()?,
                     sequence,
@@ -2615,8 +2666,6 @@ fn handle_request(
                     &req,
                     crate::resources::ROOT_VISUAL.0,
                 )
-            } else {
-                Ok(())
             }
         }
         74 => {

@@ -474,6 +474,47 @@ impl HostX11 {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Send GetImage to the host and return the raw reply bytes (32-byte header
+    /// + image data).  Returns None on host error or if the region is invalid.
+    pub fn get_image(
+        &mut self,
+        host_xid: u32,
+        format: u8,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        plane_mask: u32,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let target_seq = self.sequence;
+        self.sequence = self.sequence.wrapping_add(1);
+
+        let mut out = [0u8; 20];
+        out[0] = 73; // GetImage
+        out[1] = format;
+        out[2] = 5;
+        out[3] = 0; // request length = 5 words = 20 bytes
+        out[4..8].copy_from_slice(&host_xid.to_le_bytes());
+        out[8..10].copy_from_slice(&x.to_le_bytes());
+        out[10..12].copy_from_slice(&y.to_le_bytes());
+        out[12..14].copy_from_slice(&width.to_le_bytes());
+        out[14..16].copy_from_slice(&height.to_le_bytes());
+        out[16..20].copy_from_slice(&plane_mask.to_le_bytes());
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+
+        loop {
+            let resp = read_response(&mut self.stream)?;
+            if resp.sequence == target_seq {
+                if resp.bytes[0] == 0 {
+                    // host returned an error (e.g. BadMatch for out-of-bounds)
+                    return Ok(None);
+                }
+                return Ok(Some(resp.bytes));
+            }
+        }
+    }
+
     pub fn put_image(
         &mut self,
         host_xid: u32,
