@@ -107,6 +107,9 @@ pub struct ServerState {
     pub randr: RandrState,
     /// Selection ownership: maps selection atom → owning window (ResourceId).
     pub selections: HashMap<AtomId, ResourceId>,
+    /// Active pointer grab: (grab owner, grab window). When set, all pointer
+    /// events are redirected to the grab owner regardless of where the cursor is.
+    pub pointer_grab: Option<(ClientId, ResourceId)>,
 }
 
 impl ServerState {
@@ -120,6 +123,7 @@ impl ServerState {
             start_instant: Instant::now(),
             randr: RandrState::nested(0, 800, 600),
             selections: HashMap::new(),
+            pointer_grab: None,
         }
     }
 
@@ -260,6 +264,79 @@ pub fn pointer_event_fanout(
     event: crate::host_x11::HostPointerEvent,
 ) {
     use crate::host_x11::PointerEventKind;
+
+    // Active pointer grab: redirect all button/motion events to grab owner.
+    let grab_state = match state.lock() {
+        Ok(g) => g.pointer_grab.and_then(|(client_id, grab_window)| {
+            g.client_target(client_id).map(|t| (grab_window, t))
+        }),
+        Err(_) => return,
+    };
+    if let Some((grab_window, target)) = grab_state {
+        let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
+        let mut buf = Vec::with_capacity(32);
+        match event.kind {
+            PointerEventKind::ButtonPress => x11::encode_button_press_event(
+                &mut buf,
+                target.byte_order,
+                x11::PointerEvent {
+                    sequence: seq,
+                    detail: event.detail,
+                    time: event.time,
+                    root: crate::resources::ROOT_WINDOW,
+                    event: grab_window,
+                    root_x: event.root_x,
+                    root_y: event.root_y,
+                    event_x: event.root_x,
+                    event_y: event.root_y,
+                    state: event.state,
+                },
+            ),
+            PointerEventKind::ButtonRelease => x11::encode_button_release_event(
+                &mut buf,
+                target.byte_order,
+                x11::PointerEvent {
+                    sequence: seq,
+                    detail: event.detail,
+                    time: event.time,
+                    root: crate::resources::ROOT_WINDOW,
+                    event: grab_window,
+                    root_x: event.root_x,
+                    root_y: event.root_y,
+                    event_x: event.root_x,
+                    event_y: event.root_y,
+                    state: event.state,
+                },
+            ),
+            PointerEventKind::MotionNotify => x11::encode_motion_notify_event(
+                &mut buf,
+                target.byte_order,
+                x11::PointerEvent {
+                    sequence: seq,
+                    detail: 0,
+                    time: event.time,
+                    root: crate::resources::ROOT_WINDOW,
+                    event: grab_window,
+                    root_x: event.root_x,
+                    root_y: event.root_y,
+                    event_x: event.root_x,
+                    event_y: event.root_y,
+                    state: event.state,
+                },
+            ),
+            PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify => return,
+        }
+        if let Ok(mut w) = target.writer.lock() {
+            let _ = w.write_all(&buf);
+        }
+        if matches!(event.kind, PointerEventKind::ButtonRelease)
+            && let Ok(mut g) = state.lock()
+        {
+            g.pointer_grab = None;
+        }
+        return;
+    }
+
     let top_level_id = match xid_map.lock() {
         Ok(map) => match map.get(&event.host_xid).copied() {
             Some(id) => id,

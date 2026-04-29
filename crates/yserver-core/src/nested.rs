@@ -1992,10 +1992,18 @@ fn handle_request(
             log_void(client_id, sequence, "SendEvent")
         }
         26 => {
+            if body.len() >= 4 {
+                let grab_window =
+                    ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                lock_server(server)?.pointer_grab = Some((client_id, grab_window));
+            }
             log_reply(client_id, sequence, "GrabPointer");
             x11::write_grab_reply(&mut *lock_writer()?, sequence, 0)
         }
-        27 => log_void(client_id, sequence, "UngrabPointer"),
+        27 => {
+            lock_server(server)?.pointer_grab = None;
+            log_void(client_id, sequence, "UngrabPointer")
+        }
         28 => log_void(client_id, sequence, "GrabButton"),
         29 => log_void(client_id, sequence, "UngrabButton"),
         31 => {
