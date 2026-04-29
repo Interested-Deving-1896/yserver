@@ -178,17 +178,33 @@ In rough priority order:
 
 - [x] **RENDER extension proxy (subset).** Forwards CreatePicture,
       FreePicture, CreateGlyphSet, FreeGlyphSet, AddGlyphs,
-      CompositeGlyphs8/16/32, FillRectangles, CreateSolidFill,
+      CompositeGlyphs8/16/32, Composite, FillRectangles, CreateSolidFill,
       CreateCursor, and QueryVersion/QueryPictFormats to the host.
       Glyphset and picture XIDs are mapped between client and host
-      ID spaces. ChangePicture is a no-op stub. Coordinate offsets
-      (top-level → host) are patched into the first glyphcmd of
-      CompositeGlyphs and the rectangles of FillRectangles. Window
-      bg-pixmap retention is tracked on the Window struct so fvwm3's
-      "render to pixmap → set as bg → free pixmap → ClearArea" pattern
-      works. See [RENDER opcode table](#render-extension-major-opcode-139).
+      ID spaces. ChangePicture and SetPictureClipRectangles are stubs.
+      Coordinate offsets (top-level → host) are patched into the first
+      glyphcmd of CompositeGlyphs, into Composite's dst_xy, and into
+      FillRectangles' rects. Window bg-pixmap retention is tracked on
+      the Window struct so fvwm3's "render to pixmap → set as bg →
+      free pixmap → ClearArea" pattern works. See
+      [RENDER opcode table](#render-extension-major-opcode-139).
       **Validated:** xclock under fvwm3 shows title bar text and the
-      coords popup; cursor creation works.
+      coords popup; cursor creation works; FvwmButtons RightPanel
+      shows its bar icon.
+
+- [x] **Root drawing routed to host container.** ROOT_WINDOW now wires
+      its host_xid to the host container window at startup so root-
+      targeted drawing (ChangeWindowAttributes(root, bg-pixmap) +
+      ClearArea(root) — fvwm3's desktop-background pattern) lands in
+      the visible viewport. top_level_host_target falls through to
+      root with zero offset.
+
+- [x] **Per-depth host GCs.** The default host GC is bound to a depth-24
+      drawable, so PutImage onto non-depth-24 pixmaps (e.g. FvwmButtons'
+      depth-8 alpha masks for icon compositing) BadMatched on the host
+      and silently discarded the image data. ynest now caches one host
+      GC per pixmap depth, created on demand using the target drawable
+      as the depth/screen reference.
 
 ### Known follow-ups
 
@@ -431,7 +447,7 @@ between client and host ID spaces.
 |   5   | ChangePicture         | ∅ | clip mask / repeat not applied to host picture |
 |   6   | SetPictureClipRectangles | ✗ | |
 |   7   | FreePicture           | ✓ | |
-|   8   | Composite             | ✗ | |
+|   8   | Composite             | ✓ | dst_xy patched with dst picture's x/y offset; mask=0 forwards as host xid 0 |
 |  17   | CreateGlyphSet        | ✓ | format ID translated to host equivalent |
 |  18   | ReferenceGlyphSet     | ∅ | |
 |  19   | FreeGlyphSet          | ✓ | |
