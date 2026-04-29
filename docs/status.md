@@ -100,10 +100,9 @@ Implementation plan:
   `true` path fires when a parent's `ConfigureWindow` shrinks a child
   out of view. Wire it once we track parent-resize-driven implicit
   unmaps.
-- **Broader `SendEvent` event types.** Opcode 25 currently supports
-  synthetic `ClientMessage`, which is the Phase 1/ICCCM-critical path.
-  Other synthetic core events remain unsupported until a real client
-  requires them.
+- **Broader `SendEvent` event types.** Opcode 25 now supports all
+  event types (sent-event bit set, propagation up window tree, broadcast
+  to root subscribers). Previously ClientMessage-only.
 - **Handler-level integration tests for opcode 10 / opcode 4 fanout.**
   Today only the encoder, the `subscribers()` snapshot, and the
   `ResourceTable` state machine are unit-tested; a true
@@ -161,17 +160,33 @@ In rough priority order:
       - `RRGetScreenInfo` (legacy RANDR 1.0) if a client probes it.
       - Extension-specific error codes (`BadRROutput`, `BadRRCrtc`) instead of `BadValue`.
 
-- [ ] **SubstructureRedirect / MapRequest / ConfigureRequest.** When a WM
+- [x] **SubstructureRedirect / MapRequest / ConfigureRequest.** When a WM
       registers `SubstructureRedirectMask` (0x100000) on the root window,
-      `MapWindow` for unmapped top-level windows must send `MapRequest`
+      `MapWindow` for unmapped top-level windows sends `MapRequest`
       (event type 20) to the WM instead of mapping directly; similarly
-      `ConfigureWindow` must send `ConfigureRequest` (event type 23).
-      The WM then decides whether to honour the request (by calling
-      `MapWindow` / `ConfigureWindow` itself) and how to frame the window.
-      Required for fvwm3 (and any reparenting WM) to draw borders and
-      titlebars. `override-redirect` windows bypass redirection.
+      `ConfigureWindow` sends `ConfigureRequest` (event type 23).
+      Already working before Phase 2 plan.
 
-Other Phase 2 work not started yet.
+- [x] **Phase 2 fvwm3 feature set.** Passive button grabs
+      (GrabButton/UngrabButton/AllowEvents), FillPoly, PolyText16, CopyGC,
+      PolyPoint, real TranslateCoordinates, ListProperties, CreateCursor,
+      WarpPointer, ConvertSelection/SelectionRequest/SelectionClear, and
+      SendEvent for all event types. See plan:
+      [`2026-04-29-phase2-fvwm3.md`](superpowers/plans/2026-04-29-phase2-fvwm3.md).
+
+### Known follow-ups
+
+- **RRSelectInput mask storage.** `RRSelectInput` is accepted but the mask is not
+  stored; `RRScreenChangeNotify` is never delivered. Wire up when needed.
+- **GrabButton Sync mode freeze.** The current implementation stores the frozen
+  event but AllowEvents(ReplayPointer) requires access to the xid_map which is
+  only available in the pointer_event_fanout thread. Needs a proper inter-thread
+  channel for replay.
+- **CreateCursor XColor struct.** Xlib `XColor` layout must match the system
+  Xlib headers; verify on target platform.
+- **SendEvent propagation.** Current impl delivers to direct window subscribers;
+  does not propagate up the window tree (event_mask=0 with PointerWindow/InputFocus
+  destinations).
 
 ## Phase 3 — Toolkit compatibility
 
@@ -252,32 +267,32 @@ Not started.
 | 18 | ChangeProperty        | ✓ | fires PropertyNotify cross-client |
 | 19 | DeleteProperty        | ✓ | fires PropertyNotify |
 | 20 | GetProperty           | ↩ | |
-| 21 | ListProperties        | ✗ | |
+| 21 | ListProperties        | ✓ | returns all property atoms on window |
 | 22 | SetSelectionOwner     | ✓ | per-server ownership map |
 | 23 | GetSelectionOwner     | ↩ | |
-| 24 | ConvertSelection      | ✗ | |
+| 24 | ConvertSelection      | ✓ | delivers SelectionRequest to owner; SelectionNotify(None) if no owner |
 
 #### Input grabs and focus
 
 | Op | Name                      | Status | Notes |
 |----|---------------------------|--------|-------|
-| 25 | SendEvent                 | ✓ | ClientMessage delivery; other types unsupported |
+| 25 | SendEvent                 | ✓ | all event types; sent-event bit set; propagation and broadcast |
 | 26 | GrabPointer               | ✓ | records grab owner; all pointer events redirected until UngrabPointer |
 | 27 | UngrabPointer             | ✓ | clears active grab |
-| 28 | GrabButton                | ∅ | |
-| 29 | UngrabButton              | ∅ | |
+| 28 | GrabButton                | ✓ | passive grabs stored; ButtonPress activates transient grab |
+| 29 | UngrabButton              | ✓ | removes matching passive grabs |
 | 30 | ChangeActivePointerGrab   | ✗ | |
 | 31 | GrabKeyboard              | ↩ | stub — returns GrabSuccess |
 | 32 | UngrabKeyboard            | ∅ | |
 | 33 | GrabKey                   | ∅ | |
 | 34 | UngrabKey                 | ∅ | |
-| 35 | AllowEvents               | ✗ | |
+| 35 | AllowEvents               | ✓ | AsyncPointer/SyncPointer clears freeze; ReplayPointer re-routes |
 | 36 | GrabServer                | ∅ | |
 | 37 | UngrabServer              | ∅ | |
 | 38 | QueryPointer              | ↩ | delegates to host |
 | 39 | GetMotionEvents           | ✗ | |
-| 40 | TranslateCoordinates      | ↩ | stub — returns 0,0 |
-| 41 | WarpPointer               | ✗ | |
+| 40 | TranslateCoordinates      | ✓ | real absolute-position walk; child-window lookup |
+| 41 | WarpPointer               | ✓ | warps to host subwindow with offset translation |
 | 42 | SetInputFocus             | ✓ | routes keyboard events to focused client |
 | 43 | GetInputFocus             | ↩ | |
 | 44 | QueryKeymap               | ↩ | stub — all zeros |
@@ -303,7 +318,7 @@ Not started.
 | 54 | FreePixmap            | ✓ | |
 | 55 | CreateGC              | ✓ | |
 | 56 | ChangeGC              | ✓ | |
-| 57 | CopyGC                | ✗ | |
+| 57 | CopyGC                | ✓ | copies selected GC attributes by value_mask |
 | 58 | SetDashes             | ✗ | |
 | 59 | SetClipRectangles     | ✓ | stored and applied on host GC |
 | 60 | FreeGC                | ✓ | |
@@ -315,18 +330,18 @@ Not started.
 | 61 | ClearArea             | ✓ | respects background-pixmap (CopyArea) or background-pixel fill |
 | 62 | CopyArea              | ✓ | host-backed win↔win, pixmap↔win etc. |
 | 63 | CopyPlane             | ✗ | |
-| 64 | PolyPoint             | ∅ | |
+| 64 | PolyPoint             | ✓ | forwarded to host; coord translation applied |
 | 65 | PolyLine              | ✓ | forwarded to host; pixmap drawables supported |
 | 66 | PolySegment           | ✓ | forwarded to host; both endpoints translated; pixmap drawables supported |
 | 67 | PolyRectangle         | ✓ | forwarded to host; pixmap drawables supported |
 | 68 | PolyArc               | ✓ | forwarded to host; pixmap drawables supported |
-| 69 | FillPoly              | ∅ | |
+| 69 | FillPoly              | ✓ | forwarded to host via XFillPolygon; coord translation applied |
 | 70 | PolyFillRectangle     | ✓ | forwarded to host; pixmap drawables supported |
 | 71 | PolyFillArc           | ✓ | forwarded to host; pixmap drawables supported |
 | 72 | PutImage              | ✓ | ZPixmap; XYBitmap/XYPixmap unsupported |
 | 73 | GetImage              | ✓ | proxied to host; blank fallback if no host backing |
 | 74 | PolyText8             | ✓ | forwarded to host |
-| 75 | PolyText16            | ✗ | |
+| 75 | PolyText16            | ✓ | forwarded to host; coord translation applied |
 | 76 | ImageText8            | ✓ | forwarded to host |
 | 77 | ImageText16           | ✓ | forwarded to host |
 
@@ -354,7 +369,7 @@ Not started.
 
 | Op | Name                  | Status | Notes |
 |----|-----------------------|--------|-------|
-| 93 | CreateCursor          | ✗ | |
+| 93 | CreateCursor          | ✓ | XCreatePixmapCursor; applied via ChangeWindowAttributes |
 | 94 | CreateGlyphCursor     | ✓ | cursor ID allocated and tracked |
 | 95 | FreeCursor            | ✓ | |
 | 96 | RecolorCursor         | ∅ | |
