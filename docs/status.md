@@ -132,7 +132,22 @@ Goal: ICCCM and EWMH behavior, selections, clipboard, focus, grabs,
 configure requests, reparenting, override-redirect, root-window
 properties. Run a simple WM (Openbox / i3 / awesome / fluxbox).
 
-Not started. Blocked on Phase 1 property storage and lifecycle events.
+### Pending — Phase 2 punch list
+
+In rough priority order:
+
+- [ ] **Nested RANDR compatibility stub.** Advertise `RANDR` and expose
+      one connected output / one CRTC / one mode matching the current
+      `ynest` screen size. Implement the query path needed by simple
+      window managers first: `RRQueryVersion`,
+      `RRGetScreenResourcesCurrent`, `RRGetOutputInfo`,
+      `RRGetCrtcInfo`, and `RRGetScreenSizeRange`; keep setters
+      unsupported/no-op for now. Design:
+      [`2026-04-29-nested-randr-compat-design.md`](superpowers/specs/2026-04-29-nested-randr-compat-design.md).
+      Plan:
+      [`2026-04-29-nested-randr-compat.md`](superpowers/plans/2026-04-29-nested-randr-compat.md).
+
+Other Phase 2 work not started yet.
 
 ## Phase 3 — Toolkit compatibility
 
