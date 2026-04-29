@@ -211,3 +211,175 @@ configuration, dummy responses for unauthorized requests, an
 Xorg-compatible compatibility mode.
 
 Not started.
+
+## Opcode implementation status
+
+**Key:**
+- ✓ full — implemented with correct side effects
+- ↩ reply — sends a reply (may be stub/partial in content)
+- ∅ no-op — accepted silently, no error, no meaningful effect
+- ✗ not handled — falls to "unsupported opcode" log; fire-and-forget
+  opcodes silently succeed, reply opcodes will block the client
+
+### Core X11 opcodes (1–127)
+
+#### Window management
+
+| Op | Name                  | Status | Notes |
+|----|-----------------------|--------|-------|
+|  1 | CreateWindow          | ✓ | host subwindow allocated for top-levels |
+|  2 | ChangeWindowAttributes | ✓ | event_masks, cursor, override_redirect |
+|  3 | GetWindowAttributes   | ↩ | |
+|  4 | DestroyWindow         | ✓ | recursive; fires DestroyNotify/UnmapNotify |
+|  5 | DestroySubwindows     | ✗ | |
+|  6 | ChangeSaveSet         | ✗ | |
+|  7 | ReparentWindow        | ✓ | fires ReparentNotify |
+|  8 | MapWindow             | ✓ | SubstructureRedirect to WM if registered |
+|  9 | MapSubwindows         | ✓ | |
+| 10 | UnmapWindow           | ✓ | fires UnmapNotify |
+| 11 | UnmapSubwindows       | ✓ | |
+| 12 | ConfigureWindow       | ✓ | SubstructureRedirect to WM if registered |
+| 13 | CirculateWindow       | ✗ | |
+| 14 | GetGeometry           | ↩ | |
+| 15 | QueryTree             | ↩ | |
+
+#### Atoms, properties, selections
+
+| Op | Name                  | Status | Notes |
+|----|-----------------------|--------|-------|
+| 16 | InternAtom            | ↩ | server-global atom table, 68 predefined |
+| 17 | GetAtomName           | ↩ | |
+| 18 | ChangeProperty        | ✓ | fires PropertyNotify cross-client |
+| 19 | DeleteProperty        | ✓ | fires PropertyNotify |
+| 20 | GetProperty           | ↩ | |
+| 21 | ListProperties        | ✗ | |
+| 22 | SetSelectionOwner     | ✓ | per-server ownership map |
+| 23 | GetSelectionOwner     | ↩ | |
+| 24 | ConvertSelection      | ✗ | |
+
+#### Input grabs and focus
+
+| Op | Name                      | Status | Notes |
+|----|---------------------------|--------|-------|
+| 25 | SendEvent                 | ✓ | ClientMessage delivery; other types unsupported |
+| 26 | GrabPointer               | ↩ | stub — returns GrabSuccess, no real grab |
+| 27 | UngrabPointer             | ∅ | |
+| 28 | GrabButton                | ∅ | |
+| 29 | UngrabButton              | ∅ | |
+| 30 | ChangeActivePointerGrab   | ✗ | |
+| 31 | GrabKeyboard              | ↩ | stub — returns GrabSuccess |
+| 32 | UngrabKeyboard            | ∅ | |
+| 33 | GrabKey                   | ∅ | |
+| 34 | UngrabKey                 | ∅ | |
+| 35 | AllowEvents               | ✗ | |
+| 36 | GrabServer                | ∅ | |
+| 37 | UngrabServer              | ∅ | |
+| 38 | QueryPointer              | ↩ | delegates to host |
+| 39 | GetMotionEvents           | ✗ | |
+| 40 | TranslateCoordinates      | ↩ | stub — returns 0,0 |
+| 41 | WarpPointer               | ✗ | |
+| 42 | SetInputFocus             | ✓ | routes keyboard events to focused client |
+| 43 | GetInputFocus             | ↩ | |
+| 44 | QueryKeymap               | ↩ | stub — all zeros |
+
+#### Fonts
+
+| Op | Name                  | Status | Notes |
+|----|-----------------------|--------|-------|
+| 45 | OpenFont              | ✓ | opens on host, caches full FontMetrics |
+| 46 | CloseFont             | ∅ | |
+| 47 | QueryFont             | ↩ | from metrics cache; FONTABLE resolves GC font |
+| 48 | QueryTextExtents      | ↩ | computed locally from CharInfo cache |
+| 49 | ListFonts             | ↩ | proxied to host |
+| 50 | ListFontsWithInfo     | ↩ | proxied to host, multi-reply sentinel forwarded |
+| 51 | SetFontPath           | ✗ | |
+| 52 | GetFontPath           | ✗ | |
+
+#### Pixmaps and GCs
+
+| Op | Name                  | Status | Notes |
+|----|-----------------------|--------|-------|
+| 53 | CreatePixmap          | ✓ | host pixmap for depths 1/24/32 |
+| 54 | FreePixmap            | ✓ | |
+| 55 | CreateGC              | ✓ | |
+| 56 | ChangeGC              | ✓ | |
+| 57 | CopyGC                | ✗ | |
+| 58 | SetDashes             | ✗ | |
+| 59 | SetClipRectangles     | ✓ | stored and applied on host GC |
+| 60 | FreeGC                | ✓ | |
+
+#### Drawing
+
+| Op | Name                  | Status | Notes |
+|----|-----------------------|--------|-------|
+| 61 | ClearArea             | ✓ | forwarded to host |
+| 62 | CopyArea              | ✓ | host-backed win↔win, pixmap↔win etc. |
+| 63 | CopyPlane             | ✗ | |
+| 64 | PolyPoint             | ∅ | |
+| 65 | PolyLine              | ✓ | forwarded to host |
+| 66 | PolySegment           | ∅ | |
+| 67 | PolyRectangle         | ✓ | forwarded to host |
+| 68 | PolyArc               | ✓ | forwarded to host |
+| 69 | FillPoly              | ∅ | |
+| 70 | PolyFillRectangle     | ✓ | forwarded to host |
+| 71 | PolyFillArc           | ✓ | forwarded to host |
+| 72 | PutImage              | ✓ | ZPixmap; XYBitmap/XYPixmap unsupported |
+| 73 | GetImage              | ✗ | |
+| 74 | PolyText8             | ✓ | forwarded to host |
+| 75 | PolyText16            | ✗ | |
+| 76 | ImageText8            | ✓ | forwarded to host |
+| 77 | ImageText16           | ✓ | forwarded to host |
+
+#### Colormaps and colours
+
+| Op | Name                  | Status | Notes |
+|----|-----------------------|--------|-------|
+| 78 | CreateColormap        | ∅ | |
+| 79 | FreeColormap          | ✗ | |
+| 80 | CopyColormapAndFree   | ✗ | |
+| 81 | InstallColormap       | ✗ | |
+| 82 | UninstallColormap     | ✗ | |
+| 83 | ListInstalledColormaps | ✗ | |
+| 84 | AllocColor            | ↩ | echoes requested RGB |
+| 85 | AllocNamedColor       | ↩ | named colour table, fallback gray |
+| 86 | AllocColorCells       | ✗ | |
+| 87 | AllocColorPlanes      | ✗ | |
+| 88 | FreeColors            | ✗ | |
+| 89 | StoreColors           | ✗ | |
+| 90 | StoreNamedColors      | ✗ | |
+| 91 | QueryColors           | ↩ | returns pixel mapped back to RGB |
+| 92 | LookupColor           | ↩ | named colour table |
+
+#### Cursors
+
+| Op | Name                  | Status | Notes |
+|----|-----------------------|--------|-------|
+| 93 | CreateCursor          | ✗ | |
+| 94 | CreateGlyphCursor     | ✓ | cursor ID allocated and tracked |
+| 95 | FreeCursor            | ✓ | |
+| 96 | RecolorCursor         | ∅ | |
+| 97 | QueryBestSize         | ✗ | |
+
+#### Extensions and misc
+
+| Op | Name                      | Status | Notes |
+|----|---------------------------|--------|-------|
+|  98 | QueryExtension           | ↩ | RANDR advertised; all others absent |
+|  99 | ListExtensions           | ↩ | returns empty list |
+| 100 | ChangeKeyboardMapping    | ✗ | |
+| 101 | GetKeyboardMapping       | ↩ | stub keysyms |
+| 103 | Bell                     | ∅ | |
+| 104 | ChangeKeyboardControl    | ∅ | |
+| 108 | SetScreenSaver           | ∅ | |
+| 111 | ListHosts                | ↩ | empty list |
+| 115 | RotateProperties         | ↩ | stub — no-op with empty reply |
+| 116 | SetPointerMapping        | ∅ | |
+| 117 | GetPointerMapping        | ↩ | stub — buttons 1,2,3 |
+| 118 | SetModifierMapping       | ∅ | |
+| 119 | GetModifierMapping       | ↩ | stub — minimal modifier map |
+| 127 | NoOperation              | ∅ | |
+
+### RANDR extension (major opcode 128)
+
+Fully described in the Phase 2 RANDR item above. All read-only queries
+implemented as stubs; mutation paths return `BadValue`.
