@@ -80,6 +80,15 @@ pub fn run(display: u16) -> io::Result<()> {
     }
 
     let server = Arc::new(Mutex::new(ServerState::new()));
+    // Route root-window drawing/clearing to the host container window so
+    // clients that paint the root (e.g. fvwm3 setting its desktop bg pixmap)
+    // produce visible output in the nested viewport.
+    if let Some(host_window_id) = host_window_id
+        && let Ok(mut s) = server.lock()
+        && let Some(root) = s.resources.window_mut(ROOT_WINDOW)
+    {
+        root.host_xid = Some(host_window_id);
+    }
 
     let input_pump_handle: Option<HostInputPumpHandle> = match host_window_id {
         Some(window_id) => match HostInputPump::open_from_env(window_id) {

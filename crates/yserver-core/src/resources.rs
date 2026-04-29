@@ -314,22 +314,18 @@ impl ResourceTable {
     #[must_use]
     pub fn top_level_host_target(&self, id: ResourceId) -> Option<TopLevelTarget> {
         let mut current = self.windows.get(&id.0)?;
-        if current.id == ROOT_WINDOW {
-            return None;
-        }
         let mut x_offset: i16 = 0;
         let mut y_offset: i16 = 0;
-        while current.parent != ROOT_WINDOW {
+        // Walk up until we reach a window whose parent is root (a top-level)
+        // or root itself. Both cases use the current window's host_xid:
+        // top-levels get one when their host subwindow is created, and root
+        // is wired to the host container at startup so root drawing routes
+        // there as well.
+        while current.parent != ROOT_WINDOW && current.id != ROOT_WINDOW {
             x_offset = x_offset.wrapping_add(current.x);
             y_offset = y_offset.wrapping_add(current.y);
-            let next = self.windows.get(&current.parent.0)?;
-            if next.id == ROOT_WINDOW {
-                // Parent chain points at root through a missing or self-loop entry.
-                return None;
-            }
-            current = next;
+            current = self.windows.get(&current.parent.0)?;
         }
-        // current is now the top-level (parent == ROOT_WINDOW).
         let host_xid = current.host_xid?;
         Some(TopLevelTarget {
             top_level: current.id,
@@ -1253,9 +1249,28 @@ mod tests {
     }
 
     #[test]
-    fn top_level_host_target_returns_none_for_root() {
+    fn top_level_host_target_returns_none_for_root_when_unset() {
         let table = ResourceTable::new();
         assert_eq!(table.top_level_host_target(ROOT_WINDOW), None);
+    }
+
+    #[test]
+    fn top_level_host_target_for_root_uses_wired_host_xid() {
+        // When the nested core wires up root.host_xid to the host container,
+        // root drawing must route to that container with zero offset.
+        let mut table = ResourceTable::new();
+        if let Some(root) = table.window_mut(ROOT_WINDOW) {
+            root.host_xid = Some(0xdead_beef);
+        }
+        assert_eq!(
+            table.top_level_host_target(ROOT_WINDOW),
+            Some(TopLevelTarget {
+                top_level: ROOT_WINDOW,
+                host_xid: 0xdead_beef,
+                x_offset: 0,
+                y_offset: 0,
+            })
+        );
     }
 
     #[test]
