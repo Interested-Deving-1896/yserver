@@ -159,6 +159,7 @@ pub struct CreateWindowRequest {
 #[derive(Clone, Copy, Debug)]
 pub struct ChangeWindowAttributesRequest {
     pub window: ResourceId,
+    pub background_pixmap: Option<ResourceId>,
     pub background_pixel: Option<u32>,
     pub event_mask: Option<u32>,
     pub cursor: Option<ResourceId>,
@@ -713,10 +714,21 @@ pub fn change_window_attributes_request(body: &[u8]) -> Option<ChangeWindowAttri
     let values = value_list(value_mask, body.get(8..)?);
     Some(ChangeWindowAttributesRequest {
         window: ResourceId(read_u32_le(body.get(0..4)?)),
+        background_pixmap: values.value(0).map(ResourceId),
         background_pixel: values.value(1),
         event_mask: values.value(11),
         cursor: values.value(14).map(ResourceId),
     })
+}
+
+#[must_use]
+pub fn poly_segment_data(body: &[u8]) -> Option<(u32, &[u8])> {
+    let gc_id = read_u32_le(body.get(4..8)?);
+    let segments = body.get(8..)?;
+    if segments.len() % 8 != 0 {
+        return None;
+    }
+    Some((gc_id, segments))
 }
 
 pub fn configure_window_request(body: &[u8]) -> Option<ConfigureWindowRequest> {

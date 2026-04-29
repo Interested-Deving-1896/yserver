@@ -116,6 +116,7 @@ impl ResourceTable {
                 class: WindowClass::InputOutput,
                 map_state: MapState::Viewable,
                 background_pixel: 0x00ff_ffff,
+                background_pixmap: None,
                 override_redirect: false,
                 cursor: None,
                 owner: SERVER_OWNER,
@@ -156,6 +157,7 @@ impl ResourceTable {
             class: WindowClass::from_protocol(request.class),
             map_state: MapState::Unmapped,
             background_pixel: request.background_pixel.unwrap_or(0x00ff_ffff),
+            background_pixmap: None,
             override_redirect: request.override_redirect.unwrap_or(false),
             cursor: None,
             owner,
@@ -192,6 +194,13 @@ impl ResourceTable {
 
     pub fn change_window_attributes(&mut self, request: ChangeWindowAttributesRequest) {
         if let Some(window) = self.windows.get_mut(&request.window.0) {
+            if let Some(bg_pixmap) = request.background_pixmap {
+                window.background_pixmap = if bg_pixmap.0 == 0 {
+                    None
+                } else {
+                    Some(bg_pixmap)
+                };
+            }
             if let Some(background_pixel) = request.background_pixel {
                 window.background_pixel = background_pixel;
             }
@@ -477,6 +486,11 @@ impl ResourceTable {
         }
     }
 
+    pub fn window_background_pixmap_host_xid(&self, window_id: ResourceId) -> Option<u32> {
+        let bg_pixmap_id = self.windows.get(&window_id.0)?.background_pixmap?;
+        self.pixmaps.get(&bg_pixmap_id.0)?.host_xid
+    }
+
     #[must_use]
     pub fn host_drawable_target(&self, id: ResourceId) -> Option<HostDrawableTarget> {
         if let Some(window) = self.windows.get(&id.0) {
@@ -694,6 +708,7 @@ pub struct Window {
     pub class: WindowClass,
     pub map_state: MapState,
     pub background_pixel: u32,
+    pub background_pixmap: Option<ResourceId>,
     pub override_redirect: bool,
     pub cursor: Option<ResourceId>,
     pub owner: ClientId,
@@ -717,6 +732,7 @@ impl Window {
             class: WindowClass::InputOutput,
             map_state: MapState::Unmapped,
             background_pixel: 0x00ff_ffff,
+            background_pixmap: None,
             override_redirect: false,
             cursor: None,
             owner: SERVER_OWNER,

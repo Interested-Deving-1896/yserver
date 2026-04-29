@@ -228,7 +228,7 @@ Not started.
 | Op | Name                  | Status | Notes |
 |----|-----------------------|--------|-------|
 |  1 | CreateWindow          | ✓ | host subwindow allocated for top-levels |
-|  2 | ChangeWindowAttributes | ✓ | event_masks, cursor, override_redirect |
+|  2 | ChangeWindowAttributes | ✓ | event_masks, cursor, override_redirect, background-pixel, background-pixmap |
 |  3 | GetWindowAttributes   | ↩ | |
 |  4 | DestroyWindow         | ✓ | recursive; fires DestroyNotify/UnmapNotify |
 |  5 | DestroySubwindows     | ✗ | |
@@ -312,19 +312,19 @@ Not started.
 
 | Op | Name                  | Status | Notes |
 |----|-----------------------|--------|-------|
-| 61 | ClearArea             | ✓ | forwarded to host |
+| 61 | ClearArea             | ✓ | respects background-pixmap (CopyArea) or background-pixel fill |
 | 62 | CopyArea              | ✓ | host-backed win↔win, pixmap↔win etc. |
 | 63 | CopyPlane             | ✗ | |
 | 64 | PolyPoint             | ∅ | |
-| 65 | PolyLine              | ✓ | forwarded to host |
-| 66 | PolySegment           | ∅ | |
-| 67 | PolyRectangle         | ✓ | forwarded to host |
-| 68 | PolyArc               | ✓ | forwarded to host |
+| 65 | PolyLine              | ✓ | forwarded to host; pixmap drawables supported |
+| 66 | PolySegment           | ✓ | forwarded to host; both endpoints translated; pixmap drawables supported |
+| 67 | PolyRectangle         | ✓ | forwarded to host; pixmap drawables supported |
+| 68 | PolyArc               | ✓ | forwarded to host; pixmap drawables supported |
 | 69 | FillPoly              | ∅ | |
-| 70 | PolyFillRectangle     | ✓ | forwarded to host |
-| 71 | PolyFillArc           | ✓ | forwarded to host |
+| 70 | PolyFillRectangle     | ✓ | forwarded to host; pixmap drawables supported |
+| 71 | PolyFillArc           | ✓ | forwarded to host; pixmap drawables supported |
 | 72 | PutImage              | ✓ | ZPixmap; XYBitmap/XYPixmap unsupported |
-| 73 | GetImage              | ✗ | |
+| 73 | GetImage              | ✓ | proxied to host; blank fallback if no host backing |
 | 74 | PolyText8             | ✓ | forwarded to host |
 | 75 | PolyText16            | ✗ | |
 | 76 | ImageText8            | ✓ | forwarded to host |

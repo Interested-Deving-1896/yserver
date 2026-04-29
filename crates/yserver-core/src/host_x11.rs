@@ -565,6 +565,15 @@ impl HostX11 {
         self.draw_rectangles(host_xid, 67, foreground, rectangles)
     }
 
+    pub fn poly_segment(
+        &mut self,
+        host_xid: u32,
+        foreground: u32,
+        segments: &[u8],
+    ) -> io::Result<()> {
+        self.draw_rectangles(host_xid, 66, foreground, segments)
+    }
+
     pub fn poly_fill_rectangle(
         &mut self,
         host_xid: u32,

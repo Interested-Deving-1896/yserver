@@ -2301,14 +2301,17 @@ fn handle_request(
         }
         61 => {
             if let Some(request) = x11::clear_area_request(body) {
-                let (extents, target) = {
+                let (extents, bg_pixmap_host, target) = {
                     let s = lock_server(server)?;
                     let extents = s
                         .resources
                         .window(request.window)
                         .map(|w| (w.background_pixel, w.width, w.height));
+                    let bg_pixmap_host = s
+                        .resources
+                        .window_background_pixmap_host_xid(request.window);
                     let target = s.resources.top_level_host_target(request.window);
-                    (extents, target)
+                    (extents, bg_pixmap_host, target)
                 };
                 if let Some((background_pixel, w_width, w_height)) = extents
                     && let Some(target) = target
@@ -2321,14 +2324,27 @@ fn handle_request(
                         && let Ok(mut host) = host.lock()
                     {
                         host.clear_clip_rectangles()?;
-                        host.fill_rectangle(
-                            target.host_xid,
-                            background_pixel,
-                            translate_i16(request.x, target.x_offset),
-                            translate_i16(request.y, target.y_offset),
-                            width,
-                            height,
-                        )?;
+                        if let Some(bg_host_xid) = bg_pixmap_host {
+                            host.copy_area(
+                                bg_host_xid,
+                                target.host_xid,
+                                request.x,
+                                request.y,
+                                translate_i16(request.x, target.x_offset),
+                                translate_i16(request.y, target.y_offset),
+                                width,
+                                height,
+                            )?;
+                        } else {
+                            host.fill_rectangle(
+                                target.host_xid,
+                                background_pixel,
+                                translate_i16(request.x, target.x_offset),
+                                translate_i16(request.y, target.y_offset),
+                                width,
+                                height,
+                            )?;
+                        }
                     }
                 }
             }
@@ -2414,22 +2430,49 @@ fn handle_request(
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
                         s.resources.gc_clip_rectangles(ResourceId(gc_id)),
-                        s.resources.top_level_host_target(drawable),
+                        s.resources.host_drawable_target(drawable),
                     )
                 };
                 if let Some(target) = target
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset, target.y_offset)?;
-                    let translated =
-                        translated_points(points, header.data, target.x_offset, target.y_offset);
-                    host.poly_line(target.host_xid, foreground, header.data, &translated)?;
+                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    let translated = translated_points(
+                        points,
+                        header.data,
+                        target.x_offset(),
+                        target.y_offset(),
+                    );
+                    host.poly_line(target.host_xid(), foreground, header.data, &translated)?;
                 }
             }
             log_void(client_id, sequence, "PolyLine")
         }
-        66 => log_void(client_id, sequence, "PolySegment"),
+        66 => {
+            if let Some((gc_id, segments)) = x11::poly_segment_data(body)
+                && let Some(drawable) = x11::drawable_request_id(body)
+            {
+                let (foreground, clip, target) = {
+                    let s = lock_server(server)?;
+                    (
+                        s.resources.gc_foreground(ResourceId(gc_id)),
+                        s.resources.gc_clip_rectangles(ResourceId(gc_id)),
+                        s.resources.host_drawable_target(drawable),
+                    )
+                };
+                if let Some(target) = target
+                    && let Some(host) = host
+                    && let Ok(mut host) = host.lock()
+                {
+                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    let translated =
+                        translated_segments(segments, target.x_offset(), target.y_offset());
+                    host.poly_segment(target.host_xid(), foreground, &translated)?;
+                }
+            }
+            log_void(client_id, sequence, "PolySegment")
+        }
         67 => {
             if let Some((gc_id, rectangles)) = x11::poly_fill_rectangle_data(body)
                 && let Some(drawable) = x11::drawable_request_id(body)
@@ -2439,17 +2482,17 @@ fn handle_request(
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
                         s.resources.gc_clip_rectangles(ResourceId(gc_id)),
-                        s.resources.top_level_host_target(drawable),
+                        s.resources.host_drawable_target(drawable),
                     )
                 };
                 if let Some(target) = target
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset, target.y_offset)?;
+                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
                     let translated =
-                        translated_records(rectangles, 8, target.x_offset, target.y_offset);
-                    host.poly_rectangle(target.host_xid, foreground, &translated)?;
+                        translated_records(rectangles, 8, target.x_offset(), target.y_offset());
+                    host.poly_rectangle(target.host_xid(), foreground, &translated)?;
                 }
             }
             log_void(client_id, sequence, "PolyRectangle")
@@ -2463,16 +2506,17 @@ fn handle_request(
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
                         s.resources.gc_clip_rectangles(ResourceId(gc_id)),
-                        s.resources.top_level_host_target(drawable),
+                        s.resources.host_drawable_target(drawable),
                     )
                 };
                 if let Some(target) = target
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset, target.y_offset)?;
-                    let translated = translated_records(arcs, 12, target.x_offset, target.y_offset);
-                    host.poly_arc(target.host_xid, foreground, &translated)?;
+                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    let translated =
+                        translated_records(arcs, 12, target.x_offset(), target.y_offset());
+                    host.poly_arc(target.host_xid(), foreground, &translated)?;
                 }
             }
             log_void(client_id, sequence, "PolyArc")
@@ -2487,17 +2531,17 @@ fn handle_request(
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
                         s.resources.gc_clip_rectangles(ResourceId(gc_id)),
-                        s.resources.top_level_host_target(drawable),
+                        s.resources.host_drawable_target(drawable),
                     )
                 };
                 if let Some(target) = target
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset, target.y_offset)?;
+                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
                     let translated =
-                        translated_records(rectangles, 8, target.x_offset, target.y_offset);
-                    host.poly_fill_rectangle(target.host_xid, foreground, &translated)?;
+                        translated_records(rectangles, 8, target.x_offset(), target.y_offset());
+                    host.poly_fill_rectangle(target.host_xid(), foreground, &translated)?;
                 }
             }
             log_void(client_id, sequence, "PolyFillRectangle")
@@ -2511,16 +2555,17 @@ fn handle_request(
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
                         s.resources.gc_clip_rectangles(ResourceId(gc_id)),
-                        s.resources.top_level_host_target(drawable),
+                        s.resources.host_drawable_target(drawable),
                     )
                 };
                 if let Some(target) = target
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset, target.y_offset)?;
-                    let translated = translated_records(arcs, 12, target.x_offset, target.y_offset);
-                    host.poly_fill_arc(target.host_xid, foreground, &translated)?;
+                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
+                    let translated =
+                        translated_records(arcs, 12, target.x_offset(), target.y_offset());
+                    host.poly_fill_arc(target.host_xid(), foreground, &translated)?;
                 }
             }
             log_void(client_id, sequence, "PolyFillArc")
@@ -2676,17 +2721,17 @@ fn handle_request(
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
                         s.resources.gc_clip_rectangles(ResourceId(gc_id)),
-                        s.resources.top_level_host_target(drawable),
+                        s.resources.host_drawable_target(drawable),
                     )
                 };
                 if let Some(target) = target
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset, target.y_offset)?;
+                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
                     let translated =
-                        translated_text_body(text_body, target.x_offset, target.y_offset);
-                    host.poly_text8(target.host_xid, foreground, &translated)?;
+                        translated_text_body(text_body, target.x_offset(), target.y_offset());
+                    host.poly_text8(target.host_xid(), foreground, &translated)?;
                 }
             }
             log_void(client_id, sequence, "PolyText8")
@@ -2702,18 +2747,18 @@ fn handle_request(
                         s.resources.gc_foreground(gc),
                         s.resources.gc_background(gc),
                         s.resources.gc_clip_rectangles(gc),
-                        s.resources.top_level_host_target(ResourceId(drawable)),
+                        s.resources.host_drawable_target(ResourceId(drawable)),
                     )
                 };
                 if let Some(target) = target
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset, target.y_offset)?;
+                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
                     let translated =
-                        translated_text_body(text_body, target.x_offset, target.y_offset);
+                        translated_text_body(text_body, target.x_offset(), target.y_offset());
                     host.image_text8(
-                        target.host_xid,
+                        target.host_xid(),
                         foreground,
                         background,
                         header.data,
@@ -2734,18 +2779,18 @@ fn handle_request(
                         s.resources.gc_foreground(gc),
                         s.resources.gc_background(gc),
                         s.resources.gc_clip_rectangles(gc),
-                        s.resources.top_level_host_target(ResourceId(drawable)),
+                        s.resources.host_drawable_target(ResourceId(drawable)),
                     )
                 };
                 if let Some(target) = target
                     && let Some(host) = host
                     && let Ok(mut host) = host.lock()
                 {
-                    host.set_clip_rectangles(clip, target.x_offset, target.y_offset)?;
+                    host.set_clip_rectangles(clip, target.x_offset(), target.y_offset())?;
                     let translated =
-                        translated_text_body(text_body, target.x_offset, target.y_offset);
+                        translated_text_body(text_body, target.x_offset(), target.y_offset());
                     host.image_text16(
-                        target.host_xid,
+                        target.host_xid(),
                         foreground,
                         background,
                         header.data,
@@ -2998,6 +3043,15 @@ fn translated_text_body(body: &[u8], x_offset: i16, y_offset: i16) -> Vec<u8> {
     let mut out = body.to_vec();
     if out.len() >= 12 {
         let _ = translate_i16_pair(&mut out, 8, x_offset, y_offset);
+    }
+    out
+}
+
+fn translated_segments(data: &[u8], x_offset: i16, y_offset: i16) -> Vec<u8> {
+    let mut out = data.to_vec();
+    for seg in out.chunks_exact_mut(8) {
+        let _ = translate_i16_pair(seg, 0, x_offset, y_offset);
+        let _ = translate_i16_pair(seg, 4, x_offset, y_offset);
     }
     out
 }
