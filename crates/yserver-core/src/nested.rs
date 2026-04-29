@@ -14,6 +14,7 @@ use std::{
 use log::{debug, error, info, warn};
 use yserver_protocol::x11::{
     self, AtomId, ClientByteOrder, ClientId, RequestHeader, ResourceId, SequenceNumber,
+    randr as x11randr,
 };
 
 use crate::{
@@ -25,6 +26,10 @@ use crate::{
 };
 
 static NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
+
+const RANDR_MAJOR_OPCODE: u8 = 128;
+const RANDR_FIRST_EVENT: u8 = 89;
+const RANDR_FIRST_ERROR: u8 = 147;
 
 struct OwnedGetPropertyReply {
     format: u8,
@@ -529,6 +534,281 @@ fn clear_extent(requested: u16, offset: i16, window_extent: u16) -> u16 {
         window_extent
     } else {
         window_extent.saturating_sub(offset as u16)
+    }
+}
+
+fn handle_randr_request(
+    client_id: ClientId,
+    server: &Arc<Mutex<ServerState>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    sequence: SequenceNumber,
+    minor: u8,
+    body: &[u8],
+) -> io::Result<()> {
+    let lock_writer = || -> io::Result<std::sync::MutexGuard<'_, UnixStream>> {
+        writer
+            .lock()
+            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "client writer mutex poisoned"))
+    };
+
+    match minor {
+        x11randr::RR_QUERY_VERSION => {
+            let (reply_major, reply_minor) = x11randr::parse_query_version(body)
+                .map(|r| {
+                    let reply_major = x11randr::MAJOR_VERSION;
+                    let reply_minor = if r.major < x11randr::MAJOR_VERSION {
+                        r.minor
+                    } else {
+                        x11randr::MINOR_VERSION
+                    };
+                    (reply_major, reply_minor)
+                })
+                .unwrap_or((x11randr::MAJOR_VERSION, x11randr::MINOR_VERSION));
+            debug!(
+                "client {} #{} RANDR::QueryVersion -> {}.{}",
+                client_id.0, sequence.0, reply_major, reply_minor
+            );
+            let buf = x11randr::encode_query_version_reply(sequence, reply_major, reply_minor);
+            lock_writer()?.write_all(&buf)
+        }
+        x11randr::RR_GET_SCREEN_SIZE_RANGE => {
+            debug!(
+                "client {} #{} RANDR::GetScreenSizeRange",
+                client_id.0, sequence.0
+            );
+            let (min_w, min_h, max_w, max_h) = {
+                let s = lock_server(server)?;
+                s.randr.screen_size_range()
+            };
+            let buf =
+                x11randr::encode_get_screen_size_range_reply(sequence, min_w, min_h, max_w, max_h);
+            lock_writer()?.write_all(&buf)
+        }
+        x11randr::RR_GET_SCREEN_RESOURCES | x11randr::RR_GET_SCREEN_RESOURCES_CURRENT => {
+            debug!(
+                "client {} #{} RANDR::GetScreenResources(Current) minor={}",
+                client_id.0, sequence.0, minor
+            );
+            let resources = {
+                let s = lock_server(server)?;
+                s.randr.screen_resources_current()
+            };
+            let buf = x11randr::encode_get_screen_resources_current_reply(sequence, &resources);
+            lock_writer()?.write_all(&buf)
+        }
+        x11randr::RR_GET_OUTPUT_INFO => {
+            let req = match x11randr::parse_output_request(body) {
+                Some(r) => r,
+                None => {
+                    return emit_x11_error(
+                        writer,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        0,
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
+            };
+            debug!(
+                "client {} #{} RANDR::GetOutputInfo output={}",
+                client_id.0, sequence.0, req.output
+            );
+            let info_data = {
+                let s = lock_server(server)?;
+                s.randr.output_info(req.output, req.config_timestamp)
+            };
+            let Some(info_data) = info_data else {
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    req.output,
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let crtc_ids = [crate::randr::CRTC_ID];
+            let mode_ids = [crate::randr::MODE_ID];
+            let buf = x11randr::encode_get_output_info_reply(
+                sequence,
+                &x11randr::OutputInfoReply {
+                    timestamp: info_data.timestamp,
+                    crtc: info_data.crtc,
+                    width_mm: info_data.width_mm,
+                    height_mm: info_data.height_mm,
+                    connection: 0,     // Connected
+                    subpixel_order: 0, // Unknown
+                    crtcs: &crtc_ids,
+                    modes: &mode_ids,
+                    clones: &[],
+                    name: b"ynest-0",
+                },
+            );
+            lock_writer()?.write_all(&buf)
+        }
+        x11randr::RR_GET_CRTC_INFO => {
+            let req = match x11randr::parse_crtc_request(body) {
+                Some(r) => r,
+                None => {
+                    return emit_x11_error(
+                        writer,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        0,
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
+            };
+            debug!(
+                "client {} #{} RANDR::GetCrtcInfo crtc={}",
+                client_id.0, sequence.0, req.crtc
+            );
+            let crtc_data = {
+                let s = lock_server(server)?;
+                s.randr.crtc_info(req.crtc, req.config_timestamp)
+            };
+            let Some(crtc_data) = crtc_data else {
+                return emit_x11_error(
+                    writer,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    req.crtc,
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let output_ids = [crate::randr::OUTPUT_ID];
+            let buf = x11randr::encode_get_crtc_info_reply(
+                sequence,
+                &x11randr::CrtcInfoReply {
+                    timestamp: crtc_data.timestamp,
+                    x: 0,
+                    y: 0,
+                    width: crtc_data.width,
+                    height: crtc_data.height,
+                    mode: crate::randr::MODE_ID,
+                    rotation: 1,  // RR_Rotate_0
+                    rotations: 1, // only normal rotation supported
+                    outputs: &output_ids,
+                    possible: &output_ids,
+                },
+            );
+            lock_writer()?.write_all(&buf)
+        }
+        x11randr::RR_GET_CRTC_TRANSFORM => {
+            debug!(
+                "client {} #{} RANDR::GetCrtcTransform -> identity",
+                client_id.0, sequence.0
+            );
+            let buf = x11randr::encode_get_crtc_transform_reply(sequence);
+            lock_writer()?.write_all(&buf)
+        }
+        x11randr::RR_LIST_OUTPUT_PROPERTIES => {
+            debug!(
+                "client {} #{} RANDR::ListOutputProperties -> 0 props",
+                client_id.0, sequence.0
+            );
+            let buf = x11randr::encode_list_output_properties_reply(sequence);
+            lock_writer()?.write_all(&buf)
+        }
+        x11randr::RR_GET_PANNING => {
+            debug!(
+                "client {} #{} RANDR::GetPanning -> no panning",
+                client_id.0, sequence.0
+            );
+            let timestamp = { lock_server(server)?.randr.timestamp };
+            let buf = x11randr::encode_get_panning_reply(sequence, timestamp);
+            lock_writer()?.write_all(&buf)
+        }
+        x11randr::RR_GET_OUTPUT_PRIMARY => {
+            debug!(
+                "client {} #{} RANDR::GetOutputPrimary -> none",
+                client_id.0, sequence.0
+            );
+            let buf = x11randr::encode_get_output_primary_reply(sequence, 0);
+            lock_writer()?.write_all(&buf)
+        }
+        x11randr::RR_GET_PROVIDERS => {
+            debug!(
+                "client {} #{} RANDR::GetProviders -> 0 providers",
+                client_id.0, sequence.0
+            );
+            let timestamp = { lock_server(server)?.randr.timestamp };
+            let buf = x11randr::encode_get_providers_reply(sequence, timestamp);
+            lock_writer()?.write_all(&buf)
+        }
+        x11randr::RR_GET_MONITORS => {
+            debug!("client {} #{} RANDR::GetMonitors", client_id.0, sequence.0);
+            let (timestamp, width, height, width_mm, height_mm, name_atom) = {
+                let mut s = lock_server(server)?;
+                let t = s.randr.timestamp;
+                let w = s.randr.screen_width;
+                let h = s.randr.screen_height;
+                let wmm = s.randr.width_mm;
+                let hmm = s.randr.height_mm;
+                let atom = s.atoms.intern("ynest-0", false).0;
+                (t, w, h, wmm, hmm, atom)
+            };
+            let output_ids = [crate::randr::OUTPUT_ID];
+            let buf = x11randr::encode_get_monitors_reply(
+                sequence,
+                timestamp,
+                &[x11randr::MonitorInfo {
+                    name: name_atom,
+                    primary: true,
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                    width_mm,
+                    height_mm,
+                    outputs: &output_ids,
+                }],
+            );
+            lock_writer()?.write_all(&buf)
+        }
+        x11randr::RR_GET_CRTC_GAMMA_SIZE => {
+            debug!(
+                "client {} #{} RANDR::GetCrtcGammaSize -> size=0",
+                client_id.0, sequence.0
+            );
+            let buf = x11randr::encode_get_crtc_gamma_size_reply(sequence, 0);
+            lock_writer()?.write_all(&buf)
+        }
+        x11randr::RR_GET_CRTC_GAMMA => {
+            debug!(
+                "client {} #{} RANDR::GetCrtcGamma -> size=0",
+                client_id.0, sequence.0
+            );
+            let buf = x11randr::encode_get_crtc_gamma_reply(sequence, 0);
+            lock_writer()?.write_all(&buf)
+        }
+        x11randr::RR_SELECT_INPUT => {
+            debug!(
+                "client {} #{} RANDR::SelectInput (accepted, not stored)",
+                client_id.0, sequence.0
+            );
+            // TODO: store event masks when RRScreenChangeNotify is implemented
+            Ok(())
+        }
+        x11randr::RR_SET_SCREEN_CONFIG | x11randr::RR_SET_CRTC_CONFIG => {
+            debug!(
+                "client {} #{} RANDR::SetConfig minor={} -> BadValue (read-only)",
+                client_id.0, sequence.0, minor
+            );
+            emit_x11_error(
+                writer,
+                sequence,
+                x11::error::BAD_VALUE,
+                0,
+                RANDR_MAJOR_OPCODE,
+            )
+        }
+        other => {
+            debug!(
+                "client {} #{} RANDR::unknown minor={}",
+                client_id.0, sequence.0, other
+            );
+            Ok(())
+        }
     }
 }
 
@@ -1430,10 +1710,52 @@ fn handle_request(
             }
             Ok(())
         }
-        22 => log_void(client_id, sequence, "SetSelectionOwner"),
+        22 => {
+            // SetSelectionOwner: window(4) selection(4) time(4)
+            if body.len() >= 8 {
+                let window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let selection = AtomId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+                let name = {
+                    let mut s = lock_server(server)?;
+                    if window.0 == 0 {
+                        s.selections.remove(&selection);
+                    } else {
+                        s.selections.insert(selection, window);
+                    }
+                    s.atoms.name(selection).map(str::to_owned)
+                };
+                debug!(
+                    "client {} #{} SetSelectionOwner {} -> 0x{:x}",
+                    client_id.0,
+                    sequence.0,
+                    name.as_deref().unwrap_or("?"),
+                    window.0
+                );
+            } else {
+                debug!(
+                    "client {} #{} SetSelectionOwner (short body)",
+                    client_id.0, sequence.0
+                );
+            }
+            Ok(())
+        }
         23 => {
-            log_reply(client_id, sequence, "GetSelectionOwner");
-            x11::write_get_selection_owner_reply(&mut *lock_writer()?, sequence, ResourceId(0))
+            // GetSelectionOwner: selection(4)
+            let owner = if body.len() >= 4 {
+                let selection = AtomId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                let s = lock_server(server)?;
+                s.selections
+                    .get(&selection)
+                    .copied()
+                    .unwrap_or(ResourceId(0))
+            } else {
+                ResourceId(0)
+            };
+            debug!(
+                "client {} #{} GetSelectionOwner -> 0x{:x}",
+                client_id.0, sequence.0, owner.0
+            );
+            x11::write_get_selection_owner_reply(&mut *lock_writer()?, sequence, owner)
         }
         25 => {
             if let Some(req) = x11::send_event_request(header.data, body) {
@@ -2308,11 +2630,31 @@ fn handle_request(
         96 => log_void(client_id, sequence, "RecolorCursor"),
         98 => {
             let name = x11::query_extension_name(body);
+            let (present, major_opcode, first_event, first_error) = if name == "RANDR" {
+                (
+                    true,
+                    RANDR_MAJOR_OPCODE,
+                    RANDR_FIRST_EVENT,
+                    RANDR_FIRST_ERROR,
+                )
+            } else {
+                (false, 0, 0, 0)
+            };
             debug!(
-                "client {} #{} QueryExtension {:?} -> absent",
-                client_id.0, sequence.0, name
+                "client {} #{} QueryExtension {:?} -> {}",
+                client_id.0,
+                sequence.0,
+                name,
+                if present { "present" } else { "absent" }
             );
-            x11::write_query_extension_reply(&mut *lock_writer()?, sequence, false, 0, 0, 0)
+            x11::write_query_extension_reply(
+                &mut *lock_writer()?,
+                sequence,
+                present,
+                major_opcode,
+                first_event,
+                first_error,
+            )
         }
         99 => {
             log_reply(client_id, sequence, "ListExtensions");
@@ -2352,6 +2694,14 @@ fn handle_request(
             x11::write_get_modifier_mapping_reply(&mut *lock_writer()?, sequence)
         }
         127 => log_void(client_id, sequence, "NoOperation"),
+        RANDR_MAJOR_OPCODE => handle_randr_request(
+            client_id,
+            server,
+            writer,
+            sequence,
+            header.data, // RANDR minor opcode
+            body,
+        ),
         opcode => {
             debug!(
                 "client {} #{} unsupported opcode {} ({} bytes)",

@@ -121,8 +121,9 @@ Implementation plan:
 
 ### Out of scope for Phase 1
 
-- BIG-REQUESTS, MIT-SHM, RANDR, XKB, XFIXES, DAMAGE, COMPOSITE, SYNC,
+- BIG-REQUESTS, MIT-SHM, XKB, XFIXES, DAMAGE, COMPOSITE, SYNC,
   PRESENT, SHAPE, RENDER, XInput2, GLX. These are Phase 3+.
+- RANDR moved to Phase 2 (compatibility stub landed).
 - Big-endian clients.
 - Selections / clipboard (Phase 2).
 
@@ -136,16 +137,29 @@ properties. Run a simple WM (Openbox / i3 / awesome / fluxbox).
 
 In rough priority order:
 
-- [ ] **Nested RANDR compatibility stub.** Advertise `RANDR` and expose
-      one connected output / one CRTC / one mode matching the current
-      `ynest` screen size. Implement the query path needed by simple
-      window managers first: `RRQueryVersion`,
-      `RRGetScreenResourcesCurrent`, `RRGetOutputInfo`,
-      `RRGetCrtcInfo`, and `RRGetScreenSizeRange`; keep setters
-      unsupported/no-op for now. Design:
+- [x] **Nested RANDR compatibility stub.** Advertises `RANDR` (major
+      opcode 128) via `QueryExtension` and exposes one connected output
+      (`ynest-0`), one CRTC, and one mode matching the current `ynest`
+      screen size. Implements `RRQueryVersion` (1.5), `RRGetScreenSizeRange`,
+      `RRGetScreenResources`, `RRGetScreenResourcesCurrent`, `RRGetOutputInfo`,
+      `RRGetCrtcInfo`, `RRGetCrtcGammaSize` (size=0), `RRGetCrtcGamma` (size=0),
+      `RRGetMonitors` (RANDR 1.5, returns single `ynest-0` monitor), and
+      `RRSelectInput` (accepted, not stored). Mutation paths
+      (`RRSetScreenConfig`, `RRSetCrtcConfig`) return `BadValue`.
+      Also fixed `SetSelectionOwner`/`GetSelectionOwner` to use a real
+      per-server selection ownership map (needed for ICCCM WM_S0 acquisition).
+      Design:
       [`2026-04-29-nested-randr-compat-design.md`](superpowers/specs/2026-04-29-nested-randr-compat-design.md).
       Plan:
       [`2026-04-29-nested-randr-compat.md`](superpowers/plans/2026-04-29-nested-randr-compat.md).
+      **Validated:** `xrandr -q` shows `ynest-0 connected 800x600`; `fvwm3`
+      initializes RANDR 1.5, acquires WM_S0, and enters its main event loop.
+
+      Follow-ups:
+      - Host-window resize propagation → update `RandrState` dimensions.
+      - `RRScreenChangeNotify` delivery to clients that called `RRSelectInput`.
+      - `RRGetScreenInfo` (legacy RANDR 1.0) if a client probes it.
+      - Extension-specific error codes (`BadRROutput`, `BadRRCrtc`) instead of `BadValue`.
 
 Other Phase 2 work not started yet.
 

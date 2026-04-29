@@ -12,6 +12,8 @@ use keysyms::keysyms_for_keycode;
 mod wire;
 use wire::*;
 
+pub mod randr;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClientByteOrder {
     LittleEndian,

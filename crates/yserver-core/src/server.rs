@@ -11,7 +11,7 @@ use std::{
 
 use yserver_protocol::x11::{self, AtomId, ClientByteOrder, ClientId, ResourceId, SequenceNumber};
 
-use crate::resources::ResourceTable;
+use crate::{randr::RandrState, resources::ResourceTable};
 
 pub const FIRST_CLIENT_BASE: u32 = 0x0010_0000;
 pub const PER_CLIENT_MASK: u32 = 0x000F_FFFF;
@@ -104,6 +104,9 @@ pub struct ServerState {
     pub clients: HashMap<u32, ClientHandle>,
     pub id_allocator: IdAllocator,
     pub start_instant: Instant,
+    pub randr: RandrState,
+    /// Selection ownership: maps selection atom → owning window (ResourceId).
+    pub selections: HashMap<AtomId, ResourceId>,
 }
 
 impl ServerState {
@@ -115,6 +118,8 @@ impl ServerState {
             clients: HashMap::new(),
             id_allocator: IdAllocator::new(),
             start_instant: Instant::now(),
+            randr: RandrState::nested(0, 800, 600),
+            selections: HashMap::new(),
         }
     }
 
