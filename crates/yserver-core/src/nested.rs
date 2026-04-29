@@ -495,6 +495,32 @@ fn spawn_keyboard_forwarder(
     });
 }
 
+/// Walk every mapped descendant of `root` and send Expose to those that
+/// selected ExposureMask.  Used after a top-level window becomes viewable so
+/// that deeply-nested widgets (e.g. Xt ClockWidget) redraw immediately.
+fn emit_expose_subtree(server: &Arc<Mutex<ServerState>>, root: ResourceId) {
+    let children = match server.lock() {
+        Ok(s) => s.resources.children(root).to_vec(),
+        Err(_) => return,
+    };
+    for child in children {
+        let extents = match server.lock() {
+            Ok(s) => s
+                .resources
+                .window(child)
+                .filter(|w| w.map_state == MapState::Viewable)
+                .map(|w| (w.width, w.height)),
+            Err(_) => None,
+        };
+        if let Some((w, h)) = extents {
+            crate::server::emit_window_event(server, child, 0x0000_8000, |buf, seq, order| {
+                x11::encode_expose_event(buf, seq, order, child, w, h);
+            });
+            emit_expose_subtree(server, child);
+        }
+    }
+}
+
 fn set_focused_window(
     focused_window: &Arc<Mutex<ResourceId>>,
     server: &Arc<Mutex<ServerState>>,
@@ -1223,6 +1249,11 @@ fn handle_request(
                                     );
                                 },
                             );
+                            // Descendants that were already mapped (e.g. Xt widget children)
+                            // are now viewable; send them Expose so they redraw immediately.
+                            if host_xid.is_some() {
+                                emit_expose_subtree(server, window);
+                            }
                         }
                     }
                 }
