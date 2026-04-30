@@ -648,6 +648,70 @@ impl HostX11 {
         self.stream.flush()
     }
 
+    /// Forward RENDER::Trapezoids (minor=10) verbatim to the host.
+    /// Per-trapezoid FIXED-point coords have `x_off`/`y_off` (in pixels)
+    /// added so child-window pictures land at the right offset on the
+    /// shared host top-level. For top-level pictures the offsets are 0
+    /// and this is a straight passthrough.
+    pub fn render_trapezoids(
+        &mut self,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
+        host_mask_format: u32,
+        src_x: i16,
+        src_y: i16,
+        traps: &[u8],
+        x_off: i16,
+        y_off: i16,
+    ) -> io::Result<()> {
+        let Some(r) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let opcode = r.opcode;
+        let n_traps = traps.len() / 40;
+        // header(4) + op_pad(4) + src(4) + dst(4) + mask_format(4)
+        // + src_xy(4) = 24 bytes = 6 units, plus 10 units (40 bytes) per trap
+        let length_units = 6u16 + (n_traps as u16) * 10;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::with_capacity(24 + n_traps * 40);
+        out.push(opcode);
+        out.push(10); // Trapezoids
+        write_u16(&mut out, length_units);
+        out.push(op);
+        out.extend_from_slice(&[0, 0, 0]); // pad
+        write_u32(&mut out, host_src);
+        write_u32(&mut out, host_dst);
+        write_u32(&mut out, host_mask_format);
+        write_i16(&mut out, src_x);
+        write_i16(&mut out, src_y);
+
+        // FIXED is i32 with 16 bits of fraction; integer offset is
+        // shifted left by 16 before adding.
+        let dx = (i32::from(x_off)) << 16;
+        let dy = (i32::from(y_off)) << 16;
+        for trap in traps.chunks_exact(40) {
+            // Y-coords at offsets 0, 4, 12, 20, 28, 36
+            // X-coords at offsets 8, 16, 24, 32
+            let mut t = [0u8; 40];
+            t.copy_from_slice(trap);
+            let patch = |t: &mut [u8; 40], off: usize, delta: i32| {
+                let v = i32::from_le_bytes([t[off], t[off + 1], t[off + 2], t[off + 3]])
+                    .wrapping_add(delta);
+                t[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            };
+            for &y_off_in_trap in &[0usize, 4, 12, 20, 28, 36] {
+                patch(&mut t, y_off_in_trap, dy);
+            }
+            for &x_off_in_trap in &[8usize, 16, 24, 32] {
+                patch(&mut t, x_off_in_trap, dx);
+            }
+            out.extend_from_slice(&t);
+        }
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
+
     pub fn render_query_version(&mut self) -> io::Result<(u32, u32)> {
         let Some(r) = self.render.as_ref() else {
             return Ok((0, 0));

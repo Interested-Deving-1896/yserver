@@ -869,6 +869,63 @@ fn handle_render_request(
             }
             Ok(())
         }
+        // Trapezoids (minor=10) — anti-aliased trapezoid list.
+        // body: op(1) pad(3) src(4) dst(4) mask_format(4) src_xy(4) traps(N*40)
+        10 => {
+            if body.len() < 20 {
+                return Ok(());
+            }
+            let op = body[0];
+            let src = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+            let dst = ResourceId(u32::from_le_bytes([body[8], body[9], body[10], body[11]]));
+            let ynest_mask_format = u32::from_le_bytes([body[12], body[13], body[14], body[15]]);
+            let src_x = i16::from_le_bytes([body[16], body[17]]);
+            let src_y = i16::from_le_bytes([body[18], body[19]]);
+            let traps = &body[20..];
+
+            let (host_src, host_dst, dst_x_off, dst_y_off, host_mask_format) = {
+                let s = lock_server(server)?;
+                let host_src = s.resources.picture(src).map(|p| p.host_picture_xid);
+                let (host_dst, x_off, y_off) = s.resources.picture(dst).map_or((None, 0, 0), |p| {
+                    (Some(p.host_picture_xid), p.x_offset, p.y_offset)
+                });
+                let host_fmt = if ynest_mask_format == 0 {
+                    Some(0u32)
+                } else {
+                    drop(s);
+                    lock_host().and_then(|h| h.render_format_for_ynest_id(ynest_mask_format))
+                };
+                (host_src, host_dst, x_off, y_off, host_fmt)
+            };
+
+            debug!(
+                "client {} #{} RENDER::Trapezoids op={} src=0x{:x}->{:?} dst=0x{:x}->{:?} traps={}",
+                client_id.0,
+                sequence.0,
+                op,
+                src.0,
+                host_src,
+                dst.0,
+                host_dst,
+                traps.len() / 40
+            );
+            if let (Some(host_src), Some(host_dst), Some(host_mask_fmt), Some(mut h)) =
+                (host_src, host_dst, host_mask_format, lock_host())
+            {
+                let _ = h.render_trapezoids(
+                    op,
+                    host_src,
+                    host_dst,
+                    host_mask_fmt,
+                    src_x,
+                    src_y,
+                    traps,
+                    dst_x_off,
+                    dst_y_off,
+                );
+            }
+            Ok(())
+        }
         // FreePicture (minor=7)
         7 => {
             let Some(pic_id) = x11::render_free_resource_id(body) else {
