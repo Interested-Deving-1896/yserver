@@ -129,19 +129,27 @@ When a client sends a request with major opcode 136, extract `minor` and call
 
 ### Minors proxied
 
-| Minor | Name            | Notes |
-|-------|-----------------|-------|
-| 0     | UseExtension    | Version negotiation |
-| 1     | SelectEvents    | Store subscription mask per client; no XKB events forwarded in Phase 3.1 |
-| 4     | GetState        | Current modifier state |
-| 8     | GetMap          | Key types + sym map — primary payload Xlib needs |
-| 10    | GetCompatMap    | Compat actions |
-| 14    | GetIndicatorState | Current LED state |
-| 17    | GetNames        | Key/group name atoms |
-| 20    | GetControls     | Keyboard control bits |
+| Minor | Name              | Notes |
+|-------|-------------------|-------|
+| 0     | UseExtension      | Version negotiation; reply proxied |
+| 1     | SelectEvents      | **No-reply request.** Store mask locally; do NOT use the reply-waiting proxy helper or it will deadlock. Forward to host fire-and-forget (or consume locally since XKB events are not forwarded in Phase 3.1). |
+| 4     | GetState          | Current modifier state; reply proxied |
+| 6     | GetControls       | Keyboard control bits; reply proxied |
+| 8     | GetMap            | Key types + sym map — primary payload Xlib needs; reply proxied |
+| 10    | GetCompatMap      | Compat actions; reply proxied |
+| 12    | GetIndicatorState | Current LED state; reply proxied |
+| 17    | GetNames          | Key/group name atoms; reply proxied |
+| 24    | GetDeviceInfo     | Per-device indicator info; proxy or return minimal empty reply |
 
 All minors not in this table return an empty unsupported-minor reply rather
 than a hard error, so future additions do not break clients.
+
+### Sequence-number rewriting for proxied replies
+
+Host replies contain the host connection's sequence number in bytes 2–3. Before
+writing any raw proxy reply to a nested client, overwrite bytes 2–3 with the
+nested client's own request sequence number. Failure to do this causes Xlib to
+discard the reply as a sequence mismatch and hang waiting for the next one.
 
 ### Known limitation — atoms in GetNames
 
@@ -178,13 +186,14 @@ wrap our existing pointer/keyboard events in the XI2 wire format.
 
 ### Requests handled
 
-| Minor | Name             | Behaviour |
-|-------|------------------|-----------|
-| 44    | GetClientPointer | Return master pointer id=2 |
-| 45    | SetClientPointer | Accept, reply success, no-op |
-| 46    | SelectEvents     | Store per-(window, deviceid) event mask in client state |
-| 47    | QueryVersion     | Return major=2, minor=2 |
-| 48    | QueryDevice      | Return 2 synthetic master devices |
+| Minor | Name               | Behaviour |
+|-------|--------------------|-----------|
+| 44    | SetClientPointer   | Accept, reply success, no-op |
+| 45    | GetClientPointer   | Return master pointer id=2 |
+| 46    | SelectEvents       | Store per-(window, deviceid) event mask in client state |
+| 47    | QueryVersion       | Return major=2, minor=2 |
+| 48    | QueryDevice        | Return 2 synthetic master devices |
+| 60    | GetSelectedEvents  | Return the stored xi2_masks for the requested window |
 
 All other minors return a generic empty reply so unknown XI2 requests do not
 block clients.
@@ -242,7 +251,7 @@ KeyRelease (3):
 byte  0:     35  (GenericEvent type)
 byte  1:     137 (XI2 major opcode)
 bytes 2–3:   sequence number
-bytes 4–7:   length = 12  (additional CARD32s beyond the 32-byte base)
+bytes 4–7:   length = 13  (additional CARD32s beyond the 32-byte base)
 bytes 8–9:   evtype
 bytes 10–11: deviceid
 bytes 12–15: time
@@ -250,6 +259,7 @@ bytes 16–19: detail  (keycode or button number)
 bytes 20–23: root window id
 bytes 24–27: event window id
 bytes 28–31: child window id (0 if none)
+                                    ← 32-byte GenericEvent boundary
 bytes 32–35: root_x  FP1616  (i16 coord << 16)
 bytes 36–39: root_y  FP1616
 bytes 40–43: event_x FP1616
@@ -257,46 +267,64 @@ bytes 44–47: event_y FP1616
 bytes 48–49: buttons_len = 1  (one CARD32 for 32 button bits)
 bytes 50–51: valuators_len = 0
 bytes 52–53: sourceid  (same as deviceid)
-bytes 54–55: flags = 0
-bytes 56–59: mods_base
-bytes 60–63: mods_latched
-bytes 64–67: mods_locked
-bytes 68–71: mods_effective  (current tracked modifier state)
-bytes 72–75: group (base/latched/locked/effective, all 0 in Phase 3.1)
-bytes 76–79: button mask CARD32 = 0
+bytes 54–55: pad = 0
+bytes 56–59: flags CARD32 = 0
+bytes 60–63: mods_base
+bytes 64–67: mods_latched
+bytes 68–71: mods_locked
+bytes 72–75: mods_effective  (current tracked modifier state)
+bytes 76–79: group (base/latched/locked/effective, all 0 in Phase 3.1)
+bytes 80–83: button mask CARD32 = 0
 ```
 
-Total: 80 bytes. The `length` field = (80 − 32) / 4 = 12.
+Total: 84 bytes. The `length` field = (84 − 32) / 4 = 13.
 
 New encoder: `encode_xi2_device_event` in `yserver-protocol/src/x11/mod.rs`.
 
 ### Enter/Leave GenericEvent (XI_Enter=7, XI_Leave=8)
 
-Separate structure. Reuses the device-event header up to `child`, then:
+Different structure from XIDeviceEvent. `sourceid`, `mode`, `detail` appear
+**before** `root`/`event`/`child` (before the 32-byte boundary):
 
 ```
-bytes 32–35: root_x FP1616
-bytes 36–39: root_y FP1616
+byte  0:     35  (GenericEvent type)
+byte  1:     137 (XI2 major opcode)
+bytes 2–3:   sequence number
+bytes 4–7:   length = 11  (additional CARD32s beyond the 32-byte base)
+bytes 8–9:   evtype
+bytes 10–11: deviceid
+bytes 12–15: time
+bytes 16–17: sourceid
+byte  18:    mode   (0=Normal)
+byte  19:    detail (0=Ancestor, 1=Virtual, etc.)
+bytes 20–23: root window id
+bytes 24–27: event window id
+bytes 28–31: child window id
+                                    ← 32-byte GenericEvent boundary
+bytes 32–35: root_x  FP1616
+bytes 36–39: root_y  FP1616
 bytes 40–43: event_x FP1616
 bytes 44–47: event_y FP1616
-byte  48:    mode   (0=Normal)
-byte  49:    detail (0=Ancestor)
-byte  50:    same_screen (1)
-byte  51:    focus (0)
-bytes 52–53: buttons_len = 1
-bytes 54–55: padding
-bytes 56–75: mods + group (same layout as DeviceEvent)
-bytes 76–79: button mask = 0
+byte  48:    same_screen (1)
+byte  49:    focus (0)
+bytes 50–51: buttons_len = 1
+bytes 52–67: mods (base/latched/locked/effective CARD32s)
+bytes 68–71: group (base/latched/locked/effective CARD8s)
+bytes 72–75: button mask CARD32 = 0
 ```
 
-Total: 80 bytes, length=12.
+Total: 76 bytes, length = (76 − 32) / 4 = 11.
+
+`xXIFocusInEvent` / `xXIFocusOutEvent` use the same wire layout as
+`xXIEnterEvent` (typedef aliases in the protocol header).
 
 New encoder: `encode_xi2_enter_leave_event`.
 
 ### FocusIn/Out GenericEvent (XI_FocusIn=9, XI_FocusOut=10)
 
-Same layout as Enter/Leave but without coordinates (set to zero). Delivered
-when `SetInputFocus` changes the focused window.
+Identical wire layout to Enter/Leave (`xXIFocusInEvent` is a typedef alias for
+`xXIEnterEvent` in the protocol headers). Set coords to zero, `same_screen=1`,
+`focus=1`. Delivered when `SetInputFocus` changes the focused window.
 
 ### Dual-delivery strategy
 
