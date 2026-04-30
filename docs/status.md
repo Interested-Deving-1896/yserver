@@ -454,6 +454,18 @@ sessions.
   artifacts may also include subtly mis-encoded glyphs or composites
   for e16's themed buttons.
 
+- **Root window resize plumbing.** `handle_host_container_resize`
+  already updates `RandrState`, the nested `ROOT_WINDOW` dimensions,
+  and emits `RRScreenChangeNotify` / CRTC- and output-change events
+  to subscribers with `RRSelectInput` masks. Missing pieces:
+  `ConfigureNotify` on `ROOT_WINDOW` to clients with
+  `StructureNotify` on root (panels and "fill the screen" clients
+  rely on this), re-mapping of the container's `bg_pixel` to the new
+  bounds (host should auto-handle this but verify), and exposing the
+  new size to clients that re-query via `GetGeometry`. Clients with
+  no RANDR awareness don't reflow when the host window is resized
+  today.
+
 - **Validation runs:** Openbox, Fluxbox (called out under Phase 2 as
   deferred), then back to wmaker/e16 once SHAPE forwarding lands to
   confirm the chrome artifacts go away.
