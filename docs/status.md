@@ -966,7 +966,166 @@ Goal: replace the nested backend with a real backend on libinput, udev,
 GBM, EGL/Vulkan, and atomic KMS. Hotplug, multi-monitor presentation,
 session management, fullscreen / direct-scanout paths.
 
-Not started. The `yserver` binary is a placeholder.
+### Phase 6.1 — DRM/KMS bootstrap (in progress)
+
+Goal: replace the placeholder `crates/yserver/src/bin/yserver.rs` with
+a real DRM/KMS binary that boots in `virtme-ng`, sets a mode on
+virtio-gpu, runs a libinput-driven single-thread `epoll` loop, and
+paints a moving rectangle into a dumb-buffer swapchain. Slice B of the
+B → C trajectory; explicitly excludes any `yserver-core` integration.
+
+Design:
+[`2026-05-02-phase6-bootstrap-design.md`](superpowers/specs/2026-05-02-phase6-bootstrap-design.md).
+Plan:
+[`2026-05-02-phase6-bootstrap.md`](superpowers/plans/2026-05-02-phase6-bootstrap.md).
+
+#### Landed (branch `phase6-bootstrap`)
+
+- [x] **Step 1 — C-trait spike.** Read-only audit across
+      `resources.rs` / `host_x11.rs` / `nested.rs` confirmed a future
+      `Backend` trait can be carved out (~60–80 methods clustered into
+      seven groups; 52 `host.lock()` call-sites, mostly uniform single-
+      call leaves with a documented minority of multi-call transactions;
+      16 host-XID slots in `resources.rs` for opaque-handle migration;
+      `sync_main_connection` duct-tape dissolves for non-X-host
+      backends). Verdict: **go for B**, with a 5-item C-prework reading
+      list captured in the design doc.
+- [x] **Step 2 — Workspace skeleton.** Added `drm = 0.15`,
+      `input = 0.10`, `nix = 0.31` (event/fs/ioctl/mman/poll/signal),
+      `signal-hook = 0.4`. `crates/yserver` now hosts a lib (`src/lib.rs`
+      with `pub mod drm/input/present`) plus the existing `ynest` and
+      `yserver` binaries. The yserver binary is now a thin shell calling
+      `yserver::run()`.
+- [x] **Step 3 — DRM Device + master.** `drm::Device` wraps
+      `std::fs::File` for `/dev/dri/card0`, impls `drm::Device` +
+      `drm::control::Device`, acquires master on open, releases on
+      Drop. Distinct error messages per `io::ErrorKind` for
+      NotFound / PermissionDenied / EBUSY.
+- [x] **Step 4 — `pick_mode` policy (TDD).** Pure-logic: prefer the
+      connector's preferred mode → fall back to 1024×768@60 → first
+      → None. Four unit tests written first.
+- [x] **Step 5 — Atomic modeset.** Enable `Atomic` +
+      `UniversalPlanes` client capabilities. `discover_output`
+      walks connector → encoder → CRTC → primary plane (via
+      `possible_crtcs` filter and the "type" property).
+      `dump_properties` debug-logs every property. `commit_modeset`
+      builds an `AtomicModeReq` with name-resolved properties
+      (CRTC_ID, MODE_ID blob, ACTIVE, FB_ID, SRC_*/CRTC_*) and
+      commits with `ALLOW_MODESET`.
+- [x] **Step 6 — Buffer wrapper.** RAII `drm::Buffer` owning a
+      DumbBuffer + framebuffer + raw mmap (escapes `DumbMapping`'s
+      lifetime via `mem::forget`, takes over the unmap). Drop order:
+      destroy_framebuffer → munmap → destroy_dumb_buffer. Holds
+      `Arc<Device>` so `Vec<Buffer>` works in `Swapchain`.
+- [x] **Step 7 — Swapchain state machine (TDD).** Four-state enum
+      `{Free, Acquired, Submitted, Scanout}` with `acquire / submit /
+      complete` transitions. `with_initial_scanout(n, idx)` for the
+      first-modeset case. `submitted_idx()` is the workaround for the
+      drm 0.15 crate stripping the kernel `user_data` from
+      `PageFlipEvent` — invariant: at most one buffer is `Submitted`
+      at a time. Nine unit tests.
+- [x] **Step 8 — Page-flip events.** `submit_flip` atomic-commits
+      a new FB_ID on the primary plane (with unchanged CRTC_ID for
+      the bind) and `PAGE_FLIP_EVENT | NONBLOCK`. `drain_events`
+      reads `Device::receive_events()` and dispatches PageFlip
+      completions to a closure. The flipped buffer's index is
+      identified via `swapchain.submitted_idx()`.
+- [x] **Step 9 — libinput.** `input::Context` wraps `input::Libinput`
+      via udev seat0 with a `LibinputInterface` honouring the flags
+      libinput requests. `dispatch()` translates keyboard / pointer
+      motion / button events to a yserver-local `InputEvent` enum
+      (keycodes only — no xkbcommon, that's C's job).
+- [x] **Step 10 — Throwaway painter (TDD).** `present::State`
+      (rect + cursor + velocity) + `update` advances state and
+      bounces the rect off framebuffer edges, applies pointer motion
+      to the cursor. `paint` writes a 60×60 magenta rect, 4×4 white
+      cursor, dark-grey background into a `Buffer`. Three TDD tests
+      cover velocity, edge bounce, cursor follow.
+- [x] **Step 11 — Single-thread epoll loop.** `present::run_loop`
+      uses `nix::sys::epoll::Epoll` over `[drm.fd, libinput.fd]`
+      (signalfd added in Step 12). Always-animating: every flip
+      completion computes `dt`, advances state, paints the next
+      acquired buffer, submits the next flip. CPU is proportional
+      to refresh rate.
+- [x] **Step 12 — signalfd + clean shutdown.** SIGINT/SIGTERM
+      blocked via `sigprocmask(SIG_BLOCK)` *before* any thread
+      spawn so libinput's internal threads inherit the mask.
+      `SignalFd` added to the epoll set as the third source. On
+      signal: log, set `running = false`, fall through to break.
+      After loop exit: `disable_output` atomic-commits FB_ID=0,
+      CRTC_ID=0 on the plane, ACTIVE=0 + MODE_ID=0 on the CRTC,
+      CRTC_ID=0 on the connector. RAII unwinds: swapchain → device.
+
+#### Validation
+
+End-to-end vng-headless smoke (`just yserver-headless` and
+`just yserver-headless-shutdown`):
+
+- DRM open + master acquire + atomic capabilities ✓
+- Connector discovery: virtio-gpu's `Virtual-1` connected;
+  `pick_mode` selects the preferred 1280×800@75 ✓
+- Modeset commit: kernel accepts the full `AtomicModeReq`
+  (connector + CRTC + plane + FB + mode blob) ✓
+- Page-flip cadence ≈ refresh rate: 217 flips in 3.0 s = 72.3 Hz
+  on a 75 Hz mode (within 4%), 19 flips in 250 ms = 76 Hz over
+  short windows; well within the plan's ±10% gate ✓
+- Clean shutdown: SIGTERM observed via signalfd, loop exits,
+  `disable_output` succeeds, master released ✓
+- libinput attaches to seat0 inside the guest (input event
+  count is 0 in headless because no QEMU input source) ✓
+
+Re-run idempotence: the second back-to-back run succeeds without
+EBUSY on master acquire (the explicit `disable_output` +
+RAII Drop on Buffer + Drop on Device clear the prior state).
+
+Static gates: `cargo build --bin yserver` green; `cargo clippy
+-p yserver --all-targets` clean (one
+`#[allow(clippy::too_many_arguments)]` on `run_loop`); `cargo
+test -p yserver --lib` 16 passing (4 pick_mode + 9 swapchain +
+3 painter).
+
+Code review via codex on Steps 1, 5, 8, 12 (the design-heavy
+ones). Review pass on Step 1 surfaced three real issues (call-site
+uniformity overstated, missing resource-coupling rows, hidden
+two-phase allocation pattern) that were folded back in. Reviews
+on 5/8/12 found no blocking issues.
+
+The bwrap sandbox running this Claude Code session has no
+working virtio-gpu inside vng (different from the host shell);
+all vng smokes were run by the human on the host outside bwrap.
+
+#### Phase 6.1 follow-ups (out of scope for the bootstrap)
+
+Explicitly deferred — each is a self-contained Phase 6.x slice:
+
+- **Hotplug.** No connector-add / -remove handling. Single
+  output, single mode, modeset at startup only.
+- **Multi-output / multi-plane.** `discover_output` picks the
+  first connected connector and walks to one CRTC + one primary
+  plane. Overlay/cursor planes ignored.
+- **GBM / EGL / GLES / Vulkan.** Dumb buffers + CPU painting
+  is the entire render path. GL is a Phase 6.x optimization.
+- **logind / VT switching / suspend-resume / console restore.**
+  Not implemented; B is vng-only by design and bare-metal is a
+  Phase 6.x slice.
+- **Bare-metal targets** (real Intel/AMD/NVIDIA on the
+  CachyOS host).
+- **xkbcommon.** Keycodes are emitted as raw Linux input
+  keycodes; keysym translation is C's responsibility.
+- **`yserver-core` integration.** Slice B explicitly excludes
+  any X11 protocol code. The `Backend` trait extraction +
+  C-prework items captured in the design doc are slice C.
+- **Bigger validation surface.** `just yserver` is now validated
+  graphically. Root cause of the previous exit 255: `vng
+  --graphics` starts a guest Xorg session and runs the payload as
+  the host user (`jos`), so `yserver` failed to acquire DRM master
+  on `/dev/dri/card0` with `EACCES`. The graphical recipes now use
+  normal vng execution (payload stays root) plus explicit QEMU
+  options `-display gtk -vga none -device virtio-gpu-pci`, avoiding
+  the guest-Xorg wrapper while still opening a QEMU window.
+  Validated: `just yserver` shows the moving rectangle in the QEMU
+  window; a 3-second auto-shutdown smoke produced 177 flips and
+  clean signalfd shutdown.
 
 ## Phase 7 — Security hardening
 
