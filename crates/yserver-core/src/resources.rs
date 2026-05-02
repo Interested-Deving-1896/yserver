@@ -699,14 +699,26 @@ impl ResourceTable {
 
     #[must_use]
     pub fn top_level_host_target(&self, id: ResourceId) -> Option<TopLevelTarget> {
-        let mut current = self.windows.get(&id.0)?;
+        let start = self.windows.get(&id.0)?;
+        // Phase 3.6 Steps 3+4 (combined): every InputOutput window has
+        // its own host_xid (Step 2 invariant) and the host tree mirrors
+        // the local tree (Step 4 ReparentWindow + Configure forwarding).
+        // Drawing on a sub-window targets the sub-window's host xid
+        // directly — no coordinate translation; host clipping handles
+        // sibling occlusion. The walk-up fallback only kicks in for
+        // windows that don't have a host xid (InputOnly, or pre-
+        // HostX11 init).
+        if let Some(host_xid) = start.host_xid {
+            return Some(TopLevelTarget {
+                top_level: id,
+                host_xid,
+                x_offset: 0,
+                y_offset: 0,
+            });
+        }
+        let mut current = start;
         let mut x_offset: i16 = 0;
         let mut y_offset: i16 = 0;
-        // Walk up until we reach a window whose parent is root (a top-level)
-        // or root itself. Both cases use the current window's host_xid:
-        // top-levels get one when their host subwindow is created, and root
-        // is wired to the host container at startup so root drawing routes
-        // there as well.
         while current.parent != ROOT_WINDOW && current.id != ROOT_WINDOW {
             x_offset = x_offset.wrapping_add(current.x);
             y_offset = y_offset.wrapping_add(current.y);
@@ -966,11 +978,11 @@ impl ResourceTable {
         window.parent = request.parent;
         window.x = request.x;
         window.y = request.y;
-        // Moving a former top-level into the tree: its host subwindow is no longer
-        // the rendering target (top_level_host_target will follow the new top-level).
-        if old_parent == ROOT_WINDOW && request.parent != ROOT_WINDOW {
-            window.host_xid = None;
-        }
+        // Phase 3.6 Step 4a forwards XReparentWindow to the host, so
+        // the host subwindow stays alive and continues to be the
+        // rendering target. (Pre-Step-4a code destroyed the host
+        // subwindow when a top-level moved away from root and cleared
+        // host_xid here; that's no longer correct.)
 
         Ok(ReparentResult {
             window: request.window,

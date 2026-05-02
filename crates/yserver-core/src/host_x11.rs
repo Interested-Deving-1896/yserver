@@ -1224,20 +1224,34 @@ impl HostX11 {
         height: u16,
         border_width: u16,
         visual: HostSubwindowVisual,
+        background_pixel: Option<u32>,
+        background_pixmap: Option<u32>,
     ) -> io::Result<()> {
         let mut out = Vec::new();
-        // Subwindow attributes:
-        // - bit-gravity = NorthWest (1<<4): preserve pixels on a resize.
-        // - backing-store = Always (1<<6, value 2): the host preserves the
-        //   subwindow's pixel content even when occluded or its parent is
-        //   resized in ways that would otherwise discard it. Without this
-        //   the host can drop pixels when the container is resized and
-        //   apps appear blank until the next Expose-driven redraw.
-        // - colormap (1<<13): only set when visual differs from the
-        //   container's; the host requires a colormap whose visual matches.
+        // Subwindow value list, in increasing value-mask bit order:
+        // - bit 0: background-pixmap. If set, host auto-clears to this
+        //   pixmap on Expose / map. Takes precedence over bit 1.
+        // - bit 1: background-pixel. If set (and bit 0 isn't), host
+        //   auto-clears to this solid colour. Required so the bg shows
+        //   up without the client re-filling on every Expose.
+        // - bit 4: bit-gravity = NorthWest, preserve NW pixels on
+        //   resize.
+        // - bit 6: backing-store = Always, host keeps a backing pixmap
+        //   so partial occlusion doesn't blank our content.
+        // - bit 13: colormap; only when visual differs from parent
+        //   (Explicit).
         let needs_colormap = matches!(visual, HostSubwindowVisual::Explicit { .. });
-        let value_mask: u32 = (1 << 4) | (1 << 6) | if needs_colormap { 1 << 13 } else { 0 };
-        let value_count: u16 = 2 + u16::from(needs_colormap);
+        let mut value_mask: u32 = (1 << 4) | (1 << 6);
+        if background_pixmap.is_some() {
+            value_mask |= 1 << 0;
+        }
+        if background_pixel.is_some() && background_pixmap.is_none() {
+            value_mask |= 1 << 1;
+        }
+        if needs_colormap {
+            value_mask |= 1 << 13;
+        }
+        let value_count: u16 = u16::try_from(value_mask.count_ones()).unwrap_or(2);
         out.push(1); // CreateWindow opcode
         out.push(visual.depth());
         write_u16(&mut out, 8 + value_count); // length: 8 fixed + value words
@@ -1253,20 +1267,73 @@ impl HostX11 {
         write_u16(&mut out, 0); // class = CopyFromParent
         write_u32(&mut out, visual.visual_xid());
         write_u32(&mut out, value_mask);
+        if let Some(pix) = background_pixmap {
+            write_u32(&mut out, pix);
+        }
+        if let Some(pix) = background_pixel
+            && background_pixmap.is_none()
+        {
+            write_u32(&mut out, pix);
+        }
         write_u32(&mut out, 1); // bit-gravity = NorthWest
         write_u32(&mut out, 2); // backing-store = Always
         if let HostSubwindowVisual::Explicit { colormap_xid, .. } = visual {
             write_u32(&mut out, colormap_xid);
         }
         self.stream.write_all(&out)?;
-        self.stream.flush()?;
         self.sequence = self.sequence.wrapping_add(1);
+        // Cross-connection sync fence. The dispatch layer about to
+        // call us is going to follow up with a `ChangeWindowAttributes`
+        // on the *pump* connection (`HostInputPumpHandle::register_*`)
+        // to select `ExposureMask` on this xid. Pump and main are
+        // separate X11 connections; without a fence, the pump's CWA
+        // can arrive at the host before this CreateWindow is processed
+        // and the host returns `BadWindow`, which we absorb silently
+        // — leaving `ExposureMask` unselected, no host Expose, client
+        // never redraws. The Phase 3.6 design doc called this out
+        // (Step 2 constraint #2). One round-trip per window-create
+        // is the price for the dual-connection model; fixing it
+        // cheaper means folding the pump and main connections into
+        // one (Phase 3.7+ work).
+        self.sync_main_connection()?;
         log::debug!(
-            "create_subwindow: host_xid=0x{:x} parent=0x{:x} pos=({x},{y}) size={width}x{height} bw={border_width}",
+            "create_subwindow: host_xid=0x{:x} parent=0x{:x} pos=({x},{y}) size={width}x{height} bw={border_width} bg_pixel={background_pixel:?} bg_pixmap={background_pixmap:?}",
             host_xid,
             host_parent,
         );
         Ok(())
+    }
+
+    /// Round-trip on the main host connection: send GetInputFocus,
+    /// drain replies until the matching one arrives. Used as a fence
+    /// before any pump-connection ChangeWindowAttributes that depends
+    /// on a window we just created. Replies for unrelated requests
+    /// arriving while we wait are buffered for later
+    /// `read_response`/sync calls.
+    fn sync_main_connection(&mut self) -> io::Result<()> {
+        let sync_seq = self.sequence;
+        let mut sync = Vec::with_capacity(4);
+        sync.push(43); // GetInputFocus
+        sync.push(0);
+        write_u16(&mut sync, 1);
+        self.stream.write_all(&sync)?;
+        self.sequence = self.sequence.wrapping_add(1);
+        self.stream.flush()?;
+        if let Some(pos) = self
+            .reply_buffer
+            .iter()
+            .position(|r| r.sequence == sync_seq)
+        {
+            self.reply_buffer.remove(pos);
+            return Ok(());
+        }
+        loop {
+            let resp = read_response(&mut self.stream)?;
+            if resp.sequence == sync_seq {
+                return Ok(());
+            }
+            self.reply_buffer.push(resp);
+        }
     }
 
     pub fn destroy_subwindow(&mut self, host_xid: u32) -> io::Result<()> {
@@ -2467,8 +2534,36 @@ const POINTER_EVENT_MASK: u32 = 0x0000_0004 // ButtonPress
     | 0x0000_0040 // PointerMotion
     | 0x0000_8000; // Exposure
 
+/// Mask used for sub-window host children: Exposure only. Per X11
+/// event-propagation rules a host event with no listener at the leaf
+/// bubbles up to the closest interested ancestor — for our sub-windows
+/// that's the container, where input is dispatched. Selecting any
+/// pointer events here would short-circuit our internal dispatch and
+/// deliver to the wrong client. See Xnest `Window.c:91` and the design
+/// doc's "Input event path" section.
+const SUBWINDOW_EVENT_MASK: u32 = 0x0000_8000; // Exposure
+
 impl HostInputPumpHandle {
     pub fn register_top_level(&self, nested_id: ResourceId, host_xid: u32) -> io::Result<()> {
+        self.register_host_window(nested_id, host_xid, POINTER_EVENT_MASK)
+    }
+
+    /// Mirror a sub-window's host child for Expose-event delivery.
+    /// Adds the host_xid → nested_id mapping so the pump can route
+    /// host Exposes through `expose_event_fanout`, and selects
+    /// `ExposureMask` only on the host child. Phase 3.6 Step 3+4
+    /// invariant: every InputOutput sub-window goes through this
+    /// register call after CreateWindow + before its first map.
+    pub fn register_subwindow(&self, nested_id: ResourceId, host_xid: u32) -> io::Result<()> {
+        self.register_host_window(nested_id, host_xid, SUBWINDOW_EVENT_MASK)
+    }
+
+    fn register_host_window(
+        &self,
+        nested_id: ResourceId,
+        host_xid: u32,
+        event_mask: u32,
+    ) -> io::Result<()> {
         // Insert into the map *before* writing to X11 so that any pointer
         // events arriving on this subwindow after ChangeWindowAttributes are
         // sent can be resolved to a nested window id immediately.
@@ -2482,7 +2577,7 @@ impl HostInputPumpHandle {
         write_u16(&mut out, 4);
         write_u32(&mut out, host_xid);
         write_u32(&mut out, 1 << 11);
-        write_u32(&mut out, POINTER_EVENT_MASK);
+        write_u32(&mut out, event_mask);
         let mut stream = self
             .write_stream
             .lock()
@@ -2490,17 +2585,29 @@ impl HostInputPumpHandle {
         stream.write_all(&out)?;
         stream.flush()?;
         log::debug!(
-            "host pump: register_top_level nested=0x{:x} host=0x{:x}",
+            "host pump: register host_window nested=0x{:x} host=0x{:x} event_mask=0x{:x}",
             nested_id.0,
-            host_xid
+            host_xid,
+            event_mask
         );
         Ok(())
     }
 
-    pub fn unregister_top_level(&self, host_xid: u32) {
+    /// Drop the host_xid → nested ResourceId mapping. Used at
+    /// DestroyWindow / Reparent-away-from-root for any host-mirrored
+    /// window — top-level or sub-window — so stale host events on
+    /// the now-defunct xid drop silently instead of misrouting.
+    pub fn unregister_host_window(&self, host_xid: u32) {
         if let Ok(mut map) = self.xid_map.lock() {
             map.remove(&host_xid);
         }
+    }
+
+    /// Compatibility shim — `unregister_host_window` is the canonical
+    /// name; older call sites use this one. Will be folded into the
+    /// canonical name in a follow-up.
+    pub fn unregister_top_level(&self, host_xid: u32) {
+        self.unregister_host_window(host_xid);
     }
 
     #[must_use]

@@ -5028,11 +5028,24 @@ fn handle_request(
                 };
                 if needs_host_xid && let Some(host) = host {
                     let host_visual = resolve_host_subwindow_visual(server, window_id);
-                    let host_parent_xid = if parent == ROOT_WINDOW {
-                        host.lock().ok().map(|h| h.window_id())
-                    } else {
+                    let (host_parent_xid, host_bg_pixel, host_bg_pixmap) = {
                         let s = lock_server(server)?;
-                        s.resources.window(parent).and_then(|w| w.host_xid)
+                        let host_parent = if parent == ROOT_WINDOW {
+                            host.lock().ok().map(|h| h.window_id())
+                        } else {
+                            s.resources.window(parent).and_then(|w| w.host_xid)
+                        };
+                        // Forward the resolved local bg so the host
+                        // auto-clears to the right colour on Expose /
+                        // map. Pass the local Window's bg_pixel (which
+                        // has the X11-correct default applied) — apps
+                        // relying on the default white auto-clear
+                        // (xterm content widget, GTK content) need
+                        // this to render correctly.
+                        let local = s.resources.window(window_id);
+                        let bg_pixel = local.map(|w| w.background_pixel);
+                        let bg_pixmap = local.and_then(|w| w.background_pixmap_host_xid);
+                        (host_parent, bg_pixel, bg_pixmap)
                     };
                     let allocated_xid: Option<u32> = host_parent_xid.and_then(|host_parent| {
                         host.lock().ok().and_then(|mut h| {
@@ -5046,6 +5059,8 @@ fn handle_request(
                                 geometry.3,
                                 request.border_width,
                                 host_visual,
+                                host_bg_pixel,
+                                host_bg_pixmap,
                             ) {
                                 warn!(
                                     "client {} create_subwindow for 0x{:x} failed: {err}",
@@ -5062,28 +5077,29 @@ fn handle_request(
                             let mut s = lock_server(server)?;
                             if let Some(w) = s.resources.window_mut(window_id) {
                                 w.host_xid = Some(host_xid);
-                                if parent == ROOT_WINDOW {
-                                    // Top-level: host pump delivers
-                                    // Expose (ExposureMask selected via
-                                    // `register_top_level`), so the
-                                    // synthetic emitter must stay
-                                    // silent.
-                                    w.uses_synthetic_expose = false;
-                                }
-                                // Sub-windows keep
-                                // `uses_synthetic_expose = true` (the
-                                // default) — Step 4 flips it once host
-                                // ExposureMask routing lands.
+                                // Host pump delivers Expose for every
+                                // host-mirrored window now (top-levels
+                                // get pointer events too via
+                                // register_top_level; sub-windows get
+                                // ExposureMask only via
+                                // register_subwindow). The synthetic
+                                // emitter must stay silent so we don't
+                                // double up.
+                                w.uses_synthetic_expose = false;
                             }
                         }
-                        if parent == ROOT_WINDOW
-                            && let Some(input_handle) = input_handle
-                            && let Err(err) = input_handle.register_top_level(window_id, host_xid)
-                        {
-                            warn!(
-                                "client {} register_top_level for 0x{:x} failed: {err}",
-                                client_id.0, new_id
-                            );
+                        if let Some(input_handle) = input_handle {
+                            let result = if parent == ROOT_WINDOW {
+                                input_handle.register_top_level(window_id, host_xid)
+                            } else {
+                                input_handle.register_subwindow(window_id, host_xid)
+                            };
+                            if let Err(err) = result {
+                                warn!(
+                                    "client {} register host window for 0x{:x} failed: {err}",
+                                    client_id.0, new_id
+                                );
+                            }
                         }
                     }
                 }
@@ -5631,13 +5647,16 @@ fn handle_request(
                                 client_id.0, window.0, host_xid
                             );
                         }
-                        // Map the host child only when it's a non-dormant
-                        // window — i.e. a top-level the host server is
-                        // driving. Dormant sub-windows (Phase 3.6 Step 2)
-                        // keep their host child unmapped so its bg pixel
-                        // doesn't paint over the top-level's content.
+                        // Phase 3.6 Steps 3+4: every host-mirrored
+                        // window — top-level *and* sub-window — is
+                        // mapped on the host so drawing routed to its
+                        // host xid produces visible pixels. Sibling
+                        // clipping + occlusion now flow from the host.
+                        // The synthetic-Expose gate below keeps the
+                        // synthetic emitter silent for these — host
+                        // pump is the Expose source.
+                        let _ = uses_synthetic_expose;
                         if let Some(xid) = host_xid
-                            && !uses_synthetic_expose
                             && let Some(host) = host
                             && let Ok(mut h) = host.lock()
                         {
@@ -5729,8 +5748,8 @@ fn handle_request(
                             synthetic,
                         )
                     };
+                    let _ = synthetic;
                     if let Some(xid) = host_xid
-                        && !synthetic
                         && let Some(host) = host
                         && let Ok(mut h) = host.lock()
                     {
@@ -5804,8 +5823,8 @@ fn handle_request(
                     };
                     (snapshot, host_xid, synthetic)
                 };
+                let _ = synthetic;
                 if let Some(xid) = host_xid
-                    && !synthetic
                     && let Some(host) = host
                     && let Ok(mut h) = host.lock()
                 {
@@ -5860,8 +5879,8 @@ fn handle_request(
                     pending
                 };
                 for item in pending {
+                    let _ = item.synthetic;
                     if let Some(xid) = item.host_xid
-                        && !item.synthetic
                         && let Some(host) = host
                         && let Ok(mut h) = host.lock()
                     {
