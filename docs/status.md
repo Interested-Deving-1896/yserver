@@ -597,10 +597,96 @@ host container at default 800×600):
 - **Input-shape hit testing in the pointer pump.** Already
   deferred from Phase 3.2; still deferred.
 
+## Phase 3.5 — Extension completion (MIT-SHM, DAMAGE, COMPOSITE, RENDER, GC clip-mask) ✓ COMPLETE
+
+Goal: land four extension-completion items unblocking real WM /
+desktop / compositor workloads — MIT-SHM v1.2, DAMAGE
+auto-accumulation, COMPOSITE `NameWindowPixmap`, and the missing
+RENDER `ChangePicture` XID-attribute paths. Plus an out-of-scope
+GC clip-mask pixmap forwarding fix that surfaced during validation
+and a host `PutImage` chunking fix for >256 KB images. Design doc:
+`docs/superpowers/specs/2026-05-01-phase3-5-extension-completion-design.md`.
+
+### Landed
+
+- [x] **MIT-SHM v1.2 (full).** New `unix_fd` module wrapping
+      `recvmsg(SCM_RIGHTS)` + an `FdReader` adapter so the X11 byte
+      reader can pull file descriptors out of the connection alongside
+      the protocol stream. Implemented `AttachFd`, `Detach`,
+      `CreatePixmap`, `PutImage`, `GetImage`, the legacy SysV `Attach`
+      (minor 1, used by libwraster and older toolkits), and
+      `CreateSegment` (minor 7, server-allocated `memfd` returned via
+      SCM_RIGHTS in the reply). Depth-1 `ZPixmap` stride math handles
+      the 24×24 / 40×24 / 48×48 d1 alpha masks wmaker uses for appicon
+      compositing. wmaker appicons now show their xterm / xclock icon
+      graphic (the smoking-gun fix from Phase 3.4 follow-ups).
+- [x] **DAMAGE auto-accumulation.** `accumulate_damage` /
+      `accumulate_damage_full` helpers fire `DamageNotify` at most once
+      per `Subtract` cycle (level 1, 2, 3); `Subtract` resets
+      `pending_notify_fired`. Wired into `PutImage`, `CopyArea`,
+      `CopyPlane`, `ClearArea`, MIT-SHM `PutImage` (exact rect) and
+      `PolyPoint`, `PolyLine`, `PolySegment`, `PolyRectangle`,
+      `PolyArc`, `FillPoly`, `PolyFillRectangle`, `PolyFillArc`,
+      `PolyText8/16`, `ImageText8/16` (full drawable rect —
+      conservative). Compositors now receive `DamageNotify` whenever
+      the client draws.
+- [x] **COMPOSITE `NameWindowPixmap`.** Forwards to host instead of
+      returning `BadMatch`; host COMPOSITE major opcode is probed at
+      `HostX11` init. `Vec<NamedCompositePixmap>` per `Window` tracks
+      multiple aliases; resize / destroy / `DestroySubwindows` free
+      every alias both locally and on the host. Returns `BadAlloc` if
+      the host lacks COMPOSITE (cleaner than fake aliases that break
+      pixmap-only request paths).
+- [x] **RENDER `ChangePicture` XID translation.** `CPClipMask` /
+      `CPAlphaMap` pixmap XIDs are now translated to host XIDs (was
+      silently dropped before). wmaker close-button mask + GTK font
+      rendering now land correctly on the host.
+- [x] **GC clip-mask pixmap forwarding.** `ChangeGC` `clip_mask =
+      Pixmap` is now forwarded to the host's shared GC via a new
+      `HostClipState::Pixmap` state machine; `SetClipRectangles`
+      supersedes any prior clip-mask and vice versa per the X11 spec.
+      Without this, wmaker's close-button "X" / miniaturise dot
+      symbols vanished — the depth-1 mask never landed on the host.
+      MIT-SHM `PutImage` and the synthetic `put_image` used by MIT-SHM
+      `CreatePixmap` now clear the host clip before uploading, so a
+      clip-mask left over from an unrelated draw doesn't restrict the
+      image upload.
+- [x] **Host `PutImage` chunking.** Standard `XPutImage` has a 16-bit
+      length field (max body ≈262 KB). e16's root background was an
+      800×600 d24 image (≈1.9 MB) which overflowed the length field
+      and made `HostX11::put_image` disconnect the client. Split by
+      row count to stay under the limit. (Xephyr avoids this by
+      attaching its image to a host shm segment and using
+      `XShmPutImage`; we don't share memory with the host yet, so
+      chunking is the local equivalent.)
+
+### Validation
+
+- 174 tests passing (added 12 across MIT-SHM, RENDER, DAMAGE,
+  COMPOSITE, GC clip-mask).
+- wmaker + xterm: appicon, title bar with miniaturise + close
+  buttons, fish welcome banner all visible. Appicon icon graphic
+  is now correct (was empty in Phase 3.4).
+- e16 starts and runs.
+- gtk3-demo, Java Swing, picom unaffected.
+
+### Phase 3.5 follow-ups
+
+- **RENDER coverage audit on real e16 / GTK3 clients.** Only the
+  two known XID-attribute drops are fixed; anything else surfacing
+  during validation rolls into Phase 3.6.
+- **Damage on RENDER drawing ops.** First-cut accumulator covers
+  core drawing only. RENDER-driven damage is a follow-up if a real
+  client (compositor or screen recorder) needs it.
+- **MIT-SHM `XShmPutImage` host fast path.** We chunk regular
+  `PutImage` instead of sharing memory with the host. Revisit if
+  large-image upload latency becomes a bottleneck.
+
 ## Phase 4 — Accelerated clients
 
-Goal: modern GLX/EGL/Vulkan direct-rendering paths, MIT-SHM, buffer
-sharing. Validate real GPU-accelerated clients.
+Goal: modern GLX/EGL/Vulkan direct-rendering paths and host buffer
+sharing. Validate real GPU-accelerated clients. (MIT-SHM landed in
+Phase 3.5.)
 
 Not started.
 
