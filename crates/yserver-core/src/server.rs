@@ -205,13 +205,18 @@ pub struct ServerState {
 impl ServerState {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_geometry(800, 600)
+    }
+
+    #[must_use]
+    pub fn with_geometry(width: u16, height: u16) -> Self {
         Self {
             atoms: AtomTable::new(),
             resources: ResourceTable::new(),
             clients: HashMap::new(),
             id_allocator: IdAllocator::new(),
             start_instant: Instant::now(),
-            randr: RandrState::nested(0, 800, 600),
+            randr: RandrState::nested(0, width, height),
             randr_select_masks: HashMap::new(),
             xkb_select_event_masks: HashMap::new(),
             selections: HashMap::new(),

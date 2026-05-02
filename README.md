@@ -64,6 +64,13 @@ Or pick a different display number:
 cargo run --bin ynest -- 42
 ```
 
+The host container window is 800×600 by default. Override with
+`--geometry WxH`:
+
+```sh
+cargo run --bin ynest -- 42 --geometry 1024x768
+```
+
 Then point clients at it from another terminal, using the same display
 number you started `ynest` on:
 

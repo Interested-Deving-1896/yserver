@@ -222,7 +222,7 @@ struct OwnedGetPropertyReply {
     value: Vec<u8>,
 }
 
-pub fn run(display: u16) -> io::Result<()> {
+pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
     let socket_dir = PathBuf::from("/tmp/.X11-unix");
     fs::create_dir_all(&socket_dir)?;
 
@@ -236,9 +236,12 @@ pub fn run(display: u16) -> io::Result<()> {
     let listener = UnixListener::bind(&socket_path)?;
     info!("ynest listening on DISPLAY=:{display}");
 
-    let host = match HostX11::open_from_env() {
+    let host = match HostX11::open_from_env(width, height) {
         Ok(host) => {
-            info!("host X11 container window: 0x{:x}", host.window_id());
+            info!(
+                "host X11 container window: 0x{:x} ({width}x{height})",
+                host.window_id()
+            );
             Some(Arc::new(Mutex::new(host)))
         }
         Err(err) => {
@@ -257,7 +260,7 @@ pub fn run(display: u16) -> io::Result<()> {
         spawn_window_close_watcher(window_id);
     }
 
-    let server = Arc::new(Mutex::new(ServerState::new()));
+    let server = Arc::new(Mutex::new(ServerState::with_geometry(width, height)));
     // Route root-window drawing/clearing to the host container window so
     // clients that paint the root (e.g. fvwm3 setting its desktop bg pixmap)
     // produce visible output in the nested viewport.

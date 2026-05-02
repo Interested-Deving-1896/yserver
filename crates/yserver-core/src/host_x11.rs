@@ -161,13 +161,13 @@ pub struct HostInputPumpHandle {
 }
 
 impl HostX11 {
-    pub fn open_from_env() -> io::Result<Self> {
+    pub fn open_from_env(width: u16, height: u16) -> io::Result<Self> {
         let mut stream = connect_to_host()?;
         let setup = read_setup_reply(&mut stream)?;
         let window_id = setup.resource_id_base;
         let gc_id = setup.resource_id_base + 1;
         let font_id = setup.resource_id_base + 2;
-        create_window(&mut stream, &setup, window_id)?;
+        create_window(&mut stream, &setup, window_id, width, height)?;
         open_font(&mut stream, font_id, b"fixed")?;
         create_gc(
             &mut stream,
@@ -3241,7 +3241,13 @@ fn scan_for_argb_visual(body: &[u8], mut off: usize, depth_count: usize) -> Opti
     None
 }
 
-fn create_window(stream: &mut UnixStream, setup: &HostSetup, window_id: u32) -> io::Result<()> {
+fn create_window(
+    stream: &mut UnixStream,
+    setup: &HostSetup,
+    window_id: u32,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
     // Value-mask: bg-pixel (bit 1) | bit-gravity (bit 4) | event-mask (bit 11).
     // bit-gravity = NorthWest (1) so a host-side resize preserves the NW pixels.
     // Without this the gravity defaults to Forget and the host server is free
@@ -3258,8 +3264,8 @@ fn create_window(stream: &mut UnixStream, setup: &HostSetup, window_id: u32) -> 
     write_u32(&mut out, setup.root);
     write_i16(&mut out, 80);
     write_i16(&mut out, 80);
-    write_u16(&mut out, 800);
-    write_u16(&mut out, 600);
+    write_u16(&mut out, width);
+    write_u16(&mut out, height);
     write_u16(&mut out, 0);
     write_u16(&mut out, 1);
     write_u32(&mut out, setup.root_visual);
