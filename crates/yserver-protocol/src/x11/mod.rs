@@ -210,6 +210,11 @@ pub struct CreateGcRequest {
     pub foreground: Option<u32>,
     pub background: Option<u32>,
     pub line_width: Option<u16>,
+    pub fill_style: Option<u8>,
+    pub tile: Option<ResourceId>,
+    pub stipple: Option<ResourceId>,
+    pub tile_x_origin: Option<i16>,
+    pub tile_y_origin: Option<i16>,
     pub font: Option<ResourceId>,
     pub clip_mask: Option<Option<ResourceId>>,
 }
@@ -220,6 +225,11 @@ pub struct GcChange {
     pub foreground: Option<u32>,
     pub background: Option<u32>,
     pub line_width: Option<u16>,
+    pub fill_style: Option<u8>,
+    pub tile: Option<ResourceId>,
+    pub stipple: Option<ResourceId>,
+    pub tile_x_origin: Option<i16>,
+    pub tile_y_origin: Option<i16>,
     pub font: Option<ResourceId>,
     pub clip_mask: Option<Option<ResourceId>>,
     pub clip_x_origin: Option<i16>,
@@ -937,6 +947,11 @@ pub fn create_gc_request(body: &[u8]) -> Option<CreateGcRequest> {
         foreground: values.value(2),
         background: values.value(3),
         line_width: values.value(4).map(|value| value as u16),
+        fill_style: values.value(8).map(|v| v as u8),
+        tile: values.value(10).map(ResourceId),
+        stipple: values.value(11).map(ResourceId),
+        tile_x_origin: values.value(12).map(|v| v as i16),
+        tile_y_origin: values.value(13).map(|v| v as i16),
         font: values.value(14).map(ResourceId),
         clip_mask: values
             .value(19)
@@ -952,6 +967,11 @@ pub fn change_gc_request(body: &[u8]) -> Option<GcChange> {
         foreground: values.value(2),
         background: values.value(3),
         line_width: values.value(4).map(|value| value as u16),
+        fill_style: values.value(8).map(|v| v as u8),
+        tile: values.value(10).map(ResourceId),
+        stipple: values.value(11).map(ResourceId),
+        tile_x_origin: values.value(12).map(|v| v as i16),
+        tile_y_origin: values.value(13).map(|v| v as i16),
         font: values.value(14).map(ResourceId),
         clip_x_origin: values.value(17).map(|v| v as i16),
         clip_y_origin: values.value(18).map(|v| v as i16),
@@ -1230,6 +1250,29 @@ pub fn encode_map_notify_event(
     write_u32(order, out, window.0);
     out.push(u8::from(override_redirect));
     out.extend_from_slice(&[0; 19]);
+}
+
+pub fn encode_create_notify_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    order: ClientByteOrder,
+    parent: ResourceId,
+    window: ResourceId,
+    geometry: Geometry,
+    override_redirect: bool,
+) {
+    out.push(16); // CreateNotify
+    out.push(0);
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, parent.0);
+    write_u32(order, out, window.0);
+    write_i16(order, out, geometry.x);
+    write_i16(order, out, geometry.y);
+    write_u16(order, out, geometry.width);
+    write_u16(order, out, geometry.height);
+    write_u16(order, out, geometry.border_width);
+    out.push(u8::from(override_redirect));
+    out.extend_from_slice(&[0; 9]);
 }
 
 pub fn encode_configure_notify_event(

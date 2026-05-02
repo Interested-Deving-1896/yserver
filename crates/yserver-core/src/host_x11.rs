@@ -33,6 +33,7 @@ pub struct HostX11 {
     current_foreground: u32,
     current_background: u32,
     current_clip: HostClipState,
+    current_fill: HostFillState,
     sequence: u16,
     next_xid: u32,
     render: Option<HostRenderInfo>,
@@ -93,6 +94,21 @@ enum HostClipState {
     /// `(x_origin, y_origin)`. Used by wmaker for window-decoration
     /// symbols (close-button "X" etc.).
     Pixmap {
+        host_pixmap: u32,
+        x_origin: i16,
+        y_origin: i16,
+    },
+}
+
+/// Tracks the fill-style on the host shared GC so we don't re-issue
+/// identical `ChangeGC(fill-style+tile)` calls. e16 paints popup
+/// backgrounds via Tiled fill; the fill handlers must flip to Tiled
+/// before the draw and back to Solid after, otherwise other clients'
+/// later draws would inherit the tile pixmap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostFillState {
+    Solid,
+    Tiled {
         host_pixmap: u32,
         x_origin: i16,
         y_origin: i16,
@@ -171,6 +187,7 @@ impl HostX11 {
             current_foreground: setup.black_pixel,
             current_background: setup.white_pixel,
             current_clip: HostClipState::None,
+            current_fill: HostFillState::Solid,
             sequence: 5,
             next_xid: setup.resource_id_base + 3,
             render: None,
@@ -1810,6 +1827,75 @@ impl HostX11 {
         self.stream.flush()
     }
 
+    /// Set the host shared GC to `fill-style=Tiled, tile=host_pixmap` with
+    /// the given tile origin. Per X11 spec, ChangeGC tile/x-origin/y-origin
+    /// each occupy 4 bytes (i16 pad-to-u32). e16 calls this before
+    /// PolyFillRectangle to tile a theme pixmap onto popup backgrounds.
+    pub fn set_gc_fill_tiled(
+        &mut self,
+        host_pixmap: u32,
+        tile_x_origin: i16,
+        tile_y_origin: i16,
+    ) -> io::Result<()> {
+        let new_state = HostFillState::Tiled {
+            host_pixmap,
+            x_origin: tile_x_origin,
+            y_origin: tile_y_origin,
+        };
+        if self.current_fill == new_state {
+            return Ok(());
+        }
+        // Single ChangeGC: fill-style (1<<8) + tile (1<<10) +
+        // tile-stipple-x-origin (1<<12) + tile-stipple-y-origin (1<<13).
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::with_capacity(28);
+        out.push(56); // ChangeGC
+        out.push(0);
+        // header(4) + gc(4) + mask(4) + 4 values × 4 bytes = 28 = 7 units
+        write_u16(&mut out, 7);
+        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, (1 << 8) | (1 << 10) | (1 << 12) | (1 << 13));
+        // fill-style = Tiled (1) — value is 1 byte but X11 GC values are
+        // CARD32-padded.
+        out.push(1);
+        out.push(0);
+        out.push(0);
+        out.push(0);
+        write_u32(&mut out, host_pixmap);
+        write_i16(&mut out, tile_x_origin);
+        write_u16(&mut out, 0); // pad
+        write_i16(&mut out, tile_y_origin);
+        write_u16(&mut out, 0); // pad
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+        self.current_fill = new_state;
+        Ok(())
+    }
+
+    /// Reset the host shared GC's fill-style to Solid. No-op if already
+    /// Solid. Called after every fill draw that flipped to Tiled, so
+    /// subsequent unrelated draws on the shared GC don't inherit the tile.
+    pub fn set_gc_fill_solid(&mut self) -> io::Result<()> {
+        if self.current_fill == HostFillState::Solid {
+            return Ok(());
+        }
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::with_capacity(16);
+        out.push(56); // ChangeGC
+        out.push(0);
+        write_u16(&mut out, 4); // gc(4) + mask(4) + fill_style(4) = 12 + header(4) = 16 bytes = 4 units
+        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, 1 << 8); // fill-style only
+        out.push(0); // Solid
+        out.push(0);
+        out.push(0);
+        out.push(0);
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+        self.current_fill = HostFillState::Solid;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn copy_area(
         &mut self,
@@ -2407,6 +2493,12 @@ impl HostInputPump {
         let mut stream = connect_to_host()?;
         let _setup = read_setup_reply(&mut stream)?;
         select_keyboard_events(&mut stream, window_id)?;
+        // The main pump owns POINTER_EVENT_MASK on the container. ButtonPress
+        // is exclusive in X11 — only the main pump (not per-client kb pumps)
+        // can hold it. Without this, clicks on the container area (where no
+        // top-level child intervenes) drop on the host side and never reach
+        // any nested client.
+        select_pointer_events_on_container(&mut stream, window_id)?;
         stream.flush()?;
         let read_stream = stream.try_clone()?;
         // Map the host container window to ynest's ROOT_WINDOW so Expose
@@ -3175,6 +3267,30 @@ fn create_window(stream: &mut UnixStream, setup: &HostSetup, window_id: u32) -> 
     write_u32(&mut out, setup.white_pixel); // bg-pixel
     write_u32(&mut out, 1); // bit-gravity = NorthWest
     write_u32(&mut out, 0x0000_8000 | 0x0002_0000); // event-mask
+    stream.write_all(&out)
+}
+
+/// Select POINTER_EVENT_MASK on the host container.
+///
+/// Used only by the main `HostInputPump` (called from `nested::run`). Per
+/// X11 spec, ButtonPress is exclusive — only one client at a time per
+/// window — so the per-client keyboard pumps must NOT also try to select
+/// it (they'd get BadAccess for the entire ChangeWindowAttributes,
+/// silently zeroing out their KeyPress/KeyRelease selection too). See
+/// commit 1f43914: the prior fix folded ButtonPress out of the shared
+/// `select_keyboard_events`, but inadvertently dropped it from the main
+/// pump as well — pointer events on the container stopped reaching ynest.
+fn select_pointer_events_on_container(
+    stream: &mut UnixStream,
+    window_id: u32,
+) -> io::Result<()> {
+    let mut out = Vec::new();
+    out.push(2); // ChangeWindowAttributes
+    out.push(0);
+    write_u16(&mut out, 4);
+    write_u32(&mut out, window_id);
+    write_u32(&mut out, 1 << 11); // value-mask = event-mask
+    write_u32(&mut out, POINTER_EVENT_MASK);
     stream.write_all(&out)
 }
 

@@ -1037,6 +1037,11 @@ impl ResourceTable {
                 clip_pixmap,
                 clip_x_origin: 0,
                 clip_y_origin: 0,
+                fill_style: request.fill_style.unwrap_or(0),
+                tile: request.tile,
+                stipple: request.stipple,
+                tile_x_origin: request.tile_x_origin.unwrap_or(0),
+                tile_y_origin: request.tile_y_origin.unwrap_or(0),
                 owner,
             },
         );
@@ -1054,6 +1059,11 @@ impl ResourceTable {
             clip_pixmap: None,
             clip_x_origin: 0,
             clip_y_origin: 0,
+            fill_style: 0,
+            tile: None,
+            stipple: None,
+            tile_x_origin: 0,
+            tile_y_origin: 0,
             owner: SERVER_OWNER,
         });
         if let Some(foreground) = request.foreground {
@@ -1073,6 +1083,21 @@ impl ResourceTable {
         }
         if let Some(y) = request.clip_y_origin {
             gc.clip_y_origin = y;
+        }
+        if let Some(fs) = request.fill_style {
+            gc.fill_style = fs;
+        }
+        if let Some(tile) = request.tile {
+            gc.tile = Some(tile);
+        }
+        if let Some(stipple) = request.stipple {
+            gc.stipple = Some(stipple);
+        }
+        if let Some(x) = request.tile_x_origin {
+            gc.tile_x_origin = x;
+        }
+        if let Some(y) = request.tile_y_origin {
+            gc.tile_y_origin = y;
         }
         // CPClipMask: Some(None) = clear, Some(Some(p)) = pixmap. Setting
         // a clip-mask supersedes any prior `SetClipRectangles` per spec.
@@ -1094,6 +1119,11 @@ impl ResourceTable {
             clip_pixmap: None,
             clip_x_origin: 0,
             clip_y_origin: 0,
+            fill_style: 0,
+            tile: None,
+            stipple: None,
+            tile_x_origin: 0,
+            tile_y_origin: 0,
             owner: SERVER_OWNER,
         });
         // SetClipRectangles supersedes any prior clip-mask pixmap.
@@ -1179,6 +1209,41 @@ impl ResourceTable {
             };
         }
         GcClipState::None
+    }
+
+    /// Resolve the GC's effective fill state (Solid / Tiled / Stippled /
+    /// OpaqueStippled) plus the host pixmap xid for the tile/stipple if any.
+    /// Returns `None` for the default Solid case (no setup needed) or when
+    /// the GC is unknown. e16 paints popup backgrounds via Tiled fill — the
+    /// PolyFillRectangle / PolyFillArc / FillPoly handlers must call
+    /// `apply_gc_fill_state` before forwarding the draw and reset to Solid
+    /// after, otherwise the host's shared GC silently fills with the GC's
+    /// foreground (typically 0 = black).
+    pub fn gc_fill_state(&self, id: ResourceId) -> GcFillState {
+        let Some(gc) = self.gc(id) else {
+            return GcFillState::Solid;
+        };
+        match gc.fill_style {
+            1 => {
+                // Tiled
+                let host_pixmap = gc
+                    .tile
+                    .and_then(|p| self.pixmaps.get(&p.0))
+                    .and_then(|p| p.host_xid);
+                match host_pixmap {
+                    Some(host_pixmap) => GcFillState::Tiled {
+                        host_pixmap,
+                        tile_x_origin: gc.tile_x_origin,
+                        tile_y_origin: gc.tile_y_origin,
+                    },
+                    // Tile pixmap missing or no host backing — fall back to
+                    // Solid so the draw doesn't blow up; the host will fill
+                    // with foreground colour, same as before this fix.
+                    None => GcFillState::Solid,
+                }
+            }
+            _ => GcFillState::Solid,
+        }
     }
 
     pub fn create_picture(&mut self, id: ResourceId, state: PictureState) {
@@ -1477,6 +1542,20 @@ pub enum GcClipState {
     },
 }
 
+/// Effective fill-style of a GC. Solid = use foreground; Tiled = tile a
+/// pixmap onto the destination. Stippled / OpaqueStippled would belong
+/// here too but no observed client uses them in the popup/menu paths
+/// currently exercised — they fall through to Solid for now.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GcFillState {
+    Solid,
+    Tiled {
+        host_pixmap: u32,
+        tile_x_origin: i16,
+        tile_y_origin: i16,
+    },
+}
+
 /// One client-issued `Composite::NameWindowPixmap` alias on a window. The
 /// COMPOSITE spec allows a client to call `NameWindowPixmap` repeatedly;
 /// each call returns a distinct `Pixmap` resource pointing at the
@@ -1658,6 +1737,16 @@ pub struct Gc {
     pub clip_pixmap: Option<ResourceId>,
     pub clip_x_origin: i16,
     pub clip_y_origin: i16,
+    /// X11 GC `fill-style`: 0 = Solid, 1 = Tiled, 2 = Stippled,
+    /// 3 = OpaqueStippled. e16 paints popup backgrounds via Tiled fill,
+    /// so PolyFillRectangle on the destination pixmap tiles the theme
+    /// pixmap onto it. Without honoring this, the destination stays the
+    /// default solid foreground (typically 0 = black).
+    pub fill_style: u8,
+    pub tile: Option<ResourceId>,
+    pub stipple: Option<ResourceId>,
+    pub tile_x_origin: i16,
+    pub tile_y_origin: i16,
     pub owner: ClientId,
 }
 
@@ -2730,6 +2819,11 @@ mod tests {
                 foreground: None,
                 background: None,
                 line_width: None,
+                fill_style: None,
+                tile: None,
+                stipple: None,
+                tile_x_origin: None,
+                tile_y_origin: None,
                 font: None,
                 clip_mask: None,
             },
@@ -2750,6 +2844,11 @@ mod tests {
             foreground: None,
             background: None,
             line_width: None,
+            fill_style: None,
+            tile: None,
+            stipple: None,
+            tile_x_origin: None,
+            tile_y_origin: None,
             font: None,
             clip_mask: Some(None),
             clip_x_origin: None,

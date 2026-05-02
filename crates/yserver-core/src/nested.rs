@@ -24,7 +24,7 @@ use crate::{
         HostX11,
     },
     resources::{
-        ARGB_VISUAL, GcClipState, GlyphSetState, HostDrawableTarget, MapState,
+        ARGB_VISUAL, GcClipState, GcFillState, GlyphSetState, HostDrawableTarget, MapState,
         NamedCompositePixmap, PictureState, Pixmap, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW,
         ReparentWindowError, Window,
     },
@@ -2446,6 +2446,82 @@ fn intersect_regions(
     normalize_region_rects(out)
 }
 
+/// Subtract one rectangle `b` from another `a`, returning the parts of
+/// `a` not covered by `b`. Up to four sub-rectangles (top/bottom/left/right
+/// strips) per call.
+fn subtract_rect(
+    a: x11xfixes::RegionRect,
+    b: x11xfixes::RegionRect,
+) -> Vec<x11xfixes::RegionRect> {
+    let Some(isect) = intersect_rect(a, b) else {
+        return vec![a];
+    };
+    let mut out = Vec::new();
+    let a_right = i32::from(a.x) + i32::from(a.width);
+    let a_bottom = i32::from(a.y) + i32::from(a.height);
+    let isect_right = i32::from(isect.x) + i32::from(isect.width);
+    let isect_bottom = i32::from(isect.y) + i32::from(isect.height);
+    // Top strip: full a width, from a.y to isect.y.
+    if i32::from(a.y) < i32::from(isect.y) {
+        out.push(x11xfixes::RegionRect {
+            x: a.x,
+            y: a.y,
+            width: a.width,
+            height: (i32::from(isect.y) - i32::from(a.y)).clamp(0, i32::from(u16::MAX)) as u16,
+        });
+    }
+    // Bottom strip: full a width, from isect.bottom to a.bottom.
+    if isect_bottom < a_bottom {
+        out.push(x11xfixes::RegionRect {
+            x: a.x,
+            y: isect_bottom.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+            width: a.width,
+            height: (a_bottom - isect_bottom).clamp(0, i32::from(u16::MAX)) as u16,
+        });
+    }
+    // Left strip: only within the isect vertical span.
+    if i32::from(a.x) < i32::from(isect.x) {
+        out.push(x11xfixes::RegionRect {
+            x: a.x,
+            y: isect.y,
+            width: (i32::from(isect.x) - i32::from(a.x)).clamp(0, i32::from(u16::MAX)) as u16,
+            height: isect.height,
+        });
+    }
+    // Right strip.
+    if isect_right < a_right {
+        out.push(x11xfixes::RegionRect {
+            x: isect_right.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+            y: isect.y,
+            width: (a_right - isect_right).clamp(0, i32::from(u16::MAX)) as u16,
+            height: isect.height,
+        });
+    }
+    out
+}
+
+/// Subtract `source` (treated as a region union) from `current`.
+/// Implements the X11 SHAPE Subtract op correctly: for each rect in
+/// source, walk every accumulated rect and split off the parts not
+/// covered. e16's rounded-corner popups rely on this — they Set 6 rects
+/// for the body, then Subtract 6 small rects from the corners; the prior
+/// implementation collapsed the result to either the unchanged input or
+/// the empty set, which made the host see no shape at all.
+fn subtract_regions(
+    current: &[x11xfixes::RegionRect],
+    source: &[x11xfixes::RegionRect],
+) -> Vec<x11xfixes::RegionRect> {
+    let mut result: Vec<x11xfixes::RegionRect> = current.to_vec();
+    for s in source {
+        let mut next = Vec::new();
+        for r in result {
+            next.extend(subtract_rect(r, *s));
+        }
+        result = next;
+    }
+    normalize_region_rects(result)
+}
+
 fn translate_region(rects: &mut [x11xfixes::RegionRect], dx: i16, dy: i16) {
     for rect in rects {
         rect.x = rect.x.saturating_add(dx);
@@ -3637,13 +3713,7 @@ fn apply_shape_op(
         x11shape::OP_SET => normalize_region_rects(source),
         x11shape::OP_UNION => normalize_region_rects(current.into_iter().chain(source).collect()),
         x11shape::OP_INTERSECT => intersect_regions(&current, &source),
-        x11shape::OP_SUBTRACT => {
-            if intersect_regions(&current, &source).is_empty() {
-                current
-            } else {
-                Vec::new()
-            }
-        }
+        x11shape::OP_SUBTRACT => subtract_regions(&current, &source),
         x11shape::OP_INVERT => normalize_region_rects(source),
         _ => current,
     }
@@ -3743,16 +3813,19 @@ fn handle_shape_request(
                 let source = offset_rects(rects, req.x_off, req.y_off);
                 let mut s = lock_server(server)?;
                 let current = shape_rects_for(&s, window, req.dest_kind);
+                let current_clone = current.clone();
+                let source_clone = source.clone();
                 let rects = apply_shape_op(current, source, req.op);
                 debug!(
-                    "client {} #{} SHAPE::Rectangles dest=0x{:x} kind={} op={} rects={} extents={:?}",
+                    "client {} #{} SHAPE::Rectangles dest=0x{:x} kind={} op={} current={:?} source={:?} resolved={:?}",
                     client_id.0,
                     sequence.0,
                     window.0,
                     req.dest_kind,
                     req.op,
-                    rects.len(),
-                    region_extents(&rects)
+                    current_clone,
+                    source_clone,
+                    rects,
                 );
                 set_shape_rects(&mut s, window, req.dest_kind, rects);
                 Some((window, req.dest_kind))
@@ -4241,6 +4314,23 @@ fn apply_gc_clip(host: &mut HostX11, state: &GcClipState) -> io::Result<()> {
             clip_y_origin,
         } => host.set_clip_pixmap(*host_pixmap, *clip_x_origin, *clip_y_origin),
         GcClipState::None => host.clear_clip_rectangles(),
+    }
+}
+
+/// Configure the host shared GC's fill-style for the next draw, then return
+/// a guard that resets it to Solid on drop. Per X11 spec, the GC's
+/// fill-style affects PolyFillRectangle / PolyFillArc / FillPoly: Solid =
+/// foreground color, Tiled = repeat the tile pixmap. Without resetting
+/// after the draw, an unrelated subsequent client's draw would inherit the
+/// tile through the shared GC.
+fn apply_gc_fill_state(host: &mut HostX11, state: GcFillState) -> io::Result<()> {
+    match state {
+        GcFillState::Tiled {
+            host_pixmap,
+            tile_x_origin,
+            tile_y_origin,
+        } => host.set_gc_fill_tiled(host_pixmap, tile_x_origin, tile_y_origin),
+        GcFillState::Solid => host.set_gc_fill_solid(),
     }
 }
 
@@ -5055,6 +5145,32 @@ fn handle_request(
                 if wants_focus {
                     set_focused_window(focused_window, server, window_id)?;
                 }
+                // SubstructureNotify on parent receives CreateNotify whenever
+                // any child is created (X11 spec). Without this, a WM that
+                // selects SubstructureNotifyMask on root never learns about
+                // top-level windows that other clients create.
+                let create_notify_targets = {
+                    let s = lock_server(server)?;
+                    s.subscribers(parent, 0x0008_0000)
+                };
+                if !create_notify_targets.is_empty() {
+                    let geometry = {
+                        let s = lock_server(server)?;
+                        s.resources.window(window_id).map(window_geometry)
+                    };
+                    if let Some(geometry) = geometry {
+                        let override_redir = request.override_redirect.unwrap_or(false);
+                        crate::server::fanout_event(
+                            &create_notify_targets,
+                            |buf, seq, order| {
+                                x11::encode_create_notify_event(
+                                    buf, seq, order, parent, window_id, geometry,
+                                    override_redir,
+                                );
+                            },
+                        );
+                    }
+                }
             }
             log_void(client_id, sequence, "CreateWindow")
         }
@@ -5434,15 +5550,26 @@ fn handle_request(
                         let _ = h.reparent_subwindow(xid, host_parent, result.x, result.y);
                     }
                     // If the window stops being a top-level (left root),
-                    // unregister its host_xid → ResourceId mapping so
-                    // pointer/expose events on the host pump no longer
-                    // misroute. The host subwindow itself stays alive
-                    // under its new parent.
+                    // re-register it as a sub-window. This switches the
+                    // host event-mask from POINTER_EVENT_MASK to
+                    // ExposureMask (per Phase 3.6 sub-window design) so
+                    // that pointer events bubble up to the new top-level
+                    // ancestor on the host side, and routes them through
+                    // pointer_event_fanout correctly. Just removing the
+                    // xid_map entry (the prior behaviour) drops every
+                    // pointer event on the formerly-top-level host xid
+                    // because the mask remained POINTER_EVENT_MASK and
+                    // the entry was gone — that's the e16 popup item-
+                    // click bug.
                     if result.old_parent == ROOT_WINDOW
                         && result.new_parent != ROOT_WINDOW
                         && let Some(input_handle) = input_handle
+                        && let Err(err) = input_handle.register_subwindow(result.window, xid)
                     {
-                        input_handle.unregister_top_level(xid);
+                        warn!(
+                            "client {} register_subwindow for 0x{:x} on reparent failed: {err}",
+                            client_id.0, result.window.0
+                        );
                     }
                     // If the window becomes a top-level (moved to root),
                     // re-register so pointer events can find it again.
@@ -5595,7 +5722,7 @@ fn handle_request(
                             debug!("focus key window 0x{:x}", window.0);
                             set_focused_window(focused_window, server, window)?;
                         }
-                        if let Some((_parent, override_redir, _x, _y, _width, _height)) = map_info {
+                        if let Some((parent, override_redir, _x, _y, _width, _height)) = map_info {
                             crate::server::emit_window_event(
                                 server,
                                 window,
@@ -5606,6 +5733,26 @@ fn handle_request(
                                         seq,
                                         order,
                                         window,
+                                        window,
+                                        override_redir,
+                                    );
+                                },
+                            );
+                            // SubstructureNotify on parent (0x0008_0000): a WM
+                            // listening on root must learn when its children
+                            // map. Without this, e16's popup-state machine
+                            // stalls because it never gets MapNotify for
+                            // popups it just mapped.
+                            crate::server::emit_window_event(
+                                server,
+                                parent,
+                                0x0008_0000,
+                                |buf, seq, order| {
+                                    x11::encode_map_notify_event(
+                                        buf,
+                                        seq,
+                                        order,
+                                        parent,
                                         window,
                                         override_redir,
                                     );
@@ -5670,6 +5817,24 @@ fn handle_request(
                                     seq,
                                     order,
                                     child,
+                                    child,
+                                    override_redirect,
+                                );
+                            },
+                        );
+                        // SubstructureNotify on the parent (the request's
+                        // window argument): WMs listening on root must learn
+                        // when its children map.
+                        crate::server::emit_window_event(
+                            server,
+                            parent,
+                            0x0008_0000,
+                            |buf, seq, order| {
+                                x11::encode_map_notify_event(
+                                    buf,
+                                    seq,
+                                    order,
+                                    parent,
                                     child,
                                     override_redirect,
                                 );
@@ -5889,6 +6054,27 @@ fn handle_request(
                                 );
                             },
                         );
+                        // SubstructureNotify on the parent: a WM listening on
+                        // root must see ConfigureNotify whenever any child
+                        // resizes, moves, or restacks.
+                        if let Some(parent) = parent {
+                            crate::server::emit_window_event(
+                                server,
+                                parent,
+                                0x0008_0000,
+                                |buf, seq, order| {
+                                    x11::encode_configure_notify_event(
+                                        buf,
+                                        seq,
+                                        order,
+                                        parent,
+                                        window_id,
+                                        geometry,
+                                        override_redirect,
+                                    );
+                                },
+                            );
+                        }
                         // COMPOSITE: a resize invalidates every alias on this
                         // window in one shot. The compositor must re-issue
                         // NameWindowPixmap after the resize.
@@ -6916,6 +7102,16 @@ fn handle_request(
         53 => {
             if let Some(request) = x11::create_pixmap_request(header.data, body) {
                 let new_id = request.pixmap.0;
+                debug!(
+                    "client {} #{} CreatePixmap pid=0x{:x} depth={} {}x{} drawable=0x{:x}",
+                    client_id.0,
+                    sequence.0,
+                    request.pixmap.0,
+                    request.depth,
+                    request.width,
+                    request.height,
+                    request.drawable.0,
+                );
                 let (validation_failed, drawable_exists) = {
                     let s = lock_server(server)?;
                     let handle = s.clients.get(&client_id.0).expect("client registered");
@@ -7118,6 +7314,20 @@ fn handle_request(
                 if request.width == 0 || request.height == 0 {
                     return log_void(client_id, sequence, "CopyArea");
                 }
+                debug!(
+                    "client {} #{} CopyArea src=0x{:x} dst=0x{:x} gc=0x{:x} src=({},{}) dst=({},{}) {}x{}",
+                    client_id.0,
+                    sequence.0,
+                    request.src.0,
+                    request.dst.0,
+                    request.gc.0,
+                    request.src_x,
+                    request.src_y,
+                    request.dst_x,
+                    request.dst_y,
+                    request.width,
+                    request.height
+                );
 
                 let (gc_exists, src_exists, dst_exists, clip, src, dst) = {
                     let s = lock_server(server)?;
@@ -7364,11 +7574,12 @@ fn handle_request(
                 let gc_id = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
                 let coord_mode = body[9];
                 let points = &body[12..];
-                let (foreground, clip, target) = {
+                let (foreground, clip, fill_state, target) = {
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
                         s.resources.gc_clip_state(ResourceId(gc_id)),
+                        s.resources.gc_fill_state(ResourceId(gc_id)),
                         s.resources.host_drawable_target(drawable),
                     )
                 };
@@ -7377,7 +7588,11 @@ fn handle_request(
                     && let Ok(mut host) = host.lock()
                 {
                     apply_gc_clip(&mut host, &clip)?;
+                    apply_gc_fill_state(&mut host, fill_state)?;
                     host.fill_poly(target.host_xid(), foreground, coord_mode, points)?;
+                    if !matches!(fill_state, GcFillState::Solid) {
+                        let _ = host.set_gc_fill_solid();
+                    }
                 }
                 accumulate_damage_full(server, drawable);
             }
@@ -7387,11 +7602,12 @@ fn handle_request(
             if let Some((gc_id, rectangles)) = x11::poly_fill_rectangle_data(body)
                 && let Some(drawable) = x11::drawable_request_id(body)
             {
-                let (foreground, clip, target) = {
+                let (foreground, clip, fill_state, target) = {
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
                         s.resources.gc_clip_state(ResourceId(gc_id)),
+                        s.resources.gc_fill_state(ResourceId(gc_id)),
                         s.resources.host_drawable_target(drawable),
                     )
                 };
@@ -7400,7 +7616,13 @@ fn handle_request(
                     && let Ok(mut host) = host.lock()
                 {
                     apply_gc_clip(&mut host, &clip)?;
+                    apply_gc_fill_state(&mut host, fill_state)?;
                     host.poly_fill_rectangle(target.host_xid(), foreground, rectangles)?;
+                    // Reset shared host GC to Solid so unrelated draws don't
+                    // inherit the tile.
+                    if !matches!(fill_state, GcFillState::Solid) {
+                        let _ = host.set_gc_fill_solid();
+                    }
                 }
                 accumulate_damage_full(server, drawable);
             }
@@ -7410,11 +7632,12 @@ fn handle_request(
             if let Some((gc_id, arcs)) = x11::poly_fill_arc_data(body)
                 && let Some(drawable) = x11::drawable_request_id(body)
             {
-                let (foreground, clip, target) = {
+                let (foreground, clip, fill_state, target) = {
                     let s = lock_server(server)?;
                     (
                         s.resources.gc_foreground(ResourceId(gc_id)),
                         s.resources.gc_clip_state(ResourceId(gc_id)),
+                        s.resources.gc_fill_state(ResourceId(gc_id)),
                         s.resources.host_drawable_target(drawable),
                     )
                 };
@@ -7423,7 +7646,11 @@ fn handle_request(
                     && let Ok(mut host) = host.lock()
                 {
                     apply_gc_clip(&mut host, &clip)?;
+                    apply_gc_fill_state(&mut host, fill_state)?;
                     host.poly_fill_arc(target.host_xid(), foreground, arcs)?;
+                    if !matches!(fill_state, GcFillState::Solid) {
+                        let _ = host.set_gc_fill_solid();
+                    }
                 }
                 accumulate_damage_full(server, drawable);
             }
@@ -7434,6 +7661,18 @@ fn handle_request(
                 if request.width == 0 || request.height == 0 {
                     return log_void(client_id, sequence, "PutImage");
                 }
+                debug!(
+                    "client {} #{} PutImage drawable=0x{:x} {}x{} dst=({},{}) depth={} fmt={:?}",
+                    client_id.0,
+                    sequence.0,
+                    request.drawable.0,
+                    request.width,
+                    request.height,
+                    request.dst_x,
+                    request.dst_y,
+                    request.depth,
+                    request.format,
+                );
 
                 let (gc_exists, drawable_exists, clip, target) = {
                     let s = lock_server(server)?;
@@ -8829,7 +9068,8 @@ mod tests {
     mod xfixes_ops {
         use super::super::{
             clear_shape_rects, intersect_regions, normalize_region_rects, region_extents,
-            shape_kind_is_set, shape_mask_source_rects, shape_rects_for, translate_region,
+            shape_kind_is_set, shape_mask_source_rects, shape_rects_for, subtract_rect,
+            subtract_regions, translate_region,
         };
         use crate::{resources::ROOT_WINDOW, server::ServerState};
         use yserver_protocol::x11::{
@@ -8894,6 +9134,57 @@ mod tests {
             let nonempty = vec![r(0, 0, 10, 10)];
             assert!(intersect_regions(&empty, &nonempty).is_empty());
             assert!(intersect_regions(&nonempty, &empty).is_empty());
+        }
+
+        #[test]
+        fn subtract_rect_no_intersection_unchanged() {
+            let a = r(0, 0, 10, 10);
+            let b = r(20, 20, 5, 5);
+            assert_eq!(subtract_rect(a, b), vec![a]);
+        }
+
+        #[test]
+        fn subtract_rect_corner_clipped() {
+            // Subtract a 2x2 square from the top-left corner of a 10x10 square.
+            // Expect three remaining pieces: bottom strip 10x8 + right strip 8x2.
+            let a = r(0, 0, 10, 10);
+            let b = r(0, 0, 2, 2);
+            let result = subtract_rect(a, b);
+            // Top strip is empty (intersect.y == a.y), bottom strip 10x8, no left strip,
+            // right strip 8x2.
+            assert_eq!(result.len(), 2);
+            assert!(result.contains(&r(0, 2, 10, 8)));
+            assert!(result.contains(&r(2, 0, 8, 2)));
+        }
+
+        #[test]
+        fn subtract_rect_fully_covered_drops() {
+            let a = r(0, 0, 10, 10);
+            let b = r(-5, -5, 30, 30);
+            assert!(subtract_rect(a, b).is_empty());
+        }
+
+        #[test]
+        fn subtract_regions_e16_rounded_corners() {
+            // Reproduces the e16 popup-corner case: Set a single rect, then
+            // Subtract four 1x1 corner pixels. The resulting region must keep
+            // the body and exclude only those four corners.
+            let body = vec![r(0, 0, 10, 10)];
+            let corners = vec![
+                r(0, 0, 1, 1),
+                r(9, 0, 1, 1),
+                r(0, 9, 1, 1),
+                r(9, 9, 1, 1),
+            ];
+            let result = subtract_regions(&body, &corners);
+            // Sanity: result is non-empty and excludes all four corners.
+            assert!(!result.is_empty());
+            for c in &corners {
+                let isect = intersect_regions(&result, &[*c]);
+                assert!(isect.is_empty(), "corner {c:?} should be excluded but got {isect:?}");
+            }
+            // A pixel near the centre is still inside.
+            assert!(!intersect_regions(&result, &[r(5, 5, 1, 1)]).is_empty());
         }
 
         #[test]

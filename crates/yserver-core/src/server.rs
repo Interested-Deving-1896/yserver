@@ -535,6 +535,46 @@ impl ServerState {
             .collect()
     }
 
+    /// Walk up the parent chain from `start`, returning the first window with
+    /// any client subscribed to `mask_bit`, the (event_x, event_y) translated
+    /// to be relative to that window, and the subscriber list.
+    ///
+    /// Per X11 protocol, device events propagate up the window tree until a
+    /// client has the event selected on the chain. Used for ButtonPress,
+    /// ButtonRelease, MotionNotify. Without this walk, a click on a window
+    /// that doesn't subscribe (e.g. e16's "Root-bg" cover window over the
+    /// root) is dropped instead of bubbling to root where the WM listens.
+    #[must_use]
+    pub fn pointer_propagation_target(
+        &self,
+        start: ResourceId,
+        start_x: i16,
+        start_y: i16,
+        mask_bit: u32,
+    ) -> Option<(ResourceId, i16, i16, Vec<EventTarget>)> {
+        let mut current = start;
+        let mut x = start_x;
+        let mut y = start_y;
+        for _ in 0..256 {
+            let subs = self.subscribers(current, mask_bit);
+            if !subs.is_empty() {
+                return Some((current, x, y, subs));
+            }
+            let Some(window) = self.resources.window(current) else {
+                return None;
+            };
+            // Root's parent points to itself; stop after probing root.
+            if window.parent == current {
+                return None;
+            }
+            // Translate (x, y) from current-relative to parent-relative.
+            x = x.wrapping_add(window.x);
+            y = y.wrapping_add(window.y);
+            current = window.parent;
+        }
+        None
+    }
+
     #[must_use]
     pub fn subscribers_intersecting(
         &self,
@@ -769,15 +809,27 @@ pub fn pointer_event_fanout(
     };
 
     // Active pointer grab: redirect all button/motion events to grab owner.
+    // event_x/event_y must be relative to the grab_window (per X11 spec) so
+    // the grab owner can locate which child window (menu item, button…)
+    // was clicked. Without this translation a WM-popup grab sees clicks at
+    // root coordinates and can't match them against its menu-item children.
     let grab_state = match state.lock() {
         Ok(g) => g.pointer_grab.and_then(|(client_id, grab_window)| {
-            g.client_target(client_id).map(|t| (grab_window, t))
+            let target = g.client_target(client_id)?;
+            let (gx, gy) = g.resources.window_absolute_position(grab_window);
+            Some((grab_window, target, gx, gy))
         }),
         Err(_) => return,
     };
-    if let Some((grab_window, target)) = grab_state {
+    if let Some((grab_window, target, grab_x, grab_y)) = grab_state {
         let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
         let mut buf = Vec::with_capacity(32);
+        let event_x = i32::from(event.root_x)
+            .saturating_sub(grab_x)
+            .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+        let event_y = i32::from(event.root_y)
+            .saturating_sub(grab_y)
+            .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
         match event.kind {
             PointerEventKind::ButtonPress => x11::encode_button_press_event(
                 &mut buf,
@@ -790,8 +842,8 @@ pub fn pointer_event_fanout(
                     event: grab_window,
                     root_x: event.root_x,
                     root_y: event.root_y,
-                    event_x: event.root_x,
-                    event_y: event.root_y,
+                    event_x,
+                    event_y,
                     state: event.state,
                 },
             ),
@@ -806,8 +858,8 @@ pub fn pointer_event_fanout(
                     event: grab_window,
                     root_x: event.root_x,
                     root_y: event.root_y,
-                    event_x: event.root_x,
-                    event_y: event.root_y,
+                    event_x,
+                    event_y,
                     state: event.state,
                 },
             ),
@@ -822,8 +874,8 @@ pub fn pointer_event_fanout(
                     event: grab_window,
                     root_x: event.root_x,
                     root_y: event.root_y,
-                    event_x: event.root_x,
-                    event_y: event.root_y,
+                    event_x,
+                    event_y,
                     state: event.state,
                 },
             ),
@@ -936,15 +988,18 @@ pub fn pointer_event_fanout(
 
     let (nested_id, event_x, event_y, core_targets, xi2_targets) = match state.lock() {
         Ok(g) => {
-            let (target, event_x, event_y) = g
+            let (target, target_x, target_y) = g
                 .resources
                 .pointer_target_at(top_level_id, event.event_x, event.event_y)
                 .unwrap_or((top_level_id, event.event_x, event.event_y));
 
-            let mut core_targets = g.subscribers(target, mask_bit);
-            if core_targets.is_empty() && target != top_level_id {
-                core_targets = g.subscribers(top_level_id, mask_bit);
-            }
+            // Walk up the parent chain to the first window any client is
+            // subscribed on. Without this, a click on a window that doesn't
+            // select pointer events (e.g. e16's full-screen "Root-bg" cover)
+            // never bubbles to root where the WM is listening.
+            let (nested_id, event_x, event_y, core_targets) = g
+                .pointer_propagation_target(target, target_x, target_y, mask_bit)
+                .unwrap_or((target, target_x, target_y, Vec::new()));
 
             let mut xi2_targets = Vec::new();
             if xi2_evtype != 0 {
@@ -956,7 +1011,7 @@ pub fn pointer_event_fanout(
                 }
             }
 
-            (target, event_x, event_y, core_targets, xi2_targets)
+            (nested_id, event_x, event_y, core_targets, xi2_targets)
         }
         Err(_) => return,
     };
@@ -1810,5 +1865,209 @@ mod tests {
         assert_eq!(s.active_keyboard_grab.unwrap().owner, ClientId(7));
         s.active_keyboard_grab = None;
         assert!(s.active_keyboard_grab.is_none());
+    }
+
+    fn add_test_client(state: &mut ServerState, client_id: u32, base: u32) {
+        state.clients.insert(
+            client_id,
+            ClientHandle {
+                writer: make_test_writer(),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: base,
+                resource_id_mask: 0x000F_FFFF,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn pointer_propagation_walks_parent_chain_to_root() {
+        // Reproduces the desk-1 right-click bug: pointer-on-child of root,
+        // child has no ButtonPress mask, root does. The event must propagate
+        // up to root.
+        use crate::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        let mut state = ServerState::new();
+        add_test_client(&mut state, 1, 0x0010_0000);
+
+        // Child of root, full screen, no ButtonPress mask (e16's "Root-bg").
+        let child = ResourceId(0x0010_0004);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: child,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                background_pixel: None,
+                event_mask: None,
+                override_redirect: None,
+            },
+        );
+        let _ = state.resources.map_window(child);
+
+        // e16 selects ButtonPress on root.
+        let button_press_mask: u32 = 0x0000_0004;
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .event_masks
+            .insert(ROOT_WINDOW, button_press_mask);
+
+        // Click hits the child at (136, 111) — relative to child since child is
+        // at (0, 0). pointer_propagation_target should walk up to root.
+        let result = state.pointer_propagation_target(child, 136, 111, button_press_mask);
+        assert!(result.is_some(), "expected propagation to root");
+        let (window, x, y, subs) = result.unwrap();
+        assert_eq!(window, ROOT_WINDOW);
+        // Child is at (0, 0) on root, so coords are unchanged.
+        assert_eq!(x, 136);
+        assert_eq!(y, 111);
+        assert_eq!(subs.len(), 1);
+    }
+
+    #[test]
+    fn pointer_propagation_translates_offset_coords() {
+        // Click at (10, 20) inside a child positioned at (50, 60) on root —
+        // should translate to (60, 80) when delivered to root.
+        use crate::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        let mut state = ServerState::new();
+        add_test_client(&mut state, 1, 0x0010_0000);
+
+        let child = ResourceId(0x0010_0010);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: child,
+                parent: ROOT_WINDOW,
+                x: 50,
+                y: 60,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                background_pixel: None,
+                event_mask: None,
+                override_redirect: None,
+            },
+        );
+        let _ = state.resources.map_window(child);
+
+        let button_press_mask: u32 = 0x0000_0004;
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .event_masks
+            .insert(ROOT_WINDOW, button_press_mask);
+
+        let (window, x, y, _) = state
+            .pointer_propagation_target(child, 10, 20, button_press_mask)
+            .expect("propagation should find root");
+        assert_eq!(window, ROOT_WINDOW);
+        assert_eq!(x, 60);
+        assert_eq!(y, 80);
+    }
+
+    #[test]
+    fn pointer_propagation_stops_at_first_subscriber() {
+        // Both child and root subscribe; event delivered to child (first hit).
+        use crate::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        let mut state = ServerState::new();
+        add_test_client(&mut state, 1, 0x0010_0000);
+
+        let child = ResourceId(0x0010_0020);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: child,
+                parent: ROOT_WINDOW,
+                x: 5,
+                y: 5,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                background_pixel: None,
+                event_mask: None,
+                override_redirect: None,
+            },
+        );
+        let _ = state.resources.map_window(child);
+
+        let button_press_mask: u32 = 0x0000_0004;
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .event_masks
+            .insert(child, button_press_mask);
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .event_masks
+            .insert(ROOT_WINDOW, button_press_mask);
+
+        let (window, x, y, _) = state
+            .pointer_propagation_target(child, 30, 40, button_press_mask)
+            .expect("propagation should hit child first");
+        assert_eq!(window, child);
+        assert_eq!(x, 30);
+        assert_eq!(y, 40);
+    }
+
+    #[test]
+    fn pointer_propagation_returns_none_when_nothing_subscribes() {
+        use crate::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        let mut state = ServerState::new();
+        add_test_client(&mut state, 1, 0x0010_0000);
+
+        let child = ResourceId(0x0010_0030);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: child,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                background_pixel: None,
+                event_mask: None,
+                override_redirect: None,
+            },
+        );
+        let _ = state.resources.map_window(child);
+
+        let button_press_mask: u32 = 0x0000_0004;
+        let result = state.pointer_propagation_target(child, 10, 10, button_press_mask);
+        assert!(result.is_none());
     }
 }
