@@ -54,12 +54,22 @@ ynest-release display="99" geometry="1920x1080":
 # Visible smoke: ynest + wmaker + xterm. Ctrl-C tears it all down.
 ynest-wmaker-xterm display="99" geometry="1024x768":
     cargo build --release --bin ynest
-    target/release/ynest {{display}} --geometry {{geometry}} & \
+    RUST_LOG=debug target/release/ynest {{display}} --geometry {{geometry}} > ynest.log 2>&1 & \
         ynest_pid=$!; \
         sleep 1; \
         DISPLAY=:{{display}} wmaker & \
         sleep 2; \
         DISPLAY=:{{display}} xterm & \
+        trap 'kill $ynest_pid 2>/dev/null; wait' INT TERM EXIT; \
+        wait $ynest_pid
+
+# Visible smoke: ynest + wmaker + xterm. Ctrl-C tears it all down.
+ynest-xeyes display="99" geometry="1024x768":
+    cargo build --release --bin ynest
+    RUST_LOG=debug target/release/ynest {{display}} --geometry {{geometry}} > ynest.log 2>&1 & \
+        ynest_pid=$!; \
+        sleep 1; \
+        DISPLAY=:{{display}} xeyes & \
         trap 'kill $ynest_pid 2>/dev/null; wait' INT TERM EXIT; \
         wait $ynest_pid
 
