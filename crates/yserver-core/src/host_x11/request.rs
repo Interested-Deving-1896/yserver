@@ -1178,13 +1178,19 @@ impl HostX11Backend {
         Ok(Some(CursorHandle::from_raw_panicking(cursor_xid)))
     }
 
+    /// Install a cursor on a host window. X11 has no standalone DefineCursor
+    /// request (Xlib's `XDefineCursor` is implemented via ChangeWindowAttributes
+    /// with the CWCursor value-mask bit); we emit ChangeWindowAttributes
+    /// directly. Pass `cursor_host_xid = 0` to clear the cursor (X11 None).
     pub fn define_cursor(&mut self, host_window_xid: u32, cursor_host_xid: u32) -> io::Result<()> {
+        const CW_CURSOR: u32 = 0x0000_4000;
         self.advance_sequence();
-        let mut buf = Vec::with_capacity(12);
-        buf.push(43u8);
-        buf.push(0u8);
-        write_u16(&mut buf, 3u16);
+        let mut buf = Vec::with_capacity(16);
+        buf.push(2u8); // ChangeWindowAttributes
+        buf.push(0u8); // unused
+        write_u16(&mut buf, 4u16); // request length in 4-byte units
         write_u32(&mut buf, host_window_xid);
+        write_u32(&mut buf, CW_CURSOR);
         write_u32(&mut buf, cursor_host_xid);
         self.stream.write_all(&buf)?;
         self.stream.flush()
