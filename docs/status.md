@@ -1109,7 +1109,16 @@ Explicitly deferred — each is a self-contained Phase 6.x slice:
   Not implemented; B is vng-only by design and bare-metal is a
   Phase 6.x slice.
 - **Bare-metal targets** (real Intel/AMD/NVIDIA on the
-  CachyOS host).
+  CachyOS host). The core DRM/KMS path is **validated on bare metal**
+  on the CachyOS host: with `YSERVER_DRM_DEVICE` auto-probing
+  card0/card1, `sudo target/release/yserver` paints the moving
+  rectangle and shuts down cleanly. Caveat: the active VT's master
+  holder must be released first — on this host kmscon (the userspace
+  console renderer) holds master per active VT, so
+  `sudo systemctl stop kmsconvt@ttyN.service` for the current VT is
+  required before yserver can take master. The polished case
+  (logind handoff + VT_SETMODE coordination so yserver and kmscon
+  can coexist on different VTs) remains Phase 6.x.
 - **xkbcommon.** Keycodes are emitted as raw Linux input
   keycodes; keysym translation is C's responsibility.
 - **`yserver-core` integration.** Slice B explicitly excludes
