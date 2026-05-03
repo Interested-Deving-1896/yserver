@@ -51,6 +51,18 @@ ynest display="99":
 ynest-release display="99" geometry="1920x1080":
     cargo run --release --bin ynest -- {{display}} --geometry {{geometry}}
 
+# Visible smoke: ynest + wmaker + xterm. Ctrl-C tears it all down.
+ynest-wmaker-xterm display="99" geometry="1024x768":
+    cargo build --release --bin ynest
+    target/release/ynest {{display}} --geometry {{geometry}} & \
+        ynest_pid=$!; \
+        sleep 1; \
+        DISPLAY=:{{display}} wmaker & \
+        sleep 2; \
+        DISPLAY=:{{display}} xterm & \
+        trap 'kill $ynest_pid 2>/dev/null; wait' INT TERM EXIT; \
+        wait $ynest_pid
+
 # Smoke-test virtme harness: bring up Xorg + xterm in a QEMU window.
 harness-check:
     vng -r {{KERNEL}} --disable-microvm --rw \
