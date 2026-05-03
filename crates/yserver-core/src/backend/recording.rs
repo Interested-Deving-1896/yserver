@@ -1,0 +1,813 @@
+//! `RecordingBackend` — test double for the `Backend` trait. Records
+//! every method call into a per-instance log so unit tests can assert
+//! the exact host-side request sequence produced by a `nested.rs`
+//! request-handler hot-path.
+//!
+//! Methods that the existing tests don't exercise are
+//! `unimplemented!()` — calling them in a test fails loudly. Adding a
+//! new test that drives one is the cheap path: implement the recorder
+//! variant + impl block inline.
+//!
+//! The methods we DO implement are picked to cover the
+//! CreateWindow → MapWindow → DestroyWindow lifecycle (Phase 3.6
+//! invariant: every InputOutput sub-window goes through host
+//! create/map/destroy) plus the helpers needed to make the lifecycle
+//! tests run end-to-end (`window_id` so `nested::run` can resolve
+//! ROOT_WINDOW's host xid; `set_container_background_pixel` because
+//! `nested::handle_request`'s ChangeWindowAttributes path on
+//! ROOT_WINDOW pokes the container).
+
+#![cfg(test)]
+
+use std::{io, sync::Mutex};
+
+use yserver_protocol::x11::{ClipRectangles, FontMetrics, xfixes};
+
+use crate::{
+    backend::{
+        AnyHandle, Backend, ClipState, CursorHandle, DrawState, FillState, FontHandle,
+        GlyphSetHandle, PictureHandle, PixmapHandle, WindowHandle,
+    },
+    host_x11::{HostSubwindowConfig, HostSubwindowVisual, PointerPosition},
+};
+
+/// Records each method call. Variants are added on demand; tests
+/// assert against `Vec<RecordedCall>` snapshots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedCall {
+    CreateSubwindow {
+        parent: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        border_width: u16,
+        background_pixel: Option<u32>,
+        background_pixmap: Option<u32>,
+    },
+    DestroySubwindow(u32),
+    MapSubwindow(u32),
+    UnmapSubwindow(u32),
+    ConfigureSubwindow {
+        host_xid: u32,
+        config: HostSubwindowConfig,
+    },
+    ReparentSubwindow {
+        host_xid: u32,
+        host_parent: u32,
+        x: i16,
+        y: i16,
+    },
+    ChangeSubwindowAttributes {
+        host_xid: u32,
+        value_mask: u32,
+        values: Vec<u32>,
+    },
+    CreatePixmap {
+        depth: u8,
+        width: u16,
+        height: u16,
+    },
+    FreePixmap(u32),
+    SetContainerBackgroundPixel(u32),
+    SetContainerBackgroundPixmap(u32),
+    OpenFont(String),
+    CloseFont(u32),
+    Ping,
+}
+
+/// Test double for `Backend`. Auto-allocates host xids from a private
+/// counter so create-then-destroy round trips read back the same xid.
+pub struct RecordingBackend {
+    pub calls: Mutex<Vec<RecordedCall>>,
+    next_handle: Mutex<u32>,
+    fake_window_id: u32,
+    fake_root_visual_xid: u32,
+}
+
+impl Default for RecordingBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RecordingBackend {
+    pub fn new() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            next_handle: Mutex::new(0x0001_0000),
+            fake_window_id: 0x0000_0100,
+            fake_root_visual_xid: 0x0000_0021,
+        }
+    }
+
+    pub fn calls(&self) -> Vec<RecordedCall> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn record(&self, call: RecordedCall) {
+        self.calls.lock().unwrap().push(call);
+    }
+
+    fn allocate_handle(&self) -> u32 {
+        let mut n = self.next_handle.lock().unwrap();
+        let h = *n;
+        *n = n.wrapping_add(1);
+        h
+    }
+}
+
+impl Backend for RecordingBackend {
+    // State accessors — return fixed sentinels so the call sites that
+    // need a real number get a real number; record nothing.
+
+    fn window_id(&self) -> u32 {
+        self.fake_window_id
+    }
+
+    fn root_visual_xid(&self) -> u32 {
+        self.fake_root_visual_xid
+    }
+
+    fn argb_visual_xid(&self) -> Option<u32> {
+        None
+    }
+
+    fn argb_colormap_xid(&self) -> Option<u32> {
+        None
+    }
+
+    fn render_opcode(&self) -> Option<u8> {
+        None
+    }
+
+    fn xkb_opcode(&self) -> Option<u8> {
+        None
+    }
+
+    fn xkb_info(&self) -> Option<(u8, u8, u8)> {
+        None
+    }
+
+    fn composite_opcode(&self) -> Option<u8> {
+        None
+    }
+
+    fn render_format_for_ynest_id(&self, _ynest_fmt: u32) -> Option<u32> {
+        None
+    }
+
+    fn ping(&mut self) -> io::Result<()> {
+        self.record(RecordedCall::Ping);
+        Ok(())
+    }
+
+    // Subwindow lifecycle
+
+    fn create_subwindow(
+        &mut self,
+        host_parent: WindowHandle,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        border_width: u16,
+        _visual: HostSubwindowVisual,
+        background_pixel: Option<u32>,
+        background_pixmap: Option<u32>,
+    ) -> io::Result<WindowHandle> {
+        let xid = self.allocate_handle();
+        self.record(RecordedCall::CreateSubwindow {
+            parent: host_parent.as_raw(),
+            x,
+            y,
+            width,
+            height,
+            border_width,
+            background_pixel,
+            background_pixmap,
+        });
+        Ok(WindowHandle::from_raw_panicking(xid))
+    }
+
+    fn destroy_subwindow(&mut self, host_xid: u32) -> io::Result<()> {
+        self.record(RecordedCall::DestroySubwindow(host_xid));
+        Ok(())
+    }
+
+    fn map_subwindow(&mut self, host_xid: u32) -> io::Result<()> {
+        self.record(RecordedCall::MapSubwindow(host_xid));
+        Ok(())
+    }
+
+    fn unmap_subwindow(&mut self, host_xid: u32) -> io::Result<()> {
+        self.record(RecordedCall::UnmapSubwindow(host_xid));
+        Ok(())
+    }
+
+    fn configure_subwindow(
+        &mut self,
+        host_xid: u32,
+        config: HostSubwindowConfig,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::ConfigureSubwindow { host_xid, config });
+        Ok(())
+    }
+
+    fn reparent_subwindow(
+        &mut self,
+        host_xid: u32,
+        host_parent: u32,
+        x: i16,
+        y: i16,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::ReparentSubwindow {
+            host_xid,
+            host_parent,
+            x,
+            y,
+        });
+        Ok(())
+    }
+
+    fn change_subwindow_attributes(
+        &mut self,
+        host_xid: u32,
+        value_mask: u32,
+        values: &[u32],
+    ) -> io::Result<()> {
+        self.record(RecordedCall::ChangeSubwindowAttributes {
+            host_xid,
+            value_mask,
+            values: values.to_vec(),
+        });
+        Ok(())
+    }
+
+    fn name_window_pixmap(&mut self, _host_window: WindowHandle) -> io::Result<PixmapHandle> {
+        unimplemented!("RecordingBackend: name_window_pixmap not implemented for the current tests")
+    }
+
+    fn create_pixmap(&mut self, depth: u8, width: u16, height: u16) -> io::Result<PixmapHandle> {
+        let xid = self.allocate_handle();
+        self.record(RecordedCall::CreatePixmap {
+            depth,
+            width,
+            height,
+        });
+        Ok(PixmapHandle::from_raw_panicking(xid))
+    }
+
+    fn free_pixmap(&mut self, host_xid: u32) -> io::Result<()> {
+        self.record(RecordedCall::FreePixmap(host_xid));
+        Ok(())
+    }
+
+    fn open_font(&mut self, name: &str) -> io::Result<(FontHandle, FontMetrics)> {
+        let xid = self.allocate_handle();
+        self.record(RecordedCall::OpenFont(name.to_string()));
+        // FontMetrics is private to the protocol crate; return a Default-ish
+        // value via Default::default(). If FontMetrics has no Default we fall
+        // back to a zero-initialised one in the unimplemented branch below.
+        Ok((FontHandle::from_raw_panicking(xid), FontMetrics::default()))
+    }
+
+    fn close_font(&mut self, host_xid: u32) -> io::Result<()> {
+        self.record(RecordedCall::CloseFont(host_xid));
+        Ok(())
+    }
+
+    fn create_cursor(
+        &mut self,
+        _source_pixmap: PixmapHandle,
+        _mask_pixmap: Option<PixmapHandle>,
+        _fore: (u16, u16, u16),
+        _back: (u16, u16, u16),
+        _hot_x: u16,
+        _hot_y: u16,
+    ) -> io::Result<CursorHandle> {
+        let xid = self.allocate_handle();
+        Ok(CursorHandle::from_raw_panicking(xid))
+    }
+
+    fn define_cursor(&mut self, _host_window_xid: u32, _cursor_host_xid: u32) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_container_background_pixel(&mut self, pixel: u32) -> io::Result<()> {
+        self.record(RecordedCall::SetContainerBackgroundPixel(pixel));
+        Ok(())
+    }
+
+    fn set_container_background_pixmap(&mut self, host_pixmap_xid: u32) -> io::Result<()> {
+        self.record(RecordedCall::SetContainerBackgroundPixmap(host_pixmap_xid));
+        Ok(())
+    }
+
+    // GC state — silently no-op for tests that drive lifecycle paths.
+
+    fn clear_clip_rectangles(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_clip_rectangles(&mut self, _clip: Option<ClipRectangles>) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_clip_pixmap(
+        &mut self,
+        _host_pixmap: u32,
+        _clip_x_origin: i16,
+        _clip_y_origin: i16,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_gc_fill_solid(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_gc_fill_tiled(
+        &mut self,
+        _host_pixmap: u32,
+        _tile_x_origin: i16,
+        _tile_y_origin: i16,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn apply_clip_state(&mut self, _clip: &ClipState) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn apply_fill_state(&mut self, _fill: &FillState) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn apply_draw_state(&mut self, _state: &DrawState) -> io::Result<()> {
+        Ok(())
+    }
+
+    // Drawing primitives — `unimplemented!()` so a test that
+    // accidentally drives a draw path will surface loudly. Add an
+    // implementation when adding a draw-path test.
+
+    fn copy_area(
+        &mut self,
+        _src_host_xid: u32,
+        _dst_host_xid: u32,
+        _src_x: i16,
+        _src_y: i16,
+        _dst_x: i16,
+        _dst_y: i16,
+        _width: u16,
+        _height: u16,
+    ) -> io::Result<()> {
+        unimplemented!("RecordingBackend: copy_area")
+    }
+
+    fn copy_plane(
+        &mut self,
+        _src_host_xid: u32,
+        _dst_host_xid: u32,
+        _src_x: i16,
+        _src_y: i16,
+        _dst_x: i16,
+        _dst_y: i16,
+        _width: u16,
+        _height: u16,
+        _plane: u32,
+    ) -> io::Result<()> {
+        unimplemented!("RecordingBackend: copy_plane")
+    }
+
+    fn put_image(
+        &mut self,
+        _host_xid: u32,
+        _depth: u8,
+        _width: u16,
+        _height: u16,
+        _dst_x: i16,
+        _dst_y: i16,
+        _data: &[u8],
+    ) -> io::Result<()> {
+        unimplemented!("RecordingBackend: put_image")
+    }
+
+    fn get_image(
+        &mut self,
+        _host_xid: u32,
+        _format: u8,
+        _x: i16,
+        _y: i16,
+        _width: u16,
+        _height: u16,
+        _plane_mask: u32,
+    ) -> io::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    fn poly_line(
+        &mut self,
+        _host_xid: u32,
+        _foreground: u32,
+        _coordinate_mode: u8,
+        _points: &[u8],
+    ) -> io::Result<()> {
+        unimplemented!("RecordingBackend: poly_line")
+    }
+
+    fn poly_segment(
+        &mut self,
+        _host_xid: u32,
+        _foreground: u32,
+        _segments: &[u8],
+    ) -> io::Result<()> {
+        unimplemented!("RecordingBackend: poly_segment")
+    }
+
+    fn poly_rectangle(
+        &mut self,
+        _host_xid: u32,
+        _foreground: u32,
+        _rectangles: &[u8],
+    ) -> io::Result<()> {
+        unimplemented!("RecordingBackend: poly_rectangle")
+    }
+
+    fn poly_arc(&mut self, _host_xid: u32, _foreground: u32, _arcs: &[u8]) -> io::Result<()> {
+        unimplemented!("RecordingBackend: poly_arc")
+    }
+
+    fn poly_point(
+        &mut self,
+        _host_xid: u32,
+        _foreground: u32,
+        _coordinate_mode: u8,
+        _points: &[u8],
+    ) -> io::Result<()> {
+        unimplemented!("RecordingBackend: poly_point")
+    }
+
+    fn poly_fill_rectangle(
+        &mut self,
+        _host_xid: u32,
+        _foreground: u32,
+        _rectangles: &[u8],
+    ) -> io::Result<()> {
+        unimplemented!("RecordingBackend: poly_fill_rectangle")
+    }
+
+    fn poly_fill_arc(&mut self, _host_xid: u32, _foreground: u32, _arcs: &[u8]) -> io::Result<()> {
+        unimplemented!("RecordingBackend: poly_fill_arc")
+    }
+
+    fn fill_poly(
+        &mut self,
+        _host_xid: u32,
+        _foreground: u32,
+        _coord_mode: u8,
+        _points: &[u8],
+    ) -> io::Result<()> {
+        unimplemented!("RecordingBackend: fill_poly")
+    }
+
+    fn fill_rectangle(
+        &mut self,
+        _host_xid: u32,
+        _foreground: u32,
+        _x: i16,
+        _y: i16,
+        _width: u16,
+        _height: u16,
+    ) -> io::Result<()> {
+        unimplemented!("RecordingBackend: fill_rectangle")
+    }
+
+    fn poly_text8(&mut self, _host_xid: u32, _foreground: u32, _body: &[u8]) -> io::Result<()> {
+        unimplemented!("RecordingBackend: poly_text8")
+    }
+
+    fn poly_text16(&mut self, _host_xid: u32, _foreground: u32, _body: &[u8]) -> io::Result<()> {
+        unimplemented!("RecordingBackend: poly_text16")
+    }
+
+    fn image_text8(
+        &mut self,
+        _host_xid: u32,
+        _foreground: u32,
+        _background: u32,
+        _text_len: u8,
+        _body: &[u8],
+    ) -> io::Result<()> {
+        unimplemented!("RecordingBackend: image_text8")
+    }
+
+    fn image_text16(
+        &mut self,
+        _host_xid: u32,
+        _foreground: u32,
+        _background: u32,
+        _text_len: u8,
+        _body: &[u8],
+    ) -> io::Result<()> {
+        unimplemented!("RecordingBackend: image_text16")
+    }
+
+    // RENDER — `unimplemented!()`; render_opcode() returns None so call
+    // sites fast-path out before reaching these.
+
+    fn render_create_picture(
+        &mut self,
+        _host_drawable: AnyHandle,
+        _ynest_format: u32,
+        _value_mask: u32,
+        _values: &[u8],
+    ) -> io::Result<Option<PictureHandle>> {
+        Ok(None)
+    }
+
+    fn render_change_picture(&mut self, _host_pic: u32, _body: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn render_free_picture(&mut self, _host_pic: u32) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn render_create_glyphset(&mut self, _ynest_format: u32) -> io::Result<Option<GlyphSetHandle>> {
+        Ok(None)
+    }
+
+    fn render_free_glyphset(&mut self, _host_gs: u32) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn render_add_glyphs(&mut self, _host_gs: u32, _body_tail: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn render_free_glyphs(&mut self, _host_gs: u32, _glyph_ids: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn render_composite(
+        &mut self,
+        _op: u8,
+        _host_src: u32,
+        _host_mask: u32,
+        _host_dst: u32,
+        _src_x: i16,
+        _src_y: i16,
+        _mask_x: i16,
+        _mask_y: i16,
+        _dst_x: i16,
+        _dst_y: i16,
+        _width: u16,
+        _height: u16,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn render_composite_glyphs(
+        &mut self,
+        _minor: u8,
+        _op: u8,
+        _host_src: u32,
+        _host_dst: u32,
+        _mask_fmt: u32,
+        _host_gs: u32,
+        _src_x: i16,
+        _src_y: i16,
+        _items: &[u8],
+        _x_off: i16,
+        _y_off: i16,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn render_fill_rectangles(
+        &mut self,
+        _host_dst: u32,
+        _op: u8,
+        _color: [u8; 8],
+        _rects: &[u8],
+        _x_off: i16,
+        _y_off: i16,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn render_trapezoids(
+        &mut self,
+        _op: u8,
+        _host_src: u32,
+        _host_dst: u32,
+        _host_mask_format: u32,
+        _src_x: i16,
+        _src_y: i16,
+        _traps: &[u8],
+        _x_off: i16,
+        _y_off: i16,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn render_create_solid_fill(&mut self, _color: [u8; 8]) -> io::Result<Option<PictureHandle>> {
+        Ok(None)
+    }
+
+    fn render_create_linear_gradient(&mut self, _body: &[u8]) -> io::Result<Option<PictureHandle>> {
+        Ok(None)
+    }
+
+    fn render_create_radial_gradient(&mut self, _body: &[u8]) -> io::Result<Option<PictureHandle>> {
+        Ok(None)
+    }
+
+    fn render_create_cursor(
+        &mut self,
+        _host_src_pic: PictureHandle,
+        _x: u16,
+        _y: u16,
+    ) -> io::Result<Option<CursorHandle>> {
+        Ok(None)
+    }
+
+    fn render_set_picture_clip_rectangles(
+        &mut self,
+        _host_pic: u32,
+        _body: &[u8],
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn render_set_picture_filter(&mut self, _host_pic: u32, _body: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn render_set_picture_transform(&mut self, _host_pic: u32, _body: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn render_query_version(&mut self) -> io::Result<(u32, u32)> {
+        Ok((0, 11))
+    }
+
+    fn xkb_proxy(&mut self, _minor: u8, _body: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    fn xfixes_change_cursor_by_name(
+        &mut self,
+        _host_cursor_xid: u32,
+        _name_bytes: &[u8],
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_shape_rectangles(
+        &mut self,
+        _host_xid: u32,
+        _kind: u8,
+        _rects: &[xfixes::RegionRect],
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn warp_pointer(&mut self, _dst_host_xid: u32, _dst_x: i16, _dst_y: i16) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn query_pointer(&mut self) -> io::Result<PointerPosition> {
+        Ok(PointerPosition {
+            same_screen: true,
+            win_x: 0,
+            win_y: 0,
+            mask: 0,
+        })
+    }
+
+    fn list_fonts_proxy(&mut self, _max_names: u16, _pattern: &str) -> io::Result<Vec<u8>> {
+        // 32-byte stub reply header that downstream parsers can ignore.
+        Ok(vec![0u8; 32])
+    }
+
+    fn list_fonts_with_info_proxy(
+        &mut self,
+        _max_names: u16,
+        _pattern: &str,
+    ) -> io::Result<Vec<Vec<u8>>> {
+        Ok(Vec::new())
+    }
+
+    fn get_atom_name(&mut self, _atom: u32) -> io::Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn get_keyboard_mapping(
+        &mut self,
+        _first_keycode: u8,
+        count: u8,
+    ) -> io::Result<(u8, Vec<u32>)> {
+        // Two keysyms per code, all set to NoSymbol.
+        Ok((2, vec![0; usize::from(count) * 2]))
+    }
+
+    fn get_modifier_mapping(&mut self) -> io::Result<(u8, Vec<u8>)> {
+        Ok((0, Vec::new()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dyn-coercion smoke test: confirm the recorder can be parked
+    /// behind `Arc<Mutex<dyn Backend>>` exactly the way `nested::run`
+    /// holds the production backend. This is the *existence proof*
+    /// that the trait carve from Step 5 works for non-HostX11 impls.
+    #[test]
+    fn recording_backend_is_dyn_safe() {
+        use std::sync::{Arc, Mutex};
+        let rec = Arc::new(Mutex::new(RecordingBackend::new()));
+        let dyn_arc: Arc<Mutex<dyn Backend>> = rec;
+        // Drive a few methods through the dyn pointer to confirm vtable
+        // dispatch works at runtime.
+        let mut g = dyn_arc.lock().unwrap();
+        let parent = WindowHandle::from_raw_panicking(g.window_id());
+        let child = g
+            .create_subwindow(
+                parent,
+                10,
+                20,
+                100,
+                80,
+                0,
+                HostSubwindowVisual::CopyFromParent,
+                None,
+                None,
+            )
+            .unwrap();
+        g.map_subwindow(child.as_raw()).unwrap();
+        g.unmap_subwindow(child.as_raw()).unwrap();
+        g.destroy_subwindow(child.as_raw()).unwrap();
+    }
+
+    #[test]
+    fn recording_backend_records_basic_lifecycle() {
+        let mut rec = RecordingBackend::new();
+        let parent = WindowHandle::from_raw_panicking(rec.window_id());
+        let a = rec
+            .create_subwindow(
+                parent,
+                0,
+                0,
+                50,
+                50,
+                0,
+                HostSubwindowVisual::CopyFromParent,
+                None,
+                None,
+            )
+            .unwrap();
+        let b = rec
+            .create_subwindow(
+                parent,
+                0,
+                0,
+                30,
+                30,
+                1,
+                HostSubwindowVisual::CopyFromParent,
+                Some(0xff0000),
+                None,
+            )
+            .unwrap();
+        rec.map_subwindow(a.as_raw()).unwrap();
+        rec.map_subwindow(b.as_raw()).unwrap();
+        rec.destroy_subwindow(a.as_raw()).unwrap();
+
+        assert_ne!(a.as_raw(), b.as_raw(), "fresh handles each create");
+        let calls = rec.calls();
+        assert_eq!(calls.len(), 5, "5 calls recorded, got {calls:#?}");
+        assert!(matches!(
+            calls[0],
+            RecordedCall::CreateSubwindow {
+                width: 50,
+                height: 50,
+                ..
+            }
+        ));
+        assert!(matches!(
+            calls[1],
+            RecordedCall::CreateSubwindow {
+                background_pixel: Some(0xff0000),
+                ..
+            }
+        ));
+        assert!(matches!(calls[2], RecordedCall::MapSubwindow(_)));
+        assert!(matches!(calls[3], RecordedCall::MapSubwindow(_)));
+        assert!(matches!(calls[4], RecordedCall::DestroySubwindow(_)));
+    }
+}

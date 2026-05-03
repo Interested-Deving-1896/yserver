@@ -8,7 +8,13 @@ use yserver_protocol::x11::{
     ReparentWindowRequest, ResourceId, SetClipRectanglesRequest,
 };
 
-use crate::properties::PropertyValue;
+use crate::{
+    backend::{
+        ArcMode, CapStyle, ClipState, DrawState, FillRule, FillState, FillStyle, FontHandle,
+        GcFunction, JoinStyle, LineStyle, SubwindowMode,
+    },
+    properties::PropertyValue,
+};
 
 pub const SERVER_OWNER: ClientId = ClientId(0);
 
@@ -47,7 +53,7 @@ pub struct Visual {
     pub green_mask: u32,
     pub blue_mask: u32,
     pub alpha_mask: u32,
-    pub host_visual_xid: Option<u32>,
+    pub host_visual_xid: Option<crate::backend::VisualHandle>,
 }
 
 /// A colormap. We currently expose one per visual (root colormap +
@@ -58,19 +64,19 @@ pub struct Visual {
 pub struct Colormap {
     pub id: ResourceId,
     pub visual: ResourceId,
-    pub host_colormap_xid: Option<u32>,
+    pub host_colormap_xid: Option<crate::backend::ColormapHandle>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostDrawableTarget {
     Window {
         nested: ResourceId,
-        host_xid: u32,
+        host_xid: crate::backend::WindowHandle,
         depth: u8,
     },
     Pixmap {
         nested: ResourceId,
-        host_xid: u32,
+        host_xid: crate::backend::PixmapHandle,
         width: u16,
         height: u16,
         depth: u8,
@@ -80,7 +86,15 @@ pub enum HostDrawableTarget {
 impl HostDrawableTarget {
     pub fn host_xid(self) -> u32 {
         match self {
-            Self::Window { host_xid, .. } | Self::Pixmap { host_xid, .. } => host_xid,
+            Self::Window { host_xid, .. } => host_xid.as_raw(),
+            Self::Pixmap { host_xid, .. } => host_xid.as_raw(),
+        }
+    }
+
+    pub fn host_handle(self) -> crate::backend::AnyHandle {
+        match self {
+            Self::Window { host_xid, .. } => crate::backend::AnyHandle::Window(host_xid),
+            Self::Pixmap { host_xid, .. } => crate::backend::AnyHandle::Pixmap(host_xid),
         }
     }
 
@@ -108,7 +122,7 @@ pub struct ReparentResult {
     pub x: i16,
     pub y: i16,
     pub override_redirect: bool,
-    pub host_xid: Option<u32>,
+    pub host_xid: Option<crate::backend::WindowHandle>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,14 +134,14 @@ pub enum ReparentWindowError {
 #[derive(Debug)]
 pub struct PictureState {
     pub client: ClientId,
-    pub host_picture_xid: u32,
-    pub host_owned_pixmap: Option<u32>,
+    pub host_picture_xid: crate::backend::PictureHandle,
+    pub host_owned_pixmap: Option<crate::backend::PixmapHandle>,
 }
 
 #[derive(Debug)]
 pub struct GlyphSetState {
     pub client: ClientId,
-    pub host_glyphset_xid: u32,
+    pub host_glyphset_xid: crate::backend::GlyphSetHandle,
 }
 
 #[derive(Debug)]
@@ -258,7 +272,7 @@ impl ResourceTable {
     pub fn set_visual_host_xid(&mut self, id: ResourceId, host_xid: u32) -> bool {
         match self.visuals.get_mut(&id.0) {
             Some(v) => {
-                v.host_visual_xid = Some(host_xid);
+                v.host_visual_xid = crate::backend::VisualHandle::from_raw(host_xid);
                 true
             }
             None => false,
@@ -272,7 +286,7 @@ impl ResourceTable {
     pub fn set_colormap_host_xid(&mut self, id: ResourceId, host_xid: u32) -> bool {
         match self.colormaps.get_mut(&id.0) {
             Some(c) => {
-                c.host_colormap_xid = Some(host_xid);
+                c.host_colormap_xid = crate::backend::ColormapHandle::from_raw(host_xid);
                 true
             }
             None => false,
@@ -354,7 +368,7 @@ impl ResourceTable {
             return;
         };
         if let Some(xid) = window.background_pixmap_host_xid {
-            out.push(xid);
+            out.push(xid.as_raw());
         }
         for child in &window.children {
             self.collect_bg_pixmap_host_xids_inner(*child, out);
@@ -380,18 +394,19 @@ impl ResourceTable {
     pub fn change_window_attributes(
         &mut self,
         request: ChangeWindowAttributesRequest,
-    ) -> Option<u32> {
-        let mut previous_bg_host_xid: Option<u32> = None;
-        let new_bg_host_xid = if let Some(bg_pixmap) = request.background_pixmap {
-            if bg_pixmap.0 == 0 {
-                Some(None)
+    ) -> Option<crate::backend::PixmapHandle> {
+        let mut previous_bg_host_xid: Option<crate::backend::PixmapHandle> = None;
+        let new_bg_host_xid: Option<Option<crate::backend::PixmapHandle>> =
+            if let Some(bg_pixmap) = request.background_pixmap {
+                if bg_pixmap.0 == 0 {
+                    Some(None)
+                } else {
+                    let host = self.pixmaps.get(&bg_pixmap.0).and_then(|p| p.host_xid);
+                    Some(host)
+                }
             } else {
-                let host = self.pixmaps.get(&bg_pixmap.0).and_then(|p| p.host_xid);
-                Some(host)
-            }
-        } else {
-            None
-        };
+                None
+            };
 
         if let Some(window) = self.windows.get_mut(&request.window.0) {
             if let Some(bg_pixmap) = request.background_pixmap {
@@ -966,9 +981,13 @@ impl ResourceTable {
     }
 
     #[must_use]
-    pub fn set_pixmap_host_xid(&mut self, id: ResourceId, host_xid: u32) -> bool {
+    pub fn set_pixmap_host_xid(
+        &mut self,
+        id: ResourceId,
+        host_handle: crate::backend::PixmapHandle,
+    ) -> bool {
         if let Some(pixmap) = self.pixmaps.get_mut(&id.0) {
-            pixmap.host_xid = Some(host_xid);
+            pixmap.host_xid = Some(host_handle);
             true
         } else {
             false
@@ -979,12 +998,15 @@ impl ResourceTable {
         // Use the snapshotted host XID rather than re-resolving the pixmap, so
         // it remains valid after the client frees the original pixmap (X11
         // semantics: the server retains the bg pixmap independent of refs).
-        self.windows.get(&window_id.0)?.background_pixmap_host_xid
+        self.windows
+            .get(&window_id.0)?
+            .background_pixmap_host_xid
+            .map(|h| h.as_raw())
     }
 
     /// Returns true if any window currently uses `host_xid` as its background.
     /// Used by FreePixmap to skip releasing host pixmaps still owned by a window.
-    pub fn host_xid_referenced_by_window_bg(&self, host_xid: u32) -> bool {
+    pub fn host_xid_referenced_by_window_bg(&self, host_xid: crate::backend::PixmapHandle) -> bool {
         self.windows
             .values()
             .any(|w| w.background_pixmap_host_xid == Some(host_xid))
@@ -1024,144 +1046,257 @@ impl ResourceTable {
             Some(Some(pixmap)) => Some(pixmap),
             _ => None,
         };
-        self.gcs.insert(
-            request.gc.0,
-            Gc {
-                id: request.gc,
-                drawable: request.drawable,
-                foreground: request.foreground.unwrap_or(0),
-                background: request.background.unwrap_or(0x00ff_ffff),
-                line_width: request.line_width.unwrap_or(0),
-                font: request.font,
-                clip_rectangles: None,
-                clip_pixmap,
-                clip_x_origin: 0,
-                clip_y_origin: 0,
-                fill_style: request.fill_style.unwrap_or(0),
+        let mut gc = Gc::with_defaults(request.gc, request.drawable, owner);
+        gc.clip_pixmap = clip_pixmap;
+        Self::apply_gc_change(
+            &mut gc,
+            GcChangeView {
+                function: request.function,
+                plane_mask: request.plane_mask,
+                foreground: request.foreground,
+                background: request.background,
+                line_width: request.line_width,
+                line_style: request.line_style,
+                cap_style: request.cap_style,
+                join_style: request.join_style,
+                fill_style: request.fill_style,
+                fill_rule: request.fill_rule,
                 tile: request.tile,
                 stipple: request.stipple,
-                tile_x_origin: request.tile_x_origin.unwrap_or(0),
-                tile_y_origin: request.tile_y_origin.unwrap_or(0),
-                owner,
+                tile_x_origin: request.tile_x_origin,
+                tile_y_origin: request.tile_y_origin,
+                font: request.font,
+                subwindow_mode: request.subwindow_mode,
+                graphics_exposures: request.graphics_exposures,
+                clip_x_origin: request.clip_x_origin,
+                clip_y_origin: request.clip_y_origin,
+                // CreateGC's clip-mask is consumed by the explicit
+                // `clip_pixmap` assignment above; passing it again here
+                // would re-clear `clip_rectangles` (irrelevant on a
+                // fresh GC) but otherwise harmless. Pass `None` so the
+                // helper is purely additive.
+                clip_mask: None,
+                dash_offset: request.dash_offset,
+                dashes: request.dashes,
+                arc_mode: request.arc_mode,
+            },
+        );
+        self.gcs.insert(request.gc.0, gc);
+    }
+
+    pub fn change_gc(&mut self, request: GcChange) {
+        let gc = self
+            .gcs
+            .entry(request.gc.0)
+            .or_insert_with(|| Gc::with_defaults(request.gc, ResourceId(0), SERVER_OWNER));
+        Self::apply_gc_change(
+            gc,
+            GcChangeView {
+                function: request.function,
+                plane_mask: request.plane_mask,
+                foreground: request.foreground,
+                background: request.background,
+                line_width: request.line_width,
+                line_style: request.line_style,
+                cap_style: request.cap_style,
+                join_style: request.join_style,
+                fill_style: request.fill_style,
+                fill_rule: request.fill_rule,
+                tile: request.tile,
+                stipple: request.stipple,
+                tile_x_origin: request.tile_x_origin,
+                tile_y_origin: request.tile_y_origin,
+                font: request.font,
+                subwindow_mode: request.subwindow_mode,
+                graphics_exposures: request.graphics_exposures,
+                clip_x_origin: request.clip_x_origin,
+                clip_y_origin: request.clip_y_origin,
+                clip_mask: request.clip_mask,
+                dash_offset: request.dash_offset,
+                dashes: request.dashes,
+                arc_mode: request.arc_mode,
             },
         );
     }
 
-    pub fn change_gc(&mut self, request: GcChange) {
-        let gc = self.gcs.entry(request.gc.0).or_insert(Gc {
-            id: request.gc,
-            drawable: ResourceId(0),
-            foreground: 0,
-            background: 0x00ff_ffff,
-            line_width: 0,
-            font: None,
-            clip_rectangles: None,
-            clip_pixmap: None,
-            clip_x_origin: 0,
-            clip_y_origin: 0,
-            fill_style: 0,
-            tile: None,
-            stipple: None,
-            tile_x_origin: 0,
-            tile_y_origin: 0,
-            owner: SERVER_OWNER,
-        });
-        if let Some(foreground) = request.foreground {
+    /// Apply the `Some`-valued attributes of a CreateGC / ChangeGC
+    /// request onto an existing `Gc`. Shared between the two request
+    /// paths so all 23 attribute slots are handled the same way.
+    fn apply_gc_change(gc: &mut Gc, change: GcChangeView) {
+        if let Some(function) = change.function {
+            gc.function = GcFunction::from_protocol(function);
+        }
+        if let Some(plane_mask) = change.plane_mask {
+            gc.plane_mask = plane_mask;
+        }
+        if let Some(foreground) = change.foreground {
             gc.foreground = foreground;
         }
-        if let Some(background) = request.background {
+        if let Some(background) = change.background {
             gc.background = background;
         }
-        if let Some(line_width) = request.line_width {
+        if let Some(line_width) = change.line_width {
             gc.line_width = line_width;
         }
-        if let Some(font) = request.font {
-            gc.font = Some(font);
+        if let Some(line_style) = change.line_style {
+            gc.line_style = LineStyle::from_protocol(line_style);
         }
-        if let Some(x) = request.clip_x_origin {
-            gc.clip_x_origin = x;
+        if let Some(cap_style) = change.cap_style {
+            gc.cap_style = CapStyle::from_protocol(cap_style);
         }
-        if let Some(y) = request.clip_y_origin {
-            gc.clip_y_origin = y;
+        if let Some(join_style) = change.join_style {
+            gc.join_style = JoinStyle::from_protocol(join_style);
         }
-        if let Some(fs) = request.fill_style {
-            gc.fill_style = fs;
+        if let Some(fs) = change.fill_style {
+            gc.fill_style = FillStyle::from_protocol(fs);
         }
-        if let Some(tile) = request.tile {
+        if let Some(fill_rule) = change.fill_rule {
+            gc.fill_rule = FillRule::from_protocol(fill_rule);
+        }
+        if let Some(tile) = change.tile {
             gc.tile = Some(tile);
         }
-        if let Some(stipple) = request.stipple {
+        if let Some(stipple) = change.stipple {
             gc.stipple = Some(stipple);
         }
-        if let Some(x) = request.tile_x_origin {
+        if let Some(x) = change.tile_x_origin {
             gc.tile_x_origin = x;
         }
-        if let Some(y) = request.tile_y_origin {
+        if let Some(y) = change.tile_y_origin {
             gc.tile_y_origin = y;
+        }
+        if let Some(font) = change.font {
+            gc.font = Some(font);
+        }
+        if let Some(submode) = change.subwindow_mode {
+            gc.subwindow_mode = SubwindowMode::from_protocol(submode);
+        }
+        if let Some(graphics_exposures) = change.graphics_exposures {
+            gc.graphics_exposures = graphics_exposures;
+        }
+        if let Some(x) = change.clip_x_origin {
+            gc.clip_x_origin = x;
+        }
+        if let Some(y) = change.clip_y_origin {
+            gc.clip_y_origin = y;
         }
         // CPClipMask: Some(None) = clear, Some(Some(p)) = pixmap. Setting
         // a clip-mask supersedes any prior `SetClipRectangles` per spec.
-        if let Some(mask) = request.clip_mask {
+        if let Some(mask) = change.clip_mask {
             gc.clip_rectangles = None;
             gc.clip_pixmap = mask;
+        }
+        if let Some(offset) = change.dash_offset {
+            gc.dash_offset = offset as i16;
+        }
+        // CPDashList in CreateGC/ChangeGC is a single byte: store it as
+        // the on/off pattern `[n, n]` and reset dash_offset per the X11
+        // protocol semantics. The full SetDashes opcode (58) remains
+        // unimplemented.
+        if let Some(n) = change.dashes
+            && n != 0
+        {
+            gc.dashes = vec![n, n];
+            gc.dash_offset = 0;
+        }
+        if let Some(arc_mode) = change.arc_mode {
+            gc.arc_mode = ArcMode::from_protocol(arc_mode);
         }
     }
 
     pub fn set_clip_rectangles(&mut self, request: SetClipRectanglesRequest) {
-        let gc = self.gcs.entry(request.gc.0).or_insert(Gc {
-            id: request.gc,
-            drawable: ResourceId(0),
-            foreground: 0,
-            background: 0x00ff_ffff,
-            line_width: 0,
-            font: None,
-            clip_rectangles: None,
-            clip_pixmap: None,
-            clip_x_origin: 0,
-            clip_y_origin: 0,
-            fill_style: 0,
-            tile: None,
-            stipple: None,
-            tile_x_origin: 0,
-            tile_y_origin: 0,
-            owner: SERVER_OWNER,
-        });
+        let gc = self
+            .gcs
+            .entry(request.gc.0)
+            .or_insert_with(|| Gc::with_defaults(request.gc, ResourceId(0), SERVER_OWNER));
         // SetClipRectangles supersedes any prior clip-mask pixmap.
         gc.clip_pixmap = None;
         gc.clip_rectangles = Some(request.clip);
     }
 
     pub fn copy_gc(&mut self, src: ResourceId, dst: ResourceId, value_mask: u32) {
-        let src_data = self.gcs.get(&src.0).map(|g| {
-            (
-                g.foreground,
-                g.background,
-                g.line_width,
-                g.font,
-                g.clip_rectangles.clone(),
-            )
-        });
-        let Some((fg, bg, lw, font, clip)) = src_data else {
+        // Snapshot the source GC under the immutable borrow so we can
+        // then take a mutable borrow of dst. Cheap because the only
+        // owned field copied here is `dashes`.
+        let Some(src_gc) = self.gcs.get(&src.0).cloned() else {
             return;
         };
         let Some(dst_gc) = self.gcs.get_mut(&dst.0) else {
             return;
         };
-        if value_mask & (1 << 2) != 0 {
-            dst_gc.foreground = fg;
+        if value_mask & 0x0000_0001 != 0 {
+            dst_gc.function = src_gc.function;
         }
-        if value_mask & (1 << 3) != 0 {
-            dst_gc.background = bg;
+        if value_mask & 0x0000_0002 != 0 {
+            dst_gc.plane_mask = src_gc.plane_mask;
         }
-        if value_mask & (1 << 4) != 0 {
-            dst_gc.line_width = lw;
+        if value_mask & 0x0000_0004 != 0 {
+            dst_gc.foreground = src_gc.foreground;
         }
-        if value_mask & (1 << 14) != 0 {
-            dst_gc.font = font;
+        if value_mask & 0x0000_0008 != 0 {
+            dst_gc.background = src_gc.background;
         }
-        if value_mask & (1 << 19) != 0 {
-            // GCClipMask — copy internal clip-rectangle list
-            dst_gc.clip_rectangles = clip;
+        if value_mask & 0x0000_0010 != 0 {
+            dst_gc.line_width = src_gc.line_width;
+        }
+        if value_mask & 0x0000_0020 != 0 {
+            dst_gc.line_style = src_gc.line_style;
+        }
+        if value_mask & 0x0000_0040 != 0 {
+            dst_gc.cap_style = src_gc.cap_style;
+        }
+        if value_mask & 0x0000_0080 != 0 {
+            dst_gc.join_style = src_gc.join_style;
+        }
+        if value_mask & 0x0000_0100 != 0 {
+            dst_gc.fill_style = src_gc.fill_style;
+        }
+        if value_mask & 0x0000_0200 != 0 {
+            dst_gc.fill_rule = src_gc.fill_rule;
+        }
+        if value_mask & 0x0000_0400 != 0 {
+            dst_gc.tile = src_gc.tile;
+        }
+        if value_mask & 0x0000_0800 != 0 {
+            dst_gc.stipple = src_gc.stipple;
+        }
+        if value_mask & 0x0000_1000 != 0 {
+            dst_gc.tile_x_origin = src_gc.tile_x_origin;
+        }
+        if value_mask & 0x0000_2000 != 0 {
+            dst_gc.tile_y_origin = src_gc.tile_y_origin;
+        }
+        if value_mask & 0x0000_4000 != 0 {
+            dst_gc.font = src_gc.font;
+        }
+        if value_mask & 0x0000_8000 != 0 {
+            dst_gc.subwindow_mode = src_gc.subwindow_mode;
+        }
+        if value_mask & 0x0001_0000 != 0 {
+            dst_gc.graphics_exposures = src_gc.graphics_exposures;
+        }
+        if value_mask & 0x0002_0000 != 0 {
+            dst_gc.clip_x_origin = src_gc.clip_x_origin;
+        }
+        if value_mask & 0x0004_0000 != 0 {
+            dst_gc.clip_y_origin = src_gc.clip_y_origin;
+        }
+        if value_mask & 0x0008_0000 != 0 {
+            // GCClipMask — copy both the rectangle-list and pixmap
+            // clip-mask members. Either may be `None`; whichever the
+            // source has set wins per X11 semantics (a clip-mask and a
+            // rectangle-list cannot coexist).
+            dst_gc.clip_rectangles = src_gc.clip_rectangles.clone();
+            dst_gc.clip_pixmap = src_gc.clip_pixmap;
+        }
+        if value_mask & 0x0010_0000 != 0 {
+            dst_gc.dash_offset = src_gc.dash_offset;
+        }
+        if value_mask & 0x0020_0000 != 0 {
+            dst_gc.dashes = src_gc.dashes.clone();
+        }
+        if value_mask & 0x0040_0000 != 0 {
+            dst_gc.arc_mode = src_gc.arc_mode;
         }
     }
 
@@ -1224,8 +1359,7 @@ impl ResourceTable {
             return GcFillState::Solid;
         };
         match gc.fill_style {
-            1 => {
-                // Tiled
+            FillStyle::Tiled => {
                 let host_pixmap = gc
                     .tile
                     .and_then(|p| self.pixmaps.get(&p.0))
@@ -1242,8 +1376,103 @@ impl ResourceTable {
                     None => GcFillState::Solid,
                 }
             }
+            // Stippled / OpaqueStippled: not yet plumbed end-to-end on the
+            // host shared GC; degrade to Solid so the draw doesn't blow up.
+            // `resolve_draw_state` exposes the full FillState the host can
+            // honour once the surface plumbing is wired up.
             _ => GcFillState::Solid,
         }
+    }
+
+    /// Resolve the GC's full `DrawState` snapshot for use by drawing
+    /// call sites. Returns `None` only when the GC id is unknown — this
+    /// is the BadGC case in the X11 protocol. Missing pixmap backing
+    /// for a tile / stipple / clip-mask degrades the relevant component
+    /// to its safe default (Solid fill, unclipped) rather than failing
+    /// the whole request, mirroring `gc_fill_state` / `gc_clip_state`
+    /// pre-Phase-6.2 behavior.
+    pub fn resolve_draw_state(&self, gc_id: ResourceId) -> Option<DrawState> {
+        let gc = self.gcs.get(&gc_id.0)?;
+
+        // Clip resolution: rectangles take priority over pixmap, both
+        // shifted by (clip_x_origin, clip_y_origin). Missing pixmap
+        // backing degrades to "no clip".
+        let clip = if let Some(rects) = gc.clip_rectangles.clone() {
+            ClipState::Rectangles {
+                origin: (gc.clip_x_origin, gc.clip_y_origin),
+                rects,
+            }
+        } else if let Some(clip_pixmap_id) = gc.clip_pixmap {
+            match self.pixmaps.get(&clip_pixmap_id.0).and_then(|p| p.host_xid) {
+                Some(pixmap) => ClipState::Pixmap {
+                    origin: (gc.clip_x_origin, gc.clip_y_origin),
+                    pixmap,
+                },
+                None => ClipState::None,
+            }
+        } else {
+            ClipState::None
+        };
+
+        // Fill resolution: degrade to Solid if the named tile/stipple
+        // pixmap is missing host backing. The host's shared GC then
+        // fills with foreground (existing pre-Phase-6.2 fallback).
+        let fill = match gc.fill_style {
+            FillStyle::Solid => FillState::Solid,
+            FillStyle::Tiled => gc
+                .tile
+                .and_then(|t| self.pixmaps.get(&t.0))
+                .and_then(|p| p.host_xid)
+                .map(|pixmap| FillState::Tiled {
+                    pixmap,
+                    origin: (gc.tile_x_origin, gc.tile_y_origin),
+                })
+                .unwrap_or(FillState::Solid),
+            FillStyle::Stippled => gc
+                .stipple
+                .and_then(|s| self.pixmaps.get(&s.0))
+                .and_then(|p| p.host_xid)
+                .map(|pixmap| FillState::Stippled {
+                    pixmap,
+                    origin: (gc.tile_x_origin, gc.tile_y_origin),
+                })
+                .unwrap_or(FillState::Solid),
+            FillStyle::OpaqueStippled => gc
+                .stipple
+                .and_then(|s| self.pixmaps.get(&s.0))
+                .and_then(|p| p.host_xid)
+                .map(|pixmap| FillState::OpaqueStippled {
+                    pixmap,
+                    origin: (gc.tile_x_origin, gc.tile_y_origin),
+                })
+                .unwrap_or(FillState::Solid),
+        };
+
+        let font: Option<FontHandle> = gc
+            .font
+            .and_then(|f| self.fonts.get(&f.0))
+            .map(|f| f.host_xid);
+
+        Some(DrawState {
+            foreground: gc.foreground,
+            background: gc.background,
+            line_width: gc.line_width,
+            line_style: gc.line_style,
+            cap_style: gc.cap_style,
+            join_style: gc.join_style,
+            fill_style: gc.fill_style,
+            fill_rule: gc.fill_rule,
+            function: gc.function,
+            plane_mask: gc.plane_mask,
+            font,
+            clip,
+            fill,
+            subwindow_mode: gc.subwindow_mode,
+            graphics_exposures: gc.graphics_exposures,
+            dashes: gc.dashes.clone(),
+            dash_offset: gc.dash_offset,
+            arc_mode: gc.arc_mode,
+        })
     }
 
     pub fn create_picture(&mut self, id: ResourceId, state: PictureState) {
@@ -1260,18 +1489,18 @@ impl ResourceTable {
 
     pub fn create_glyphset(&mut self, id: ResourceId, state: GlyphSetState) {
         if let Some(old) = self.glyphsets.remove(&id.0) {
-            let _ = self.release_host_glyphset_ref(old.host_glyphset_xid);
+            let _ = self.release_host_glyphset_ref(old.host_glyphset_xid.as_raw());
         }
         *self
             .host_glyphset_refcounts
-            .entry(state.host_glyphset_xid)
+            .entry(state.host_glyphset_xid.as_raw())
             .or_insert(0) += 1;
         self.glyphsets.insert(id.0, state);
     }
 
     pub fn free_glyphset(&mut self, id: ResourceId) -> Option<GlyphSetState> {
         let state = self.glyphsets.remove(&id.0)?;
-        if self.release_host_glyphset_ref(state.host_glyphset_xid) {
+        if self.release_host_glyphset_ref(state.host_glyphset_xid.as_raw()) {
             Some(state)
         } else {
             None
@@ -1319,7 +1548,7 @@ impl ResourceTable {
         owner: ClientId,
         id: ResourceId,
         name: String,
-        host_xid: u32,
+        host_xid: crate::backend::FontHandle,
         metrics: FontMetrics,
     ) {
         self.fonts.insert(
@@ -1373,14 +1602,14 @@ impl ResourceTable {
         );
     }
 
-    pub fn set_cursor_host_xid(&mut self, id: ResourceId, xid: u32) {
+    pub fn set_cursor_host_xid(&mut self, id: ResourceId, handle: crate::backend::CursorHandle) {
         if let Some(c) = self.cursors.get_mut(&id.0) {
-            c.host_xid = Some(xid);
+            c.host_xid = Some(handle);
         }
     }
 
     pub fn cursor_host_xid(&self, id: ResourceId) -> Option<u32> {
-        self.cursors.get(&id.0)?.host_xid
+        self.cursors.get(&id.0)?.host_xid.map(|h| h.as_raw())
     }
 
     pub fn free_cursor(&mut self, id: ResourceId) {
@@ -1414,7 +1643,7 @@ impl ResourceTable {
         self.pixmaps.retain(|_, p| {
             if p.owner == client {
                 if let Some(xid) = p.host_xid {
-                    freed_pixmaps.push(xid);
+                    freed_pixmaps.push(xid.as_raw());
                 }
                 false
             } else {
@@ -1426,7 +1655,7 @@ impl ResourceTable {
         let mut closed_fonts = Vec::new();
         self.fonts.retain(|_, f| {
             if f.owner == client {
-                closed_fonts.push(f.host_xid);
+                closed_fonts.push(f.host_xid.as_raw());
                 false
             } else {
                 true
@@ -1435,7 +1664,10 @@ impl ResourceTable {
         let mut freed_pictures: Vec<(u32, Option<u32>)> = Vec::new();
         self.pictures.retain(|_, p| {
             if p.client == client {
-                freed_pictures.push((p.host_picture_xid, p.host_owned_pixmap));
+                freed_pictures.push((
+                    p.host_picture_xid.as_raw(),
+                    p.host_owned_pixmap.map(|h| h.as_raw()),
+                ));
                 false
             } else {
                 true
@@ -1445,7 +1677,7 @@ impl ResourceTable {
         let removed_glyphsets = self
             .glyphsets
             .extract_if(|_, g| g.client == client)
-            .map(|(_, g)| g.host_glyphset_xid)
+            .map(|(_, g)| g.host_glyphset_xid.as_raw())
             .collect::<Vec<_>>();
         for host_xid in removed_glyphsets {
             if self.release_host_glyphset_ref(host_xid) {
@@ -1536,7 +1768,7 @@ pub enum GcClipState {
     None,
     Rectangles(ClipRectangles),
     Pixmap {
-        host_pixmap: u32,
+        host_pixmap: crate::backend::PixmapHandle,
         clip_x_origin: i16,
         clip_y_origin: i16,
     },
@@ -1550,7 +1782,7 @@ pub enum GcClipState {
 pub enum GcFillState {
     Solid,
     Tiled {
-        host_pixmap: u32,
+        host_pixmap: crate::backend::PixmapHandle,
         tile_x_origin: i16,
         tile_y_origin: i16,
     },
@@ -1564,7 +1796,7 @@ pub enum GcFillState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NamedCompositePixmap {
     pub client_pixmap: ResourceId,
-    pub host_pixmap: u32,
+    pub host_pixmap: crate::backend::PixmapHandle,
     pub width: u16,
     pub height: u16,
 }
@@ -1621,15 +1853,15 @@ pub struct Window {
     /// Host XID of the bg pixmap, snapshotted at attrs-change time so
     /// it survives FreePixmap (X11 servers retain bg pixmaps independent
     /// of client refs).
-    pub background_pixmap_host_xid: Option<u32>,
+    pub background_pixmap_host_xid: Option<crate::backend::PixmapHandle>,
     /// Host XID of the border pixmap (if any). Parallel to
     /// `background_pixmap_host_xid`, retained for the same reason.
-    pub border_pixmap_host_xid: Option<u32>,
+    pub border_pixmap_host_xid: Option<crate::backend::PixmapHandle>,
     pub override_redirect: bool,
     pub cursor: Option<ResourceId>,
     pub owner: ClientId,
     pub properties: HashMap<AtomId, PropertyValue>,
-    pub host_xid: Option<u32>,
+    pub host_xid: Option<crate::backend::WindowHandle>,
     /// Per-window list of `Composite::NameWindowPixmap` aliases. All are
     /// invalidated together on resize per the COMPOSITE spec.
     pub composite_named_pixmaps: Vec<NamedCompositePixmap>,
@@ -1717,7 +1949,7 @@ pub struct Pixmap {
     pub height: u16,
     pub depth: u8,
     pub owner: ClientId,
-    pub host_xid: Option<u32>,
+    pub host_xid: Option<crate::backend::PixmapHandle>,
 }
 
 #[derive(Clone, Debug)]
@@ -1737,24 +1969,105 @@ pub struct Gc {
     pub clip_pixmap: Option<ResourceId>,
     pub clip_x_origin: i16,
     pub clip_y_origin: i16,
-    /// X11 GC `fill-style`: 0 = Solid, 1 = Tiled, 2 = Stippled,
-    /// 3 = OpaqueStippled. e16 paints popup backgrounds via Tiled fill,
+    /// X11 GC `fill-style`. e16 paints popup backgrounds via Tiled fill,
     /// so PolyFillRectangle on the destination pixmap tiles the theme
     /// pixmap onto it. Without honoring this, the destination stays the
     /// default solid foreground (typically 0 = black).
-    pub fill_style: u8,
+    pub fill_style: FillStyle,
     pub tile: Option<ResourceId>,
     pub stipple: Option<ResourceId>,
     pub tile_x_origin: i16,
     pub tile_y_origin: i16,
+    // Phase 6.2 additive scope: stored per-GC so they can be forwarded
+    // to the host's shared GC at draw time. Pre-Phase-6.2 ynest silently
+    // ignored these and drew with host-GC defaults; honoring them is a
+    // behavioral improvement (e.g. drag-rectangle Xor now works).
+    pub line_style: LineStyle,
+    pub cap_style: CapStyle,
+    pub join_style: JoinStyle,
+    pub fill_rule: FillRule,
+    pub function: GcFunction,
+    pub plane_mask: u32,
+    pub subwindow_mode: SubwindowMode,
+    pub graphics_exposures: bool,
+    pub dashes: Vec<u8>,
+    pub dash_offset: i16,
+    pub arc_mode: ArcMode,
     pub owner: ClientId,
+}
+
+/// Internal projection of CreateGC / ChangeGC's value-list onto a
+/// single struct. Both request paths build one of these and feed it to
+/// `apply_gc_change`, so all 23 attribute slots are handled identically.
+#[derive(Clone, Copy, Debug, Default)]
+struct GcChangeView {
+    function: Option<u8>,
+    plane_mask: Option<u32>,
+    foreground: Option<u32>,
+    background: Option<u32>,
+    line_width: Option<u16>,
+    line_style: Option<u8>,
+    cap_style: Option<u8>,
+    join_style: Option<u8>,
+    fill_style: Option<u8>,
+    fill_rule: Option<u8>,
+    tile: Option<ResourceId>,
+    stipple: Option<ResourceId>,
+    tile_x_origin: Option<i16>,
+    tile_y_origin: Option<i16>,
+    font: Option<ResourceId>,
+    subwindow_mode: Option<u8>,
+    graphics_exposures: Option<bool>,
+    clip_x_origin: Option<i16>,
+    clip_y_origin: Option<i16>,
+    clip_mask: Option<Option<ResourceId>>,
+    dash_offset: Option<u16>,
+    dashes: Option<u8>,
+    arc_mode: Option<u8>,
+}
+
+impl Gc {
+    /// Construct a GC with all-default attributes for the given id /
+    /// drawable / owner. Used by the `change_gc` and
+    /// `set_clip_rectangles` paths when the GC has not been seen before.
+    fn with_defaults(id: ResourceId, drawable: ResourceId, owner: ClientId) -> Self {
+        Self {
+            id,
+            drawable,
+            foreground: 0,
+            background: 0x00ff_ffff,
+            line_width: 0,
+            font: None,
+            clip_rectangles: None,
+            clip_pixmap: None,
+            clip_x_origin: 0,
+            clip_y_origin: 0,
+            fill_style: FillStyle::Solid,
+            tile: None,
+            stipple: None,
+            tile_x_origin: 0,
+            tile_y_origin: 0,
+            line_style: LineStyle::Solid,
+            cap_style: CapStyle::Butt,
+            join_style: JoinStyle::Miter,
+            fill_rule: FillRule::EvenOdd,
+            function: GcFunction::Copy,
+            plane_mask: u32::MAX,
+            subwindow_mode: SubwindowMode::ClipByChildren,
+            graphics_exposures: true,
+            dashes: vec![4, 4],
+            dash_offset: 0,
+            arc_mode: ArcMode::PieSlice,
+            owner,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Font {
     pub id: ResourceId,
     pub name: String,
-    pub host_xid: u32,
+    pub host_xid: crate::backend::FontHandle,
     pub metrics: FontMetrics,
     pub owner: ClientId,
 }
@@ -1763,7 +2076,7 @@ pub struct Font {
 pub struct Cursor {
     pub id: ResourceId,
     pub owner: ClientId,
-    pub host_xid: Option<u32>,
+    pub host_xid: Option<crate::backend::CursorHandle>,
 }
 
 #[cfg(test)]
@@ -1795,7 +2108,8 @@ mod tests {
 
     fn make_top_level_with_host_xid(table: &mut ResourceTable, id: u32, host_xid: u32) {
         make_window(table, id);
-        table.windows.get_mut(&id).unwrap().host_xid = Some(host_xid);
+        table.windows.get_mut(&id).unwrap().host_xid =
+            Some(crate::backend::WindowHandle::from_raw_for_test(host_xid));
     }
 
     fn make_child(table: &mut ResourceTable, id: u32, parent: u32, x: i16, y: i16) {
@@ -1841,7 +2155,7 @@ mod tests {
             ResourceId(0x200),
             GlyphSetState {
                 client: ClientId(1),
-                host_glyphset_xid: 0xabc,
+                host_glyphset_xid: crate::backend::GlyphSetHandle::from_raw_for_test(0xabc),
             },
         );
 
@@ -1849,7 +2163,7 @@ mod tests {
         assert_eq!(
             table
                 .glyphset(ResourceId(0x201))
-                .map(|g| g.host_glyphset_xid),
+                .map(|g| g.host_glyphset_xid.as_raw()),
             Some(0xabc)
         );
 
@@ -1857,7 +2171,7 @@ mod tests {
         assert_eq!(
             table
                 .free_glyphset(ResourceId(0x201))
-                .map(|g| g.host_glyphset_xid),
+                .map(|g| g.host_glyphset_xid.as_raw()),
             Some(0xabc)
         );
     }
@@ -1869,7 +2183,7 @@ mod tests {
             ResourceId(0x200),
             GlyphSetState {
                 client: ClientId(1),
-                host_glyphset_xid: 0xabc,
+                host_glyphset_xid: crate::backend::GlyphSetHandle::from_raw_for_test(0xabc),
             },
         );
         assert!(table.reference_glyphset(ClientId(1), ResourceId(0x201), ResourceId(0x200)));
@@ -1958,7 +2272,7 @@ mod tests {
             target,
             Some(HostDrawableTarget::Window {
                 nested: ResourceId(0x0010_0002),
-                host_xid: 0xAA,
+                host_xid: crate::backend::WindowHandle::from_raw_for_test(0xAA),
                 depth: 24,
             })
         );
@@ -1973,14 +2287,14 @@ mod tests {
         make_top_level_with_host_xid(&mut table, 0x0010_0002, 0xBB);
         make_child(&mut table, 0x0010_0003, 0x0010_0002, 10, 20);
         if let Some(child) = table.window_mut(ResourceId(0x0010_0003)) {
-            child.host_xid = Some(0xCC);
+            child.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(0xCC));
         }
         let target = table.host_drawable_target(ResourceId(0x0010_0003));
         assert_eq!(
             target,
             Some(HostDrawableTarget::Window {
                 nested: ResourceId(0x0010_0003),
-                host_xid: 0xCC,
+                host_xid: crate::backend::WindowHandle::from_raw_for_test(0xCC),
                 depth: 24,
             })
         );
@@ -1992,10 +2306,7 @@ mod tests {
         make_top_level_with_host_xid(&mut table, 0x0010_0002, 0xBB);
         make_child(&mut table, 0x0010_0003, 0x0010_0002, 10, 20);
         // child has no host_xid; drawing on it drops silently.
-        assert_eq!(
-            table.host_drawable_target(ResourceId(0x0010_0003)),
-            None
-        );
+        assert_eq!(table.host_drawable_target(ResourceId(0x0010_0003)), None);
     }
 
     #[test]
@@ -2009,13 +2320,16 @@ mod tests {
             depth: 32,
         };
         table.create_pixmap(ClientId(1), request);
-        assert!(table.set_pixmap_host_xid(ResourceId(0x0020_0002), 0xDEAD_BEEF));
+        assert!(table.set_pixmap_host_xid(
+            ResourceId(0x0020_0002),
+            crate::backend::PixmapHandle::from_raw_for_test(0xDEAD_BEEF),
+        ));
         let target = table.host_drawable_target(ResourceId(0x0020_0002));
         assert_eq!(
             target,
             Some(HostDrawableTarget::Pixmap {
                 nested: ResourceId(0x0020_0002),
-                host_xid: 0xDEAD_BEEF,
+                host_xid: crate::backend::PixmapHandle::from_raw_for_test(0xDEAD_BEEF),
                 width: 256,
                 height: 256,
                 depth: 32,
@@ -2049,7 +2363,10 @@ mod tests {
     #[test]
     fn set_pixmap_host_xid_unknown_id_returns_false() {
         let mut table = ResourceTable::new();
-        let result = table.set_pixmap_host_xid(ResourceId(0xDEAD), 0x1234);
+        let result = table.set_pixmap_host_xid(
+            ResourceId(0xDEAD),
+            crate::backend::PixmapHandle::from_raw_for_test(0x1234),
+        );
         assert!(!result);
     }
 
@@ -2064,10 +2381,17 @@ mod tests {
             depth: 24,
         };
         table.create_pixmap(ClientId(1), request);
-        let result = table.set_pixmap_host_xid(ResourceId(0x0020_0002), 0x5678);
+        let result = table.set_pixmap_host_xid(
+            ResourceId(0x0020_0002),
+            crate::backend::PixmapHandle::from_raw_for_test(0x5678),
+        );
         assert!(result);
         assert_eq!(
-            table.pixmap(ResourceId(0x0020_0002)).unwrap().host_xid,
+            table
+                .pixmap(ResourceId(0x0020_0002))
+                .unwrap()
+                .host_xid
+                .map(|h| h.as_raw()),
             Some(0x5678)
         );
     }
@@ -2683,7 +3007,9 @@ mod tests {
         let mut t = ResourceTable::new();
         assert!(t.set_visual_host_xid(ARGB_VISUAL, 0x4711));
         assert_eq!(
-            t.visual(ARGB_VISUAL).and_then(|v| v.host_visual_xid),
+            t.visual(ARGB_VISUAL)
+                .and_then(|v| v.host_visual_xid)
+                .map(|h| h.as_raw()),
             Some(0x4711)
         );
         assert!(!t.set_visual_host_xid(ResourceId(0xdead), 0x42));
@@ -2694,7 +3020,9 @@ mod tests {
         let mut t = ResourceTable::new();
         assert!(t.set_colormap_host_xid(ARGB_COLORMAP, 0x9999));
         assert_eq!(
-            t.colormap(ARGB_COLORMAP).and_then(|c| c.host_colormap_xid),
+            t.colormap(ARGB_COLORMAP)
+                .and_then(|c| c.host_colormap_xid)
+                .map(|h| h.as_raw()),
             Some(0x9999)
         );
     }
@@ -2808,25 +3136,88 @@ mod tests {
         assert_eq!(w.depth, 24);
     }
 
+    fn empty_create_gc_request(gc: ResourceId, drawable: ResourceId) -> CreateGcRequest {
+        CreateGcRequest {
+            gc,
+            drawable,
+            function: None,
+            plane_mask: None,
+            foreground: None,
+            background: None,
+            line_width: None,
+            line_style: None,
+            cap_style: None,
+            join_style: None,
+            fill_style: None,
+            fill_rule: None,
+            tile: None,
+            stipple: None,
+            tile_x_origin: None,
+            tile_y_origin: None,
+            font: None,
+            subwindow_mode: None,
+            graphics_exposures: None,
+            clip_x_origin: None,
+            clip_y_origin: None,
+            clip_mask: None,
+            dash_offset: None,
+            dashes: None,
+            arc_mode: None,
+        }
+    }
+
+    fn empty_change_gc(gc: ResourceId) -> GcChange {
+        GcChange {
+            gc,
+            function: None,
+            plane_mask: None,
+            foreground: None,
+            background: None,
+            line_width: None,
+            line_style: None,
+            cap_style: None,
+            join_style: None,
+            fill_style: None,
+            fill_rule: None,
+            tile: None,
+            stipple: None,
+            tile_x_origin: None,
+            tile_y_origin: None,
+            font: None,
+            subwindow_mode: None,
+            graphics_exposures: None,
+            clip_mask: None,
+            clip_x_origin: None,
+            clip_y_origin: None,
+            dash_offset: None,
+            dashes: None,
+            arc_mode: None,
+        }
+    }
+
+    fn install_pixmap_with_host_xid(table: &mut ResourceTable, id: u32, host_xid: u32) {
+        table.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(id),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+            },
+        );
+        assert!(table.set_pixmap_host_xid(
+            ResourceId(id),
+            crate::backend::PixmapHandle::from_raw_for_test(host_xid),
+        ));
+    }
+
     #[test]
     fn change_gc_clip_mask_none_clears_clip_rectangles() {
         let mut t = ResourceTable::new();
         t.create_gc(
             ClientId(1),
-            CreateGcRequest {
-                gc: ResourceId(0x500),
-                drawable: ROOT_WINDOW,
-                foreground: None,
-                background: None,
-                line_width: None,
-                fill_style: None,
-                tile: None,
-                stipple: None,
-                tile_x_origin: None,
-                tile_y_origin: None,
-                font: None,
-                clip_mask: None,
-            },
+            empty_create_gc_request(ResourceId(0x500), ROOT_WINDOW),
         );
         t.set_clip_rectangles(SetClipRectanglesRequest {
             gc: ResourceId(0x500),
@@ -2839,22 +3230,296 @@ mod tests {
         });
         assert!(t.gc_clip_rectangles(ResourceId(0x500)).is_some());
 
-        t.change_gc(GcChange {
-            gc: ResourceId(0x500),
-            foreground: None,
-            background: None,
-            line_width: None,
-            fill_style: None,
-            tile: None,
-            stipple: None,
-            tile_x_origin: None,
-            tile_y_origin: None,
-            font: None,
-            clip_mask: Some(None),
-            clip_x_origin: None,
-            clip_y_origin: None,
-        });
+        let mut clear = empty_change_gc(ResourceId(0x500));
+        clear.clip_mask = Some(None);
+        t.change_gc(clear);
 
         assert!(t.gc_clip_rectangles(ResourceId(0x500)).is_none());
+    }
+
+    fn install_dummy_gc(table: &mut ResourceTable, id: u32) {
+        table.create_gc(
+            ClientId(1),
+            empty_create_gc_request(ResourceId(id), ROOT_WINDOW),
+        );
+    }
+
+    fn install_font_with_host_xid(table: &mut ResourceTable, id: u32, host_xid: u32) {
+        table.install_font(
+            ClientId(1),
+            ResourceId(id),
+            "fixed".to_string(),
+            crate::backend::FontHandle::from_raw_for_test(host_xid),
+            FontMetrics::default(),
+        );
+    }
+
+    // ---- Phase 6.2 Step 3: copy_gc unit tests for the new fields. ----
+
+    #[test]
+    fn copy_gc_function_and_plane_mask() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        install_dummy_gc(&mut t, 0x501);
+        // Mutate src.
+        let mut chg = empty_change_gc(ResourceId(0x500));
+        chg.function = Some(GcFunction::Xor.protocol_value());
+        chg.plane_mask = Some(0x00ff_00ff);
+        t.change_gc(chg);
+        // Copy GCFunction (1<<0) + GCPlaneMask (1<<1).
+        t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0x0000_0003);
+        let dst = t.gc(ResourceId(0x501)).unwrap();
+        assert_eq!(dst.function, GcFunction::Xor);
+        assert_eq!(dst.plane_mask, 0x00ff_00ff);
+    }
+
+    #[test]
+    fn copy_gc_line_join_cap_styles() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        install_dummy_gc(&mut t, 0x501);
+        let mut chg = empty_change_gc(ResourceId(0x500));
+        chg.line_style = Some(LineStyle::OnOffDash.protocol_value());
+        chg.cap_style = Some(CapStyle::Round.protocol_value());
+        chg.join_style = Some(JoinStyle::Bevel.protocol_value());
+        t.change_gc(chg);
+        // line_style (1<<5) | cap_style (1<<6) | join_style (1<<7) = 0xE0
+        t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0x0000_00E0);
+        let dst = t.gc(ResourceId(0x501)).unwrap();
+        assert_eq!(dst.line_style, LineStyle::OnOffDash);
+        assert_eq!(dst.cap_style, CapStyle::Round);
+        assert_eq!(dst.join_style, JoinStyle::Bevel);
+    }
+
+    #[test]
+    fn copy_gc_fill_rule_and_subwindow_mode() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        install_dummy_gc(&mut t, 0x501);
+        let mut chg = empty_change_gc(ResourceId(0x500));
+        chg.fill_rule = Some(FillRule::Winding.protocol_value());
+        chg.subwindow_mode = Some(SubwindowMode::IncludeInferiors.protocol_value());
+        t.change_gc(chg);
+        // fill_rule (1<<9) | subwindow_mode (1<<15) = 0x8200
+        t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0x0000_8200);
+        let dst = t.gc(ResourceId(0x501)).unwrap();
+        assert_eq!(dst.fill_rule, FillRule::Winding);
+        assert_eq!(dst.subwindow_mode, SubwindowMode::IncludeInferiors);
+    }
+
+    #[test]
+    fn copy_gc_graphics_exposures_and_dash_offset() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        install_dummy_gc(&mut t, 0x501);
+        let mut chg = empty_change_gc(ResourceId(0x500));
+        chg.graphics_exposures = Some(false);
+        chg.dash_offset = Some(7);
+        t.change_gc(chg);
+        // graphics_exposures (1<<16) | dash_offset (1<<20) = 0x0011_0000
+        t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0x0011_0000);
+        let dst = t.gc(ResourceId(0x501)).unwrap();
+        assert!(!dst.graphics_exposures);
+        assert_eq!(dst.dash_offset, 7);
+    }
+
+    #[test]
+    fn copy_gc_dashes_and_arc_mode() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        install_dummy_gc(&mut t, 0x501);
+        let mut chg = empty_change_gc(ResourceId(0x500));
+        chg.dashes = Some(9);
+        chg.arc_mode = Some(ArcMode::Chord.protocol_value());
+        t.change_gc(chg);
+        // dashes (1<<21) | arc_mode (1<<22) = 0x00600000
+        t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0x0060_0000);
+        let dst = t.gc(ResourceId(0x501)).unwrap();
+        assert_eq!(dst.dashes, vec![9, 9]);
+        assert_eq!(dst.arc_mode, ArcMode::Chord);
+    }
+
+    #[test]
+    fn copy_gc_zero_mask_copies_nothing() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        install_dummy_gc(&mut t, 0x501);
+        let mut chg = empty_change_gc(ResourceId(0x500));
+        chg.function = Some(GcFunction::Xor.protocol_value());
+        t.change_gc(chg);
+        t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0);
+        let dst = t.gc(ResourceId(0x501)).unwrap();
+        assert_eq!(dst.function, GcFunction::Copy);
+    }
+
+    // ---- Phase 6.2 Step 3: resolve_draw_state unit tests. ----
+
+    #[test]
+    fn resolve_draw_state_default_gc() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        let state = t.resolve_draw_state(ResourceId(0x500)).expect("known gc");
+        // A fresh GC should match the DrawState::default() for the
+        // attribute-only fields.
+        let d = DrawState::default();
+        assert_eq!(state.foreground, d.foreground);
+        assert_eq!(state.background, d.background);
+        assert_eq!(state.line_width, d.line_width);
+        assert_eq!(state.line_style, d.line_style);
+        assert_eq!(state.cap_style, d.cap_style);
+        assert_eq!(state.join_style, d.join_style);
+        assert_eq!(state.fill_style, d.fill_style);
+        assert_eq!(state.fill_rule, d.fill_rule);
+        assert_eq!(state.function, d.function);
+        assert_eq!(state.plane_mask, d.plane_mask);
+        assert_eq!(state.font, None);
+        assert_eq!(state.clip, ClipState::None);
+        assert_eq!(state.fill, FillState::Solid);
+        assert_eq!(state.subwindow_mode, d.subwindow_mode);
+        assert!(state.graphics_exposures);
+        assert_eq!(state.dashes, d.dashes);
+        assert_eq!(state.dash_offset, d.dash_offset);
+        assert_eq!(state.arc_mode, d.arc_mode);
+    }
+
+    #[test]
+    fn resolve_draw_state_tiled_fill_resolves_pixmap_handle() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        install_pixmap_with_host_xid(&mut t, 0x600, 0x12345);
+        let mut chg = empty_change_gc(ResourceId(0x500));
+        chg.fill_style = Some(FillStyle::Tiled.protocol_value());
+        chg.tile = Some(ResourceId(0x600));
+        chg.tile_x_origin = Some(3);
+        chg.tile_y_origin = Some(5);
+        t.change_gc(chg);
+        let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
+        match state.fill {
+            FillState::Tiled { pixmap, origin } => {
+                assert_eq!(pixmap.as_raw(), 0x12345);
+                assert_eq!(origin, (3, 5));
+            }
+            other => panic!("expected Tiled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_draw_state_stippled_fill_resolves_pixmap_handle() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        install_pixmap_with_host_xid(&mut t, 0x600, 0xabcde);
+        let mut chg = empty_change_gc(ResourceId(0x500));
+        chg.fill_style = Some(FillStyle::Stippled.protocol_value());
+        chg.stipple = Some(ResourceId(0x600));
+        t.change_gc(chg);
+        let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
+        match state.fill {
+            FillState::Stippled { pixmap, origin } => {
+                assert_eq!(pixmap.as_raw(), 0xabcde);
+                assert_eq!(origin, (0, 0));
+            }
+            other => panic!("expected Stippled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_draw_state_clip_rectangles_with_origin() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        let rect_bytes = vec![0u8, 0, 0, 0, 10, 0, 10, 0];
+        t.set_clip_rectangles(SetClipRectanglesRequest {
+            gc: ResourceId(0x500),
+            clip: ClipRectangles {
+                ordering: 0,
+                x_origin: 4,
+                y_origin: 7,
+                rectangles: rect_bytes.clone(),
+            },
+        });
+        let mut chg = empty_change_gc(ResourceId(0x500));
+        chg.clip_x_origin = Some(11);
+        chg.clip_y_origin = Some(13);
+        t.change_gc(chg);
+        let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
+        match state.clip {
+            ClipState::Rectangles { origin, rects } => {
+                // origin comes from the GC's clip-x/y-origin (set above),
+                // not from the SetClipRectangles x/y_origin (which lives
+                // inside the rectangles payload itself).
+                assert_eq!(origin, (11, 13));
+                assert_eq!(rects.x_origin, 4);
+                assert_eq!(rects.y_origin, 7);
+                assert_eq!(rects.rectangles, rect_bytes);
+            }
+            other => panic!("expected Rectangles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_draw_state_pixmap_clip_with_origin() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        install_pixmap_with_host_xid(&mut t, 0x600, 0xdead);
+        let mut chg = empty_change_gc(ResourceId(0x500));
+        chg.clip_mask = Some(Some(ResourceId(0x600)));
+        chg.clip_x_origin = Some(2);
+        chg.clip_y_origin = Some(3);
+        t.change_gc(chg);
+        let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
+        match state.clip {
+            ClipState::Pixmap { origin, pixmap } => {
+                assert_eq!(origin, (2, 3));
+                assert_eq!(pixmap.as_raw(), 0xdead);
+            }
+            other => panic!("expected Pixmap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_draw_state_unknown_gc_returns_none() {
+        let t = ResourceTable::new();
+        assert!(t.resolve_draw_state(ResourceId(0x999)).is_none());
+    }
+
+    #[test]
+    fn resolve_draw_state_tiled_with_freed_tile_pixmap_degrades_to_solid() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        install_pixmap_with_host_xid(&mut t, 0x600, 0xbeef);
+        let mut chg = empty_change_gc(ResourceId(0x500));
+        chg.fill_style = Some(FillStyle::Tiled.protocol_value());
+        chg.tile = Some(ResourceId(0x600));
+        t.change_gc(chg);
+        // Now free the tile pixmap; the GC still names it but the host
+        // backing is gone — the resolver must fall back to Solid.
+        let _ = t.free_pixmap(ResourceId(0x600));
+        let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
+        assert_eq!(state.fill, FillState::Solid);
+    }
+
+    #[test]
+    fn resolve_draw_state_clip_pixmap_freed_degrades_to_unclipped() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        install_pixmap_with_host_xid(&mut t, 0x600, 0xcafe);
+        let mut chg = empty_change_gc(ResourceId(0x500));
+        chg.clip_mask = Some(Some(ResourceId(0x600)));
+        t.change_gc(chg);
+        let _ = t.free_pixmap(ResourceId(0x600));
+        let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
+        assert_eq!(state.clip, ClipState::None);
+    }
+
+    #[test]
+    fn resolve_draw_state_font_resolves_handle() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        install_font_with_host_xid(&mut t, 0x700, 0x4242);
+        let mut chg = empty_change_gc(ResourceId(0x500));
+        chg.font = Some(ResourceId(0x700));
+        t.change_gc(chg);
+        let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
+        let f = state.font.expect("font handle");
+        assert_eq!(f.as_raw(), 0x4242);
     }
 }

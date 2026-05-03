@@ -1,313 +1,38 @@
+//! Host X11 request-side methods.
+//!
+//! All `HostX11Backend` methods that send wire bytes to the host (drawing,
+//! extension proxies, `apply_*` sync points, etc.) live here, plus the
+//! pure-byte wire builders they call (`build_xfixes_change_cursor_by_name`,
+//! `build_shape_rectangles`, `patch_glyph_command_offsets`,
+//! `push_card8_padded`, the font-request builders).
+//!
+//! Setup-time helpers (`create_window`, `create_gc`, `open_font`,
+//! `map_window`) and the response framer (`read_response`,
+//! `HostResponse`) stay in `mod.rs` because they're shared between the
+//! constructor and these request methods. The split here is purely about
+//! file size and reviewability — Rust merges all `impl HostX11Backend { ... }`
+//! blocks across the module's files.
+
 use std::{
-    collections::HashMap,
-    env, fs,
     io::{self, ErrorKind, Read, Write},
     os::unix::net::UnixStream,
-    path::PathBuf,
-    sync::{Arc, Mutex},
 };
 
-use log::debug;
-use yserver_protocol::x11::{self, ClipRectangles, FontMetrics, ResourceId};
+use yserver_protocol::x11::{self, ClipRectangles, FontMetrics};
 
-const MIT_MAGIC_COOKIE: &str = "MIT-MAGIC-COOKIE-1";
+use crate::backend::{
+    AnyHandle, CursorHandle, FontHandle, GlyphSetHandle, PictureHandle, PixmapHandle, WindowHandle,
+};
 
-struct HostRenderInfo {
-    opcode: u8,
-    fmt_a1: u32,
-    fmt_a8: u32,
-    fmt_rgb24: u32,
-    fmt_argb32: u32,
-}
+use super::{
+    HostClipRectangles, HostClipState, HostFillState, HostSubwindowConfig, HostSubwindowVisual,
+    HostX11Backend, PointerPosition, open_font, padded_len, read_i16, read_response, read_u16,
+    read_u32, write_i16, write_u16, write_u32,
+};
 
-struct HostXkbInfo {
-    opcode: u8,
-    first_event: u8,
-    first_error: u8,
-}
-
-pub struct HostX11 {
-    stream: UnixStream,
-    window_id: u32,
-    gc_id: u32,
-    current_foreground: u32,
-    current_background: u32,
-    current_clip: HostClipState,
-    current_fill: HostFillState,
-    sequence: u16,
-    next_xid: u32,
-    render: Option<HostRenderInfo>,
-    xkb: Option<HostXkbInfo>,
-    /// Major opcode of the host's SHAPE extension, cached on init. `None`
-    /// means the host doesn't advertise SHAPE — forwarders become no-ops.
-    shape_opcode: Option<u8>,
-    /// Major opcode of the host's XFIXES extension. Used so far only by
-    /// `ChangeCursorByName`; other XFIXES requests are still served locally.
-    xfixes_opcode: Option<u8>,
-    /// Major opcode of the host's COMPOSITE extension. Used to forward
-    /// `Composite::NameWindowPixmap` so that compositors (picom, mutter)
-    /// see actual host backing-store contents through our nested layer.
-    /// `None` means the host doesn't advertise COMPOSITE — clients then
-    /// receive `BadAlloc` for `NameWindowPixmap`.
-    composite_opcode: Option<u8>,
-    /// Host XID of the host root visual. Pushed into `ResourceTable` so
-    /// that core CreateWindow forwarding for our `ROOT_VISUAL` resolves
-    /// to a real host visual.
-    root_visual_xid: u32,
-    /// Host XID of an ARGB (32-bit TrueColor) visual on the host, if
-    /// one was advertised at setup. `None` means we can't honour
-    /// `ARGB_VISUAL` for top-level CreateWindow on this host.
-    argb_visual_xid: Option<u32>,
-    /// Host XID of a colormap allocated for `argb_visual_xid` during
-    /// init. Required by `CreateWindow` whenever the child visual is
-    /// not `CopyFromParent`.
-    argb_colormap_xid: Option<u32>,
-    // Responses read during create_subwindow drain loops that belong to future
-    // requests (sequence > geom_seq at time of read). Without this buffer,
-    // the drain loop for window N discards the GetGeometry reply for window N+k,
-    // causing the subsequent drain loop to hang forever.
-    reply_buffer: Vec<HostResponse>,
-    // GCs cached per pixmap depth. The default `gc_id` is bound to a depth-24
-    // drawable so PutImage onto pixmaps with a different depth (e.g. depth-8
-    // alpha masks for RENDER) would BadMatch. We lazily create one GC per
-    // depth using the target drawable as the screen-and-depth reference.
-    depth_gcs: HashMap<u8, u32>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HostClipRectangles {
-    pub ordering: u8,
-    pub x_origin: i16,
-    pub y_origin: i16,
-    pub rectangles: Vec<u8>,
-}
-
-/// Tracks what clip-state the host shared GC currently has, so we don't
-/// re-issue identical `SetClipRectangles` / `ChangeGC(clip-mask)` calls.
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum HostClipState {
-    /// `clip-mask = None` — no clipping, draw everywhere.
-    None,
-    /// Clip to a list of rectangles set via `SetClipRectangles`.
-    Rectangles(HostClipRectangles),
-    /// Clip to the 1-bits of a depth-1 host pixmap, shifted by
-    /// `(x_origin, y_origin)`. Used by wmaker for window-decoration
-    /// symbols (close-button "X" etc.).
-    Pixmap {
-        host_pixmap: u32,
-        x_origin: i16,
-        y_origin: i16,
-    },
-}
-
-/// Tracks the fill-style on the host shared GC so we don't re-issue
-/// identical `ChangeGC(fill-style+tile)` calls. e16 paints popup
-/// backgrounds via Tiled fill; the fill handlers must flip to Tiled
-/// before the draw and back to Solid after, otherwise other clients'
-/// later draws would inherit the tile pixmap.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HostFillState {
-    Solid,
-    Tiled {
-        host_pixmap: u32,
-        x_origin: i16,
-        y_origin: i16,
-    },
-}
-
-/// Visual / depth / colormap selector for [`HostX11::create_subwindow`].
-/// `CopyFromParent` is the historical path — depth=0, visual=0, no
-/// colormap value — used when the requested child visual matches the
-/// host container's visual. `Explicit` carries the host xids needed to
-/// honour ARGB top-levels: the host requires both a real visual id and
-/// a colormap whose visual matches.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HostSubwindowVisual {
-    CopyFromParent,
-    Explicit {
-        depth: u8,
-        visual_xid: u32,
-        colormap_xid: u32,
-    },
-}
-
-impl HostSubwindowVisual {
-    fn depth(self) -> u8 {
-        match self {
-            Self::CopyFromParent => 0,
-            Self::Explicit { depth, .. } => depth,
-        }
-    }
-
-    fn visual_xid(self) -> u32 {
-        match self {
-            Self::CopyFromParent => 0,
-            Self::Explicit { visual_xid, .. } => visual_xid,
-        }
-    }
-}
-
-pub type HostXidMap = Arc<Mutex<HashMap<u32, ResourceId>>>;
-
-pub struct HostInputPump {
-    read_stream: UnixStream,
-    handle: HostInputPumpHandle,
-}
-
-#[derive(Clone)]
-pub struct HostInputPumpHandle {
-    write_stream: Arc<Mutex<UnixStream>>,
-    xid_map: HostXidMap,
-}
-
-impl HostX11 {
-    pub fn open_from_env(width: u16, height: u16) -> io::Result<Self> {
-        let mut stream = connect_to_host()?;
-        let setup = read_setup_reply(&mut stream)?;
-        let window_id = setup.resource_id_base;
-        let gc_id = setup.resource_id_base + 1;
-        let font_id = setup.resource_id_base + 2;
-        create_window(&mut stream, &setup, window_id, width, height)?;
-        open_font(&mut stream, font_id, b"fixed")?;
-        create_gc(
-            &mut stream,
-            window_id,
-            gc_id,
-            setup.black_pixel,
-            setup.white_pixel,
-            font_id,
-        )?;
-        map_window(&mut stream, window_id)?;
-        stream.flush()?;
-
-        let mut this = Self {
-            stream,
-            window_id,
-            gc_id,
-            current_foreground: setup.black_pixel,
-            current_background: setup.white_pixel,
-            current_clip: HostClipState::None,
-            current_fill: HostFillState::Solid,
-            sequence: 5,
-            next_xid: setup.resource_id_base + 3,
-            render: None,
-            xkb: None,
-            shape_opcode: None,
-            xfixes_opcode: None,
-            composite_opcode: None,
-            reply_buffer: Vec::new(),
-            depth_gcs: HashMap::new(),
-            root_visual_xid: setup.root_visual,
-            argb_visual_xid: setup.argb_visual,
-            argb_colormap_xid: None,
-        };
-        this.render = this.init_render().ok();
-        this.xkb = this.init_xkb().ok();
-        this.shape_opcode = this.query_extension_opcode(b"SHAPE").ok().flatten();
-        if this.shape_opcode.is_none() {
-            log::info!("host SHAPE extension absent — top-level shape forwarding disabled");
-        }
-        this.xfixes_opcode = this.query_extension_opcode(b"XFIXES").ok().flatten();
-        if this.xfixes_opcode.is_none() {
-            log::info!("host XFIXES extension absent — cursor-by-name forwarding disabled");
-        }
-        this.composite_opcode = this.query_extension_opcode(b"Composite").ok().flatten();
-        if this.composite_opcode.is_none() {
-            log::info!("host COMPOSITE extension absent — NameWindowPixmap will return BadAlloc");
-        }
-        if let Some(argb_visual) = this.argb_visual_xid {
-            match this.create_argb_colormap(setup.root, argb_visual) {
-                Ok(xid) => this.argb_colormap_xid = Some(xid),
-                Err(err) => {
-                    log::warn!(
-                        "could not allocate host ARGB colormap (visual=0x{argb_visual:x}): {err}; \
-                         ARGB CreateWindow will fall back to CopyFromParent"
-                    );
-                }
-            }
-        } else {
-            log::info!("host advertises no depth-32 TrueColor visual — ARGB CreateWindow disabled");
-        }
-        Ok(this)
-    }
-
-    /// Host XIDs the upper layer pushes into the visual / colormap
-    /// tables in `ResourceTable`. `argb_*` are `None` when the host
-    /// has no depth-32 TrueColor visual.
-    pub fn root_visual_xid(&self) -> u32 {
-        self.root_visual_xid
-    }
-
-    pub fn argb_visual_xid(&self) -> Option<u32> {
-        self.argb_visual_xid
-    }
-
-    pub fn argb_colormap_xid(&self) -> Option<u32> {
-        self.argb_colormap_xid
-    }
-
-    /// Allocate a host colormap for our ARGB visual via `XCreateColormap(
-    /// alloc=None, mid, root, visual)`. Sent fire-and-forget — host errors
-    /// (visual not depth-32, etc.) become async and are absorbed silently;
-    /// the resulting xid is still returned but if the host failed, later
-    /// CreateWindow attempts using it will surface a host BadColor / BadValue
-    /// (also absorbed). This is acceptable here — the alternative is a
-    /// blocking sync round-trip during HostX11 init.
-    fn create_argb_colormap(&mut self, host_root: u32, argb_visual: u32) -> io::Result<u32> {
-        let cmap_id = self.allocate_xid();
-        let mut out = Vec::with_capacity(16);
-        out.push(78); // CreateColormap opcode
-        out.push(0); // alloc = None
-        write_u16(&mut out, 4); // length = 4 words
-        write_u32(&mut out, cmap_id);
-        write_u32(&mut out, host_root);
-        write_u32(&mut out, argb_visual);
-        self.stream.write_all(&out)?;
-        self.stream.flush()?;
-        self.sequence = self.sequence.wrapping_add(1);
-        Ok(cmap_id)
-    }
-
-    /// Major opcode of the host's COMPOSITE extension, or `None` if the
-    /// host didn't advertise it at startup. The nested COMPOSITE handler
-    /// uses this to gate `NameWindowPixmap` forwarding.
-    #[must_use]
-    pub fn composite_opcode(&self) -> Option<u8> {
-        self.composite_opcode
-    }
-
-    /// Forward `Composite::NameWindowPixmap(window, pixmap)` to the host.
-    /// Caller is responsible for validating `host_window` is a redirected
-    /// host top-level and for allocating `host_pixmap` via `allocate_xid`.
-    /// No reply is generated by the host.
-    pub fn name_window_pixmap(&mut self, host_window: u32, host_pixmap: u32) -> io::Result<()> {
-        let Some(major) = self.composite_opcode else {
-            return Err(io::Error::new(
-                ErrorKind::Unsupported,
-                "host COMPOSITE extension not available",
-            ));
-        };
-        // Wire layout: opcode(1) minor(1) length(2 = 3) window(4) pixmap(4)
-        let mut out = [0u8; 12];
-        out[0] = major;
-        out[1] = yserver_protocol::x11::composite::NAME_WINDOW_PIXMAP;
-        out[2..4].copy_from_slice(&3u16.to_le_bytes());
-        out[4..8].copy_from_slice(&host_window.to_le_bytes());
-        out[8..12].copy_from_slice(&host_pixmap.to_le_bytes());
-        self.stream.write_all(&out)?;
-        self.stream.flush()?;
-        self.sequence = self.sequence.wrapping_add(1);
-        Ok(())
-    }
-
-    pub fn allocate_xid(&mut self) -> u32 {
-        let xid = self.next_xid;
-        self.next_xid = self.next_xid.wrapping_add(1);
-        xid
-    }
-
-    pub fn open_font(&mut self, name: &str) -> io::Result<(u32, FontMetrics)> {
-        let host_xid = self.allocate_xid();
+impl HostX11Backend {
+    pub fn open_font(&mut self, name: &str) -> io::Result<(FontHandle, FontMetrics)> {
+        let host_xid = self.next_xid();
         let open_seq = self.sequence;
         write_open_font(&mut self.stream, host_xid, name.as_bytes())?;
         self.sequence = self.sequence.wrapping_add(1);
@@ -344,7 +69,7 @@ impl HostX11 {
                         "could not parse host QueryFont reply",
                     )
                 })?;
-                return Ok((host_xid, metrics));
+                return Ok((FontHandle::from_raw_panicking(host_xid), metrics));
             }
         }
     }
@@ -484,196 +209,6 @@ impl HostX11 {
             }
         }
     }
-
-    pub fn window_id(&self) -> u32 {
-        self.window_id
-    }
-
-    pub fn render_opcode(&self) -> Option<u8> {
-        self.render.as_ref().map(|r| r.opcode)
-    }
-
-    pub fn xkb_opcode(&self) -> Option<u8> {
-        self.xkb.as_ref().map(|r| r.opcode)
-    }
-
-    pub fn xkb_info(&self) -> Option<(u8, u8, u8)> {
-        self.xkb
-            .as_ref()
-            .map(|r| (r.opcode, r.first_event, r.first_error))
-    }
-
-    pub fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32> {
-        let r = self.render.as_ref()?;
-        match ynest_fmt {
-            1 => Some(r.fmt_a1),
-            2 => Some(r.fmt_a8),
-            3 => Some(r.fmt_rgb24),
-            4 => Some(r.fmt_argb32),
-            _ => None,
-        }
-    }
-
-    fn init_render(&mut self) -> io::Result<HostRenderInfo> {
-        let ext_name = b"RENDER";
-        let padded = padded_len(ext_name.len());
-        let length_units = 2 + (padded / 4) as u16;
-        let ext_seq = self.sequence; // use current BEFORE increment (matches open_font pattern)
-        self.sequence = self.sequence.wrapping_add(1);
-        let mut out = Vec::new();
-        out.push(98u8);
-        out.push(0);
-        write_u16(&mut out, length_units);
-        write_u16(&mut out, ext_name.len() as u16);
-        write_u16(&mut out, 0);
-        out.extend_from_slice(ext_name);
-        out.resize(8 + padded, 0);
-        self.stream.write_all(&out)?;
-        self.stream.flush()?;
-        debug!(
-            "init_render: sent QueryExtension RENDER, expecting seq={}",
-            ext_seq
-        );
-
-        let opcode;
-        loop {
-            let resp = read_response(&mut self.stream)?;
-            debug!(
-                "init_render: got response byte0={} seq={}",
-                resp.bytes[0], resp.sequence
-            );
-            if resp.sequence == ext_seq {
-                if resp.bytes[8] == 0 {
-                    return Err(io::Error::other("host RENDER extension not present"));
-                }
-                opcode = resp.bytes[9];
-                debug!("init_render: RENDER present, opcode={}", opcode);
-                break;
-            }
-        }
-
-        let fmt_seq = self.sequence; // use current BEFORE increment
-        self.sequence = self.sequence.wrapping_add(1);
-        let mut out = Vec::new();
-        out.push(opcode);
-        out.push(1); // QueryPictFormats
-        write_u16(&mut out, 1);
-        self.stream.write_all(&out)?;
-        self.stream.flush()?;
-        debug!(
-            "init_render: sent QueryPictFormats, expecting seq={}",
-            fmt_seq
-        );
-
-        loop {
-            let resp = read_response(&mut self.stream)?;
-            debug!(
-                "init_render: got response byte0={} seq={}",
-                resp.bytes[0], resp.sequence
-            );
-            if resp.sequence == fmt_seq {
-                let info = parse_host_pict_formats(&resp.bytes, opcode)?;
-                debug!(
-                    "init_render: host formats a1=0x{:x} a8=0x{:x} rgb24=0x{:x} argb32=0x{:x}",
-                    info.fmt_a1, info.fmt_a8, info.fmt_rgb24, info.fmt_argb32
-                );
-                return Ok(info);
-            }
-        }
-    }
-
-    fn init_xkb(&mut self) -> io::Result<HostXkbInfo> {
-        let ext_name = b"XKEYBOARD";
-        let padded = padded_len(ext_name.len());
-        let length_units = 2 + (padded / 4) as u16;
-        let ext_seq = self.sequence;
-        self.sequence = self.sequence.wrapping_add(1);
-        let mut out = Vec::new();
-        out.push(98u8);
-        out.push(0);
-        write_u16(&mut out, length_units);
-        write_u16(&mut out, ext_name.len() as u16);
-        write_u16(&mut out, 0);
-        out.extend_from_slice(ext_name);
-        out.resize(8 + padded, 0);
-        self.stream.write_all(&out)?;
-        self.stream.flush()?;
-
-        let (opcode, first_event, first_error);
-        loop {
-            let resp = read_response(&mut self.stream)?;
-            if resp.sequence == ext_seq {
-                if resp.bytes[8] == 0 {
-                    return Err(io::Error::other("host XKEYBOARD extension not present"));
-                }
-                opcode = resp.bytes[9];
-                first_event = resp.bytes[10];
-                first_error = resp.bytes[11];
-                break;
-            }
-        }
-
-        // We also need to send UseExtension to the host for XKB to be fully functional.
-        let use_seq = self.sequence;
-        self.sequence = self.sequence.wrapping_add(1);
-        let mut out = Vec::new();
-        out.push(opcode);
-        out.push(0); // UseExtension
-        write_u16(&mut out, 2);
-        write_u16(&mut out, 1); // want major 1
-        write_u16(&mut out, 0); // want minor 0
-        self.stream.write_all(&out)?;
-        self.stream.flush()?;
-
-        loop {
-            let resp = read_response(&mut self.stream)?;
-            if resp.sequence == use_seq {
-                // byte 8 is supported (bool)
-                if resp.bytes[8] == 0 {
-                    return Err(io::Error::other("host XKB UseExtension failed"));
-                }
-                break;
-            }
-        }
-
-        Ok(HostXkbInfo {
-            opcode,
-            first_event,
-            first_error,
-        })
-    }
-
-    /// Issue `QueryExtension(name)` on the host stream and return the major
-    /// opcode if the extension is present. Used for capability probes that
-    /// don't need the first-event/first-error fields (`init_render` and
-    /// `init_xkb` cache those for their own bookkeeping).
-    fn query_extension_opcode(&mut self, name: &[u8]) -> io::Result<Option<u8>> {
-        let padded = padded_len(name.len());
-        let length_units = 2 + (padded / 4) as u16;
-        let ext_seq = self.sequence;
-        self.sequence = self.sequence.wrapping_add(1);
-        let mut out = Vec::new();
-        out.push(98u8); // QueryExtension
-        out.push(0);
-        write_u16(&mut out, length_units);
-        write_u16(&mut out, name.len() as u16);
-        write_u16(&mut out, 0);
-        out.extend_from_slice(name);
-        out.resize(8 + padded, 0);
-        self.stream.write_all(&out)?;
-        self.stream.flush()?;
-        loop {
-            let resp = read_response(&mut self.stream)?;
-            if resp.sequence == ext_seq {
-                if resp.bytes[8] == 0 {
-                    return Ok(None);
-                }
-                return Ok(Some(resp.bytes[9]));
-            }
-            self.reply_buffer.push(resp);
-        }
-    }
-
     /// Mirror the resolved bounding/clip rectangles for a top-level subwindow
     /// to the host's SHAPE extension. The local `ServerState::shape_windows`
     /// remains the source of truth for protocol-visible queries (`QueryExtents`,
@@ -716,14 +251,13 @@ impl HostX11 {
 
     pub fn render_create_picture(
         &mut self,
-        host_pic: u32,
-        host_drawable: u32,
+        host_drawable: AnyHandle,
         ynest_format: u32,
         value_mask: u32,
         values: &[u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<PictureHandle>> {
         let Some(r) = self.render.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
         let host_fmt = if ynest_format == 0 {
             0u32
@@ -737,9 +271,10 @@ impl HostX11 {
             }
         };
         if host_fmt == 0 && ynest_format != 0 {
-            return Ok(());
+            return Ok(None);
         }
         let opcode = r.opcode;
+        let host_pic = self.next_xid();
         let nvals = (values.len() / 4) as u16;
         // header(4) + pid(4) + drawable(4) + format(4) + value-mask(4) = 20 bytes = 5 units
         let length_units = 5 + nvals;
@@ -749,12 +284,13 @@ impl HostX11 {
         out.push(4); // CreatePicture
         write_u16(&mut out, length_units);
         write_u32(&mut out, host_pic);
-        write_u32(&mut out, host_drawable);
+        write_u32(&mut out, host_drawable.as_raw());
         write_u32(&mut out, host_fmt);
         write_u32(&mut out, value_mask);
         out.extend_from_slice(values);
         self.stream.write_all(&out)?;
-        self.stream.flush()
+        self.stream.flush()?;
+        Ok(Some(PictureHandle::from_raw_panicking(host_pic)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -816,9 +352,12 @@ impl HostX11 {
         self.stream.flush()
     }
 
-    pub fn render_create_glyphset(&mut self, host_gs: u32, ynest_format: u32) -> io::Result<()> {
+    pub fn render_create_glyphset(
+        &mut self,
+        ynest_format: u32,
+    ) -> io::Result<Option<GlyphSetHandle>> {
         let Some(r) = self.render.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
         let host_fmt = match ynest_format {
             1 => r.fmt_a1,
@@ -828,6 +367,7 @@ impl HostX11 {
             _ => r.fmt_a8,
         };
         let opcode = r.opcode;
+        let host_gs = self.next_xid();
         self.sequence = self.sequence.wrapping_add(1);
         let mut out = Vec::new();
         out.push(opcode);
@@ -836,7 +376,8 @@ impl HostX11 {
         write_u32(&mut out, host_gs);
         write_u32(&mut out, host_fmt);
         self.stream.write_all(&out)?;
-        self.stream.flush()
+        self.stream.flush()?;
+        Ok(Some(GlyphSetHandle::from_raw_panicking(host_gs)))
     }
 
     pub fn render_free_glyphset(&mut self, host_gs: u32) -> io::Result<()> {
@@ -982,15 +523,32 @@ impl HostX11 {
     }
 
     /// RENDER::CreateLinearGradient (minor=34): create gradient picture on host.
-    /// `host_pic` is a fresh XID already allocated by the caller.
+    /// Allocates a fresh host picture XID and overwrites the picture-XID slot
+    /// in `body` (the client body after the request header) with it.
     /// `body` is the client body after the picture XID field (p1 x/y, p2 x/y,
     /// num_stops, offsets[], colors[]).
-    pub fn render_create_linear_gradient(&mut self, host_pic: u32, body: &[u8]) -> io::Result<()> {
-        self.render_forward_picture_op(34, host_pic, body)
+    pub fn render_create_linear_gradient(
+        &mut self,
+        body: &[u8],
+    ) -> io::Result<Option<PictureHandle>> {
+        if self.render.is_none() {
+            return Ok(None);
+        }
+        let host_pic = self.next_xid();
+        self.render_forward_picture_op(34, host_pic, body)?;
+        Ok(Some(PictureHandle::from_raw_panicking(host_pic)))
     }
 
-    pub fn render_create_radial_gradient(&mut self, host_pic: u32, body: &[u8]) -> io::Result<()> {
-        self.render_forward_picture_op(35, host_pic, body)
+    pub fn render_create_radial_gradient(
+        &mut self,
+        body: &[u8],
+    ) -> io::Result<Option<PictureHandle>> {
+        if self.render.is_none() {
+            return Ok(None);
+        }
+        let host_pic = self.next_xid();
+        self.render_forward_picture_op(35, host_pic, body)?;
+        Ok(Some(PictureHandle::from_raw_panicking(host_pic)))
     }
 
     pub fn render_change_picture(&mut self, host_pic: u32, body: &[u8]) -> io::Result<()> {
@@ -1005,11 +563,15 @@ impl HostX11 {
         self.render_forward_picture_op(6, host_pic, body)
     }
 
-    pub fn render_create_solid_fill(&mut self, host_pic: u32, color: [u8; 8]) -> io::Result<()> {
+    pub fn render_create_solid_fill(
+        &mut self,
+        color: [u8; 8],
+    ) -> io::Result<Option<PictureHandle>> {
         let Some(r) = self.render.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
         let opcode = r.opcode;
+        let host_pic = self.next_xid();
         self.sequence = self.sequence.wrapping_add(1);
         let mut out = Vec::new();
         out.push(opcode);
@@ -1018,7 +580,8 @@ impl HostX11 {
         write_u32(&mut out, host_pic);
         out.extend_from_slice(&color);
         self.stream.write_all(&out)?;
-        self.stream.flush()
+        self.stream.flush()?;
+        Ok(Some(PictureHandle::from_raw_panicking(host_pic)))
     }
 
     pub fn render_fill_rectangles(
@@ -1233,8 +796,7 @@ impl HostX11 {
     /// only during Phase 3.6 Step 2; sub-window mirroring stays dormant).
     pub fn create_subwindow(
         &mut self,
-        host_parent: u32,
-        host_xid: u32,
+        host_parent: WindowHandle,
         x: i16,
         y: i16,
         width: u16,
@@ -1243,7 +805,9 @@ impl HostX11 {
         visual: HostSubwindowVisual,
         background_pixel: Option<u32>,
         background_pixmap: Option<u32>,
-    ) -> io::Result<()> {
+    ) -> io::Result<WindowHandle> {
+        let host_xid = self.next_xid();
+        let host_parent = host_parent.as_raw();
         let mut out = Vec::new();
         // Subwindow value list, in increasing value-mask bit order:
         // - bit 0: background-pixmap. If set, host auto-clears to this
@@ -1318,7 +882,7 @@ impl HostX11 {
             host_xid,
             host_parent,
         );
-        Ok(())
+        Ok(WindowHandle::from_raw_panicking(host_xid))
     }
 
     /// Round-trip on the main host connection: send GetInputFocus,
@@ -1635,11 +1199,11 @@ impl HostX11 {
 
     pub fn create_pixmap(
         &mut self,
-        host_xid: u32,
         depth: u8,
         width: u16,
         height: u16,
-    ) -> io::Result<()> {
+    ) -> io::Result<PixmapHandle> {
+        let host_xid = self.next_xid();
         self.sequence = self.sequence.wrapping_add(1);
         let mut out = Vec::new();
         out.push(53); // CreatePixmap opcode
@@ -1650,7 +1214,8 @@ impl HostX11 {
         write_u16(&mut out, width);
         write_u16(&mut out, height);
         self.stream.write_all(&out)?;
-        self.stream.flush()
+        self.stream.flush()?;
+        Ok(PixmapHandle::from_raw_panicking(host_xid))
     }
 
     pub fn free_pixmap(&mut self, host_xid: u32) -> io::Result<()> {
@@ -1666,22 +1231,22 @@ impl HostX11 {
 
     pub fn create_cursor(
         &mut self,
-        source_pixmap_xid: u32,
-        mask_pixmap_xid: u32,
+        source_pixmap: PixmapHandle,
+        mask_pixmap: Option<PixmapHandle>,
         fore: (u16, u16, u16),
         back: (u16, u16, u16),
         hot_x: u16,
         hot_y: u16,
-    ) -> io::Result<u32> {
-        let cursor_xid = self.allocate_xid();
+    ) -> io::Result<CursorHandle> {
+        let cursor_xid = self.next_xid();
         self.sequence = self.sequence.wrapping_add(1);
         let mut buf = Vec::with_capacity(32);
         buf.push(93u8);
         buf.push(0u8);
         write_u16(&mut buf, 8u16);
         write_u32(&mut buf, cursor_xid);
-        write_u32(&mut buf, source_pixmap_xid);
-        write_u32(&mut buf, mask_pixmap_xid);
+        write_u32(&mut buf, source_pixmap.as_raw());
+        write_u32(&mut buf, mask_pixmap.map(|h| h.as_raw()).unwrap_or(0));
         write_u16(&mut buf, fore.0);
         write_u16(&mut buf, fore.1);
         write_u16(&mut buf, fore.2);
@@ -1692,31 +1257,32 @@ impl HostX11 {
         write_u16(&mut buf, hot_y);
         self.stream.write_all(&buf)?;
         self.stream.flush()?;
-        Ok(cursor_xid)
+        Ok(CursorHandle::from_raw_panicking(cursor_xid))
     }
 
     pub fn render_create_cursor(
         &mut self,
-        cursor_xid: u32,
-        host_src_pic: u32,
+        host_src_pic: PictureHandle,
         x: u16,
         y: u16,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<CursorHandle>> {
         let Some(r) = self.render.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
         let opcode = r.opcode;
+        let cursor_xid = self.next_xid();
         self.sequence = self.sequence.wrapping_add(1);
         let mut buf = Vec::with_capacity(16);
         buf.push(opcode);
         buf.push(27); // CreateCursor minor opcode
         write_u16(&mut buf, 4u16);
         write_u32(&mut buf, cursor_xid);
-        write_u32(&mut buf, host_src_pic);
+        write_u32(&mut buf, host_src_pic.as_raw());
         write_u16(&mut buf, x);
         write_u16(&mut buf, y);
         self.stream.write_all(&buf)?;
-        self.stream.flush()
+        self.stream.flush()?;
+        Ok(Some(CursorHandle::from_raw_panicking(cursor_xid)))
     }
 
     pub fn define_cursor(&mut self, host_window_xid: u32, cursor_host_xid: u32) -> io::Result<()> {
@@ -1872,6 +1438,180 @@ impl HostX11 {
         Ok(())
     }
 
+    /// Push the `DrawState`'s clip-state to the host shared GC.
+    /// Honours `ChangeGC(clip_mask=Pixmap)` (wmaker decoration symbols)
+    /// — without this, depth-1 clip-mask draws fill the entire rect with
+    /// the foreground colour and X/dot symbols vanish.
+    pub fn apply_clip_state(&mut self, clip: &crate::backend::ClipState) -> io::Result<()> {
+        match clip {
+            crate::backend::ClipState::Rectangles { rects, .. } => {
+                self.set_clip_rectangles(Some(rects.clone()))
+            }
+            crate::backend::ClipState::Pixmap { origin, pixmap } => {
+                self.set_clip_pixmap(pixmap.as_raw(), origin.0, origin.1)
+            }
+            crate::backend::ClipState::None => self.clear_clip_rectangles(),
+        }
+    }
+
+    /// Push the `DrawState`'s fill-state to the host shared GC.
+    /// Stippled / OpaqueStippled fall through to Solid for now; the
+    /// caller is expected to reset to Solid after a fill draw so an
+    /// unrelated subsequent draw doesn't inherit the tile.
+    pub fn apply_fill_state(&mut self, fill: &crate::backend::FillState) -> io::Result<()> {
+        match fill {
+            crate::backend::FillState::Tiled { pixmap, origin } => {
+                self.set_gc_fill_tiled(pixmap.as_raw(), origin.0, origin.1)
+            }
+            _ => self.set_gc_fill_solid(),
+        }
+    }
+
+    /// Push the GC attributes that aren't already covered by the
+    /// foreground / clip / fill helpers (function, plane-mask,
+    /// line-width / style / cap / join, fill-rule, subwindow-mode,
+    /// graphics-exposures, dash-offset, dashes, arc-mode) to the host's
+    /// shared GC. Called by drawing call sites after `apply_clip_state`
+    /// / `apply_fill_state` so the host honours the full GC state, not
+    /// just clip + fill + foreground.
+    ///
+    /// All fields are sent in a single ChangeGC, with the value-mask
+    /// limited to the fields that have changed since the last call.
+    /// This is the additive-scope behavioural improvement of Phase 6.2:
+    /// pre-Phase-6.2, fields like `function=Xor` were silently
+    /// overridden to `Copy` because we never forwarded them.
+    pub fn apply_draw_state(&mut self, state: &crate::backend::DrawState) -> io::Result<()> {
+        let mut mask: u32 = 0;
+        let mut values: Vec<u8> = Vec::new();
+
+        let function_byte = state.function.protocol_value();
+        if self.current_function != Some(function_byte) {
+            mask |= 1 << 0;
+            push_card8_padded(&mut values, function_byte);
+        }
+        if self.current_plane_mask != Some(state.plane_mask) {
+            mask |= 1 << 1;
+            write_u32(&mut values, state.plane_mask);
+        }
+        if self.current_line_width != Some(state.line_width) {
+            mask |= 1 << 4;
+            write_u16(&mut values, state.line_width);
+            write_u16(&mut values, 0); // pad to 4 bytes
+        }
+        let line_style_byte = state.line_style.protocol_value();
+        if self.current_line_style != Some(line_style_byte) {
+            mask |= 1 << 5;
+            push_card8_padded(&mut values, line_style_byte);
+        }
+        let cap_style_byte = state.cap_style.protocol_value();
+        if self.current_cap_style != Some(cap_style_byte) {
+            mask |= 1 << 6;
+            push_card8_padded(&mut values, cap_style_byte);
+        }
+        let join_style_byte = state.join_style.protocol_value();
+        if self.current_join_style != Some(join_style_byte) {
+            mask |= 1 << 7;
+            push_card8_padded(&mut values, join_style_byte);
+        }
+        let fill_rule_byte = state.fill_rule.protocol_value();
+        if self.current_fill_rule != Some(fill_rule_byte) {
+            mask |= 1 << 9;
+            push_card8_padded(&mut values, fill_rule_byte);
+        }
+        let submode_byte = state.subwindow_mode.protocol_value();
+        if self.current_subwindow_mode != Some(submode_byte) {
+            mask |= 1 << 15;
+            push_card8_padded(&mut values, submode_byte);
+        }
+        if self.current_graphics_exposures != Some(state.graphics_exposures) {
+            mask |= 1 << 16;
+            push_card8_padded(&mut values, u8::from(state.graphics_exposures));
+        }
+        if self.current_dash_offset != Some(state.dash_offset) {
+            mask |= 1 << 20;
+            write_i16(&mut values, state.dash_offset);
+            write_u16(&mut values, 0); // pad
+        }
+        // CPDashList: a single byte (the on/off length). We store the
+        // pair as `[n, n]`; if the GC has a different shape (set via a
+        // hypothetical SetDashes opcode), we send the first byte.
+        let dash_byte = *state.dashes.first().unwrap_or(&4);
+        if self
+            .current_dashes
+            .as_ref()
+            .is_none_or(|d| d.first() != Some(&dash_byte))
+        {
+            mask |= 1 << 21;
+            push_card8_padded(&mut values, dash_byte);
+        }
+        let arc_byte = state.arc_mode.protocol_value();
+        if self.current_arc_mode != Some(arc_byte) {
+            mask |= 1 << 22;
+            push_card8_padded(&mut values, arc_byte);
+        }
+
+        if mask == 0 {
+            return Ok(());
+        }
+
+        // Header(4) + gc(4) + mask(4) + values = 12 + values.len() bytes.
+        // Length is in 4-byte units.
+        let length_bytes = 12 + values.len();
+        debug_assert!(length_bytes.is_multiple_of(4));
+        let length_units = u16::try_from(length_bytes / 4).map_err(|_| {
+            io::Error::new(ErrorKind::InvalidInput, "apply_draw_state: too many fields")
+        })?;
+        self.sequence = self.sequence.wrapping_add(1);
+        let mut out = Vec::with_capacity(length_bytes);
+        out.push(56); // ChangeGC
+        out.push(0);
+        write_u16(&mut out, length_units);
+        write_u32(&mut out, self.gc_id);
+        write_u32(&mut out, mask);
+        out.extend_from_slice(&values);
+        self.stream.write_all(&out)?;
+        self.stream.flush()?;
+
+        // Update cached state on success.
+        if mask & (1 << 0) != 0 {
+            self.current_function = Some(function_byte);
+        }
+        if mask & (1 << 1) != 0 {
+            self.current_plane_mask = Some(state.plane_mask);
+        }
+        if mask & (1 << 4) != 0 {
+            self.current_line_width = Some(state.line_width);
+        }
+        if mask & (1 << 5) != 0 {
+            self.current_line_style = Some(line_style_byte);
+        }
+        if mask & (1 << 6) != 0 {
+            self.current_cap_style = Some(cap_style_byte);
+        }
+        if mask & (1 << 7) != 0 {
+            self.current_join_style = Some(join_style_byte);
+        }
+        if mask & (1 << 9) != 0 {
+            self.current_fill_rule = Some(fill_rule_byte);
+        }
+        if mask & (1 << 15) != 0 {
+            self.current_subwindow_mode = Some(submode_byte);
+        }
+        if mask & (1 << 16) != 0 {
+            self.current_graphics_exposures = Some(state.graphics_exposures);
+        }
+        if mask & (1 << 20) != 0 {
+            self.current_dash_offset = Some(state.dash_offset);
+        }
+        if mask & (1 << 21) != 0 {
+            self.current_dashes = Some(state.dashes.clone());
+        }
+        if mask & (1 << 22) != 0 {
+            self.current_arc_mode = Some(arc_byte);
+        }
+        Ok(())
+    }
+
     /// Reset the host shared GC's fill-style to Solid. No-op if already
     /// Solid. Called after every fill draw that flipped to Tiled, so
     /// subsequent unrelated draws on the shared GC don't inherit the tile.
@@ -2010,7 +1750,7 @@ impl HostX11 {
         if let Some(&gc) = self.depth_gcs.get(&depth) {
             return Ok(gc);
         }
-        let gc = self.allocate_xid();
+        let gc = self.next_xid();
         self.sequence = self.sequence.wrapping_add(1);
         let mut out = Vec::new();
         out.push(55); // CreateGC opcode
@@ -2471,367 +2211,143 @@ pub(crate) fn xkb_minor_has_reply(minor: u8) -> bool {
             | 101
     )
 }
-
-fn connect_to_host() -> io::Result<UnixStream> {
-    let display = env::var("DISPLAY").map_err(|_| {
-        io::Error::new(
-            ErrorKind::NotFound,
-            "DISPLAY is not set for host X11 backend",
-        )
-    })?;
-    let display_number = parse_display_number(&display)?;
-    let socket_path = format!("/tmp/.X11-unix/X{display_number}");
-
-    let auth = XAuthority::load(display_number).unwrap_or_default();
-    let mut stream = UnixStream::connect(socket_path)?;
-    write_setup_request(&mut stream, auth.as_ref())?;
-    Ok(stream)
+/// Push a CARD8 GC value into a ChangeGC value-list, padded to 4 bytes
+/// (X11 GC values are CARD32-aligned even when the semantic type is one byte).
+fn push_card8_padded(out: &mut Vec<u8>, value: u8) {
+    out.push(value);
+    out.push(0);
+    out.push(0);
+    out.push(0);
 }
 
-impl HostInputPump {
-    pub fn open_from_env(window_id: u32) -> io::Result<Self> {
-        let mut stream = connect_to_host()?;
-        let _setup = read_setup_reply(&mut stream)?;
-        select_keyboard_events(&mut stream, window_id)?;
-        // The main pump owns POINTER_EVENT_MASK on the container. ButtonPress
-        // is exclusive in X11 — only the main pump (not per-client kb pumps)
-        // can hold it. Without this, clicks on the container area (where no
-        // top-level child intervenes) drop on the host side and never reach
-        // any nested client.
-        select_pointer_events_on_container(&mut stream, window_id)?;
-        stream.flush()?;
-        let read_stream = stream.try_clone()?;
-        // Map the host container window to ynest's ROOT_WINDOW so Expose
-        // events on the container (raised by the host when subwindows uncover
-        // the desktop area) are delivered as Expose on ROOT_WINDOW. Without
-        // this entry expose_event_fanout drops the event and the desktop
-        // background is never repainted after a window drag.
-        let mut xid_map = HashMap::new();
-        xid_map.insert(window_id, crate::resources::ROOT_WINDOW);
-        let handle = HostInputPumpHandle {
-            write_stream: Arc::new(Mutex::new(stream)),
-            xid_map: Arc::new(Mutex::new(xid_map)),
-        };
-        Ok(Self {
-            read_stream,
-            handle,
-        })
+/// Add `(x_off, y_off)` to every non-sentinel glyph command's delta in a
+/// `CompositeGlyphs{8,16,32}` payload. Previously this only patched the first
+/// command's delta and stopped, which mispositioned multi-run composites
+/// — anything containing a 255 sentinel that switches glyphsets between runs.
+///
+/// `id_size` is 1 for `CompositeGlyphs8` (minor 23), 2 for the 16-bit variant
+/// (minor 24), 4 for the 32-bit variant (minor 25). The glyph-id payload that
+/// follows each non-sentinel header is `count * id_size` bytes, padded to a
+/// 4-byte boundary; the next header begins immediately after that.
+fn patch_glyph_command_offsets(items: &mut [u8], x_off: i16, y_off: i16, id_size: usize) {
+    if x_off == 0 && y_off == 0 {
+        return;
     }
-
-    #[must_use]
-    pub fn handle(&self) -> HostInputPumpHandle {
-        self.handle.clone()
-    }
-
-    pub fn read_event(&mut self) -> io::Result<HostEvent> {
-        loop {
-            let mut event = [0; 32];
-            self.read_stream.read_exact(&mut event)?;
-            let event_type = event[0] & 0x7f;
-            match event_type {
-                2 | 3 => {
-                    return Ok(HostEvent::Key(HostKeyEvent {
-                        pressed: event_type == 2,
-                        keycode: event[1],
-                        time: read_u32(&event[4..8]),
-                        root_x: read_i16(&event[20..22]),
-                        root_y: read_i16(&event[22..24]),
-                        event_x: read_i16(&event[24..26]),
-                        event_y: read_i16(&event[26..28]),
-                        state: read_u16(&event[28..30]),
-                    }));
-                }
-                4..=6 => {
-                    let kind = match event_type {
-                        4 => PointerEventKind::ButtonPress,
-                        5 => PointerEventKind::ButtonRelease,
-                        _ => PointerEventKind::MotionNotify,
-                    };
-                    return Ok(HostEvent::Pointer(HostPointerEvent {
-                        kind,
-                        host_xid: read_u32(&event[12..16]), // event window
-                        detail: event[1],
-                        time: read_u32(&event[4..8]),
-                        root_x: read_i16(&event[20..22]),
-                        root_y: read_i16(&event[22..24]),
-                        event_x: read_i16(&event[24..26]),
-                        event_y: read_i16(&event[26..28]),
-                        state: read_u16(&event[28..30]),
-                    }));
-                }
-                7 | 8 => {
-                    let kind = if event_type == 7 {
-                        PointerEventKind::EnterNotify
-                    } else {
-                        PointerEventKind::LeaveNotify
-                    };
-                    return Ok(HostEvent::Pointer(HostPointerEvent {
-                        kind,
-                        host_xid: read_u32(&event[12..16]),
-                        detail: 0,
-                        time: read_u32(&event[4..8]),
-                        root_x: read_i16(&event[20..22]),
-                        root_y: read_i16(&event[22..24]),
-                        event_x: read_i16(&event[24..26]),
-                        event_y: read_i16(&event[26..28]),
-                        state: read_u16(&event[28..30]),
-                    }));
-                }
-                12 => {
-                    let host_xid = read_u32(&event[4..8]);
-                    let x = read_u16(&event[8..10]);
-                    let y = read_u16(&event[10..12]);
-                    let width = read_u16(&event[12..14]);
-                    let height = read_u16(&event[14..16]);
-                    let count = read_u16(&event[16..18]);
-                    log::trace!(
-                        "host pump: Expose host_xid=0x{host_xid:x} x={x} y={y} w={width} h={height} count={count}",
-                    );
-                    return Ok(HostEvent::Expose(HostExposeEvent {
-                        host_xid,
-                        x,
-                        y,
-                        width,
-                        height,
-                        count,
-                    }));
-                }
-                22 => {
-                    return Ok(HostEvent::Configure(HostConfigureEvent {
-                        host_xid: read_u32(&event[8..12]),
-                        x: read_i16(&event[16..18]),
-                        y: read_i16(&event[18..20]),
-                        width: read_u16(&event[20..22]),
-                        height: read_u16(&event[22..24]),
-                    }));
-                }
-                17 => return Ok(HostEvent::Closed),
-                _ => {}
-            }
+    debug_assert!(matches!(id_size, 1 | 2 | 4));
+    let mut pos = 0;
+    while pos + 8 <= items.len() {
+        let count = items[pos];
+        if count == 255 {
+            // Glyphset-switch sentinel: 8 bytes total (count, pad×3, glyphset
+            // XID), no payload follows.
+            pos += 8;
+            continue;
         }
+        let dx = i16::from_le_bytes([items[pos + 4], items[pos + 5]]).wrapping_add(x_off);
+        let dy = i16::from_le_bytes([items[pos + 6], items[pos + 7]]).wrapping_add(y_off);
+        items[pos + 4..pos + 6].copy_from_slice(&dx.to_le_bytes());
+        items[pos + 6..pos + 8].copy_from_slice(&dy.to_le_bytes());
+        let payload_bytes = usize::from(count) * id_size;
+        let padded = (payload_bytes + 3) & !3;
+        pos += 8 + padded;
     }
 }
 
-const POINTER_EVENT_MASK: u32 = 0x0000_0004 // ButtonPress
-    | 0x0000_0008 // ButtonRelease
-    | 0x0000_0010 // EnterWindow
-    | 0x0000_0020 // LeaveWindow
-    | 0x0000_0040 // PointerMotion
-    | 0x0000_8000; // Exposure
+/// Build the wire bytes for XFIXES `ChangeCursorByName` (minor 23). Returns
+/// `None` when the host XFIXES extension is unavailable.
+fn build_xfixes_change_cursor_by_name(
+    host_xfixes_opcode: Option<u8>,
+    host_cursor_xid: u32,
+    name_bytes: &[u8],
+) -> Option<Vec<u8>> {
+    let opcode = host_xfixes_opcode?;
+    let nbytes = u16::try_from(name_bytes.len()).ok()?;
+    let padded_name = padded_len(name_bytes.len());
+    let length_units = u16::try_from(3 + padded_name / 4).ok()?;
+    let mut out = Vec::with_capacity(12 + padded_name);
+    out.push(opcode);
+    out.push(yserver_protocol::x11::xfixes::CHANGE_CURSOR_BY_NAME);
+    write_u16(&mut out, length_units);
+    write_u32(&mut out, host_cursor_xid);
+    write_u16(&mut out, nbytes);
+    write_u16(&mut out, 0); // pad
+    out.extend_from_slice(name_bytes);
+    out.resize(12 + padded_name, 0);
+    Some(out)
+}
 
-/// Mask used for sub-window host children: Exposure only. Per X11
-/// event-propagation rules a host event with no listener at the leaf
-/// bubbles up to the closest interested ancestor — for our sub-windows
-/// that's the container, where input is dispatched. Selecting any
-/// pointer events here would short-circuit our internal dispatch and
-/// deliver to the wrong client. See Xnest `Window.c:91` and the design
-/// doc's "Input event path" section.
-const SUBWINDOW_EVENT_MASK: u32 = 0x0000_8000; // Exposure
-
-impl HostInputPumpHandle {
-    pub fn register_top_level(&self, nested_id: ResourceId, host_xid: u32) -> io::Result<()> {
-        self.register_host_window(nested_id, host_xid, POINTER_EVENT_MASK)
+/// Build the wire bytes for SHAPE `Rectangles(op=Set, ordering=Unsorted)`
+/// targeting `host_xid`. Returns `None` when the host SHAPE extension is
+/// unavailable so the caller doesn't waste a stream write.
+fn build_shape_rectangles(
+    host_shape_opcode: Option<u8>,
+    host_xid: u32,
+    kind: u8,
+    rects: &[yserver_protocol::x11::xfixes::RegionRect],
+) -> Option<Vec<u8>> {
+    let opcode = host_shape_opcode?;
+    let length_units = u16::try_from(4 + rects.len() * 2).ok()?;
+    let mut out = Vec::with_capacity(16 + rects.len() * 8);
+    out.push(opcode);
+    out.push(yserver_protocol::x11::shape::RECTANGLES);
+    write_u16(&mut out, length_units);
+    out.push(yserver_protocol::x11::shape::OP_SET);
+    out.push(kind);
+    out.push(0); // ordering = Unsorted
+    out.push(0); // pad
+    write_u32(&mut out, host_xid);
+    write_i16(&mut out, 0); // x_off (top-level coords already match)
+    write_i16(&mut out, 0); // y_off
+    for rect in rects {
+        write_i16(&mut out, rect.x);
+        write_i16(&mut out, rect.y);
+        write_u16(&mut out, rect.width);
+        write_u16(&mut out, rect.height);
     }
-
-    /// Mirror a sub-window's host child for Expose-event delivery.
-    /// Adds the host_xid → nested_id mapping so the pump can route
-    /// host Exposes through `expose_event_fanout`, and selects
-    /// `ExposureMask` only on the host child. Phase 3.6 Step 3+4
-    /// invariant: every InputOutput sub-window goes through this
-    /// register call after CreateWindow + before its first map.
-    pub fn register_subwindow(&self, nested_id: ResourceId, host_xid: u32) -> io::Result<()> {
-        self.register_host_window(nested_id, host_xid, SUBWINDOW_EVENT_MASK)
-    }
-
-    fn register_host_window(
-        &self,
-        nested_id: ResourceId,
-        host_xid: u32,
-        event_mask: u32,
-    ) -> io::Result<()> {
-        // Insert into the map *before* writing to X11 so that any pointer
-        // events arriving on this subwindow after ChangeWindowAttributes are
-        // sent can be resolved to a nested window id immediately.
-        if let Ok(mut map) = self.xid_map.lock() {
-            map.insert(host_xid, nested_id);
-        }
-        // ChangeWindowAttributes — value-mask = (1<<11) (event-mask), value = pointer mask.
-        let mut out = Vec::new();
-        out.push(2); // ChangeWindowAttributes
-        out.push(0);
-        write_u16(&mut out, 4);
-        write_u32(&mut out, host_xid);
-        write_u32(&mut out, 1 << 11);
-        write_u32(&mut out, event_mask);
-        let mut stream = self
-            .write_stream
-            .lock()
-            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "host pump stream poisoned"))?;
-        stream.write_all(&out)?;
-        stream.flush()?;
-        log::debug!(
-            "host pump: register host_window nested=0x{:x} host=0x{:x} event_mask=0x{:x}",
-            nested_id.0,
-            host_xid,
-            event_mask
-        );
-        Ok(())
-    }
-
-    /// Drop the host_xid → nested ResourceId mapping. Used at
-    /// DestroyWindow / Reparent-away-from-root for any host-mirrored
-    /// window — top-level or sub-window — so stale host events on
-    /// the now-defunct xid drop silently instead of misrouting.
-    pub fn unregister_host_window(&self, host_xid: u32) {
-        if let Ok(mut map) = self.xid_map.lock() {
-            map.remove(&host_xid);
-        }
-    }
-
-    /// Compatibility shim — `unregister_host_window` is the canonical
-    /// name; older call sites use this one. Will be folded into the
-    /// canonical name in a follow-up.
-    pub fn unregister_top_level(&self, host_xid: u32) {
-        self.unregister_host_window(host_xid);
-    }
-
-    #[must_use]
-    pub fn xid_map(&self) -> HostXidMap {
-        self.xid_map.clone()
-    }
+    Some(out)
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum HostEvent {
-    Key(HostKeyEvent),
-    Pointer(HostPointerEvent),
-    Expose(HostExposeEvent),
-    Configure(HostConfigureEvent),
-    Closed,
+fn write_open_font(stream: &mut UnixStream, font_id: u32, name: &[u8]) -> io::Result<()> {
+    open_font(stream, font_id, name)
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct HostExposeEvent {
-    pub host_xid: u32,
-    pub x: u16,
-    pub y: u16,
-    pub width: u16,
-    pub height: u16,
-    pub count: u16,
+fn write_query_font(stream: &mut UnixStream, font_id: u32) -> io::Result<()> {
+    let mut out = Vec::new();
+    out.push(47);
+    out.push(0);
+    write_u16(&mut out, 2);
+    write_u32(&mut out, font_id);
+    stream.write_all(&out)
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct HostConfigureEvent {
-    pub host_xid: u32,
-    pub x: i16,
-    pub y: i16,
-    pub width: u16,
-    pub height: u16,
-}
+fn write_list_fonts(
+    stream: &mut UnixStream,
+    opcode: u8,
+    max_names: u16,
+    pattern: &[u8],
+) -> io::Result<()> {
+    let padded = padded_len(pattern.len());
+    let length_units = 2 + u16::try_from(padded / 4)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "font pattern is too long"))?;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PointerEventKind {
-    ButtonPress,
-    ButtonRelease,
-    MotionNotify,
-    EnterNotify,
-    LeaveNotify,
+    let mut out = Vec::new();
+    out.push(opcode);
+    out.push(0);
+    write_u16(&mut out, length_units);
+    write_u16(&mut out, max_names);
+    write_u16(
+        &mut out,
+        u16::try_from(pattern.len())
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "font pattern is too long"))?,
+    );
+    out.extend_from_slice(pattern);
+    out.resize(8 + padded, 0);
+    stream.write_all(&out)
 }
-
-#[derive(Clone, Copy, Debug)]
-pub struct HostPointerEvent {
-    pub kind: PointerEventKind,
-    pub host_xid: u32,
-    pub detail: u8,
-    pub time: u32,
-    pub root_x: i16,
-    pub root_y: i16,
-    pub event_x: i16,
-    pub event_y: i16,
-    pub state: u16,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct HostKeyEvent {
-    pub pressed: bool,
-    pub keycode: u8,
-    pub time: u32,
-    pub root_x: i16,
-    pub root_y: i16,
-    pub event_x: i16,
-    pub event_y: i16,
-    pub state: u16,
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{build_shape_rectangles, scan_for_argb_visual, xkb_minor_has_reply};
+    use super::{build_shape_rectangles, xkb_minor_has_reply};
     use yserver_protocol::x11::xfixes::RegionRect;
-
-    /// `(visual_id, class, red_mask, green_mask, blue_mask)`.
-    type VisualRec = (u32, u8, u32, u32, u32);
-    type DepthRec<'a> = (u8, &'a [VisualRec]);
-
-    /// Build a single-screen depth list with the given (depth, visuals)
-    /// records. Returns the byte buffer + the offset at which the depth
-    /// list starts (matches the layout `read_setup_reply` hands to
-    /// `scan_for_argb_visual`).
-    fn build_depth_list(records: &[DepthRec<'_>]) -> (Vec<u8>, usize) {
-        let mut body = Vec::new();
-        let depth_offset = 0;
-        for (depth, visuals) in records {
-            body.push(*depth);
-            body.push(0); // pad
-            body.extend_from_slice(&(visuals.len() as u16).to_le_bytes());
-            body.extend_from_slice(&[0; 4]); // pad
-            for (vid, class, red, green, blue) in *visuals {
-                body.extend_from_slice(&vid.to_le_bytes());
-                body.push(*class);
-                body.push(8); // bits_per_rgb
-                body.extend_from_slice(&256u16.to_le_bytes()); // colormap_entries
-                body.extend_from_slice(&red.to_le_bytes());
-                body.extend_from_slice(&green.to_le_bytes());
-                body.extend_from_slice(&blue.to_le_bytes());
-                body.extend_from_slice(&[0; 4]); // pad
-            }
-        }
-        (body, depth_offset)
-    }
-
-    #[test]
-    fn scan_for_argb_visual_picks_depth_32_truecolor_with_8bit_rgb() {
-        let (body, off) = build_depth_list(&[
-            (24, &[(0x21, 4, 0x00ff_0000, 0x0000_ff00, 0x0000_00ff)]),
-            (32, &[(0x42, 4, 0x00ff_0000, 0x0000_ff00, 0x0000_00ff)]),
-        ]);
-        assert_eq!(scan_for_argb_visual(&body, off, 2), Some(0x42));
-    }
-
-    #[test]
-    fn scan_for_argb_visual_skips_non_true_color_at_depth_32() {
-        let (body, off) =
-            build_depth_list(&[(32, &[(0x42, 5, 0x00ff_0000, 0x0000_ff00, 0x0000_00ff)])]);
-        assert_eq!(scan_for_argb_visual(&body, off, 1), None);
-    }
-
-    #[test]
-    fn scan_for_argb_visual_returns_none_when_no_depth_32() {
-        let (body, off) =
-            build_depth_list(&[(24, &[(0x21, 4, 0x00ff_0000, 0x0000_ff00, 0x0000_00ff)])]);
-        assert_eq!(scan_for_argb_visual(&body, off, 1), None);
-    }
-
-    #[test]
-    fn scan_for_argb_visual_returns_none_on_truncated_body() {
-        // Header claims a depth-32 visual but the body cuts off early.
-        let mut body = Vec::new();
-        body.push(32);
-        body.push(0);
-        body.extend_from_slice(&1u16.to_le_bytes());
-        body.extend_from_slice(&[0; 4]);
-        body.extend_from_slice(&[0; 12]); // less than the 24-byte VisualType
-        assert_eq!(scan_for_argb_visual(&body, 0, 1), None);
-    }
 
     #[test]
     fn xkb_reply_minor_audit_includes_known_blocking_requests() {
@@ -3028,616 +2544,4 @@ mod tests {
         assert_eq!(u16::from_le_bytes([bytes[28], bytes[29]]), 30);
         assert_eq!(u16::from_le_bytes([bytes[30], bytes[31]]), 40);
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct PointerPosition {
-    pub same_screen: bool,
-    pub win_x: i16,
-    pub win_y: i16,
-    pub mask: u16,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct HostSubwindowConfig {
-    pub x: Option<i16>,
-    pub y: Option<i16>,
-    pub width: Option<u16>,
-    pub height: Option<u16>,
-    pub border_width: Option<u16>,
-    pub sibling: Option<u32>,
-    pub stack_mode: Option<u8>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct XAuthority {
-    name: Vec<u8>,
-    data: Vec<u8>,
-}
-
-impl XAuthority {
-    fn load(display_number: u16) -> io::Result<Option<Self>> {
-        let path = env::var_os("XAUTHORITY")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".Xauthority")))
-            .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "no Xauthority path"))?;
-
-        let bytes = fs::read(path)?;
-        let display_number = display_number.to_string();
-        let mut cursor = 0;
-        let mut fallback = None;
-
-        while cursor < bytes.len() {
-            let Some(_family) = read_be_u16_record(&bytes, &mut cursor) else {
-                break;
-            };
-            let Some(address) = read_record_field(&bytes, &mut cursor) else {
-                break;
-            };
-            let Some(number) = read_record_field(&bytes, &mut cursor) else {
-                break;
-            };
-            let Some(name) = read_record_field(&bytes, &mut cursor) else {
-                break;
-            };
-            let Some(data) = read_record_field(&bytes, &mut cursor) else {
-                break;
-            };
-
-            if name == MIT_MAGIC_COOKIE.as_bytes() && number == display_number.as_bytes() {
-                let auth = Self { name, data };
-                if address.is_empty() {
-                    return Ok(Some(auth));
-                }
-                fallback = Some(auth);
-            }
-        }
-
-        Ok(fallback)
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct HostSetup {
-    resource_id_base: u32,
-    root: u32,
-    root_visual: u32,
-    root_depth: u8,
-    white_pixel: u32,
-    black_pixel: u32,
-    /// First TrueColor visual at depth 32 with a non-zero alpha mask, if
-    /// the host advertises one. Used to forward CreateWindow with our
-    /// `ARGB_VISUAL` so the host produces an ARGB drawable instead of a
-    /// 24-bit one. `None` = host has no ARGB visual; we fall back to
-    /// CopyFromParent in that case.
-    argb_visual: Option<u32>,
-}
-
-fn parse_display_number(display: &str) -> io::Result<u16> {
-    let display = display
-        .rsplit_once(':')
-        .map_or(display, |(_, suffix)| suffix);
-    let number = display.split('.').next().unwrap_or(display);
-    number.parse::<u16>().map_err(|err| {
-        io::Error::new(
-            ErrorKind::InvalidInput,
-            format!("unsupported DISPLAY value {display:?}: {err}"),
-        )
-    })
-}
-
-fn write_setup_request(stream: &mut UnixStream, auth: Option<&XAuthority>) -> io::Result<()> {
-    let (name, data) = auth
-        .map(|auth| (auth.name.as_slice(), auth.data.as_slice()))
-        .unwrap_or((&[][..], &[][..]));
-
-    let mut out = Vec::new();
-    out.push(b'l');
-    out.push(0);
-    write_u16(&mut out, 11);
-    write_u16(&mut out, 0);
-    write_u16(&mut out, name.len() as u16);
-    write_u16(&mut out, data.len() as u16);
-    write_u16(&mut out, 0);
-    out.extend_from_slice(name);
-    pad4(&mut out);
-    out.extend_from_slice(data);
-    pad4(&mut out);
-    stream.write_all(&out)
-}
-
-fn read_setup_reply(stream: &mut UnixStream) -> io::Result<HostSetup> {
-    let mut header = [0; 8];
-    stream.read_exact(&mut header)?;
-    if header[0] != 1 {
-        return Err(io::Error::new(
-            ErrorKind::PermissionDenied,
-            format!("host X11 setup failed with status {}", header[0]),
-        ));
-    }
-
-    let length = u16::from_le_bytes([header[6], header[7]]) as usize * 4;
-    let mut body = vec![0; length];
-    stream.read_exact(&mut body)?;
-    if body.len() < 40 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "host X11 setup body is too short",
-        ));
-    }
-
-    let resource_id_base = read_u32(&body[4..8]);
-    let vendor_len = read_u16(&body[16..18]) as usize;
-    let roots_len = body[20] as usize;
-    let pixmap_formats_len = body[21] as usize;
-    if roots_len == 0 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "host X11 server has no roots",
-        ));
-    }
-
-    let screen_offset = 32 + padded_len(vendor_len) + pixmap_formats_len * 8;
-    if body.len() < screen_offset + 40 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "host X11 screen body is too short",
-        ));
-    }
-
-    let screen = &body[screen_offset..];
-    let allowed_depths_len = screen[39] as usize;
-    let argb_visual = scan_for_argb_visual(&body, screen_offset + 40, allowed_depths_len);
-
-    Ok(HostSetup {
-        resource_id_base,
-        root: read_u32(&screen[0..4]),
-        root_visual: read_u32(&screen[32..36]),
-        root_depth: screen[38],
-        white_pixel: read_u32(&screen[8..12]),
-        black_pixel: read_u32(&screen[12..16]),
-        argb_visual,
-    })
-}
-
-/// Walk the screen's depth-list looking for a depth-32 TrueColor visual
-/// with a non-zero alpha mask. Each depth record is `depth(1) pad(1)
-/// visuals_len(2) pad(4)` followed by `visuals_len * 24` bytes of
-/// VisualType records (visual_id(4) class(1) bits_per_rgb(1)
-/// colormap_entries(2) red(4) green(4) blue(4) pad(4)).
-///
-/// Returns `None` if the host has no such visual or the body is too
-/// short to parse cleanly. `pad(4)` after the per-depth header is part
-/// of the X11 protocol layout — see Protocol Reference, Setup section.
-fn scan_for_argb_visual(body: &[u8], mut off: usize, depth_count: usize) -> Option<u32> {
-    for _ in 0..depth_count {
-        if body.len() < off + 8 {
-            return None;
-        }
-        let depth = body[off];
-        let visuals_len = read_u16(&body[off + 2..off + 4]) as usize;
-        off += 8;
-        for _ in 0..visuals_len {
-            if body.len() < off + 24 {
-                return None;
-            }
-            let visual_id = read_u32(&body[off..off + 4]);
-            let class = body[off + 4];
-            let red_mask = read_u32(&body[off + 8..off + 12]);
-            let green_mask = read_u32(&body[off + 12..off + 16]);
-            let blue_mask = read_u32(&body[off + 16..off + 20]);
-            // Approximate "alpha mask present": for a 32-bit TrueColor
-            // visual the host does not actually expose the alpha mask in
-            // the setup reply (X11 only exposes R/G/B). We infer ARGB by
-            // depth=32 + class=TrueColor + the standard 8-bit RGB layout.
-            let standard_argb_layout =
-                red_mask == 0x00ff_0000 && green_mask == 0x0000_ff00 && blue_mask == 0x0000_00ff;
-            if depth == 32 && class == 4 && standard_argb_layout {
-                return Some(visual_id);
-            }
-            off += 24;
-        }
-    }
-    None
-}
-
-fn create_window(
-    stream: &mut UnixStream,
-    setup: &HostSetup,
-    window_id: u32,
-    width: u16,
-    height: u16,
-) -> io::Result<()> {
-    // Value-mask: bg-pixel (bit 1) | bit-gravity (bit 4) | event-mask (bit 11).
-    // bit-gravity = NorthWest (1) so a host-side resize preserves the NW pixels.
-    // Without this the gravity defaults to Forget and the host server is free
-    // to clear the entire container on resize, which paints over every visible
-    // subwindow and leaves the desktop blank until the apps redraw.
-    let value_mask: u32 = (1 << 1) | (1 << 4) | (1 << 11);
-    // length = 3 fixed words + 1 word per value bit (3 values). 3 + 3 = 6
-    // fixed; add 4-word CreateWindow header → 10 total length units.
-    let mut out = Vec::new();
-    out.push(1);
-    out.push(setup.root_depth);
-    write_u16(&mut out, 11);
-    write_u32(&mut out, window_id);
-    write_u32(&mut out, setup.root);
-    write_i16(&mut out, 80);
-    write_i16(&mut out, 80);
-    write_u16(&mut out, width);
-    write_u16(&mut out, height);
-    write_u16(&mut out, 0);
-    write_u16(&mut out, 1);
-    write_u32(&mut out, setup.root_visual);
-    write_u32(&mut out, value_mask);
-    write_u32(&mut out, setup.white_pixel); // bg-pixel
-    write_u32(&mut out, 1); // bit-gravity = NorthWest
-    write_u32(&mut out, 0x0000_8000 | 0x0002_0000); // event-mask
-    stream.write_all(&out)
-}
-
-/// Select POINTER_EVENT_MASK on the host container.
-///
-/// Used only by the main `HostInputPump` (called from `nested::run`). Per
-/// X11 spec, ButtonPress is exclusive — only one client at a time per
-/// window — so the per-client keyboard pumps must NOT also try to select
-/// it (they'd get BadAccess for the entire ChangeWindowAttributes,
-/// silently zeroing out their KeyPress/KeyRelease selection too). See
-/// commit 1f43914: the prior fix folded ButtonPress out of the shared
-/// `select_keyboard_events`, but inadvertently dropped it from the main
-/// pump as well — pointer events on the container stopped reaching ynest.
-fn select_pointer_events_on_container(
-    stream: &mut UnixStream,
-    window_id: u32,
-) -> io::Result<()> {
-    let mut out = Vec::new();
-    out.push(2); // ChangeWindowAttributes
-    out.push(0);
-    write_u16(&mut out, 4);
-    write_u32(&mut out, window_id);
-    write_u32(&mut out, 1 << 11); // value-mask = event-mask
-    write_u32(&mut out, POINTER_EVENT_MASK);
-    stream.write_all(&out)
-}
-
-fn select_keyboard_events(stream: &mut UnixStream, window_id: u32) -> io::Result<()> {
-    let mut out = Vec::new();
-    out.push(2);
-    out.push(0);
-    write_u16(&mut out, 4);
-    write_u32(&mut out, window_id);
-    write_u32(&mut out, 1 << 11);
-    // KeyPress | KeyRelease | StructureNotify only.
-    //
-    // Per X11 spec ButtonPress is *exclusive* — only one client at a
-    // time per window. The main `HostInputPump` (created in
-    // `nested::run`) already selects POINTER_EVENT_MASK (which
-    // includes ButtonPress) on the container; if the per-client kb
-    // pump tries to also select ButtonPress here the host returns
-    // BadAccess for the entire ChangeWindowAttributes request,
-    // leaving the kb pump connection with no mask at all on
-    // container — the pump then silently receives nothing including
-    // KeyPress. Selecting only KeyPress / KeyRelease /
-    // StructureNotify avoids the conflict; pointer events arrive on
-    // the main pump's connection where they belong.
-    write_u32(&mut out, (1 << 0) | (1 << 1) | (1 << 17));
-    stream.write_all(&out)
-}
-
-fn create_gc(
-    stream: &mut UnixStream,
-    drawable: u32,
-    gc_id: u32,
-    foreground: u32,
-    background: u32,
-    font_id: u32,
-) -> io::Result<()> {
-    let mut out = Vec::new();
-    out.push(55);
-    out.push(0);
-    write_u16(&mut out, 7);
-    write_u32(&mut out, gc_id);
-    write_u32(&mut out, drawable);
-    write_u32(&mut out, (1 << 2) | (1 << 3) | (1 << 14));
-    write_u32(&mut out, foreground);
-    write_u32(&mut out, background);
-    write_u32(&mut out, font_id);
-    stream.write_all(&out)
-}
-
-fn open_font(stream: &mut UnixStream, font_id: u32, name: &[u8]) -> io::Result<()> {
-    let padded_name_len = padded_len(name.len());
-    let length_units = 3 + u16::try_from(padded_name_len / 4)
-        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "font name is too long"))?;
-
-    let mut out = Vec::new();
-    out.push(45);
-    out.push(0);
-    write_u16(&mut out, length_units);
-    write_u32(&mut out, font_id);
-    write_u16(
-        &mut out,
-        u16::try_from(name.len())
-            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "font name is too long"))?,
-    );
-    write_u16(&mut out, 0);
-    out.extend_from_slice(name);
-    out.resize(12 + padded_name_len, 0);
-    stream.write_all(&out)
-}
-
-fn map_window(stream: &mut UnixStream, window_id: u32) -> io::Result<()> {
-    let mut out = Vec::new();
-    out.push(8);
-    out.push(0);
-    write_u16(&mut out, 2);
-    write_u32(&mut out, window_id);
-    stream.write_all(&out)
-}
-
-fn read_be_u16_record(bytes: &[u8], cursor: &mut usize) -> Option<u16> {
-    let end = *cursor + 2;
-    let value = u16::from_be_bytes(bytes.get(*cursor..end)?.try_into().ok()?);
-    *cursor = end;
-    Some(value)
-}
-
-fn read_record_field(bytes: &[u8], cursor: &mut usize) -> Option<Vec<u8>> {
-    let len = read_be_u16_record(bytes, cursor)? as usize;
-    let end = *cursor + len;
-    let value = bytes.get(*cursor..end)?.to_vec();
-    *cursor = end;
-    Some(value)
-}
-
-fn read_u16(bytes: &[u8]) -> u16 {
-    u16::from_le_bytes([bytes[0], bytes[1]])
-}
-
-fn read_i16(bytes: &[u8]) -> i16 {
-    i16::from_le_bytes([bytes[0], bytes[1]])
-}
-
-fn read_u32(bytes: &[u8]) -> u32 {
-    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-}
-
-fn write_u16(out: &mut Vec<u8>, value: u16) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn write_i16(out: &mut Vec<u8>, value: i16) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn write_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn padded_len(len: usize) -> usize {
-    (len + 3) & !3
-}
-
-fn pad4(out: &mut Vec<u8>) {
-    while !out.len().is_multiple_of(4) {
-        out.push(0);
-    }
-}
-
-/// Add `(x_off, y_off)` to every non-sentinel glyph command's delta in a
-/// `CompositeGlyphs{8,16,32}` payload. Previously this only patched the first
-/// command's delta and stopped, which mispositioned multi-run composites
-/// — anything containing a 255 sentinel that switches glyphsets between runs.
-///
-/// `id_size` is 1 for `CompositeGlyphs8` (minor 23), 2 for the 16-bit variant
-/// (minor 24), 4 for the 32-bit variant (minor 25). The glyph-id payload that
-/// follows each non-sentinel header is `count * id_size` bytes, padded to a
-/// 4-byte boundary; the next header begins immediately after that.
-fn patch_glyph_command_offsets(items: &mut [u8], x_off: i16, y_off: i16, id_size: usize) {
-    if x_off == 0 && y_off == 0 {
-        return;
-    }
-    debug_assert!(matches!(id_size, 1 | 2 | 4));
-    let mut pos = 0;
-    while pos + 8 <= items.len() {
-        let count = items[pos];
-        if count == 255 {
-            // Glyphset-switch sentinel: 8 bytes total (count, pad×3, glyphset
-            // XID), no payload follows.
-            pos += 8;
-            continue;
-        }
-        let dx = i16::from_le_bytes([items[pos + 4], items[pos + 5]]).wrapping_add(x_off);
-        let dy = i16::from_le_bytes([items[pos + 6], items[pos + 7]]).wrapping_add(y_off);
-        items[pos + 4..pos + 6].copy_from_slice(&dx.to_le_bytes());
-        items[pos + 6..pos + 8].copy_from_slice(&dy.to_le_bytes());
-        let payload_bytes = usize::from(count) * id_size;
-        let padded = (payload_bytes + 3) & !3;
-        pos += 8 + padded;
-    }
-}
-
-/// Build the wire bytes for XFIXES `ChangeCursorByName` (minor 23). Returns
-/// `None` when the host XFIXES extension is unavailable.
-fn build_xfixes_change_cursor_by_name(
-    host_xfixes_opcode: Option<u8>,
-    host_cursor_xid: u32,
-    name_bytes: &[u8],
-) -> Option<Vec<u8>> {
-    let opcode = host_xfixes_opcode?;
-    let nbytes = u16::try_from(name_bytes.len()).ok()?;
-    let padded_name = padded_len(name_bytes.len());
-    let length_units = u16::try_from(3 + padded_name / 4).ok()?;
-    let mut out = Vec::with_capacity(12 + padded_name);
-    out.push(opcode);
-    out.push(yserver_protocol::x11::xfixes::CHANGE_CURSOR_BY_NAME);
-    write_u16(&mut out, length_units);
-    write_u32(&mut out, host_cursor_xid);
-    write_u16(&mut out, nbytes);
-    write_u16(&mut out, 0); // pad
-    out.extend_from_slice(name_bytes);
-    out.resize(12 + padded_name, 0);
-    Some(out)
-}
-
-/// Build the wire bytes for SHAPE `Rectangles(op=Set, ordering=Unsorted)`
-/// targeting `host_xid`. Returns `None` when the host SHAPE extension is
-/// unavailable so the caller doesn't waste a stream write.
-fn build_shape_rectangles(
-    host_shape_opcode: Option<u8>,
-    host_xid: u32,
-    kind: u8,
-    rects: &[yserver_protocol::x11::xfixes::RegionRect],
-) -> Option<Vec<u8>> {
-    let opcode = host_shape_opcode?;
-    let length_units = u16::try_from(4 + rects.len() * 2).ok()?;
-    let mut out = Vec::with_capacity(16 + rects.len() * 8);
-    out.push(opcode);
-    out.push(yserver_protocol::x11::shape::RECTANGLES);
-    write_u16(&mut out, length_units);
-    out.push(yserver_protocol::x11::shape::OP_SET);
-    out.push(kind);
-    out.push(0); // ordering = Unsorted
-    out.push(0); // pad
-    write_u32(&mut out, host_xid);
-    write_i16(&mut out, 0); // x_off (top-level coords already match)
-    write_i16(&mut out, 0); // y_off
-    for rect in rects {
-        write_i16(&mut out, rect.x);
-        write_i16(&mut out, rect.y);
-        write_u16(&mut out, rect.width);
-        write_u16(&mut out, rect.height);
-    }
-    Some(out)
-}
-
-fn write_open_font(stream: &mut UnixStream, font_id: u32, name: &[u8]) -> io::Result<()> {
-    open_font(stream, font_id, name)
-}
-
-fn write_query_font(stream: &mut UnixStream, font_id: u32) -> io::Result<()> {
-    let mut out = Vec::new();
-    out.push(47);
-    out.push(0);
-    write_u16(&mut out, 2);
-    write_u32(&mut out, font_id);
-    stream.write_all(&out)
-}
-
-fn write_list_fonts(
-    stream: &mut UnixStream,
-    opcode: u8,
-    max_names: u16,
-    pattern: &[u8],
-) -> io::Result<()> {
-    let padded = padded_len(pattern.len());
-    let length_units = 2 + u16::try_from(padded / 4)
-        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "font pattern is too long"))?;
-
-    let mut out = Vec::new();
-    out.push(opcode);
-    out.push(0);
-    write_u16(&mut out, length_units);
-    write_u16(&mut out, max_names);
-    write_u16(
-        &mut out,
-        u16::try_from(pattern.len())
-            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "font pattern is too long"))?,
-    );
-    out.extend_from_slice(pattern);
-    out.resize(8 + padded, 0);
-    stream.write_all(&out)
-}
-
-fn parse_host_pict_formats(bytes: &[u8], opcode: u8) -> io::Result<HostRenderInfo> {
-    if bytes.len() < 32 {
-        return Err(io::Error::other("QueryPictFormats reply too short"));
-    }
-    let num_formats = read_u32(&bytes[8..12]) as usize;
-    let mut fmt_a1 = 0u32;
-    let mut fmt_a8 = 0u32;
-    let mut fmt_rgb24 = 0u32;
-    let mut fmt_argb32 = 0u32;
-    for i in 0..num_formats {
-        let base = 32 + i * 28;
-        if base + 28 > bytes.len() {
-            break;
-        }
-        let id = read_u32(&bytes[base..base + 4]);
-        let type_ = bytes[base + 4];
-        let depth = bytes[base + 5];
-        let alpha_shift = read_u16(&bytes[base + 20..base + 22]);
-        let alpha_mask = read_u16(&bytes[base + 22..base + 24]);
-        let red_shift = read_u16(&bytes[base + 8..base + 10]);
-        let red_mask = read_u16(&bytes[base + 10..base + 12]);
-        if type_ == 1 {
-            match depth {
-                1 if alpha_mask == 1 => fmt_a1 = id,
-                8 if alpha_mask == 0xFF && alpha_shift == 0 => fmt_a8 = id,
-                24 if red_mask == 0xFF && red_shift == 16 && alpha_mask == 0 => fmt_rgb24 = id,
-                32 if alpha_mask == 0xFF && alpha_shift == 24 => fmt_argb32 = id,
-                _ => {}
-            }
-        }
-    }
-    Ok(HostRenderInfo {
-        opcode,
-        fmt_a1,
-        fmt_a8,
-        fmt_rgb24,
-        fmt_argb32,
-    })
-}
-
-struct HostResponse {
-    sequence: u16,
-    bytes: Vec<u8>,
-}
-
-fn read_response(stream: &mut UnixStream) -> io::Result<HostResponse> {
-    let mut header = [0u8; 32];
-    loop {
-        stream.read_exact(&mut header)?;
-        match header[0] {
-            0 | 1 => break,
-            35 => {
-                // GenericEvent: may have extra data beyond the 32-byte header.
-                // Read and discard any extra bytes to keep the stream aligned.
-                let extra =
-                    u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize * 4;
-                log::debug!(
-                    "read_response: GenericEvent extra={} seq={}",
-                    extra,
-                    u16::from_le_bytes([header[2], header[3]])
-                );
-                if extra > 0 {
-                    let mut tail = vec![0u8; extra];
-                    stream.read_exact(&mut tail)?;
-                }
-                continue;
-            }
-            t => {
-                log::debug!(
-                    "read_response: skipping event type={} seq={}",
-                    t,
-                    u16::from_le_bytes([header[2], header[3]])
-                );
-                continue;
-            }
-        }
-    }
-    let sequence = u16::from_le_bytes([header[2], header[3]]);
-    let extra = if header[0] == 1 {
-        u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize * 4
-    } else {
-        0
-    };
-    let mut bytes = Vec::with_capacity(32 + extra);
-    bytes.extend_from_slice(&header);
-    if extra > 0 {
-        let mut tail = vec![0u8; extra];
-        stream.read_exact(&mut tail)?;
-        bytes.extend_from_slice(&tail);
-    }
-    Ok(HostResponse { sequence, bytes })
 }

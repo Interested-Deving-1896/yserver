@@ -1136,6 +1136,133 @@ Explicitly deferred — each is a self-contained Phase 6.x slice:
   window; a 3-second auto-shutdown smoke produced 177 flips and
   clean signalfd shutdown.
 
+### Phase 6.2 — Backend trait extraction (complete)
+
+Goal: carve a `Backend` trait out of `yserver-core` so request
+handlers call into it (via `Arc<Mutex<dyn Backend>>` for the hot
+path) and a future KMS backend slots in. Lands three of the five
+C-prework items from the 6.1 design. Pump construction sites
+(`HostInputPump` and per-client kb pumps) keep a separate concrete
+`Arc<Mutex<HostX11Backend>>` clone via natural unsized coercion
+(no downcast helper). Pump/main connection merge is deferred to
+its own slice.
+
+Design:
+[`2026-05-03-phase6-2-backend-trait-design.md`](superpowers/specs/2026-05-03-phase6-2-backend-trait-design.md).
+Plan:
+[`2026-05-03-phase6-2-backend-trait.md`](superpowers/plans/2026-05-03-phase6-2-backend-trait.md).
+Pre-step audit:
+[`2026-05-03-phase6-2-host-surface-audit.md`](superpowers/notes/2026-05-03-phase6-2-host-surface-audit.md).
+
+#### Landed (branch `phase6-2-backend-trait`)
+
+- [x] **Step 0 — Host-X11 surface audit.** Concrete enumeration of
+      every `host.X` / `h.X` / `hh.X` / inline-locked call in
+      nested.rs and server.rs, plus every host_xid-bearing field
+      in resources.rs. Source of truth for Steps 1, 2, 3, 5.
+- [x] **Step 1 — Per-kind handle newtypes.** 8 newtypes
+      (`WindowHandle`, `PixmapHandle`, `PictureHandle`,
+      `GlyphSetHandle`, `FontHandle`, `CursorHandle`,
+      `ColormapHandle`, `VisualHandle`) plus `AnyHandle` for
+      drawables. Replaces 18 host_xid slots (8 required, 9
+      optional, 1 map key) across resources.rs. ~280 call sites
+      adjusted.
+- [x] **Step 2 — Bundle `allocate_xid` into `create_*`.** 11
+      creator methods refactored to atomic create-returns-handle
+      (create_subwindow, create_pixmap, create_cursor, open_font,
+      name_window_pixmap, render_create_picture/glyphset/solid_fill/
+      linear_gradient/radial_gradient/cursor). `next_xid` private to
+      host_x11 module.
+- [x] **Step 3 — `Gc` expansion + `DrawState` resolution.** `Gc`
+      gains 11 fields (line_style, cap_style, join_style,
+      fill_rule, function, plane_mask, subwindow_mode,
+      graphics_exposures, dashes, dash_offset, arc_mode) — additive
+      scope. CreateGC/ChangeGC parsers handle all 23 mask bits.
+      CopyGC handler updated. `ResourceTable::resolve_draw_state`
+      computes a `DrawState` snapshot with graceful degradation on
+      missing pixmaps. 15 drawing call sites refactored to resolve
+      once + apply_draw_state. The new GC fields are forwarded to
+      the host's shared GC (line_style / function / plane_mask /
+      arc_mode etc. now honored — was silently dropped before).
+- [x] **Step 4 — Module split.** `host_x11.rs` (3,889 lines) →
+      `host_x11/{mod, request, pump}.rs`. (No `sync.rs` — sync
+      logic woven through several request methods, kept in
+      `mod.rs`.)
+- [x] **Step 5 — `Backend` trait carve.** ~80-method trait surface
+      enumerated from the audit. `HostX11Backend` is the sole impl.
+      `nested.rs` request-handler hot path uses
+      `Arc<Mutex<dyn Backend>>`. Pump-construction sites hold a
+      separate concrete-typed `Arc<Mutex<HostX11Backend>>` clone
+      alongside the dyn one (natural unsized coercion at the
+      `Arc::clone` site — no downcast helper needed).
+      `RecordingBackend` test double + 4 integration tests proving
+      the trait is implementable by something other than
+      `HostX11Backend`. **Sink wiring deferred** —
+      `register_event_sink` / `BackendEventSink` / sink-routing
+      moves to its own follow-up.
+
+#### Validation (Step 6)
+
+End-to-end manual smoke against the Phase 3.x WM matrix on the
+trait-carved ynest. 341 tests passing
+(16 yserver + 9 ynest + 229 yserver-core + 87 yserver-protocol).
+
+WMs available in this environment: wmaker, fvwm3, openbox.
+Not installed (skipped, not regressions): enlightenment-16,
+gtk3-demo. (gtk-demo is gtk4 only on the host and exits silently
+when nested — pre-existing gap, unrelated to Phase 6.2.)
+
+- **wmaker** (`/tmp/wmaker-smoke.png`): chrome + clip + dock +
+  appicons render. xterm/xclock/xeyes appicons show correct icon
+  graphics (xterm "X" colour icon visible). Close buttons on
+  title bars. xclock title bar text via RENDER intact. ynest log
+  WARN/ERROR count: 0.
+- **fvwm3** (`/tmp/fvwm3-smoke2.png`): chrome renders. xclock
+  title bar text via RENDER intact. FVWM right panel
+  (Pager / IconMan / FvwmScript-DateTime "15:30 zo mei 03")
+  renders. xterm framed with title bar. ynest log WARN/ERROR
+  count: 0. Programmatic widget click not exercised — XTEST
+  extension is unimplemented in ynest, so xdotool can't drive
+  clicks; the Phase 3.7 input-routing fix is structurally in
+  place (event masks intact in carved trait surface, pump
+  threads still attached), but verifying it requires a manual
+  click. gtk-demo (gtk4) starts but exits silently in this
+  environment regardless of WM — pre-existing limitation.
+- **e16** (skipped): `enlightenment-16` not installed.
+- **openbox** (`/tmp/openbox-smoke.png`): clients render inside
+  openbox frames with correct title bars (xclock, xeyes labels +
+  buttons). The "openbox frame chrome is a known pre-existing
+  gap" caveat in the plan turned out to be obsolete — frame
+  chrome renders correctly. ynest log WARN/ERROR count: 0.
+- **gtk3-demo** (skipped): gtk3-demo binary not installed; only
+  gtk4's `gtk-demo` is available, and it exits silently when
+  launched headlessly regardless of which X server it targets
+  (reproduces against host `:0` too).
+
+No regressions surfaced against the Phase 3.x baseline. ynest
+ran cleanly across all three WM smokes — zero log lines at
+`RUST_LOG=warn`. The structural decoupling (newtypes / atomic
+creates / DrawState / module split / dyn trait) introduced no
+observable behavioural change.
+
+#### Phase 6.2 follow-ups (deferred)
+
+The pump/main connection merge — Phase 3.7's structural fix and
+prework item #5 — is its own future slice (Phase 6.2.5 or fold
+into Phase 6.3 design). It carries:
+
+- Single-X11-connection merge.
+- `BackendEventSink` / `register_event_sink` on the trait + sink
+  routing.
+- `fd()` / `dispatch()` / `drain_events()` on the trait.
+- Per-client kb pump dissolution.
+- Migration of pump construction sites to `dyn Backend`
+  (eliminating the separate concrete-typed clone).
+- 64-bit `seq_full` tracking for X11 16-bit sequence wrap.
+- Retention window for late void-request errors.
+- `OriginContext` plumbing for async host-error attribution.
+- Reply demux / `ReplyMap` rework.
+
 ## Phase 7 — Security hardening
 
 Goal: per-client capabilities, permission prompts or launch-time

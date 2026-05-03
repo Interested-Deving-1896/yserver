@@ -203,37 +203,66 @@ pub struct CreatePixmapRequest {
     pub height: u16,
 }
 
+/// All 23 attribute slots of an X11 CreateGC request, post-mask-parse.
+/// `None` means the value-mask bit was clear and the attribute was not
+/// supplied. The enum-typed fields carry the raw protocol byte; the
+/// caller (yserver-core) maps it into its `LineStyle` / `CapStyle` /
+/// etc. enums, with unknown values clamped to the X11 default.
 #[derive(Clone, Copy, Debug)]
 pub struct CreateGcRequest {
     pub gc: ResourceId,
     pub drawable: ResourceId,
+    pub function: Option<u8>,
+    pub plane_mask: Option<u32>,
     pub foreground: Option<u32>,
     pub background: Option<u32>,
     pub line_width: Option<u16>,
+    pub line_style: Option<u8>,
+    pub cap_style: Option<u8>,
+    pub join_style: Option<u8>,
     pub fill_style: Option<u8>,
+    pub fill_rule: Option<u8>,
     pub tile: Option<ResourceId>,
     pub stipple: Option<ResourceId>,
     pub tile_x_origin: Option<i16>,
     pub tile_y_origin: Option<i16>,
     pub font: Option<ResourceId>,
+    pub subwindow_mode: Option<u8>,
+    pub graphics_exposures: Option<bool>,
+    pub clip_x_origin: Option<i16>,
+    pub clip_y_origin: Option<i16>,
     pub clip_mask: Option<Option<ResourceId>>,
+    pub dash_offset: Option<u16>,
+    pub dashes: Option<u8>,
+    pub arc_mode: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct GcChange {
     pub gc: ResourceId,
+    pub function: Option<u8>,
+    pub plane_mask: Option<u32>,
     pub foreground: Option<u32>,
     pub background: Option<u32>,
     pub line_width: Option<u16>,
+    pub line_style: Option<u8>,
+    pub cap_style: Option<u8>,
+    pub join_style: Option<u8>,
     pub fill_style: Option<u8>,
+    pub fill_rule: Option<u8>,
     pub tile: Option<ResourceId>,
     pub stipple: Option<ResourceId>,
     pub tile_x_origin: Option<i16>,
     pub tile_y_origin: Option<i16>,
     pub font: Option<ResourceId>,
+    pub subwindow_mode: Option<u8>,
+    pub graphics_exposures: Option<bool>,
     pub clip_mask: Option<Option<ResourceId>>,
     pub clip_x_origin: Option<i16>,
     pub clip_y_origin: Option<i16>,
+    pub dash_offset: Option<u16>,
+    pub dashes: Option<u8>,
+    pub arc_mode: Option<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -944,18 +973,31 @@ pub fn create_gc_request(body: &[u8]) -> Option<CreateGcRequest> {
     Some(CreateGcRequest {
         gc: ResourceId(read_u32_le(body.get(0..4)?)),
         drawable: ResourceId(read_u32_le(body.get(4..8)?)),
+        function: values.value(0).map(|v| v as u8),
+        plane_mask: values.value(1),
         foreground: values.value(2),
         background: values.value(3),
         line_width: values.value(4).map(|value| value as u16),
+        line_style: values.value(5).map(|v| v as u8),
+        cap_style: values.value(6).map(|v| v as u8),
+        join_style: values.value(7).map(|v| v as u8),
         fill_style: values.value(8).map(|v| v as u8),
+        fill_rule: values.value(9).map(|v| v as u8),
         tile: values.value(10).map(ResourceId),
         stipple: values.value(11).map(ResourceId),
         tile_x_origin: values.value(12).map(|v| v as i16),
         tile_y_origin: values.value(13).map(|v| v as i16),
         font: values.value(14).map(ResourceId),
+        subwindow_mode: values.value(15).map(|v| v as u8),
+        graphics_exposures: values.value(16).map(|v| v != 0),
+        clip_x_origin: values.value(17).map(|v| v as i16),
+        clip_y_origin: values.value(18).map(|v| v as i16),
         clip_mask: values
             .value(19)
             .map(|value| (value != 0).then_some(ResourceId(value))),
+        dash_offset: values.value(20).map(|v| v as u16),
+        dashes: values.value(21).map(|v| v as u8),
+        arc_mode: values.value(22).map(|v| v as u8),
     })
 }
 
@@ -964,20 +1006,31 @@ pub fn change_gc_request(body: &[u8]) -> Option<GcChange> {
     let values = value_list(value_mask, body.get(8..)?);
     Some(GcChange {
         gc: ResourceId(read_u32_le(body.get(0..4)?)),
+        function: values.value(0).map(|v| v as u8),
+        plane_mask: values.value(1),
         foreground: values.value(2),
         background: values.value(3),
         line_width: values.value(4).map(|value| value as u16),
+        line_style: values.value(5).map(|v| v as u8),
+        cap_style: values.value(6).map(|v| v as u8),
+        join_style: values.value(7).map(|v| v as u8),
         fill_style: values.value(8).map(|v| v as u8),
+        fill_rule: values.value(9).map(|v| v as u8),
         tile: values.value(10).map(ResourceId),
         stipple: values.value(11).map(ResourceId),
         tile_x_origin: values.value(12).map(|v| v as i16),
         tile_y_origin: values.value(13).map(|v| v as i16),
         font: values.value(14).map(ResourceId),
+        subwindow_mode: values.value(15).map(|v| v as u8),
+        graphics_exposures: values.value(16).map(|v| v != 0),
         clip_x_origin: values.value(17).map(|v| v as i16),
         clip_y_origin: values.value(18).map(|v| v as i16),
         clip_mask: values
             .value(19)
             .map(|value| (value != 0).then_some(ResourceId(value))),
+        dash_offset: values.value(20).map(|v| v as u16),
+        dashes: values.value(21).map(|v| v as u8),
+        arc_mode: values.value(22).map(|v| v as u8),
     })
 }
 
