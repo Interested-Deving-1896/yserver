@@ -106,30 +106,74 @@ once the underlying patterns are understood.
       not accumulated. Matters once a real client (compositor /
       screen recorder) drives the path.
 
-## KMS backend (Phase 6.4)
+## KMS backend (Phase 6.4 / 6.5)
 
-Surfaced while bringing up xeyes / xterm / xclock against `KmsBackend`.
-The backend is the bare-metal counterpart to `HostX11Backend` — primitives
-go straight to a pixman scanout buffer instead of a host X server, so
-gaps in our rasterisation surface here that the host hides for us.
+Surfaced while bringing up xeyes / xterm / xclock and fvwm3 against
+`KmsBackend`. The backend is the bare-metal counterpart to
+`HostX11Backend` — primitives go straight to a pixman scanout buffer
+instead of a host X server, so gaps in our rasterisation surface here
+that the host hides for us.
 
-- [ ] **GC `function` not honoured.** `apply_draw_state` ignores the GC
-      `function` field; we always composite with `Operation::Src`.
-      Visible: xclock's second-hand line is invisible (xclock draws it
-      with `GXxor` so it can erase by overdrawing on the next tick). 
-      Likely also blocks xterm's text cursor blink and any client that
-      does the standard XOR-rubber-band trick. Fix needs:
-      (1) pipe `function` from GC state into `DrawState`, (2) translate
-      to a pixman op (`GXcopy → Src`, `GXxor → Xor`, `GXand → ...`, etc.)
-      per-primitive in the backend.
-- [ ] **xterm glyph baseline / placement.** xterm runs without crashing
-      and the white background is correct, but rendered text appears as
-      scattered black dots instead of legible glyphs. Suggests the
-      `bitmap_top` / baseline math in `render_text_string`'s phase-2
-      composite is off — most of each glyph is composited above or below
-      the visible row. Compare against XLFD ascent/descent reported to
-      the client and the actual freetype glyph metrics; likely a sign
-      flip or off-by-`font_ascent`.
+- [x] **GC `function` not honoured.** Fixed in Phase 6.5 Step 2
+      (`6972c39`). `apply_draw_state` now captures `state.function` and
+      every client-draw primitive routes through
+      `fill_rects_with_gc_function` which maps `GcFunction::Copy →
+      pixman SRC` and `GcFunction::Xor →` per-pixel bitwise XOR. (Pixman
+      `PIXMAN_OP_XOR` is Porter-Duff and produces zero for opaque
+      pixels — not what X11 GXxor wants — so the Xor path uses raw
+      pixel manipulation.) Other GcFunction variants log-and-fall-back
+      to Src.
+- [x] **xterm glyph baseline / placement.** Fixed in Phase 6.5 Step 3
+      (`993c437`). The 1×1 solid-colour source image in
+      `render_text_string` was created with `REPEAT_NONE` (pixman
+      default), so every source read outside pixel (0,0) returned
+      transparent — Operation::Over was a no-op for all glyph columns
+      except the leftmost, producing scattered dots. Fix:
+      `color_img.set_repeat(Repeat::Normal)`.
+- [x] **fvwm3 modules wedge.** Fixed in Phase 6.5 Step 1A (`e19ca7c`)
+      via `KmsBackend::render_opcode() → Some(133)`. The original
+      "synthesise ConfigureNotify from configure_subwindow" hypothesis
+      was incorrect: nested.rs already synthesises ConfigureNotify
+      backend-agnostically. Real cause was that without RENDER fvwm3
+      uses a two-level frame hierarchy that places the client at
+      parent-relative `(0,0)`, which traps FvwmPager's "have I been
+      placed?" loop forever. Trace-diff in
+      `docs/superpowers/notes/2026-05-04-phase6-5-fvwm3-trace.md`.
+- [x] **`Opcode 58` (SetDashes), `Opcode 81` (InstallColormap)
+      unsupported.** Still logged as `unsupported opcode N` (cosmetic).
+      Both intentionally left as-is in 6.5 — dashes fall back to
+      solid (visually fine), InstallColormap is a no-op on TrueColor.
+- [ ] **`RENDER::CompositeGlyphs8` is a no-op stub on KMS.** Visible:
+      fvwm3 panel labels (FvwmPager desktop names, FvwmIconMan window
+      titles, FvwmButtons text) render as solid-colour rectangles with
+      no glyphs; fvwm3's window-list popup shows rows but each row's
+      title is empty. Implementation outline: glyphset registry +
+      `AddGlyphs` decode (per-glyph bitmap into a HashMap on
+      `KmsBackend`) + `render_composite_glyphs` walking the glyph
+      stream and compositing each glyph alpha mask onto the dst image
+      with `Operation::Over` (mirroring the existing
+      `render_text_string` path for core text). Phase 6.6.
+- [ ] **`RENDER::Composite` is a no-op stub on KMS.** Off-screen-
+      buffer-to-window blits via the generic Composite call drop
+      silently. Visible: fvwm3 popup chrome shows garbage where
+      double-buffered widgets blit their content. Implementation:
+      look up src + dst pictures, call `dst.0.composite32(...)` with
+      the appropriate Operation. Bounded scope (~50 LoC) once the
+      picture-state model from 6.5 Step 1B is in place. Phase 6.6.
+- [ ] **Window drag does not work under fvwm3/KMS.** Click-and-drag
+      on a fvwm-framed window does not move the window; click/focus/
+      keyboard input all work. Most likely a pointer-grab / motion-
+      routing gap surfaced by KmsBackend's pointer pump (the host
+      backend gets grab semantics for free from the host X server).
+      Investigate: does KmsBackend deliver MotionNotify while a
+      ButtonPress grab is active? Does the grab path correctly route
+      events to the grabbing client? Phase 6.6.
+- [ ] **xterm text corrupts after scrolling on KMS.** After running
+      a command that scrolls the buffer (e.g. `ls`), some glyphs
+      appear doubled / overlapped. Probably a CopyArea-within-window
+      stride/clip issue surfaced when xterm scrolls its content via
+      CopyArea. Pre-existing scrollback issue (already tracked under
+      "WM-specific behaviour") may be related. Phase 6.6.
 - [ ] **`poly_arc` / `poly_fill_arc` partial-angle clipping.** Both
       treat any arc as a full ellipse regardless of `angle1`/`angle2`.
       Fine for xeyes (full circles) but anything that draws actual

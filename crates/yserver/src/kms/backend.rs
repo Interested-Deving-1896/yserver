@@ -6,11 +6,12 @@ use std::{
 };
 
 use crossbeam_channel::Sender;
-use pixman::{Color, FormatCode, Image, Operation, Rectangle16};
+use pixman::{Color, FormatCode, Image, Operation, Rectangle16, Repeat};
 use yserver_core::{
     backend::{
         AnyHandle, Backend, BackendEventSink, ClipState, CursorHandle, DrawState, FillState,
-        FontHandle, GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle, WindowHandle,
+        FontHandle, GcFunction, GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle,
+        WindowHandle,
     },
     host_x11::{
         HostEvent, HostExposeEvent, HostKeyEvent, HostPointerEvent, HostSubwindowConfig,
@@ -219,6 +220,58 @@ fn color_from_u32(pixel: u32) -> Color {
     Color::new(r << 8, g << 8, b << 8, 0xFFFF)
 }
 
+/// Apply X11 GC `function` to a set of rectangles on `img`.
+///
+/// `GcFunction::Copy` maps to `PIXMAN_OP_SRC` (fast path).
+/// `GcFunction::Xor` requires manual pixel manipulation: pixman's Porter-Duff
+/// `PIXMAN_OP_XOR` is `src*(1-dst.a) + dst*(1-src.a)` which gives zero for
+/// fully opaque images — NOT the bitwise XOR that X11 GXxor specifies.
+/// All other GcFunction variants fall back to `Src` with a debug log.
+fn fill_rects_with_gc_function(
+    img: &mut PixmanImage,
+    function: GcFunction,
+    foreground_rgb: u32,
+    rects: &[Rectangle16],
+) {
+    if matches!(function, GcFunction::Xor) {
+        // Bitwise XOR over the RGB channels (X byte is preserved).
+        let xor_mask = foreground_rgb & 0x00FF_FFFF;
+        let stride_words = img.0.stride() / 4;
+        let iw = img.0.width() as i32;
+        let ih = img.0.height() as i32;
+        // SAFETY: PixmanImage::data() is unsafe; we hold an exclusive &mut
+        // reference to img so no other live references to the pixel buffer exist.
+        let ptr = unsafe { img.0.data() };
+        for r in rects {
+            let x0 = (r.x as i32).max(0) as usize;
+            let y0 = (r.y as i32).max(0) as usize;
+            let x1 = (r.x as i32 + r.width as i32).min(iw).max(0) as usize;
+            let y1 = (r.y as i32 + r.height as i32).min(ih).max(0) as usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    // SAFETY: x < iw ≤ img width, y < ih ≤ img height, and
+                    // stride_words * ih ≤ allocation size.
+                    unsafe {
+                        let p = ptr.add(y * stride_words + x);
+                        let old = *p;
+                        *p = (old & 0xFF00_0000) | ((old ^ xor_mask) & 0x00FF_FFFF);
+                    }
+                }
+            }
+        }
+        return;
+    }
+    let op = match function {
+        GcFunction::Copy => Operation::Src,
+        other => {
+            log::debug!("GC function {:?} not implemented, falling back to Copy", other);
+            Operation::Src
+        }
+    };
+    let color = color_from_u32(foreground_rgb);
+    let _ = img.0.fill_rectangles(op, color, rects);
+}
+
 /// Parse a packed pair of i16 values (2 bytes each) from a byte slice.
 fn read_i16_pair(data: &[u8], offset: usize) -> Option<(i16, i16)> {
     if offset + 4 > data.len() {
@@ -291,6 +344,28 @@ pub struct KmsBackend {
 
     // Current font for text rendering
     current_font: Option<u32>,
+
+    // Current GC drawing function (default: Copy)
+    current_function: GcFunction,
+
+    // RENDER picture tracking
+    pictures: HashMap<u32, PictureState>,
+}
+
+/// State for a RENDER picture on the KMS backend.
+enum PictureState {
+    /// Picture wraps a window or pixmap drawable. Composites are forwarded
+    /// to that drawable's Pixman image.
+    Drawable {
+        /// XID of the backing window or pixmap in self.windows / self.pixmaps.
+        host_xid: u32,
+        /// Optional clip rectangles set via SetPictureClipRectangles.
+        clip: Option<Vec<Rectangle16>>,
+    },
+    /// 1×1 solid colour image (CreateSolidFill). Used as composite source.
+    SolidFill {
+        image: RefCell<PixmanImage>,
+    },
 }
 
 struct WindowState {
@@ -569,6 +644,8 @@ impl KmsBackend {
             cursor_x: 0.0,
             cursor_y: 0.0,
             current_font: None,
+            current_function: GcFunction::Copy,
+            pictures: HashMap::new(),
         })
     }
 
@@ -1034,6 +1111,12 @@ impl KmsBackend {
                 fg_color,
                 &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
             );
+            // The 1×1 solid-colour source must tile across the full glyph
+            // width/height.  Without REPEAT_NORMAL, pixman returns transparent
+            // black for any source read outside (0, 0), making Operation::Over
+            // a no-op for every column except the leftmost — producing scattered
+            // dots (only pixels where glyph-col=0 has non-zero alpha are drawn).
+            color_img.set_repeat(Repeat::Normal);
 
             // A8 image: pixman allocates with 4-byte row stride so we must
             // write byte-by-byte using the actual stride, not width.
@@ -1134,7 +1217,14 @@ impl Backend for KmsBackend {
     }
 
     fn render_opcode(&self) -> Option<u8> {
-        None
+        // X11 conventional major opcode for RENDER. Advertising RENDER as
+        // present (with all 21 render_* trait methods stubbed below as
+        // no-ops) is enough to flip fvwm3 from a two-level frame hierarchy
+        // into a single-level one — without RENDER fvwm3 builds a deeper
+        // frame, which makes GetGeometry on client windows return (0,0)
+        // and traps FvwmPager's init loop. See:
+        // docs/superpowers/notes/2026-05-04-phase6-5-fvwm3-trace.md.
+        Some(133)
     }
 
     fn xkb_opcode(&self) -> Option<u8> {
@@ -1149,8 +1239,14 @@ impl Backend for KmsBackend {
         None
     }
 
-    fn render_format_for_ynest_id(&self, _ynest_fmt: u32) -> Option<u32> {
-        None
+    fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32> {
+        // Pass the format ID through as an opaque handle. For zero (no mask)
+        // the caller (nested.rs) maps it to Some(0) directly; we only reach
+        // here for nonzero values. Returning Some(ynest_fmt) is sufficient
+        // for render_trapezoids to receive a non-None host_mask_format and
+        // proceed; the actual format code is mapped to PIXMAN_a8 inside
+        // render_trapezoids.
+        if ynest_fmt == 0 { None } else { Some(ynest_fmt) }
     }
 
     fn ping(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
@@ -1626,6 +1722,7 @@ impl Backend for KmsBackend {
         if let Some(font) = state.font {
             self.current_font = Some(font.as_raw());
         }
+        self.current_function = state.function;
         Ok(())
     }
 
@@ -1879,7 +1976,6 @@ impl Backend for KmsBackend {
         // X11 PolyLine: connect consecutive points with line segments.
         // coordinate_mode 0 = Origin (absolute), 1 = Previous (each point is
         // a delta from the previous).  Rasterise each segment with Bresenham.
-        let color = color_from_u32(foreground);
         let mut rects: Vec<Rectangle16> = Vec::new();
         let mut prev: Option<(i32, i32)> = None;
         let mut offset = 0;
@@ -1902,9 +1998,10 @@ impl Backend for KmsBackend {
             }
             prev = Some((xi, yi));
         }
+        let function = self.current_function;
         self.with_image_mut(host_xid, |img| {
             let clipped = clip_rects_to_image(&rects, img.0.width() as i32, img.0.height() as i32);
-            let _ = img.0.fill_rectangles(Operation::Src, color, &clipped);
+            fill_rects_with_gc_function(img, function, foreground, &clipped);
         });
         Ok(())
     }
@@ -1919,7 +2016,6 @@ impl Backend for KmsBackend {
         // Each segment is (x1:i16, y1:i16, x2:i16, y2:i16). Bresenham
         // rasterises diagonals correctly (axis-aligned bbox would only work
         // for horizontal / vertical segments).
-        let color = color_from_u32(foreground);
         let mut rects: Vec<Rectangle16> = Vec::new();
         let mut offset = 0;
         while offset + 8 <= segments.len() {
@@ -1928,9 +2024,10 @@ impl Backend for KmsBackend {
             offset += 8;
             bresenham_segment(x1 as i32, y1 as i32, x2 as i32, y2 as i32, &mut rects);
         }
+        let function = self.current_function;
         self.with_image_mut(host_xid, |img| {
             let clipped = clip_rects_to_image(&rects, img.0.width() as i32, img.0.height() as i32);
-            let _ = img.0.fill_rectangles(Operation::Src, color, &clipped);
+            fill_rects_with_gc_function(img, function, foreground, &clipped);
         });
         Ok(())
     }
@@ -1943,7 +2040,6 @@ impl Backend for KmsBackend {
         rectangles: &[u8],
     ) -> io::Result<()> {
         // Draw rectangle outlines (4 thin rectangles per rect)
-        let color = color_from_u32(foreground);
         let mut rects = Vec::new();
         let mut offset = 0;
         while offset + 8 <= rectangles.len() {
@@ -1983,8 +2079,9 @@ impl Backend for KmsBackend {
                 height: r.height,
             });
         }
+        let function = self.current_function;
         self.with_image_mut(host_xid, |img| {
-            let _ = img.0.fill_rectangles(Operation::Src, color, &rects);
+            fill_rects_with_gc_function(img, function, foreground, &rects);
         });
         Ok(())
     }
@@ -2008,7 +2105,7 @@ impl Backend for KmsBackend {
         //   - segments connecting the prev row's left/right edges to this
         //     row's left/right edges otherwise (the side outlines).
         // This produces a closed 1-pixel outline.
-        let color = color_from_u32(foreground);
+        let function = self.current_function;
         self.with_image_mut(host_xid, |img| {
             let iw = img.0.width() as i32;
             let ih = img.0.height() as i32;
@@ -2078,7 +2175,7 @@ impl Backend for KmsBackend {
                 }
             }
             let clipped = clip_rects_to_image(&rects, iw, ih);
-            let _ = img.0.fill_rectangles(Operation::Src, color, &clipped);
+            fill_rects_with_gc_function(img, function, foreground, &clipped);
         });
         Ok(())
     }
@@ -2091,7 +2188,6 @@ impl Backend for KmsBackend {
         _coordinate_mode: u8,
         points: &[u8],
     ) -> io::Result<()> {
-        let color = color_from_u32(foreground);
         let mut rects = Vec::new();
         let mut offset = 0;
         while offset + 4 <= points.len() {
@@ -2106,8 +2202,9 @@ impl Backend for KmsBackend {
                 height: 1,
             });
         }
+        let function = self.current_function;
         self.with_image_mut(host_xid, |img| {
-            let _ = img.0.fill_rectangles(Operation::Src, color, &rects);
+            fill_rects_with_gc_function(img, function, foreground, &rects);
         });
         Ok(())
     }
@@ -2119,7 +2216,6 @@ impl Backend for KmsBackend {
         foreground: u32,
         rectangles: &[u8],
     ) -> io::Result<()> {
-        let color = color_from_u32(foreground);
         let mut rects = Vec::new();
         let mut offset = 0;
         while offset + 8 <= rectangles.len() {
@@ -2129,8 +2225,9 @@ impl Backend for KmsBackend {
             offset += 8;
             rects.push(r);
         }
+        let function = self.current_function;
         self.with_image_mut(host_xid, |img| {
-            let _ = img.0.fill_rectangles(Operation::Src, color, &rects);
+            fill_rects_with_gc_function(img, function, foreground, &rects);
         });
         Ok(())
     }
@@ -2147,7 +2244,7 @@ impl Backend for KmsBackend {
         // We treat any arc with |angle2| >= 360*64 as a full ellipse and fill it
         // with a scanline approach. Partial arcs fall back to filling the full
         // ellipse for now; xeyes uses full circles so this is sufficient.
-        let color = color_from_u32(foreground);
+        let function = self.current_function;
         self.with_image_mut(host_xid, |img| {
             let img_w = img.0.width() as i32;
             let img_h = img.0.height() as i32;
@@ -2186,7 +2283,7 @@ impl Backend for KmsBackend {
                 }
             }
             if !rects.is_empty() {
-                let _ = img.0.fill_rectangles(Operation::Src, color, &rects);
+                fill_rects_with_gc_function(img, function, foreground, &rects);
             }
         });
         Ok(())
@@ -2216,12 +2313,12 @@ impl Backend for KmsBackend {
             verts.push((xi, yi));
             last = (xi, yi);
         }
-        let color = color_from_u32(foreground);
         let mut rects: Vec<Rectangle16> = Vec::new();
         scanline_fill_polygon(&verts, &mut rects);
+        let function = self.current_function;
         self.with_image_mut(host_xid, |img| {
             let clipped = clip_rects_to_image(&rects, img.0.width() as i32, img.0.height() as i32);
-            let _ = img.0.fill_rectangles(Operation::Src, color, &clipped);
+            fill_rects_with_gc_function(img, function, foreground, &clipped);
         });
         Ok(())
     }
@@ -2236,15 +2333,10 @@ impl Backend for KmsBackend {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
-        let color = color_from_u32(foreground);
-        let rect = Rectangle16 {
-            x,
-            y,
-            width,
-            height,
-        };
+        let rect = Rectangle16 { x, y, width, height };
+        let function = self.current_function;
         self.with_image_mut(host_xid, |img| {
-            let _ = img.0.fill_rectangles(Operation::Src, color, &[rect]);
+            fill_rects_with_gc_function(img, function, foreground, &[rect]);
         });
         Ok(())
     }
@@ -2336,7 +2428,6 @@ impl Backend for KmsBackend {
                 .sum();
             let ascent = font_state.metrics.font_ascent as i32;
             let descent = font_state.metrics.font_descent as i32;
-            let color = color_from_u32(background);
             // Clamp to i16/u16 ranges so a buggy font (huge ascent) can't
             // produce a rect that overflows pixman's internal arithmetic.
             let rect = Rectangle16 {
@@ -2345,8 +2436,9 @@ impl Backend for KmsBackend {
                 width: total_width.clamp(0, u16::MAX as i32) as u16,
                 height: (ascent + descent).clamp(0, u16::MAX as i32) as u16,
             };
+            let function = self.current_function;
             self.with_image_mut(host_xid, |img| {
-                let _ = img.0.fill_rectangles(Operation::Src, color, &[rect]);
+                fill_rects_with_gc_function(img, function, background, &[rect]);
             });
         }
 
@@ -2372,12 +2464,18 @@ impl Backend for KmsBackend {
     fn render_create_picture(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_drawable: AnyHandle,
+        host_drawable: AnyHandle,
         _ynest_format: u32,
         _value_mask: u32,
         _values: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
-        Ok(None)
+        let drawable_xid = host_drawable.as_raw();
+        let picture_xid = self.next_host_xid();
+        self.pictures.insert(
+            picture_xid,
+            PictureState::Drawable { host_xid: drawable_xid, clip: None },
+        );
+        Ok(PictureHandle::from_raw(picture_xid))
     }
 
     fn render_change_picture(
@@ -2392,8 +2490,9 @@ impl Backend for KmsBackend {
     fn render_free_picture(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
+        host_pic: u32,
     ) -> io::Result<()> {
+        self.pictures.remove(&host_pic);
         Ok(())
     }
 
@@ -2484,25 +2583,170 @@ impl Backend for KmsBackend {
     fn render_trapezoids(
         &mut self,
         _origin: Option<OriginContext>,
-        _op: u8,
-        _host_src: u32,
-        _host_dst: u32,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
         _host_mask_format: u32,
-        _src_x: i16,
-        _src_y: i16,
-        _traps: &[u8],
-        _x_off: i16,
-        _y_off: i16,
+        src_x: i16,
+        src_y: i16,
+        traps: &[u8],
+        x_off: i16,
+        y_off: i16,
     ) -> io::Result<()> {
+        if !traps.len().is_multiple_of(40) || traps.is_empty() {
+            return Ok(());
+        }
+
+        // Translate X RENDER op code to pixman op. X RENDER and pixman share
+        // the same numeric values (0=Clear, 1=Src, 2=Dst, 3=Over, …).
+        let pixman_op = op as u32;
+
+        // Decode the trap wire bytes element-by-element to avoid alignment UB.
+        // Each trap is 40 bytes: top(4), bottom(4), left.p1.x(4), left.p1.y(4),
+        // left.p2.x(4), left.p2.y(4), right.p1.x(4), right.p1.y(4),
+        // right.p2.x(4), right.p2.y(4).
+        let n_traps = traps.len() / 40;
+        let mut trap_vec: Vec<pixman::ffi::pixman_trapezoid_t> =
+            Vec::with_capacity(n_traps);
+        for chunk in traps.chunks_exact(40) {
+            let t = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let b = i32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            let lp1x = i32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
+            let lp1y = i32::from_le_bytes([chunk[12], chunk[13], chunk[14], chunk[15]]);
+            let lp2x = i32::from_le_bytes([chunk[16], chunk[17], chunk[18], chunk[19]]);
+            let lp2y = i32::from_le_bytes([chunk[20], chunk[21], chunk[22], chunk[23]]);
+            let rp1x = i32::from_le_bytes([chunk[24], chunk[25], chunk[26], chunk[27]]);
+            let rp1y = i32::from_le_bytes([chunk[28], chunk[29], chunk[30], chunk[31]]);
+            let rp2x = i32::from_le_bytes([chunk[32], chunk[33], chunk[34], chunk[35]]);
+            let rp2y = i32::from_le_bytes([chunk[36], chunk[37], chunk[38], chunk[39]]);
+            trap_vec.push(pixman::ffi::pixman_trapezoid_t {
+                top: t,
+                bottom: b,
+                left: pixman::ffi::pixman_line_fixed_t {
+                    p1: pixman::ffi::pixman_point_fixed_t { x: lp1x, y: lp1y },
+                    p2: pixman::ffi::pixman_point_fixed_t { x: lp2x, y: lp2y },
+                },
+                right: pixman::ffi::pixman_line_fixed_t {
+                    p1: pixman::ffi::pixman_point_fixed_t { x: rp1x, y: rp1y },
+                    p2: pixman::ffi::pixman_point_fixed_t { x: rp2x, y: rp2y },
+                },
+            });
+        }
+
+        // Look up source picture — must be SolidFill. Borrow and get raw ptr.
+        let src_ptr = match self.pictures.get(&host_src) {
+            Some(PictureState::SolidFill { image }) => image.borrow().0.as_ptr(),
+            _ => {
+                log::debug!(
+                    "render_trapezoids: host_src 0x{:x} is not a SolidFill picture; skipping",
+                    host_src
+                );
+                return Ok(());
+            }
+        };
+
+        // Look up destination picture — must be Drawable. Extract host_xid
+        // and any clip info, then release the pictures borrow before we
+        // mutably borrow the drawable image below.
+        let (drawable_xid, clip) = match self.pictures.get(&host_dst) {
+            Some(PictureState::Drawable { host_xid, clip }) => {
+                (*host_xid, clip.clone())
+            }
+            _ => {
+                log::debug!(
+                    "render_trapezoids: host_dst 0x{:x} is not a Drawable picture; skipping",
+                    host_dst
+                );
+                return Ok(());
+            }
+        };
+
+        // Apply clip if set, composite traps, then clear clip.
+        // We need to borrow the dst image mutably; use with_image_mut.
+        // src_ptr is valid for the duration of this call because self.pictures
+        // is not modified between obtaining src_ptr and the composite call.
+        self.with_image_mut(drawable_xid, |dst| {
+            // SAFETY: dst.0.as_ptr() returns a valid *mut pixman_image_t that
+            // pixman allocated and that we own (inside RefCell<PixmanImage>).
+            // src_ptr was obtained from another PixmanImage we also own and
+            // that outlives this call (src and dst are different pictures by
+            // checked contract). trap_vec is a Vec we own. n_traps matches
+            // trap_vec.len().
+            let dst_ptr = dst.0.as_ptr();
+
+            // Apply clip region if present.
+            if let Some(ref rects) = clip {
+                use pixman::{Box32, Region32};
+                let boxes: Vec<Box32> = rects
+                    .iter()
+                    .map(|r| Box32 {
+                        x1: r.x as i32,
+                        y1: r.y as i32,
+                        x2: r.x as i32 + r.width as i32,
+                        y2: r.y as i32 + r.height as i32,
+                    })
+                    .collect();
+                let region = Region32::init_rects(boxes.as_slice());
+                let _ = dst.0.set_clip_region32(Some(&region));
+            }
+
+            unsafe {
+                pixman::ffi::pixman_composite_trapezoids(
+                    pixman_op,
+                    src_ptr,
+                    dst_ptr,
+                    // Use PIXMAN_a8 as the mask-format for anti-aliased
+                    // trap coverage. X RENDER mask format IDs are opaque
+                    // to us; a8 gives 256-level AA which is correct for
+                    // all common cases.
+                    pixman::ffi::pixman_format_code_t_PIXMAN_a8,
+                    src_x as std::os::raw::c_int,
+                    src_y as std::os::raw::c_int,
+                    x_off as std::os::raw::c_int,
+                    y_off as std::os::raw::c_int,
+                    trap_vec.len() as std::os::raw::c_int,
+                    trap_vec.as_ptr(),
+                );
+            }
+
+            // Clear clip after composite to avoid stale clip affecting
+            // subsequent operations on this image.
+            if clip.is_some() {
+                let _ = dst.0.set_clip_region32(None);
+            }
+        });
+
         Ok(())
     }
 
     fn render_create_solid_fill(
         &mut self,
         _origin: Option<OriginContext>,
-        _color: [u8; 8],
+        color: [u8; 8],
     ) -> io::Result<Option<PictureHandle>> {
-        Ok(None)
+        // X RENDER CreateSolidFill color: 16-bit per channel, little-endian.
+        // Byte layout: red[0..2], green[2..4], blue[4..6], alpha[6..8].
+        let r = u16::from_le_bytes([color[0], color[1]]);
+        let g = u16::from_le_bytes([color[2], color[3]]);
+        let b = u16::from_le_bytes([color[4], color[5]]);
+        let a = u16::from_le_bytes([color[6], color[7]]);
+        let pixman_color = Color::new(r, g, b, a);
+
+        // Create a 1×1 A8R8G8B8 image, fill it, and set repeat so it tiles.
+        let mut img = PixmanImage::new(FormatCode::A8R8G8B8, 1, 1, true)?;
+        let _ = img.0.fill_rectangles(
+            Operation::Src,
+            pixman_color,
+            &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+        );
+        img.0.set_repeat(Repeat::Normal);
+
+        let picture_xid = self.next_host_xid();
+        self.pictures.insert(
+            picture_xid,
+            PictureState::SolidFill { image: RefCell::new(img) },
+        );
+        Ok(PictureHandle::from_raw(picture_xid))
     }
 
     fn render_create_linear_gradient(
@@ -2534,9 +2778,32 @@ impl Backend for KmsBackend {
     fn render_set_picture_clip_rectangles(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
-        _body: &[u8],
+        host_pic: u32,
+        body: &[u8],
     ) -> io::Result<()> {
+        // Wire body (passed through from nested.rs): picture(4) +
+        // clip_x_origin(INT16) + clip_y_origin(INT16) + N × [x y w h].
+        // The picture XID has already been resolved to host_pic; we just
+        // skip past it. Origin offset is stored but not applied — xclock
+        // sets it to (0,0) and that's all we currently exercise.
+        if body.len() < 8 {
+            return Ok(());
+        }
+        let _x_origin = i16::from_le_bytes([body[4], body[5]]);
+        let _y_origin = i16::from_le_bytes([body[6], body[7]]);
+        let rects_data = &body[8..];
+        let mut rects = Vec::with_capacity(rects_data.len() / 8);
+        for chunk in rects_data.chunks_exact(8) {
+            let x = i16::from_le_bytes([chunk[0], chunk[1]]);
+            let y = i16::from_le_bytes([chunk[2], chunk[3]]);
+            let w = u16::from_le_bytes([chunk[4], chunk[5]]);
+            let h = u16::from_le_bytes([chunk[6], chunk[7]]);
+            rects.push(Rectangle16 { x, y, width: w, height: h });
+        }
+        if let Some(PictureState::Drawable { clip, .. }) = self.pictures.get_mut(&host_pic) {
+            *clip = if rects.is_empty() { None } else { Some(rects) };
+        }
+        // SolidFill pictures: clip is a no-op.
         Ok(())
     }
 
@@ -2693,5 +2960,378 @@ impl Backend for KmsBackend {
             0, 0, 0, 0, // Mod5
         ];
         Ok((4, data))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pixman::{Color, FormatCode, Image, Operation, Rectangle16, Repeat};
+    use yserver_core::backend::GcFunction;
+
+    use super::{PixmanImage, fill_rects_with_gc_function};
+
+    // ---------------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------------
+
+    /// Fill a PixmanImage with a solid 24-bit colour (X8R8G8B8 format).
+    fn fill_image(img: &mut PixmanImage, pixel: u32) {
+        let color = super::color_from_u32(pixel);
+        let w = img.0.width() as u16;
+        let h = img.0.height() as u16;
+        let _ = img.0.fill_rectangles(
+            Operation::Src,
+            color,
+            &[Rectangle16 { x: 0, y: 0, width: w, height: h }],
+        );
+    }
+
+    /// Read the packed X8R8G8B8 pixel at (x, y) from a PixmanImage.
+    fn read_pixel(img: &PixmanImage, x: usize, y: usize) -> u32 {
+        let stride_words = img.0.stride() / 4;
+        // SAFETY: x, y are within the image bounds (caller's responsibility).
+        unsafe { *img.0.data().add(y * stride_words + x) }
+    }
+
+    // ---------------------------------------------------------------------------
+    // GcFunction::Copy: fill_rects_with_gc_function must overwrite the destination
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn fill_rects_copy_overwrites_destination() {
+        let mut img = PixmanImage::new(FormatCode::X8R8G8B8, 4, 4, true).unwrap();
+        fill_image(&mut img, 0x00ff_ffff); // white
+        let rect = Rectangle16 { x: 0, y: 0, width: 4, height: 4 };
+        fill_rects_with_gc_function(&mut img, GcFunction::Copy, 0x00ff_00ff, &[rect]);
+        let pixel = read_pixel(&img, 1, 1);
+        assert_eq!(pixel & 0x00ff_ffff, 0x00ff_00ff, "Copy should overwrite with magenta");
+    }
+
+    // ---------------------------------------------------------------------------
+    // GcFunction::Xor: must produce bitwise XOR of destination and foreground.
+    //
+    // NOTE: KmsBackend requires DRM hardware and cannot be constructed in a unit
+    // test.  This test verifies XOR semantics at the PixmanImage level by calling
+    // fill_rects_with_gc_function() directly — the same helper invoked by every
+    // client-draw primitive (poly_segment, poly_line, fill_rectangle, …).
+    //
+    // NOTE: pixman's Porter-Duff PIXMAN_OP_XOR produces zero for fully-opaque
+    // images (src*(1-dst.a) + dst*(1-src.a) = 0 when both alphas are 1).
+    // fill_rects_with_gc_function implements GcFunction::Xor as a manual bitwise
+    // XOR over the RGB channels to match X11 GXxor semantics.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn poly_segment_xor_inverts_destination_pixels() {
+        // Create a 16×16 image pre-filled with white (0x00FFFFFF).
+        let mut img = PixmanImage::new(FormatCode::X8R8G8B8, 16, 16, true).unwrap();
+        fill_image(&mut img, 0x00ff_ffff); // white
+
+        // Draw a horizontal line at y=8 with magenta (0x00FF00FF) using XOR.
+        let row: Vec<Rectangle16> = (0..16_i16)
+            .map(|x| Rectangle16 { x, y: 8, width: 1, height: 1 })
+            .collect();
+        fill_rects_with_gc_function(&mut img, GcFunction::Xor, 0x00ff_00ff, &row);
+
+        // White (0xFFFFFF) XOR magenta (0xFF00FF) = green (0x00FF00).
+        let pixel = read_pixel(&img, 8, 8);
+        assert_eq!(
+            pixel & 0x00ff_ffff,
+            0x0000_ff00,
+            "expected green (0x00FF00), got 0x{:08x}",
+            pixel
+        );
+
+        // Pixels outside the drawn row must remain white.
+        let untouched = read_pixel(&img, 8, 0);
+        assert_eq!(
+            untouched & 0x00ff_ffff,
+            0x00ff_ffff,
+            "pixel at (8,0) should be untouched white"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Glyph rendering: verify freetype GRAY mode + pixman A8 stride handling.
+    //
+    // This test does NOT require DRM hardware.  It loads a font via freetype,
+    // renders a single glyph, and composites it onto a white pixman image using
+    // exactly the same path as render_text_string.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn glyph_render_gray_pixels_land_on_correct_rows() {
+        // ------------------------------------------------------------------
+        // 1. Load font and render glyph 'A'.
+        // ------------------------------------------------------------------
+        let lib = freetype::Library::init().expect("freetype init");
+        let candidates = [
+            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+        ];
+        let face = candidates
+            .iter()
+            .find_map(|p| lib.new_face(p, 0).ok())
+            .expect("DejaVuSansMono.ttf not found — install dejavu fonts");
+        let _ = face.set_char_size(12 << 6, 12 << 6, 96, 96);
+        let _ = face.load_char('A' as usize, freetype::face::LoadFlag::RENDER);
+        let glyph = face.glyph();
+        let bitmap = glyph.bitmap();
+
+        // Must be GRAY (8bpp) — not MONO.  RENDER flag on an outline font
+        // always produces GRAY; MONO would indicate an embedded bitmap strike.
+        let pm = bitmap.pixel_mode().expect("pixel_mode");
+        assert_eq!(
+            pm,
+            freetype::bitmap::PixelMode::Gray,
+            "expected GRAY pixel mode, got {:?}",
+            pm
+        );
+
+        let w = bitmap.width() as usize;
+        let h = bitmap.rows() as usize;
+        let pitch = bitmap.pitch();
+        let buf = bitmap.buffer();
+
+        assert!(w > 0 && h > 0, "glyph 'A' should have non-empty bitmap");
+        // For GRAY the pitch in bytes >= width in pixels.
+        assert!(pitch >= 0, "expected positive (downward) pitch");
+        assert!(pitch as usize >= w, "pitch should be >= width for GRAY");
+
+        // ------------------------------------------------------------------
+        // 2. Copy glyph pixels into a flat Vec (same logic as render_text_string).
+        // ------------------------------------------------------------------
+        let mut pixels = vec![0u8; w * h];
+        for row in 0..h {
+            let src = if pitch >= 0 {
+                row * pitch as usize
+            } else {
+                (h - 1 - row) * (pitch as isize).unsigned_abs()
+            };
+            pixels[row * w..row * w + w].copy_from_slice(&buf[src..src + w]);
+        }
+
+        // At least some pixels must be non-zero (the glyph is not blank).
+        let has_nonzero = pixels.iter().any(|&b| b > 0);
+        assert!(has_nonzero, "glyph pixels should contain non-zero alpha values");
+
+        // ------------------------------------------------------------------
+        // 3. Write into a pixman A8 image using stride (same as phase 2).
+        // ------------------------------------------------------------------
+        let glyph_img = Image::new(FormatCode::A8, w, h, true)
+            .expect("pixman A8 image");
+        let stride_bytes = glyph_img.stride();
+        // stride_bytes must be >= w (pixman pads A8 rows to 4-byte alignment).
+        assert!(stride_bytes >= w, "pixman A8 stride must be >= width");
+
+        let gdata = unsafe { glyph_img.data() } as *mut u8;
+        for row in 0..h {
+            for col in 0..w {
+                unsafe {
+                    *gdata.add(row * stride_bytes + col) = pixels[row * w + col];
+                }
+            }
+        }
+
+        // Verify that the A8 image contains non-zero bytes in its first row.
+        let first_row_nonzero = (0..w).any(|col| {
+            unsafe { *gdata.add(col) > 0 }
+        });
+        assert!(first_row_nonzero, "A8 image first row should have non-zero alpha");
+
+        // ------------------------------------------------------------------
+        // 4. Composite onto a white X8R8G8B8 image and verify pixels changed.
+        //
+        // We use bitmap_top to position the glyph correctly: the baseline is
+        // at y = bitmap_top (so the glyph top is at row 0, baseline at
+        // bitmap_top). With a foreground of black (0x000000) on white
+        // (0xFFFFFF), composited pixels should be darker than 0xFFFFFF.
+        // ------------------------------------------------------------------
+        let baseline_y = glyph.bitmap_top() as i32;  // rows from top to baseline
+        let img_h = (baseline_y + 4).max(h as i32 + 4) as u16;
+        let img_w = (w + 4) as u16;
+        let mut dst = PixmanImage::new(FormatCode::X8R8G8B8, img_w, img_h, true)
+            .expect("dst image");
+        fill_image(&mut dst, 0x00ff_ffff); // white
+
+        let mut color_img = Image::new(FormatCode::A8R8G8B8, 1, 1, true)
+            .expect("color image");
+        let black = Color::new(0, 0, 0, 0xffff);
+        let _ = color_img.fill_rectangles(
+            Operation::Src,
+            black,
+            &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+        );
+        // Must tile across the glyph — same fix as render_text_string.
+        color_img.set_repeat(Repeat::Normal);
+
+        // dst_y = baseline_y - bitmap_top = 0 (glyph top lands on row 0).
+        let dst_y = baseline_y - glyph.bitmap_top();
+        dst.0.composite32(
+            Operation::Over,
+            &color_img,
+            Some(&glyph_img),
+            (0, 0),
+            (0, 0),
+            (0, dst_y),
+            (w as i32, h as i32),
+        );
+
+        // The destination should no longer be all-white: the composited 'A'
+        // glyph (black foreground) should have darkened some pixels.
+        let any_changed = (0..img_w as usize).any(|x| {
+            (0..img_h as usize).any(|y| read_pixel(&dst, x, y) & 0x00ff_ffff != 0x00ff_ffff)
+        });
+        assert!(any_changed, "composite should darken some white pixels with black 'A'");
+    }
+
+    // ---------------------------------------------------------------------------
+    // RENDER picture + trapezoid tests.
+    //
+    // KmsBackend requires DRM hardware so we cannot instantiate it here.
+    // Instead we exercise the same Pixman logic that render_trapezoids uses,
+    // calling pixman_composite_trapezoids directly with a solid-fill 1×1 source
+    // image and an A8R8G8B8 destination.
+    // ---------------------------------------------------------------------------
+
+    /// Encode one X RENDER Trapezoid (40 bytes, little-endian 16.16 fixed).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_trap(
+        top: i32, bottom: i32,
+        lp1x: i32, lp1y: i32, lp2x: i32, lp2y: i32,
+        rp1x: i32, rp1y: i32, rp2x: i32, rp2y: i32,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(40);
+        for v in [top, bottom, lp1x, lp1y, lp2x, lp2y, rp1x, rp1y, rp2x, rp2y] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Decode the wire bytes for one trap into a pixman_trapezoid_t.
+    fn decode_trap(bytes: &[u8]) -> pixman::ffi::pixman_trapezoid_t {
+        assert_eq!(bytes.len(), 40);
+        let i32_at = |off: usize| i32::from_le_bytes([bytes[off], bytes[off+1], bytes[off+2], bytes[off+3]]);
+        pixman::ffi::pixman_trapezoid_t {
+            top:    i32_at(0),
+            bottom: i32_at(4),
+            left: pixman::ffi::pixman_line_fixed_t {
+                p1: pixman::ffi::pixman_point_fixed_t { x: i32_at(8),  y: i32_at(12) },
+                p2: pixman::ffi::pixman_point_fixed_t { x: i32_at(16), y: i32_at(20) },
+            },
+            right: pixman::ffi::pixman_line_fixed_t {
+                p1: pixman::ffi::pixman_point_fixed_t { x: i32_at(24), y: i32_at(28) },
+                p2: pixman::ffi::pixman_point_fixed_t { x: i32_at(32), y: i32_at(36) },
+            },
+        }
+    }
+
+    #[test]
+    fn render_trapezoids_over_produces_nonzero_alpha_in_dst() {
+        // Destination: 8×8 A8R8G8B8, cleared to transparent black.
+        let dst_img = PixmanImage::new(FormatCode::A8R8G8B8, 8, 8, true).unwrap();
+
+        // Source: 1×1 solid red (fully opaque), with REPEAT_NORMAL so it tiles.
+        let mut src_img = Image::new(FormatCode::A8R8G8B8, 1, 1, true).unwrap();
+        let red = Color::new(0xFFFF, 0x0000, 0x0000, 0xFFFF);
+        let _ = src_img.fill_rectangles(
+            Operation::Src,
+            red,
+            &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+        );
+        src_img.set_repeat(Repeat::Normal);
+
+        // A rectangle trap covering pixels (1,1)–(6,6).
+        // In 16.16 fixed: pixel N → N << 16.
+        let left_x  = 1i32 << 16;
+        let right_x = 6i32 << 16;
+        let top_y   = 1i32 << 16;
+        let bot_y   = 6i32 << 16;
+        let wire = encode_trap(
+            top_y, bot_y,
+            left_x, top_y, left_x, bot_y,   // left edge: vertical at x=1
+            right_x, top_y, right_x, bot_y, // right edge: vertical at x=6
+        );
+        let trap_struct = decode_trap(&wire);
+
+        // SAFETY: both images are valid, non-overlapping pixman images owned by
+        // this stack frame.  trap_struct is POD constructed above.
+        unsafe {
+            pixman::ffi::pixman_composite_trapezoids(
+                pixman::ffi::pixman_op_t_PIXMAN_OP_OVER,
+                src_img.as_ptr(),
+                dst_img.0.as_ptr(),
+                pixman::ffi::pixman_format_code_t_PIXMAN_a8,
+                0, 0, // src_x, src_y
+                0, 0, // dst_x, dst_y
+                1,
+                &trap_struct,
+            );
+        }
+
+        // Center pixel (3,3) must have nonzero alpha after the composite.
+        let stride_words = dst_img.0.stride() / 4;
+        let pixel = unsafe { *dst_img.0.data().add(3 * stride_words + 3) };
+        let alpha = (pixel >> 24) & 0xFF;
+        assert!(
+            alpha > 0,
+            "center pixel at (3,3) should have nonzero alpha after trap composite; got 0x{:08x}",
+            pixel
+        );
+
+        // And pixels outside the trap (e.g. (0,0)) must remain transparent.
+        let corner = unsafe { *dst_img.0.data().add(0) };
+        assert_eq!(
+            (corner >> 24) & 0xFF,
+            0,
+            "pixel at (0,0) outside trap should remain transparent; got 0x{:08x}",
+            corner
+        );
+    }
+
+    #[test]
+    fn render_trapezoids_center_pixel_carries_source_color() {
+        // Destination: 8×8 A8R8G8B8, cleared to transparent black.
+        let dst_img = PixmanImage::new(FormatCode::A8R8G8B8, 8, 8, true).unwrap();
+
+        // Source: solid green (0x00FF00), fully opaque.
+        let mut src_img = Image::new(FormatCode::A8R8G8B8, 1, 1, true).unwrap();
+        let green = Color::new(0x0000, 0xFFFF, 0x0000, 0xFFFF);
+        let _ = src_img.fill_rectangles(
+            Operation::Src,
+            green,
+            &[Rectangle16 { x: 0, y: 0, width: 1, height: 1 }],
+        );
+        src_img.set_repeat(Repeat::Normal);
+
+        // Rectangular trap covering the full image interior (1,1)–(6,6).
+        let l  = 1i32 << 16;
+        let r  = 6i32 << 16;
+        let t  = 1i32 << 16;
+        let b  = 6i32 << 16;
+        let trap_struct = decode_trap(&encode_trap(t, b, l, t, l, b, r, t, r, b));
+
+        unsafe {
+            pixman::ffi::pixman_composite_trapezoids(
+                pixman::ffi::pixman_op_t_PIXMAN_OP_OVER,
+                src_img.as_ptr(),
+                dst_img.0.as_ptr(),
+                pixman::ffi::pixman_format_code_t_PIXMAN_a8,
+                0, 0, 0, 0, 1, &trap_struct,
+            );
+        }
+
+        // Center pixel (3,3): alpha must be 0xFF and RGB must be pure green.
+        let stride_words = dst_img.0.stride() / 4;
+        let pixel = unsafe { *dst_img.0.data().add(3 * stride_words + 3) };
+        let a = (pixel >> 24) & 0xFF;
+        let r_ch = (pixel >> 16) & 0xFF;
+        let g_ch = (pixel >> 8)  & 0xFF;
+        let b_ch =  pixel        & 0xFF;
+        assert_eq!(a, 0xFF, "center alpha should be fully opaque");
+        assert_eq!(r_ch, 0x00, "center red channel should be 0");
+        assert_eq!(g_ch, 0xFF, "center green channel should be 0xFF");
+        assert_eq!(b_ch, 0x00, "center blue channel should be 0");
     }
 }

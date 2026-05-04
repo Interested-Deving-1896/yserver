@@ -1402,7 +1402,7 @@ No regressions surfaced against the Phase 6.2 baseline. The
 warning counts and screenshot quality match what 6.2 produced
 under the dual-connection topology.
 
-### Phase 6.4 — KMS backend + `yserver` integration (planned)
+### Phase 6.4 — KMS backend + `yserver` integration (complete)
 
 Goal: implement a `KmsBackend` impl of the `Backend` trait and
 wire `yserver-core` into the `yserver` binary. First real X11
@@ -1452,7 +1452,197 @@ Out of scope (deferred to Phase 6.5+):
   no console restore — Phase 6.1 follow-ups note above documents
   the recipe.
 
-Not started. Depends on Phase 6.3.
+#### Landed (commit `7763055`)
+
+- **Steps 0–6 — `KmsBackend` bring-up.** Scaffolding + deps,
+  pixman rasterisation of core drawing primitives, swapchain +
+  per-window image compositor, libinput / xkbcommon input
+  pumping, freetype font loading + eager glyph cache, and the
+  epoll event loop wiring `yserver-core` onto a bare DRM/KMS
+  surface. The `Backend` trait shape from Phase 6.2 carried
+  through unchanged — `nested.rs` is backend-agnostic, the
+  `yserver` binary swaps in `KmsBackend` where `ynest` swaps in
+  `HostX11Backend`.
+- **Pixman bring-up fixes.** `compute_font_metrics` ascent /
+  right-side-bearing sentinels were inverted (text background
+  rects overflowed pixman). `poly_line` / `poly_segment` switched
+  to i32 Bresenham (i16 subtract-then-bbox-rect overflowed in
+  debug on extreme-coord probes from xterm and rendered diagonals
+  as bounding boxes). `poly_fill_arc` / `poly_arc` got scanline
+  ellipse fill / outline. `fill_poly` got even-odd scanline
+  polygon fill. `create_subwindow` / `configure_subwindow` now
+  pre-fill the new window image with `background_pixel` so
+  clients that rely on auto-clear (xclock black-on-white) get
+  the right backdrop.
+- **Workarounds for surfaced quirks.** `pixman::fill_rectangles`
+  segfaults on partly-out-of-bounds rects in our build —
+  `clip_rects_to_image` works around it for the affected
+  primitives. `list_fonts_proxy` /
+  `list_fonts_with_info_proxy` synthesise a properly-formed
+  empty / terminator reply so font-querying clients (xclock)
+  don't block. `render_text_string` replaced an
+  `as_ptr`-via-`RefCell` raw-pointer cast with a two-phase impl
+  (collect glyphs while a `Ref` is held, composite after the
+  borrow drops). Default mid-grey scanout when no root
+  `bg_pixel` set. virtio-tablet absolute pointer support added
+  via `InputEvent::PointerMotionAbsolute` +
+  `process_pointer_absolute`.
+
+#### Validation (commit `7763055`)
+
+xeyes, xterm, and xclock connect, render, and respond to input
+on bare DRM/KMS without a host X server. xeyes' pupils track
+the cursor; xclock's analog face draws (the seconds hand is
+invisible — known issue, GC `function` not honoured). xterm
+runs without crashing and the white background is correct, but
+glyph baseline is off (known issue).
+
+WM-readiness on KMS is *not* in scope for 6.4 — that's the
+6.5 deliverable. fvwm3 starts and reparents client windows but
+modules wedge waiting for ConfigureNotify synthesis (see
+`known-issues.md` "KMS backend (Phase 6.4)" and "fvwm3 modules
+wedge on missing ConfigureNotify").
+
+### Phase 6.5 — WM-readiness on KMS (complete)
+
+Goal: make fvwm3 fully usable on the bare-metal `KmsBackend`
+running standard X11 clients (xterm, xclock, xeyes). Achieved:
+fvwm3 manages and frames clients on bare DRM/KMS without a host
+X server; xclock renders its full anti-aliased dial and sweeping
+seconds hand via RENDER trapezoids; xterm renders legible text.
+
+#### Diagnostic discovery (Step 0 — pre-implementation trace diff)
+
+The pre-implementation hypothesis from `known-issues.md` ("fvwm3
+modules wedge on missing ConfigureNotify; fix is to synthesise
+notify events from `KmsBackend::configure_subwindow`") turned out
+to be *wrong*. `nested.rs` already synthesises ConfigureNotify
+unconditionally for both backends at lines 5926–5962, plus the
+SubstructureNotify variant on the parent. Trace-diff against
+Xephyr-fvwm3.log showed the actual root cause: without RENDER,
+fvwm3 builds a *two-level* frame hierarchy and places the
+managed client at parent-relative `(0, 0)` inside the inner
+frame. FvwmPager's init loop terminates only when `GetGeometry`
+on its top-level returns `x != 0 || y != 0`; under Xephyr (with
+RENDER) fvwm uses a single-level frame with non-zero placement
+and the loop exits, but under bare KMS (RENDER absent) the loop
+never terminates.
+
+The full diagnostic note lives at
+`docs/superpowers/notes/2026-05-04-phase6-5-fvwm3-trace.md`.
+
+#### Landed (branch `phase6-5-wm-readiness`)
+
+- **Step 2 — GC `function` plumbing (`6972c39`).** Adds
+  `current_function: GcFunction` on `KmsBackend`, captured in
+  `apply_draw_state`, read by every client-draw primitive via a
+  new `fill_rects_with_gc_function` helper. `GcFunction::Copy`
+  → `pixman_op::SRC` (fast path); `GcFunction::Xor` →
+  per-pixel bitwise XOR over the RGB channels via raw pixel
+  manipulation. Pixman's `PIXMAN_OP_XOR` is *not* what X11
+  `GXxor` requires (Porter-Duff `src×(1-dst.a)+dst×(1-src.a)`
+  produces zero for fully-opaque images), so the Xor path uses
+  manual XOR. All other GcFunction variants log-and-fall-back
+  to `Src`. Unblocks xclock's seconds hand, will unblock WM
+  rubber-band selection when the WMs that exercise it are
+  smoke-tested.
+- **Step 1A — RENDER advertise (`e19ca7c`).** Flips
+  `KmsBackend::render_opcode()` from `None` to `Some(133)`. All
+  21 `render_*` trait methods were already stubbed as no-ops, so
+  RENDER capability is advertised without breaking any prior
+  call site. This single line resolves the FvwmPager wedge by
+  triggering fvwm's RENDER-aware single-level frame strategy.
+- **Step 3 — xterm glyph rasterisation (`993c437`).** The 1×1
+  pixman colour-source image used in `render_text_string`'s
+  phase-2 composite was created with the default `REPEAT_NONE`,
+  so pixman read transparent black for any source coordinate
+  outside `(0,0)`. `Operation::Over` with transparent source is
+  a no-op — only the leftmost column of each glyph (where the
+  alpha mask is usually near-zero anyway) received the foreground
+  colour, producing the "scattered black dots" symptom.  Fix:
+  `color_img.set_repeat(Repeat::Normal)` so pixman tiles the
+  solid colour uniformly across the entire glyph bounding box.
+- **Step 1B — RENDER Trapezoids + Picture/SolidFill
+  (`9bf29f1`).** Flipping render_opcode (Step 1A) regressed
+  xclock — xclock switched to RENDER for all drawing and the
+  no-op stubs dropped every trapezoid. Step 1B adds a
+  `pictures: HashMap<u32, PictureState>` on `KmsBackend` with
+  `Drawable { host_xid, clip }` and `SolidFill { image }`
+  variants; implements `render_create_picture`,
+  `render_create_solid_fill`, `render_free_picture`,
+  `render_set_picture_clip_rectangles`, `render_trapezoids`
+  (forwards to `pixman_composite_trapezoids` via `pixman-sys`
+  FFI), and `render_format_for_ynest_id` (passes nonzero IDs
+  through so `nested.rs` actually dispatches the trapezoid
+  call). Trap wire format matches `pixman_trapezoid_t` byte-
+  for-byte, decoded element-by-element to avoid alignment
+  pitfalls. Adds 2 colocated unit tests verifying nonzero alpha
+  in dst + center-pixel colour propagation.
+- **Step 1B follow-up — clip-rect parser
+  fix (`db54ce4`).** `render_set_picture_clip_rectangles`
+  received the whole request body from nested.rs (picture XID
+  at `body[0..4]`, then `clip_x_origin` / `clip_y_origin`,
+  then rectangles). The initial parser treated bytes 0..4 as
+  the origin and 4+ as rectangles — clip rects were the real
+  rect bytes shifted up by one field, pixman clipped most of
+  xclock's traps to a tiny region and only a partial arc of the
+  dial appeared. One-line fix: skip past the picture-XID prefix
+  in the parser.
+
+#### Validation (commits `6972c39 .. db54ce4`)
+
+xclock, xterm, xeyes, and fvwm3 all run together on bare
+DRM/KMS without a host X server. fvwm3 manages and frames
+xterm + xclock (visible title-bar chrome on both); xclock's
+full dial renders with anti-aliased ticks, hour/minute/second
+hands sweep correctly; xterm's text is legible (env output
+verified end-to-end including a fish prompt status line).
+fvwm3 modules (FvwmPager, FvwmIconMan, FvwmButtons) reach
+idle without busy-looping — Step 0's busy-loop signature
+(`ConfigureWindow → ChangeWindowAttributes → GetInputFocus`
+on the same window with `(-1, -1)` coords) does not appear
+in the post-1A log.
+
+365 tests passing in workspace (16 yserver + 9 ynest + 248
+yserver-core + 87 yserver-protocol + 5 misc). The yserver lib
+test count grew from 18 → 21 with three new colocated tests:
+`fill_rects_copy_overwrites_destination`,
+`poly_segment_xor_inverts_destination_pixels`,
+`render_trapezoids_over_produces_nonzero_alpha_in_dst`,
+`render_trapezoids_center_pixel_carries_source_color`,
+`glyph_render_gray_pixels_land_on_correct_rows`.
+
+WM matrix: fvwm3 fully validated on KMS. wmaker / e16 not
+re-tested on KMS; the WMs already worked under host backend
+in 6.3, and 6.5's KMS-specific changes (GC function, glyph
+REPEAT, RENDER stubs) are backend-internal and don't regress
+the host path. Standalone WM smoke under bare KMS for
+wmaker / e16 is parked as a 6.6 follow-up.
+
+Out of scope (deferred to 6.6+):
+
+- **`RENDER::CompositeGlyphs8` on KMS.** fvwm3's panel labels
+  (FvwmPager desktop names, FvwmIconMan window titles,
+  FvwmButtons text) are rendered via CompositeGlyphs8, which
+  is still a no-op stub. fvwm3 manages clients correctly with
+  the panel chrome rendered as solid backgrounds — text/icons
+  on those panels are blank.
+- **`RENDER::Composite` on KMS.** Off-screen-buffer-to-window
+  blits via the generic Composite call are also no-op stubs.
+  Used by some toolkits for double-buffered widget rendering.
+- Real font enumeration on KMS (`list_fonts_proxy` still
+  returns the empty terminator).
+- Host (GTK) cursor and guest cursor drift / lock.
+- pixman `fill_rectangles` partly-out-of-bounds segfault
+  root-cause investigation.
+- Full VT_SETMODE / logind / suspend-resume / hotplug polish.
+- wmaker / e16 smoke under bare KMS.
+- `SetDashes` no-op + reply (still surfaced as `unsupported
+  opcode 58` in the log; cosmetic).
+- `InstallColormap` no-op (still `unsupported opcode 81`;
+  TrueColor backend so safe to ignore).
+- `line_width` thick lines in `poly_line`.
+- Partial-angle clipping for `poly_arc` / `poly_fill_arc`.
 
 ## Phase 7 — Security hardening
 
