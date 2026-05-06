@@ -474,6 +474,25 @@ that the host hides for us.
 
 ## Validation surface
 
+- [ ] **xts XI / XIproto blocked on missing XI 1.x reply handlers.** Our
+      `XInputExtension` dispatcher only implements minor 1
+      (`GetExtensionVersion`) and a handful of XI2 minors (42, 44–48, 60).
+      The xts `XI` (36 cases / 316 purposes) and `XIproto` (35 cases /
+      107 purposes) scenarios test the original X Input Extension
+      (XI 1.x). Every XI test uses Xlib's `XListInputDevices` /
+      `XOpenDevice` (XI1 minors 2 / 3 — both reply-required) via
+      `Setup_Extension_DeviceInfo`; without replies the client blocks
+      in `_XReply()` and the test hangs the full timeout. Confirmed
+      2026-05-07 by running `just xts-ynest XI 99 1024x768 600` — first
+      test (`AllowDeviceEvents`) hung 600s and tcc was SIGTERM'd. To
+      unblock measurement we need the ~20 reply-required XI1 minors
+      (`ListInputDevices`, `OpenDevice`, `SetDeviceMode`,
+      `GetSelectedExtensionEvents`, `GetDeviceMotionEvents`, `GrabDevice`,
+      `GetDeviceFocus`, `GetFeedbackControl`, `GetDeviceKeyMapping`,
+      `QueryDeviceState`, …) stubbed with "no devices / empty list /
+      not-granted" replies. Test bodies will mostly UNTESTED ("required
+      extension devices are not present") rather than PASS — but the
+      suite will at least run to completion and produce a baseline.
 - [ ] **XTEST extension in ynest.** Implementing `XTestFakeKeyEvent` /
       `XTestFakeButtonEvent` (extension major 138, opcodes 2 and 3)
       would let `xdotool key`/`xdotool click` drive ynest in headless

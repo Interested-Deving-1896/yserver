@@ -2237,6 +2237,16 @@ artefacts. In rough priority:
   pads through unchanged, so BE-only probes still UNRES.
 - **`yserver` (KMS) baseline.** Deferred — running xts in a vng
   guest needs either an in-guest xts build or a tunneled DISPLAY.
+- **xts `XI` / `XIproto` baseline.** Blocked on missing XI 1.x reply
+  handlers. Our `XInputExtension` dispatcher only implements XI2 plus
+  XI1 minor 1 (`GetExtensionVersion`); xts probes the XI 1.x surface
+  through `Setup_Extension_DeviceInfo`, which calls Xlib's
+  `XListInputDevices` (minor 2) and `XOpenDevice` (minor 3) — both
+  reply-required. Without replies the client blocks in `_XReply()`.
+  Confirmed 2026-05-07: `XI` first test (`AllowDeviceEvents`) hung the
+  full 600s timeout. Unblocking requires stubbing ~20 reply-required
+  XI1 minors with empty / not-granted replies; full ticket in
+  `docs/known-issues.md` under "Validation surface".
 
 ## Phase 7 — Security hardening
 
