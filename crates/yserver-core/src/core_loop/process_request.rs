@@ -4953,13 +4953,14 @@ fn handle_map_subwindows(
             .resources
             .window(child)
             .is_some_and(|w| w.map_state == MapState::Viewable);
-        if was_unmapped && viewable {
-            if let Some((width, height)) = extents {
-                let _dropped =
-                    emit_window_event_to_state(state, child, 0x0000_8000, |buf, seq, order| {
-                        x11::encode_expose_event(buf, seq, order, child, 0, 0, width, height, 0);
-                    });
-            }
+        if was_unmapped
+            && viewable
+            && let Some((width, height)) = extents
+        {
+            let _dropped =
+                emit_window_event_to_state(state, child, 0x0000_8000, |buf, seq, order| {
+                    x11::encode_expose_event(buf, seq, order, child, 0, 0, width, height, 0);
+                });
         }
     }
     debug!("client {} #{} MapSubwindows", client_id.0, sequence.0);

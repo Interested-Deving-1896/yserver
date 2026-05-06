@@ -142,7 +142,7 @@ pub fn core_event_swap_table(event_type: u8) -> &'static [FieldEntry] {
     // Most events have time(u32) at offset 4, root(u32) at 8, etc.
     match event_type {
         // 2 KeyPress, 3 KeyRelease, 4 ButtonPress, 5 ButtonRelease, 6 MotionNotify
-        2 | 3 | 4 | 5 | 6 => &[
+        2..=6 => &[
             u16f!(2),  // sequence
             u32f!(4),  // time
             u32f!(8),  // root

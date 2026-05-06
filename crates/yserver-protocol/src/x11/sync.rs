@@ -1,6 +1,6 @@
 use super::{
     ClientByteOrder, SequenceNumber,
-    wire::{write_i16, write_u16, write_u32},
+    wire::{write_u16, write_u32},
 };
 
 pub const INITIALIZE: u8 = 0;

@@ -331,16 +331,16 @@ pub fn encode_get_screen_resources_current_reply(
     out.extend_from_slice(&resources.config_timestamp.to_le_bytes());
     // bytes 16-17: num_crtcs
     #[allow(clippy::cast_possible_truncation)]
-    put(byte_order, &mut out, (num_crtcs as u16));
+    put(byte_order, &mut out, num_crtcs as u16);
     // bytes 18-19: num_outputs
     #[allow(clippy::cast_possible_truncation)]
-    put(byte_order, &mut out, (num_outputs as u16));
+    put(byte_order, &mut out, num_outputs as u16);
     // bytes 20-21: num_modes
     #[allow(clippy::cast_possible_truncation)]
-    put(byte_order, &mut out, (num_modes as u16));
+    put(byte_order, &mut out, num_modes as u16);
     // bytes 22-23: names_len
     #[allow(clippy::cast_possible_truncation)]
-    put(byte_order, &mut out, (names_len as u16));
+    put(byte_order, &mut out, names_len as u16);
     // bytes 24-31: 8 bytes padding
     out.extend_from_slice(&[0u8; 8]);
 
@@ -437,19 +437,19 @@ pub fn encode_get_output_info_reply(
     out.push(subpixel_order);
     // bytes 26-27: num_crtcs
     #[allow(clippy::cast_possible_truncation)]
-    put(byte_order, &mut out, (num_crtcs as u16));
+    put(byte_order, &mut out, num_crtcs as u16);
     // bytes 28-29: num_modes
     #[allow(clippy::cast_possible_truncation)]
-    put(byte_order, &mut out, (num_modes as u16));
+    put(byte_order, &mut out, num_modes as u16);
     // bytes 30-31: num_preferred (all modes are preferred in this stub)
     #[allow(clippy::cast_possible_truncation)]
-    put(byte_order, &mut out, (num_modes as u16));
+    put(byte_order, &mut out, num_modes as u16);
     // bytes 32-33: num_clones  (extra word read by _XReply with extra=1)
     #[allow(clippy::cast_possible_truncation)]
-    put(byte_order, &mut out, (num_clones as u16));
+    put(byte_order, &mut out, num_clones as u16);
     // bytes 34-35: name_len
     #[allow(clippy::cast_possible_truncation)]
-    put(byte_order, &mut out, (name_len as u16));
+    put(byte_order, &mut out, name_len as u16);
     // no pad: byte 36 is 4-byte aligned, arrays follow immediately
 
     // crtcs
@@ -529,10 +529,10 @@ pub fn encode_get_crtc_info_reply(
     put(byte_order, &mut out, rotations);
     // bytes 28-29: num_outputs
     #[allow(clippy::cast_possible_truncation)]
-    put(byte_order, &mut out, (num_outputs as u16));
+    put(byte_order, &mut out, num_outputs as u16);
     // bytes 30-31: num_possible
     #[allow(clippy::cast_possible_truncation)]
-    put(byte_order, &mut out, (num_possible as u16));
+    put(byte_order, &mut out, num_possible as u16);
 
     // outputs
     for &o in outputs {
@@ -675,10 +675,10 @@ pub fn encode_get_monitors_reply(
     put(byte_order, &mut out, timestamp);
     // bytes 12-15: nMonitors
     #[allow(clippy::cast_possible_truncation)]
-    put(byte_order, &mut out, (n_monitors as u32));
+    put(byte_order, &mut out, n_monitors as u32);
     // bytes 16-19: nOutputs (total across all monitors)
     #[allow(clippy::cast_possible_truncation)]
-    put(byte_order, &mut out, (n_outputs as u32));
+    put(byte_order, &mut out, n_outputs as u32);
     // bytes 20-31: pad
     out.extend_from_slice(&[0u8; 12]);
     debug_assert_eq!(out.len(), 32);

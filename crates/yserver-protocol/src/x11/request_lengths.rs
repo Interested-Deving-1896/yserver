@@ -163,7 +163,7 @@ pub fn validate_core_request_length(opcode: u8, length_units: u32) -> bool {
 /// Helper: round `bytes` up to the next 4-byte multiple, expressed
 /// in 4-byte units.
 const fn pad_units(bytes: u32) -> u32 {
-    (bytes + 3) / 4
+    bytes.div_ceil(4)
 }
 
 const fn read_u16_le(b: &[u8]) -> u32 {
@@ -349,7 +349,7 @@ pub fn exact_required_length(opcode: u8, header_data: u8, body: &[u8]) -> Option
             let n = u32::from(header_data);
             #[allow(clippy::cast_possible_truncation)]
             let body_units = (body.len() / 4) as u32;
-            let expected_units = 4 + (n + 3) / 4; // total request length_units
+            let expected_units = 4 + n.div_ceil(4); // total request length_units
             if body_units == expected_units - 1 {
                 None
             } else {
@@ -361,7 +361,7 @@ pub fn exact_required_length(opcode: u8, header_data: u8, body: &[u8]) -> Option
             let n = 2 * u32::from(header_data);
             #[allow(clippy::cast_possible_truncation)]
             let body_units = (body.len() / 4) as u32;
-            let expected_units = 4 + (n + 3) / 4;
+            let expected_units = 4 + n.div_ceil(4);
             if body_units == expected_units - 1 {
                 None
             } else {
@@ -383,7 +383,7 @@ pub fn validate_exact_request_length(
     length_units: u32,
     body: &[u8],
 ) -> bool {
-    exact_required_length(opcode, header_data, body).map_or(true, |req| length_units == req)
+    exact_required_length(opcode, header_data, body).is_none_or(|req| length_units == req)
 }
 
 /// For opcodes that carry a value-mask, returns `Some(bad_value)` if

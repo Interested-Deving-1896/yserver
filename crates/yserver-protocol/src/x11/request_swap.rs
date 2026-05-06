@@ -252,7 +252,7 @@ const fn core_request_swap_table(opcode: u8) -> Option<&'static [FieldEntry]> {
         73 => &[u32f!(0), i16f!(4), i16f!(6), u16f!(8), u16f!(10), u32f!(12)],
         // 74 PolyText8 / 75 PolyText16 / 76 ImageText8 / 77 ImageText16:
         //   drawable(u32) gc(u32) x(i16) y(i16) text(opaque)
-        74 | 75 | 76 | 77 => &[
+        74..=77 => &[
             u32f!(0),
             u32f!(4),
             i16f!(8),
