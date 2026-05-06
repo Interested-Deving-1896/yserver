@@ -2140,27 +2140,38 @@ the suite tell us where the real gaps are.
   `CASES TESTS PASS UNSUP UNTST NOTIU WARN FIP FAIL UNRES UNIN ABORT`).
   `just xts-ynest scenario=…` boots release `ynest` on `:99` and
   runs the scenario, killing ynest on exit.
-- **Baseline:** [`docs/xts-baseline.md`](xts-baseline.md) captures
-  the first ynest Xproto run (1 PASS / 210 FAIL / 160 UNRES out of
-  389 tests). The headline is that **ynest survives the entire
-  battery without panic, hang, or crash** — the per-test pass
-  count is gated on two structural bugs (big-endian client
-  rejection, missing `BadLength` enforcement) that mask hundreds of
-  otherwise-correct paths.
+- **Baseline + run history:** [`docs/xts-baseline.md`](xts-baseline.md)
+  tracks each xts run as a row in the run-history table. The headline
+  is that **ynest survives the entire battery without panic, hang, or
+  crash**. Per-test result counts (Xproto scenario, 122 cases / 389
+  purposes):
+
+  | Date       | PASS | FAIL | UNRES | UNIN | NORES | Change |
+  |------------|-----:|-----:|------:|-----:|------:|--------|
+  | 2026-05-06 |    1 |  210 |   160 |   11 |     7 | First run after XTEST landed. |
+  | 2026-05-06 |    1 |   74 |   296 |   11 |     7 | `BadLength` enforcement at the top of `process_request`. |
+
+- **`BadLength` enforcement landed.** A per-opcode length contract
+  table covers all of opcodes 1–127: `Fixed(n)` for fixed-length
+  requests, `AtLeast(n)` for variable. `process_request` validates
+  `header.length_units` against the contract before dispatch and
+  replies `BadLength` on mismatch. Cascading effect on the tally:
+  136 tests moved FAIL → UNRES. Each AllocColor-style probe runs
+  native + reversed-byte-sex sub-checks; previously the native
+  sub-checks FAILed (BadLength not raised) so the test result was
+  FAIL; now those sub-checks pass but the BE sub-checks still UNRES
+  on connection rejection. The `BadLength` work is correct on its
+  own merits — surfacing it as a PASS-count delta requires the
+  big-endian fix below.
 
 #### Phase 6.9 follow-ups (next quick wins)
 
 Ranked by ROI on the xts tally:
 
-- **`BadLength` enforcement** (433 REPORT lines, ~50–80 tests).
-  Single guard in `process_request` checking
-  `header.length * 4 == 4 + body.len()` (or honouring BIG-REQUESTS
-  extended length). Fires `BadLength` errors for over/under-length
-  requests. Half-day fix.
-- **Big-endian client byte-order at the wire reader** (483 REPORT
-  lines, ~80–150 tests). Swap-on-read for u16/u32 setup + request
-  fields when the client signals big-endian byte sex. Larger scope
-  but unblocks ~161 tests' second-connection probes.
+- **Big-endian client byte-order at the wire reader** (now the
+  gating issue, ~136 tests UNRES'd purely on this). Swap tables
+  for request bodies, replies, events, and the setup-success
+  encoder. Realistic scope: 2–4 days of mostly-mechanical work.
 - **`Expose` correctness pass** (131 lines, ~30 tests). Specific
   Expose-generation gaps; smaller bucket but real bugs.
 - **`yserver` (KMS) baseline.** Deferred — running xts in a vng

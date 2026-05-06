@@ -17,6 +17,7 @@ pub mod damage;
 pub mod mit_shm;
 pub mod present;
 pub mod randr;
+pub mod request_lengths;
 pub mod shape;
 pub mod sync;
 pub mod xfixes;

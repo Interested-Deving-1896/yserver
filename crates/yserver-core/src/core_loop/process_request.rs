@@ -93,6 +93,16 @@ pub fn process_request(
             .last_sequence
             .store(sequence.0, std::sync::atomic::Ordering::Relaxed);
     }
+    if !x11::request_lengths::validate_core_request_length(header.opcode, header.length_units) {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_LENGTH,
+            0,
+            header.opcode,
+        );
+    }
     match header.opcode {
         // ── log-only no-ops (no reply, no state mutation) ──
         36 => log_void(client_id, sequence, "GrabServer"),
