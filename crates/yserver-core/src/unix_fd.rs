@@ -142,17 +142,38 @@ impl FdReader {
         );
         self.buf.clear();
         self.buf.resize(4096, 0);
-        let (n, fds) = recv_with_fds(&mut self.stream, &mut self.buf)?;
-        if n == 0 && fds.is_empty() {
-            // Peer closed the connection.
-            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        match recv_with_fds(&mut self.stream, &mut self.buf) {
+            Ok((n, fds)) => {
+                if n == 0 && fds.is_empty() {
+                    // Peer closed the connection.
+                    self.buf.clear();
+                    self.pos = 0;
+                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                }
+                self.buf.truncate(n);
+                self.pos = 0;
+                for fd in fds {
+                    self.fds.push_back(fd);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Restore the empty-buffer invariant so a caller that
+                // retries (e.g. after `WouldBlock` + poll) sees a
+                // clean state. Without this, `pos == buf.len` (the
+                // debug assert at the top) would fail because we
+                // already resized buf to 4096.
+                self.buf.clear();
+                self.pos = 0;
+                Err(e)
+            }
         }
-        self.buf.truncate(n);
-        self.pos = 0;
-        for fd in fds {
-            self.fds.push_back(fd);
-        }
-        Ok(())
+    }
+
+    /// Raw fd backing this reader. Useful for `poll(2)` waits in the
+    /// reader-thread WouldBlock retry loop.
+    pub fn fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
     }
 }
 

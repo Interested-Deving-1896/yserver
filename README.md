@@ -12,18 +12,23 @@ design, scope, and phased plan.
 
 ## Status
 
-`ynest` (nested backend) runs real desktop sessions: GTK3 apps, fvwm3,
-Window Maker, e16, and partial openbox; many extensions implemented
-(BIG-REQUESTS, RANDR, RENDER, XKB, XInput2, XFIXES, SHAPE, DAMAGE,
-COMPOSITE, SYNC, Present, MIT-SHM).
+Both backends run real desktop sessions on a single-threaded core
+(no `Arc<Mutex<ServerState>>`, no per-client pump threads — the core
+thread owns state and a mio poller).
 
-`yserver` (standalone DRM/KMS) is in Phase 6.1 bootstrap on the
-`phase6-bootstrap` branch: a real DRM/KMS binary that boots in
-`virtme-ng`, sets a mode on virtio-gpu, runs a libinput-driven
-single-thread `epoll` loop, and paints a moving rectangle into a
-dumb-buffer swapchain with clean signalfd shutdown.
+`ynest` (nested) runs GTK3 apps and fvwm3 / Window Maker / e16 /
+partial openbox via a host X11 connection; extensions implemented
+include BIG-REQUESTS, RANDR, RENDER, XKB, XInput2, XFIXES, SHAPE,
+DAMAGE, COMPOSITE, SYNC, Present, MIT-SHM.
 
-See [`docs/status.md`](docs/status.md) for per-phase progress.
+`yserver` (standalone DRM/KMS) runs the same WM matrix end-to-end on
+bare DRM/KMS — boots in `virtme-ng`, sets a mode on virtio-gpu,
+drives input via libinput, and renders via pixman + freetype. e16
+and Window Maker work; fvwm3 boots but its core-font menu rendering
+has a known gap (see [`docs/known-issues.md`](docs/known-issues.md)).
+
+See [`docs/status.md`](docs/status.md) for per-phase progress and
+[`docs/known-issues.md`](docs/known-issues.md) for current gaps.
 
 ## Layout
 

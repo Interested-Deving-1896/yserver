@@ -1,0 +1,24 @@
+//! Single-threaded core loop scaffolding.
+//!
+//! This module is being grown phase-by-phase per
+//! `docs/superpowers/plans/2026-05-06-single-threaded-core.md`. In its
+//! current form (Phase B) it only exposes the message types; the
+//! sender/receiver pair and `run_core` come online in B2/B4.
+
+pub mod client_io;
+pub mod client_reader;
+pub mod damage_fanout;
+pub mod fanout;
+pub mod key_fanout;
+pub mod message;
+pub mod pointer_fanout;
+pub mod poll_tokens;
+pub mod process_disconnect;
+pub mod process_request;
+pub mod run;
+pub mod sender;
+pub mod setup_thread;
+
+pub use message::{HostInputEvent, Message, SetupAllocateResponse};
+pub use run::run_core;
+pub use sender::{CoreReceiver, CoreSender, NOTIFY_TOKEN, channel};

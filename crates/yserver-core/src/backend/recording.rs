@@ -19,13 +19,8 @@
 
 #![cfg(test)]
 
-use std::{
-    collections::HashMap,
-    io,
-    sync::{Arc, Mutex},
-};
+use std::{io, sync::Mutex};
 
-use crossbeam_channel::Sender;
 use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, xfixes};
 
 use crate::{
@@ -33,9 +28,7 @@ use crate::{
         AnyHandle, Backend, ClipState, CursorHandle, DrawState, FillState, FontHandle,
         GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle, WindowHandle,
     },
-    host_x11::{
-        HostKeyEvent, HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition,
-    },
+    host_x11::{HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition},
 };
 
 /// Records each method call. Variants are added on demand; tests
@@ -108,6 +101,11 @@ pub struct RecordingBackend {
     /// through `Backend::xid_map`. Tests inspect it via `Backend`'s
     /// trait surface.
     xid_map: HostXidMap,
+    /// E3 liveness counter — incremented every time
+    /// `on_page_flip_ready` is invoked. Tests assert back-to-back
+    /// PageFlipReady dispatches do not get suppressed by the run_core
+    /// dispatch loop.
+    pub page_flip_count: std::sync::atomic::AtomicU32,
 }
 
 impl Default for RecordingBackend {
@@ -123,7 +121,8 @@ impl RecordingBackend {
             next_handle: Mutex::new(0x0001_0000),
             fake_window_id: 0x0000_0100,
             fake_root_visual_xid: 0x0000_0021,
-            xid_map: Arc::new(Mutex::new(HashMap::new())),
+            xid_map: HostXidMap::new(),
+            page_flip_count: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -188,7 +187,21 @@ impl Backend for RecordingBackend {
         Ok(())
     }
 
-    fn set_event_sink(&mut self, _sink: Option<Box<dyn crate::backend::BackendEventSink>>) {}
+    fn on_host_input(
+        &mut self,
+        _state: &mut crate::server::ServerState,
+        _ev: crate::core_loop::HostInputEvent,
+    ) {
+    }
+
+    fn on_page_flip_ready(&mut self, _state: &mut crate::server::ServerState) {
+        self.page_flip_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)> {
+        Vec::new()
+    }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -309,9 +322,7 @@ impl Backend for RecordingBackend {
         nested_id: ResourceId,
         host_xid: u32,
     ) -> io::Result<()> {
-        if let Ok(mut map) = self.xid_map.lock() {
-            map.insert(host_xid, nested_id);
-        }
+        self.xid_map.insert(host_xid, nested_id);
         self.record(RecordedCall::RegisterTopLevel {
             nested_id,
             host_xid,
@@ -325,9 +336,7 @@ impl Backend for RecordingBackend {
         nested_id: ResourceId,
         host_xid: u32,
     ) -> io::Result<()> {
-        if let Ok(mut map) = self.xid_map.lock() {
-            map.insert(host_xid, nested_id);
-        }
+        self.xid_map.insert(host_xid, nested_id);
         self.record(RecordedCall::RegisterSubwindow {
             nested_id,
             host_xid,
@@ -336,19 +345,12 @@ impl Backend for RecordingBackend {
     }
 
     fn unregister_host_window(&mut self, host_xid: u32) {
-        if let Ok(mut map) = self.xid_map.lock() {
-            map.remove(&host_xid);
-        }
+        self.xid_map.remove(&host_xid);
         self.record(RecordedCall::UnregisterHostWindow(host_xid));
     }
 
-    fn xid_map(&self) -> HostXidMap {
-        Arc::clone(&self.xid_map)
-    }
-
-    fn add_key_subscriber(&mut self, _tx: Sender<HostKeyEvent>) {
-        // RecordingBackend doesn't have a dispatcher; tests that need
-        // to drive kb fanout do so directly through their own channel.
+    fn xid_map(&self) -> &HostXidMap {
+        &self.xid_map
     }
 
     fn name_window_pixmap(
@@ -1100,9 +1102,7 @@ mod tests {
             .expect("register_top_level");
         // xid_map sees the new entry.
         let map = rec.xid_map();
-        let g = map.lock().unwrap();
-        assert_eq!(g.get(&host_xid).copied(), Some(nested_id));
-        drop(g);
+        assert_eq!(map.get(&host_xid).copied(), Some(nested_id));
         // Call is recorded with the same nested_id / host_xid.
         let calls = rec.calls();
         assert!(matches!(
@@ -1124,7 +1124,7 @@ mod tests {
         rec.register_subwindow(None, nested_id, host_xid)
             .expect("register_subwindow");
         let map = rec.xid_map();
-        assert_eq!(map.lock().unwrap().get(&host_xid).copied(), Some(nested_id),);
+        assert_eq!(map.get(&host_xid).copied(), Some(nested_id));
         let calls = rec.calls();
         assert!(matches!(
             calls.last().unwrap(),
@@ -1146,7 +1146,7 @@ mod tests {
         rec.register_top_level(None, nested_id, host_xid).unwrap();
         rec.unregister_host_window(host_xid);
         let map = rec.xid_map();
-        assert!(map.lock().unwrap().get(&host_xid).is_none());
+        assert!(map.get(&host_xid).is_none());
         let calls = rec.calls();
         assert!(matches!(
             calls.last().unwrap(),

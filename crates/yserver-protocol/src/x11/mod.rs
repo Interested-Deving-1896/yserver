@@ -27,7 +27,7 @@ pub enum ClientByteOrder {
     BigEndian,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ClientId(pub u32);
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -127,6 +127,13 @@ pub struct PointerEvent {
     pub time: u32,
     pub root: ResourceId,
     pub event: ResourceId,
+    /// Topmost child of `event` that contains the pointer (i.e. the
+    /// immediate descendant of the propagation target on the path to
+    /// the source window). `ResourceId(0)` (the X11 `None` sentinel)
+    /// when the source IS the event window — this is what window
+    /// managers use to distinguish bare-root clicks from clicks
+    /// propagated up from an app window.
+    pub child: ResourceId,
     pub root_x: i16,
     pub root_y: i16,
     pub event_x: i16,
@@ -1238,21 +1245,28 @@ pub fn input_focus_window(body: &[u8]) -> Option<ResourceId> {
 
 pub fn write_key_event(writer: &mut impl Write, event: KeyEvent) -> io::Result<()> {
     let mut out = Vec::with_capacity(32);
+    encode_key_event(&mut out, ClientByteOrder::LittleEndian, event);
+    writer.write_all(&out)
+}
+
+/// Encode a `KeyPress` (`event.pressed = true`) or `KeyRelease` event
+/// against `order`. Mirrors [`write_key_event`] but produces a buffer
+/// instead of writing — used by the state-borrowing fanout helpers.
+pub fn encode_key_event(out: &mut Vec<u8>, order: ClientByteOrder, event: KeyEvent) {
     out.push(if event.pressed { 2 } else { 3 });
     out.push(event.keycode);
-    write_u16(ClientByteOrder::LittleEndian, &mut out, event.sequence.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, event.time);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, event.root.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, event.event.0);
-    write_u32(ClientByteOrder::LittleEndian, &mut out, 0); // child
-    write_i16(ClientByteOrder::LittleEndian, &mut out, event.root_x);
-    write_i16(ClientByteOrder::LittleEndian, &mut out, event.root_y);
-    write_i16(ClientByteOrder::LittleEndian, &mut out, event.event_x);
-    write_i16(ClientByteOrder::LittleEndian, &mut out, event.event_y);
-    write_u16(ClientByteOrder::LittleEndian, &mut out, event.state);
+    write_u16(order, out, event.sequence.0);
+    write_u32(order, out, event.time);
+    write_u32(order, out, event.root.0);
+    write_u32(order, out, event.event.0);
+    write_u32(order, out, 0); // child
+    write_i16(order, out, event.root_x);
+    write_i16(order, out, event.root_y);
+    write_i16(order, out, event.event_x);
+    write_i16(order, out, event.event_y);
+    write_u16(order, out, event.state);
     out.push(1); // same-screen
     out.push(0);
-    writer.write_all(&out)
 }
 
 pub fn encode_focus_event(
@@ -1697,13 +1711,27 @@ pub fn encode_xi2_device_event(
 
     out.extend_from_slice(&[0; 4]); // group base/latched/locked/effective
 
+    // X11 XInput2 spec: the `buttons` mask reports buttons that are
+    // pressed AFTER the event. For ButtonPress (4): the just-pressed
+    // button is now down ⇒ set its bit on top of `state`'s pre-event
+    // mask. For ButtonRelease (5): the just-released button is no
+    // longer down ⇒ clear its bit from `state`'s pre-event mask.
+    // For all other event types: 0.
+    //
+    // `state` carries pre-event button state in bits 8..13 (Button1..5).
     if evtype == 4 || evtype == 5 {
-        let bit = if detail > 0 && detail <= 32 {
+        let pre_buttons: u32 = u32::from((state >> 8) & 0x1f);
+        let bit: u32 = if (1..=5).contains(&detail) {
             1 << (detail - 1)
         } else {
             0
         };
-        write_u32(ClientByteOrder::LittleEndian, out, bit);
+        let post_buttons = if evtype == 4 {
+            pre_buttons | bit
+        } else {
+            pre_buttons & !bit
+        };
+        write_u32(ClientByteOrder::LittleEndian, out, post_buttons);
     } else {
         write_u32(ClientByteOrder::LittleEndian, out, 0);
     }
@@ -2525,7 +2553,7 @@ fn encode_pointer_event(
     write_u32(order, out, event.time);
     write_u32(order, out, event.root.0);
     write_u32(order, out, event.event.0);
-    write_u32(order, out, 0); // child — descendant hit-testing not implemented
+    write_u32(order, out, event.child.0);
     write_i16(order, out, event.root_x);
     write_i16(order, out, event.root_y);
     write_i16(order, out, event.event_x);
@@ -3262,6 +3290,7 @@ mod tests {
                     time: 0xdead_beef,
                     root: ResourceId(0x100),
                     event: ResourceId(0x0010_0002),
+                    child: ResourceId(0),
                     root_x: 100,
                     root_y: 200,
                     event_x: 10,
@@ -3298,6 +3327,7 @@ mod tests {
                     time: 0,
                     root: ResourceId(0x100),
                     event: ResourceId(0x0010_0002),
+                    child: ResourceId(0),
                     root_x: 0,
                     root_y: 0,
                     event_x: 0,
@@ -3323,6 +3353,7 @@ mod tests {
                     time: 0,
                     root: ResourceId(0x100),
                     event: ResourceId(0x0010_0002),
+                    child: ResourceId(0),
                     root_x: 0,
                     root_y: 0,
                     event_x: 0,
@@ -3442,6 +3473,7 @@ mod tests {
                                 root_y,
                                 event_x,
                                 event_y,
+                                child: ResourceId(0),
                                 state,
                             },
                         );
@@ -3462,6 +3494,7 @@ mod tests {
                                 root_y,
                                 event_x,
                                 event_y,
+                                child: ResourceId(0),
                                 state,
                             },
                         );
@@ -3482,6 +3515,7 @@ mod tests {
                                 root_y,
                                 event_x,
                                 event_y,
+                                child: ResourceId(0),
                                 state,
                             },
                         );

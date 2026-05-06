@@ -1,4 +1,6 @@
 pub mod backend;
+pub mod core_loop;
+pub mod crossings;
 pub mod host_x11;
 pub mod nested;
 pub mod properties;

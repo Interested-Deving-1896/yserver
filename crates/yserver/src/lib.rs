@@ -1,72 +1,43 @@
 pub mod drm;
 pub mod input;
+pub mod input_thread;
 pub mod kms;
 pub mod present;
 
 use std::{
     fs,
     io::{self, ErrorKind},
-    os::{
-        fd::{AsRawFd, BorrowedFd},
-        unix::{fs::PermissionsExt, net::UnixListener},
-    },
+    os::unix::{fs::PermissionsExt, net::UnixListener},
     path::PathBuf,
-    sync::Arc,
     thread,
 };
 
 use nix::sys::{
-    epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout},
     signal::{SigSet, SigmaskHow, Signal, sigprocmask},
     signalfd::SignalFd,
 };
 
 use yserver_core::{
-    backend::{Backend, BackendEvent, BackendEventSink},
-    host_x11::HostEvent,
-    nested::handle_client,
-    server::{ServerState, host_pump_event_sink},
+    core_loop::{self, Message, poll_tokens::ClientIdAllocator},
+    server::ServerState,
 };
 
 use crate::kms::KmsBackend;
 
 const DISPLAY: u16 = 7;
-const LISTENER_TOKEN: u64 = 0;
-const DRM_TOKEN: u64 = 1;
-const INPUT_TOKEN: u64 = 2;
-const SIGNAL_TOKEN: u64 = 3;
 
 pub fn run() -> io::Result<()> {
-    log::info!("yserver: Phase 6.4 KMS bootstrap — startup");
+    log::info!("yserver: Phase 6.4 KMS bootstrap — startup (single-threaded core)");
 
     let signal_fd = block_termination_signals()?;
     let device_path = resolve_drm_device()?;
     log::info!("yserver: opening DRM device {device_path}");
 
-    let backend = KmsBackend::open(&device_path)?;
-    let fb_w = backend.fb_dimensions().0;
-    let fb_h = backend.fb_dimensions().1;
+    let mut backend = KmsBackend::open(&device_path)?;
+    let (fb_w, fb_h) = backend.fb_dimensions();
     log::info!("yserver: scanout {fb_w}x{fb_h}");
 
-    let backend_arc: Arc<std::sync::Mutex<dyn Backend>> = Arc::new(std::sync::Mutex::new(backend));
-
-    let server = Arc::new(std::sync::Mutex::new(ServerState::with_geometry(
-        fb_w, fb_h,
-    )));
-
-    let xid_map = backend_arc.lock().unwrap().xid_map();
-    let window_id = backend_arc.lock().unwrap().window_id();
-    let sink = host_pump_event_sink(server.clone(), xid_map, window_id);
-    // Clone the sink so the input thread can dispatch buffered pointer
-    // events through it WITHOUT holding the backend mutex. The sink in
-    // the backend itself is unused for the KMS pointer path (see the
-    // `pending_pointer_events` doc) but stays wired for the
-    // `BackendEventSink` trait surface.
-    let input_sink = sink.clone();
-    backend_arc
-        .lock()
-        .unwrap()
-        .set_event_sink(Some(Box::new(sink)));
+    let mut state = ServerState::with_geometry(fb_w, fb_h);
 
     let socket_dir = PathBuf::from("/tmp/.X11-unix");
     fs::create_dir_all(&socket_dir)?;
@@ -82,209 +53,85 @@ pub fn run() -> io::Result<()> {
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o777))?;
     log::info!("yserver: listening on unix socket DISPLAY=:{DISPLAY}");
 
-    // Submit initial flip with root background
-    {
-        let mut b = backend_arc.lock().unwrap();
-        let kms = b.as_any_mut().downcast_mut::<KmsBackend>().unwrap();
-        if let Err(e) = kms.composite_and_flip() {
-            log::warn!("yserver: initial composite_and_flip failed: {e}");
-        }
+    // Initial composite+flip so the screen has a known frame before any
+    // client connects.
+    if let Err(e) = backend.composite_and_flip() {
+        log::warn!("yserver: initial composite_and_flip failed: {e}");
     }
 
-    let epoll = Epoll::new(EpollCreateFlags::empty())?;
+    // Build the channel + waker before spawning anything: senders need
+    // a clone, run_core needs the receiver.
+    let (poll, sender, rx) = core_loop::channel()?;
 
-    // SAFETY: we're borrowing the fd from objects that outlive the epoll set
-    let drm_fd = {
-        let b = backend_arc.lock().unwrap();
-        let kms = b.as_any().downcast_ref::<KmsBackend>().unwrap();
-        kms.drm_fd()
-    };
-    let drm_borrow = unsafe { BorrowedFd::borrow_raw(drm_fd) };
-    epoll.add(drm_borrow, EpollEvent::new(EpollFlags::EPOLLIN, DRM_TOKEN))?;
-
-    // Spawn a dedicated thread for libinput dispatch. The thread owns
-    // the libinput context, polls the input fd, and for each event
-    // briefly acquires the backend mutex (microseconds) to call
-    // process_one_input_event. This decouples motion-event delivery
-    // from per-client X11 request handlers — without it, a tight burst
-    // of X11 requests (e.g. fvwm processing a Press) holds the backend
-    // mutex long enough that motion events accumulate in libinput and
-    // arrive at fvwm too late, breaking drag-to-move and similar
-    // interactions that depend on prompt motion delivery.
-    let input_ctx = {
-        let mut b = backend_arc.lock().unwrap();
-        let kms = b.as_any_mut().downcast_mut::<KmsBackend>().unwrap();
-        kms.take_input_ctx()
-    };
-    if let Some(mut input_ctx) = input_ctx {
-        let backend_for_input = backend_arc.clone();
-        let mut input_sink = input_sink;
-        log::info!("yserver: spawning dedicated libinput thread");
-        thread::spawn(move || {
-            // Dedicated input epoll set — wakes only on libinput events,
-            // never blocked by other epoll consumers.
-            let input_epoll = match Epoll::new(EpollCreateFlags::empty()) {
-                Ok(e) => e,
-                Err(err) => {
-                    log::error!("input thread: epoll_create failed: {err}");
-                    return;
+    // Hand the libinput context off to the dedicated input thread. After
+    // this `take_input_ctx`, the backend's `poll_fds()` returns only
+    // the DRM fd, so run_core's E3 registration step won't double-poll
+    // libinput.
+    if let Some(input_ctx) = backend.take_input_ctx() {
+        let input_sender = sender.clone_handle();
+        log::info!("yserver: spawning libinput sender thread");
+        thread::Builder::new()
+            .name("yserver-libinput".into())
+            .spawn(move || {
+                if let Err(err) =
+                    input_thread::run(input_ctx, input_sender, u32::from(fb_w), u32::from(fb_h))
+                {
+                    log::warn!("yserver: libinput thread exited: {err}");
                 }
-            };
-            let fd = input_ctx.fd();
-            let borrow = unsafe { BorrowedFd::borrow_raw(fd) };
-            if let Err(err) = input_epoll.add(borrow, EpollEvent::new(EpollFlags::EPOLLIN, 0)) {
-                log::error!("input thread: epoll_add failed: {err}");
-                return;
-            }
-            let mut buf = [EpollEvent::empty(); 4];
+            })?;
+    }
+
+    // signalfd → Message::Shutdown bridge. yserver-core deliberately
+    // doesn't depend on nix; a tiny thread wraps the SignalFd read so
+    // run_core only sees the channel-side `Shutdown` message.
+    let signal_sender = sender.clone_handle();
+    thread::Builder::new()
+        .name("yserver-signalfd".into())
+        .spawn(move || {
+            let signal_fd = signal_fd;
             loop {
-                match input_epoll.wait(&mut buf, EpollTimeout::NONE) {
-                    Ok(_) => {}
-                    Err(nix::errno::Errno::EINTR) => continue,
-                    Err(err) => {
-                        log::warn!("input thread: epoll_wait error: {err}");
-                        continue;
-                    }
-                }
-                let events = match input_ctx.dispatch() {
-                    Ok(evs) => evs,
-                    Err(err) => {
-                        log::warn!("input thread: libinput dispatch error: {err}");
-                        continue;
-                    }
-                };
-                for event in events {
-                    // Hold the backend mutex only for the state mutation
-                    // and event buffering. Forwarding to the sink — which
-                    // takes `server.lock()` — must happen AFTER the
-                    // backend mutex is dropped, otherwise we deadlock
-                    // against request handlers that hold `server.lock()`
-                    // while reaching for the backend mutex.
-                    let pending = {
-                        let mut b = match backend_for_input.lock() {
-                            Ok(b) => b,
-                            Err(_) => return,
-                        };
-                        let Some(kms) = b.as_any_mut().downcast_mut::<KmsBackend>() else {
-                            return;
-                        };
-                        kms.process_one_input_event(event);
-                        kms.drain_pending_pointer_events()
-                    };
-                    for ptr_event in pending {
-                        input_sink
-                            .handle_backend_event(BackendEvent::HostEvent(HostEvent::Pointer(
-                                ptr_event,
-                            )));
-                    }
-                }
-            }
-        });
-    }
-
-    let listener_fd = listener.as_raw_fd();
-    let listener_borrow = unsafe { BorrowedFd::borrow_raw(listener_fd) };
-    epoll.add(
-        listener_borrow,
-        EpollEvent::new(EpollFlags::EPOLLIN, LISTENER_TOKEN),
-    )?;
-
-    epoll.add(
-        &signal_fd,
-        EpollEvent::new(EpollFlags::EPOLLIN, SIGNAL_TOKEN),
-    )?;
-
-    let mut events_buf = [EpollEvent::empty(); 8];
-    let mut running = true;
-    let mut client_count: u32 = 0;
-
-    log::info!("yserver: entering epoll event loop");
-
-    while running {
-        let n = match epoll.wait(&mut events_buf, EpollTimeout::NONE) {
-            Ok(n) => n,
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(err) => return Err(io::Error::other(format!("epoll_wait: {err}"))),
-        };
-
-        for ev in &events_buf[..n] {
-            match ev.data() {
-                LISTENER_TOKEN => match listener.accept() {
-                    Ok((stream, _addr)) => {
-                        let client_id = yserver_protocol::x11::ClientId(client_count);
-                        client_count += 1;
-                        let host = backend_arc.clone();
-                        let server = server.clone();
-                        let handle = thread::spawn(move || {
-                            if let Err(err) = handle_client(
-                                client_id,
-                                stream,
-                                server,
-                                Some(host),
-                                Some(window_id),
-                            ) {
-                                log::info!("client {} disconnected: {err}", client_id.0);
-                            }
-                        });
-                        thread::spawn(move || {
-                            if let Err(panic) = handle.join() {
-                                let msg = panic
-                                    .downcast_ref::<String>()
-                                    .map(|s| s.as_str())
-                                    .or_else(|| panic.downcast_ref::<&str>().copied())
-                                    .unwrap_or("(non-string panic)");
-                                log::error!("client {} panicked: {msg}", client_id.0);
-                            }
-                        });
-                        log::info!("yserver: client {} connected", client_id.0);
-                    }
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => {}
-                    Err(err) => log::warn!("yserver: accept failed: {err}"),
-                },
-                DRM_TOKEN => {
-                    let mut b = backend_arc.lock().unwrap();
-                    let kms = b.as_any_mut().downcast_mut::<KmsBackend>().unwrap();
-                    if let Err(e) = kms.drain_page_flips_and_composite() {
-                        log::warn!("yserver: page flip / composite error: {e}");
-                    }
-                }
-                INPUT_TOKEN => {
-                    // Input is handled by a dedicated thread now; this
-                    // arm should never fire because we don't register
-                    // INPUT_TOKEN with epoll. Kept as a defensive
-                    // no-op in case a future refactor re-introduces the
-                    // registration.
-                }
-                SIGNAL_TOKEN => match signal_fd.read_signal() {
+                match signal_fd.read_signal() {
                     Ok(Some(siginfo)) => {
                         log::info!(
-                            "yserver: received signal {}, shutting down",
+                            "yserver: received signal {}, requesting shutdown",
                             siginfo.ssi_signo
                         );
-                        running = false;
+                        let _ = signal_sender.send(Message::Shutdown);
+                        return;
                     }
                     Ok(None) => {}
                     Err(err) => {
                         log::warn!("yserver: signalfd read error: {err}");
+                        let _ = signal_sender.send(Message::Shutdown);
+                        return;
                     }
-                },
-                _ => {}
+                }
             }
-        }
+        })?;
+
+    let alloc = ClientIdAllocator::new();
+    log::info!("yserver: entering single-threaded core loop");
+    let result = core_loop::run_core(
+        poll,
+        rx,
+        sender,
+        &mut state,
+        &mut backend,
+        Some(listener),
+        &alloc,
+    );
+    if let Err(err) = &result {
+        log::warn!("yserver: run_core returned error: {err}");
     }
 
     log::info!("yserver: shutting down, disabling output");
-    {
-        let b = backend_arc.lock().unwrap();
-        let kms = b.as_any().downcast_ref::<KmsBackend>().unwrap();
-        if let Err(e) = kms.disable_output() {
-            log::warn!("yserver: disable_output failed: {e}");
-        }
+    if let Err(e) = backend.disable_output() {
+        log::warn!("yserver: disable_output failed: {e}");
     }
 
     let _ = fs::remove_file(&socket_path);
     log::info!("yserver: master released, exiting");
-    Ok(())
+    result
 }
 
 fn resolve_drm_device() -> io::Result<String> {

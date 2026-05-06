@@ -16,7 +16,7 @@ pub use params::{
     ArcMode, BgState, CapStyle, ClipState, DrawState, FillRule, FillState, FillStyle, GcFunction,
     JoinStyle, LineStyle, SubwindowMode,
 };
-pub use trait_def::{Backend, BackendEvent, BackendEventSink};
+pub use trait_def::{Backend, BackendFdKind, HostSocketStatus};
 
 use yserver_protocol::x11::ClientId;
 

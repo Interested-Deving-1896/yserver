@@ -1,24 +1,14 @@
-//! `Backend` trait — the surface that `nested.rs` calls on the host
-//! during request dispatch. Exists primarily as a seam for testing
+//! `Backend` trait — the surface `process_request` and the core loop
+//! call on the host backend. Exists primarily as a seam for testing
 //! (`RecordingBackend` lives next door, gated `#[cfg(test)]`) and so
-//! that Phase 6.3+ can land a KMS backend without touching every call
-//! site in `nested.rs`.
+//! that the KMS backend can sit alongside the host-X11 backend without
+//! touching every call site.
 //!
 //! Method signatures mirror the existing `HostX11Backend::*` methods
-//! 1:1 — no `Param` structs, no parameter renaming. The pragmatic
-//! guidance for Step 5 is that the trait surface follows existing
-//! signatures rather than the plan's draft shape; bundling parameters
-//! into structs would cascade into churn at every call site for no
-//! gain. Several methods still take raw `u32` host xids rather than
-//! handle newtypes for the same reason — call sites pass `u32` from
-//! the `ResourceTable`'s `host_xid` field, and rewrapping/unwrapping
-//! at every call boundary is noise.
-//!
-//! Phase 6.3 lands `set_event_sink` and `BackendEventSink` here too;
-//! the dispatcher inside `HostX11Backend` feeds the sink via the
-//! merged main connection (Step 4 "Big Flip"), and `register_top_level`
-//! / `register_subwindow` / `unregister_host_window` migrated onto the
-//! trait at Step 6 — replacing the deleted pump-handle wrapper.
+//! 1:1 — no `Param` structs, no parameter renaming. Several methods
+//! still take raw `u32` host xids rather than handle newtypes — call
+//! sites pass `u32` from the `ResourceTable`'s `host_xid` field, and
+//! rewrapping/unwrapping at every call boundary is noise.
 
 use std::{any::Any, io};
 
@@ -29,27 +19,32 @@ use crate::{
         AnyHandle, ClipState, CursorHandle, DrawState, FillState, FontHandle, GlyphSetHandle,
         OriginContext, PictureHandle, PixmapHandle, WindowHandle,
     },
-    host_x11::{
-        HostEvent, HostKeyEvent, HostSubwindowConfig, HostSubwindowVisual, HostXidMap,
-        PointerPosition,
-    },
+    core_loop::HostInputEvent,
+    host_x11::{HostEvent, HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition},
+    server::ServerState,
 };
 
-use crossbeam_channel::Sender;
 use yserver_protocol::x11::ResourceId;
 
-#[derive(Debug)]
-pub enum BackendEvent {
-    HostEvent(HostEvent),
-    HostError {
-        origin: Option<OriginContext>,
-        error: io::Error,
-    },
+/// Categorises the raw fds a backend wants the core's mio poller to
+/// watch on its behalf (returned by `Backend::poll_fds`).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BackendFdKind {
+    /// libinput's epoll fd. Readiness is dispatched to the libinput
+    /// thread (KMS) — but the fd inventory still flows through the
+    /// trait so the core's poller can register it uniformly.
+    Libinput,
+    /// DRM device fd; readiness drives `on_page_flip_ready`.
+    Drm,
+    /// Host X11 connection fd (ynest only); readiness drives
+    /// `Backend::drain_host_socket` on the core thread.
+    HostX11,
 }
 
-pub trait BackendEventSink: Send {
-    fn handle_backend_event(&mut self, event: BackendEvent);
-}
+/// Outcome of a single `Backend::drain_host_socket` pass. Re-exported
+/// from `host_x11` so non-host-X11 backends can spell the type
+/// without depending on the host module.
+pub use crate::host_x11::HostSocketStatus;
 
 /// The dynamic backend surface. `Send` is required so that
 /// `Arc<Mutex<dyn Backend>>` is `Send + Sync` (`Mutex<T>` is Sync iff
@@ -70,7 +65,25 @@ pub trait Backend: Send {
     fn composite_opcode(&self) -> Option<u8>;
     fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32>;
     fn ping(&mut self, origin: Option<OriginContext>) -> io::Result<()>;
-    fn set_event_sink(&mut self, sink: Option<Box<dyn BackendEventSink>>);
+
+    // ──────────────────────────────────────────────────────────────
+    // Single-threaded core hooks
+    // ──────────────────────────────────────────────────────────────
+
+    /// Dispatch a host input event the core received over the
+    /// `Message::HostInput` channel. The backend produces zero or more
+    /// X11 wire events via `state` fanout helpers. Filled in by E2
+    /// (KMS) and F2 (host-X11); inert until then.
+    fn on_host_input(&mut self, state: &mut ServerState, ev: HostInputEvent);
+
+    /// DRM page-flip completion fd is readable. The backend should
+    /// drain completion events and submit the next composite/flip.
+    fn on_page_flip_ready(&mut self, state: &mut ServerState);
+
+    /// Raw fds the core's poller should watch on this backend's behalf.
+    /// The core registers each fd against the matching token derived
+    /// from `BackendFdKind`.
+    fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)>;
 
     /// Downcast to `Any` for backend-specific operations (e.g. KMS composite).
     fn as_any(&self) -> &dyn Any;
@@ -161,18 +174,29 @@ pub trait Backend: Send {
     /// misroute.
     fn unregister_host_window(&mut self, host_xid: u32);
 
-    /// Phase 6.3 Step 4: clone of the merged `host_xid → ResourceId`
-    /// map. The sink uses this in `pointer_event_fanout` /
-    /// `expose_event_fanout`. Pre-Step-4 the map lived behind the
-    /// pump handle.
-    fn xid_map(&self) -> HostXidMap;
+    /// View of the `host_xid → ResourceId` map. F2: plain HashMap —
+    /// the core thread is the only writer/reader, so no Arc/Mutex.
+    fn xid_map(&self) -> &HostXidMap;
 
-    /// Phase 6.3 Step 4: per-client kb forwarder registers a Sender
-    /// here so it receives every host KeyPress / KeyRelease the
-    /// dispatcher decodes. Each subscriber applies its own focus
-    /// state — mirrors the pre-Step-4 "every client kb pump sees
-    /// every key event" shape, just on one merged connection.
-    fn add_key_subscriber(&mut self, tx: Sender<HostKeyEvent>);
+    /// F2: drain whatever the kernel has buffered on the host fd and
+    /// classify into `pending_replies` / `pending_events`. KMS
+    /// backend has no host fd; the default no-op suits.
+    fn drain_host_socket(&mut self) -> io::Result<HostSocketStatus> {
+        Ok(HostSocketStatus::WouldBlock)
+    }
+
+    /// F2: pop the next decoded host event so the core can fan out at
+    /// the outer-loop boundary. Default `None` — only HostX11Backend
+    /// produces these.
+    fn pop_pending_host_event(&mut self) -> Option<HostEvent> {
+        None
+    }
+
+    /// F2: did the host close the connection? `run_core` posts
+    /// `Message::Shutdown` once this flips true.
+    fn host_socket_eof(&self) -> bool {
+        false
+    }
 
     fn name_window_pixmap(
         &mut self,

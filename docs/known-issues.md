@@ -63,6 +63,107 @@ once the underlying patterns are understood.
 - [ ] **`CreateCursor` `XColor` struct layout.** Xlib `XColor` layout
       must match the system Xlib headers; verify on non-CachyOS target
       platforms. (Phase 2 follow-up.)
+- [ ] **yserver/KMS: fvwm3 menus render with no text.**
+      Surfaced during Phase J yserver+fvwm3 smoke. fvwm3 opens its
+      font (`-misc-fixed-medium-r-normal--14-130-75-75-c-70-iso10646-1`)
+      and `QueryFont`s it, but issues **zero** `ImageText` /
+      `PolyText` / RENDER text-drawing requests — popups draw the
+      background rectangles only, no menu items. Same fvwm3 in ynest
+      works correctly (text comes from the host X server's font).
+      First fix attempt: `core_loop::process_request::handle_open_font`
+      now synthesizes the standard XLFD property set (FONT, FOUNDRY,
+      FAMILY_NAME, …, CHARSET_ENCODING — 15 properties / 120 bytes)
+      when the backend returns empty `metrics.properties`. Confirmed
+      the synthesis runs (debug log:
+      `synthesized 120 property bytes (15 props), 95 char_infos`),
+      but fvwm3 still skips text drawing — so the gating check is
+      something other than missing properties. Suspects:
+        - char_info widths returned by `compute_char_info` for the
+          freetype-loaded font may have a sign/bit issue that fvwm3
+          interprets as "zero-width font, unusable"
+        - char range we report (`min_char_or_byte2 = 0x20`,
+          `max_char_or_byte2 = 0x7E`) may be too narrow for fvwm3's
+          ISO10646 expectation — fvwm3 asked for an iso10646-1
+          font but we report it as essentially ASCII-only
+        - fvwm3 may probe the font via `QueryTextExtents` and fall
+          through if the answer is zero
+      Next debug step: log the full `FontMetrics` we install for the
+      KMS path and run xterm under yserver — xterm renders text
+      correctly, so its QueryFont reply path is fine; diff what
+      changes between xterm's font query and fvwm3's font query.
+- [ ] **xterm stops receiving KeyPress after focus/state-changing
+      interaction (WM-independent, backend-independent — likely a
+      regression from the single-threaded core refactor).**
+      Surfaced during Phase J smoke. Triggers we've reproduced:
+        - **ynest + wmaker**: type `ls` Enter four times in xterm.
+          The 4th invocation reliably leaves xterm unresponsive to
+          subsequent keystrokes. Typing once worked at first, so
+          the trigger is cumulative.
+        - **ynest + fvwm3**: works indefinitely until you *resize*
+          the xterm window. The redraw at the new size completes
+          correctly, and then xterm stops receiving keystrokes —
+          same symptom.
+        - **yserver (KMS) + e16**: also reproduces the same xterm
+          KeyPress drop after some interaction. User reports this
+          as a regression — pre-refactor xterm typing worked
+          indefinitely on this backend.
+      Strace on the hung xterm shows it's healthy: still in `poll()`
+      on its X11 socket (fd 3) and PTY (fd 4), and **does** receive
+      MotionNotify events when the mouse moves over it, so ynest is
+      delivering events to xterm. KeyPress events specifically are
+      missing. Our `set_focused_window` trace shows focused_window
+      is correctly set to xterm's main window with KeyPress in its
+      event_masks at the time keys stop arriving.
+      Suspect: a state-change in `state.active_keyboard_grab` or
+      `state.pointer_grab` that redirects KeyPress somewhere other
+      than `current_focus`'s subscribers. Once the WM does any
+      non-trivial focus dance (wmaker's 21 passive `GrabKey`
+      activations during typing; fvwm3's grab/ungrab during resize),
+      our grab-release condition can leave a grab stuck because the
+      release fires only on KeyRelease of the *exact* triggering
+      keycode — if the user never types that key again, the grab
+      sticks forever and keys keep funneling to grab_window
+      (typically the WM frame, which has no KeyPress mask in its
+      `event_masks` and just drops them).
+      Diagnostics needed:
+        - trace in `host_x11/pump.rs::decode_host_event` for
+          KeyPress/KeyRelease so we know the host is actually
+          firing keys when the user types
+        - trace in `key_event_fanout_to_state`'s entry +
+          grab-activation + grab-release + target-resolution
+          branches
+        - log `state.active_keyboard_grab` on every keypress at the
+          point of decision, so the stuck-grab condition is
+          observable
+      Then re-run the fvwm3+resize repro (cleaner than the wmaker
+      one — fvwm3 has no passive key grabs in its trace). If the
+      grab IS stuck, fix the release condition: clear the active
+      grab when the modifier set returns to grabable state, not
+      just on the exact triggering-keycode release.
+- [ ] **GTK3 tree-view expander triangles don't reliably toggle.**
+      Surfaced during Phase J ynest+fvwm3+gtk3-demo / ynest+e16+gtk3-demo
+      smoke. After fixing two prerequisite routing bugs (the
+      `PointerEvent.child` field was hard-coded to 0 → fvwm3
+      MainMenu fired on every click; XI2 events were being stolen by
+      core grabs → GTK never saw ButtonRelease) and the XI2
+      `buttons` mask post-event semantics (was always-set on Release;
+      now correctly reflects post-event button state), gtk3-demo's
+      tree expanders work for *one* click — the first expand triggers,
+      then subsequent collapse / expand clicks on triangles don't
+      register. Trace logging confirmed the failing clicks deliver
+      byte-identical XI2 events to gtk3-demo as the working click
+      (same target, same xi2_targets, same coords ±1px, same `state`,
+      reasonable time deltas, comfortably outside double-click
+      threshold). Suspect remaining issues are XI2 wire-encoding
+      details GTK is sensitive to but we don't currently emit:
+      `flags` field is hard-coded to 0 (could need `XIPointerEmulated`
+      or similar), `valuators_len` is 0 (GTK tree views may rely on
+      X+Y valuators for hit-testing inside a column), or device-
+      hierarchy / device-changed events that GTK uses to track the
+      master pointer's identity. Not a regression of the
+      single-threaded core — same-shaped event flow worked
+      immediately for xterm, xclock, xeyes, and for gtk3-demo's main
+      list-row clicks.
 - [x] ~~**xeyes doesn't track cursor.**~~ Fixed: xeyes selects
       `XI_RawMotion` (XI2 event type 17) on root, which our
       `pointer_event_fanout` was not synthesizing —

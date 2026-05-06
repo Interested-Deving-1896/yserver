@@ -1,21 +1,14 @@
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    io,
-    sync::{Arc, Mutex},
-};
+use std::{cell::RefCell, collections::HashMap, io, sync::Arc};
 
-use crossbeam_channel::Sender;
 use pixman::{Color, FormatCode, Image, Operation, Rectangle16, Repeat};
 use yserver_core::{
     backend::{
-        AnyHandle, Backend, BackendEventSink, ClipState, CursorHandle, DrawState, FillState,
-        FontHandle, GcFunction, GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle,
-        WindowHandle,
+        AnyHandle, Backend, ClipState, CursorHandle, DrawState, FillState, FontHandle, GcFunction,
+        GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle, WindowHandle,
     },
     host_x11::{
-        HostEvent, HostExposeEvent, HostKeyEvent, HostPointerEvent, HostSubwindowConfig,
-        HostSubwindowVisual, HostXidMap, PointerEventKind, PointerPosition,
+        HostKeyEvent, HostPointerEvent, HostSubwindowConfig, HostSubwindowVisual, HostXidMap,
+        PointerEventKind, PointerPosition,
     },
 };
 use yserver_protocol::x11::{
@@ -28,7 +21,7 @@ use crate::drm;
 /// Newtype wrapper around `freetype::Face`.
 /// `repr(transparent)` is required so `RefCell::as_ptr` can be safely cast
 /// from `*mut FreetypeFace` to `*mut freetype::Face` in `render_text_string`.
-/// SAFETY: All access is serialized through `Arc<Mutex<dyn Backend>>`.
+/// SAFETY: All access is on the single-threaded core thread.
 /// Single-threaded context makes this sound. `Face` contains raw pointers
 /// and `Rc<Vec<u8>>` by default, both `!Send`.
 #[repr(transparent)]
@@ -36,23 +29,23 @@ pub struct FreetypeFace(#[allow(dead_code)] pub freetype::Face);
 unsafe impl Send for FreetypeFace {}
 
 /// Newtype wrapper around `xkb::Context`.
-/// SAFETY: All access is serialized through `Arc<Mutex<dyn Backend>>`.
+/// SAFETY: All access is on the single-threaded core thread.
 /// The raw pointer in xkbcommon is not `Send`, but the C library is thread-safe.
 pub struct XkbContext(pub xkbcommon::xkb::Context);
 unsafe impl Send for XkbContext {}
 
 /// Newtype wrapper around `xkb::Keymap`.
-/// SAFETY: All access is serialized through `Arc<Mutex<dyn Backend>>`.
+/// SAFETY: All access is on the single-threaded core thread.
 pub struct XkbKeymap(pub xkbcommon::xkb::Keymap);
 unsafe impl Send for XkbKeymap {}
 
 /// Newtype wrapper around `xkb::State`.
-/// SAFETY: All access is serialized through `Arc<Mutex<dyn Backend>>`.
+/// SAFETY: All access is on the single-threaded core thread.
 pub struct XkbState(pub xkbcommon::xkb::State);
 unsafe impl Send for XkbState {}
 
 /// Newtype wrapper around pixman::Image.
-/// SAFETY: All access is serialized through `Arc<Mutex<dyn Backend>>`.
+/// SAFETY: All access is on the single-threaded core thread.
 /// The main thread owns scanout; window/pixmap images are only touched
 /// on the main thread.
 pub struct PixmanImage(pub Image<'static, 'static>);
@@ -247,16 +240,6 @@ struct DrawableGeometry<'a> {
     stride_bytes: usize,
     data_ptr: *mut u8,
     _phantom: std::marker::PhantomData<&'a ()>,
-}
-
-/// Lock a `Mutex`, transparently recovering from poison instead of
-/// panicking. KMS backend mutexes (`xid_map`, `key_subscribers`) guard
-/// short critical sections that mutate independent collections; if a
-/// thread panicked while holding the lock the data is still consistent
-/// from our caller's perspective, so the server can keep running rather
-/// than tumbling into a recursive panic.
-fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn read_drawable_pixel_for_plane(
@@ -533,9 +516,7 @@ pub struct KmsBackend {
     // Backend trait state
     window_id: u32,
     root_visual_xid: u32,
-    event_sink: Option<Box<dyn BackendEventSink>>,
     xid_map: HostXidMap,
-    key_subscribers: Arc<Mutex<Vec<Sender<HostKeyEvent>>>>,
 
     // xkbcommon
     #[allow(dead_code)]
@@ -1007,9 +988,8 @@ impl KmsBackend {
         let xkb_state = XkbState(xkbcommon::xkb::State::new(&keymap));
         let xkb_keymap = XkbKeymap(keymap);
 
-        let mut xid_map = HashMap::new();
-        xid_map.insert(0x00000001, ResourceId(0x0000_0100));
-        let xid_map = Arc::new(Mutex::new(xid_map));
+        let mut xid_map: HostXidMap = HashMap::new();
+        xid_map.insert(0x0000_0001u32, ResourceId(0x0000_0100));
 
         let mut me = Self {
             device,
@@ -1022,9 +1002,7 @@ impl KmsBackend {
             top_level_order: Vec::new(),
             window_id: 1,
             root_visual_xid: 0x21,
-            event_sink: None,
             xid_map,
-            key_subscribers: Arc::new(Mutex::new(Vec::new())),
             xkb_context: ctx,
             xkb_keymap,
             xkb_state,
@@ -1368,20 +1346,6 @@ impl KmsBackend {
         }
     }
 
-    fn synthesize_expose(&mut self, host_xid: u32, x: u16, y: u16, w: u16, h: u16) {
-        let expose_event = HostEvent::Expose(HostExposeEvent {
-            host_xid,
-            x,
-            y,
-            width: w,
-            height: h,
-            count: 0,
-        });
-        if let Some(ref mut sink) = self.event_sink {
-            sink.handle_backend_event(yserver_core::backend::BackendEvent::HostEvent(expose_event));
-        }
-    }
-
     fn serialize_modifiers(&self) -> u16 {
         let state = &self.xkb_state.0;
         let flags = xkbcommon::xkb::STATE_MODS_EFFECTIVE;
@@ -1413,101 +1377,35 @@ impl KmsBackend {
         mask
     }
 
-    /// Process all pending libinput events and route them through xkbcommon
-    /// and the event sink. Called by the epoll loop when libinput fd is readable.
-    /// Take the libinput context out of `self`. Used by the binary's
-    /// startup to hand the context to a dedicated input thread, so
-    /// libinput dispatch doesn't compete with per-client request
-    /// handlers for the backend mutex. After this call, the in-process
-    /// `process_input_events` becomes a no-op.
+    /// Take the libinput context out of `self`. The standalone yserver
+    /// binary hands the context to `input_thread::run` so libinput
+    /// dispatch happens off the core thread; events arrive at the
+    /// backend through `Backend::on_host_input` instead.
     pub fn take_input_ctx(&mut self) -> Option<crate::input::SendContext> {
         self.input_ctx.take()
     }
 
-    /// Dispatch a single libinput event. Designed to be called from the
-    /// dedicated input thread, which holds the backend mutex briefly
-    /// per-event (microseconds) so per-client request handlers can
-    /// interleave between events. This keeps motion events flowing to
-    /// fvwm in real time during a drag rather than batching at the end
-    /// of an X11 request burst.
-    pub fn process_one_input_event(&mut self, event: crate::input::InputEvent) {
-        match event {
-            crate::input::InputEvent::KeyPress { keycode } => {
-                self.process_key_event(keycode, true);
-            }
-            crate::input::InputEvent::KeyRelease { keycode } => {
-                self.process_key_event(keycode, false);
-            }
-            crate::input::InputEvent::PointerMotion { dx, dy } => {
-                self.process_pointer_motion(dx, dy);
-            }
-            crate::input::InputEvent::PointerMotionAbsolute { x_norm, y_norm } => {
-                let x = (x_norm.clamp(0.0, 1.0) * (self.fb_w as f64 - 1.0)) as f32;
-                let y = (y_norm.clamp(0.0, 1.0) * (self.fb_h as f64 - 1.0)) as f32;
-                self.process_pointer_absolute(x, y);
-            }
-            crate::input::InputEvent::Button { code, pressed } => {
-                self.process_pointer_button(code, pressed);
-            }
-        }
-    }
-
-    pub fn process_input_events(&mut self) -> io::Result<()> {
-        let Some(input_ctx) = &mut self.input_ctx else {
-            return Ok(());
-        };
-        let events = input_ctx.dispatch()?;
-        for event in events {
-            match event {
-                crate::input::InputEvent::KeyPress { keycode } => {
-                    self.process_key_event(keycode, true);
-                }
-                crate::input::InputEvent::KeyRelease { keycode } => {
-                    self.process_key_event(keycode, false);
-                }
-                crate::input::InputEvent::PointerMotion { dx, dy } => {
-                    self.process_pointer_motion(dx, dy);
-                }
-                crate::input::InputEvent::PointerMotionAbsolute { x_norm, y_norm } => {
-                    let x = (x_norm.clamp(0.0, 1.0) * (self.fb_w as f64 - 1.0)) as f32;
-                    let y = (y_norm.clamp(0.0, 1.0) * (self.fb_h as f64 - 1.0)) as f32;
-                    self.process_pointer_absolute(x, y);
-                }
-                crate::input::InputEvent::Button { code, pressed } => {
-                    self.process_pointer_button(code, pressed);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn process_key_event(&mut self, evdev_keycode: u32, is_press: bool) {
-        let xkb_keycode = xkbcommon::xkb::Keycode::new(evdev_keycode + 8);
-        let direction = if is_press {
+    /// Update the local xkbcommon state from a libinput key event and
+    /// build the cooked `HostKeyEvent` for fanout.
+    ///
+    /// `raw.keycode` is already the X11 keycode (evdev + 8) as supplied
+    /// by the libinput thread. The xkb update needs the same value.
+    fn cook_host_key(&mut self, raw: HostKeyEvent) -> HostKeyEvent {
+        let xkb_keycode = xkbcommon::xkb::Keycode::new(u32::from(raw.keycode));
+        let direction = if raw.pressed {
             xkbcommon::xkb::KeyDirection::Down
         } else {
             xkbcommon::xkb::KeyDirection::Up
         };
         self.xkb_state.0.update_key(xkb_keycode, direction);
-
-        let mask = self.serialize_modifiers();
-        let key_event = HostKeyEvent {
-            pressed: is_press,
-            keycode: (evdev_keycode + 8) as u8,
-            time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u32,
+        HostKeyEvent {
+            state: self.serialize_modifiers(),
             root_x: self.cursor_x as i16,
             root_y: self.cursor_y as i16,
             event_x: self.cursor_x as i16,
             event_y: self.cursor_y as i16,
-            state: mask,
-        };
-        // Fan out to key subscribers (keyboard forwarders)
-        let subs = lock_recover(&self.key_subscribers);
-        for tx in subs.iter() {
-            let _ = tx.send(key_event);
+            time: Self::current_time_ms(),
+            ..raw
         }
     }
 
@@ -1543,16 +1441,6 @@ impl KmsBackend {
         // Buffer; the input thread drains and dispatches outside the
         // backend lock. See the doc on `pending_pointer_events`.
         self.pending_pointer_events.push(ev);
-    }
-
-    /// Take ownership of all pointer events buffered since the last
-    /// drain. The caller MUST drop the backend mutex before forwarding
-    /// these to the event sink — the sink reaches for `server.lock()`
-    /// and request handlers hold `server.lock()` while reaching for the
-    /// backend mutex, so dispatching with the backend mutex still held
-    /// deadlocks.
-    pub fn drain_pending_pointer_events(&mut self) -> Vec<HostPointerEvent> {
-        std::mem::take(&mut self.pending_pointer_events)
     }
 
     fn current_time_ms() -> u32 {
@@ -1627,33 +1515,12 @@ impl KmsBackend {
         self.emit_pointer(ev);
     }
 
-    fn process_pointer_motion(&mut self, dx: f64, dy: f64) {
-        self.cursor_x = (self.cursor_x + dx as f32).clamp(0.0, self.fb_w as f32 - 1.0);
-        self.cursor_y = (self.cursor_y + dy as f32).clamp(0.0, self.fb_h as f32 - 1.0);
-        // Fall back to the root container so server.rs can deliver
-        // to root-window subscribers (e16's right-click-desktop menu,
-        // fvwm3's root bindings) when the cursor is over the
-        // wallpaper / no top-level window.
-        let host_xid = self.window_under_cursor().unwrap_or(self.window_id);
-        let (event_x, event_y) = self.event_relative_coords(host_xid);
-        let mask = self.serialize_modifiers() | self.button_mask;
-        self.update_pointer_window(host_xid, mask);
-        let ev = HostPointerEvent {
-            kind: PointerEventKind::MotionNotify,
-            host_xid,
-            detail: 0,
-            time: Self::current_time_ms(),
-            root_x: self.cursor_x as i16,
-            root_y: self.cursor_y as i16,
-            event_x,
-            event_y,
-            state: mask,
-            crossing_mode: 0,
-        };
-        self.emit_pointer(ev);
-    }
-
-    fn process_pointer_button(&mut self, code: u32, pressed: bool) {
+    fn process_pointer_button(
+        &mut self,
+        code: u32,
+        pressed: bool,
+        server_state: &yserver_core::server::ServerState,
+    ) {
         let detail = match code {
             0x110 => 1, // BTN_LEFT
             0x111 => 3, // BTN_RIGHT
@@ -1727,23 +1594,70 @@ impl KmsBackend {
             crossing_mode: 0,
         };
         self.emit_pointer(ptr_event);
-        // Implicit pointer grab crossing events. X11 spec: when a press
-        // creates an implicit pointer grab, the grab activation generates
-        // a Leave(NotifyGrab) on the focus window and an Enter(NotifyGrab)
-        // on the grab-window; on release, Leave(NotifyUngrab) on the
-        // grab-window and Enter(NotifyUngrab) on the focus. Without
-        // these, click-tracking widgets (e16's button widgets in
-        // particular) never confirm "press and release on the same
-        // window" and dialog actions fail to fire.
-        // We only emit the crossing on the press/release window itself —
-        // sufficient for the common case where focus and press window
-        // coincide; if they differ, the proper path-walk crossings are
-        // future work.
+        // G3: spec-correct implicit-grab crossings. X11 protocol:
+        // a press that creates an implicit pointer grab walks Leaves
+        // up from the focus window to the deepest common ancestor of
+        // focus + grab, then Enters down to the grab window; release
+        // walks the symmetric Ungrab pairs back. Detail codes
+        // (NotifyAncestor / NotifyVirtual / NotifyInferior /
+        // NotifyNonlinear / NotifyNonlinearVirtual) come from the
+        // pure helper `crossings::implicit_grab_crossings`. The
+        // crossing-mode field marks the activation: 1 = NotifyGrab
+        // on press, 2 = NotifyUngrab on release.
         let post_state = self.serialize_modifiers() | self.button_mask;
-        if pressed {
-            self.emit_crossing(host_xid, PointerEventKind::EnterNotify, 1, post_state);
+        let press_mode: u8 = if pressed { 1 } else { 2 };
+        let press_kind = if pressed {
+            PointerEventKind::LeaveNotify
         } else {
-            self.emit_crossing(host_xid, PointerEventKind::LeaveNotify, 2, post_state);
+            PointerEventKind::EnterNotify
+        };
+        let post_kind = if pressed {
+            PointerEventKind::EnterNotify
+        } else {
+            PointerEventKind::LeaveNotify
+        };
+
+        // Resolve focus + grab to nested ResourceIds via xid_map.
+        let grab_id = self.xid_map.get(&host_xid).copied();
+        let focus_id = self
+            .prev_pointer_window
+            .and_then(|prev| self.xid_map.get(&prev).copied());
+
+        match (focus_id, grab_id) {
+            (Some(focus), Some(grab)) => {
+                let events =
+                    yserver_core::crossings::implicit_grab_crossings(server_state, focus, grab);
+                if events.is_empty() {
+                    // focus == grab: a single mode-stamped crossing
+                    // pair is sufficient (Leave→Enter on press,
+                    // Enter→Leave on release) on the same window.
+                    self.emit_crossing(host_xid, press_kind, press_mode, post_state);
+                    self.emit_crossing(host_xid, post_kind, press_mode, post_state);
+                } else {
+                    for ev in events {
+                        let win_host_xid = server_state
+                            .resources
+                            .window(ev.window)
+                            .and_then(|w| w.host_xid.map(|h| h.as_raw()))
+                            .unwrap_or(host_xid);
+                        let kind = match ev.kind {
+                            yserver_core::crossings::CrossingKind::Enter => {
+                                PointerEventKind::EnterNotify
+                            }
+                            yserver_core::crossings::CrossingKind::Leave => {
+                                PointerEventKind::LeaveNotify
+                            }
+                        };
+                        self.emit_crossing(win_host_xid, kind, press_mode, post_state);
+                    }
+                }
+            }
+            _ => {
+                // Either focus or grab isn't a known nested window;
+                // fall back to the one-event approximation.
+                self.emit_crossing(host_xid, press_kind, press_mode, post_state);
+                self.emit_crossing(host_xid, post_kind, press_mode, post_state);
+            }
         }
     }
 
@@ -2251,16 +2165,82 @@ impl Backend for KmsBackend {
         Ok(())
     }
 
-    fn set_event_sink(&mut self, sink: Option<Box<dyn BackendEventSink>>) {
-        self.event_sink = sink;
-    }
-
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+
+    /// Translate a host input event into wire events and fan them out
+    /// directly into `state`.
+    ///
+    /// Pointer events use the existing `process_pointer_*` methods,
+    /// which buffer into `self.pending_pointer_events`. We drain that
+    /// buffer immediately and route through
+    /// `pointer_event_fanout_to_state`. The buffer is local to a
+    /// single call — there is no cross-thread handoff.
+    ///
+    /// Key events update `xkb_state` here, then go through
+    /// `key_event_fanout_to_state`. The event passed in by the libinput
+    /// thread carries a placeholder modifier mask and cursor coords;
+    /// we override both with the backend's authoritative values.
+    fn on_host_input(
+        &mut self,
+        state: &mut yserver_core::server::ServerState,
+        ev: yserver_core::core_loop::HostInputEvent,
+    ) {
+        use yserver_core::core_loop::{
+            HostInputEvent, key_fanout::key_event_fanout_to_state,
+            pointer_fanout::pointer_event_fanout_to_state,
+        };
+
+        match ev {
+            HostInputEvent::PointerMotion { x, y, time: _ } => {
+                self.process_pointer_absolute(x as f32, y as f32);
+            }
+            HostInputEvent::PointerButton {
+                button,
+                pressed,
+                time: _,
+            } => {
+                self.process_pointer_button(u32::from(button), pressed, state);
+            }
+            HostInputEvent::Key(raw) => {
+                let cooked = self.cook_host_key(raw);
+                let _dropped = key_event_fanout_to_state(state, cooked);
+                return;
+            }
+        }
+
+        // Drain pointer events queued by the process_pointer_* call
+        // and fan each one out directly into state. The buffer must
+        // be empty after this — a future on_host_input call asserts
+        // it via `take`.
+        let pending = std::mem::take(&mut self.pending_pointer_events);
+        for ev in pending {
+            let _dropped = pointer_event_fanout_to_state(state, &self.xid_map, ev, true);
+        }
+    }
+
+    /// Drain DRM completion events and submit the next composite/flip.
+    /// Errors are logged; the trait method is infallible because the
+    /// core loop has no useful place to propagate them yet (B3 stub —
+    /// E3 wires this into the poller).
+    fn on_page_flip_ready(&mut self, _state: &mut yserver_core::server::ServerState) {
+        if let Err(e) = self.drain_page_flips_and_composite() {
+            log::warn!("kms: drain_page_flips_and_composite: {e}");
+        }
+    }
+
+    fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, yserver_core::backend::BackendFdKind)> {
+        let mut out = Vec::with_capacity(2);
+        if let Some(fd) = self.input_fd() {
+            out.push((fd, yserver_core::backend::BackendFdKind::Libinput));
+        }
+        out.push((self.drm_fd(), yserver_core::backend::BackendFdKind::Drm));
+        out
     }
 
     fn create_subwindow(
@@ -2365,27 +2345,15 @@ impl Backend for KmsBackend {
             self.shape_clip.remove(&host_xid);
             self.shape_input.remove(&host_xid);
         }
-        let mut map = lock_recover(&self.xid_map);
-        map.remove(&host_xid);
-        drop(map);
+        self.xid_map.remove(&host_xid);
 
-        // Expose siblings that may have been uncovered
-        for &sibling_id in &siblings {
-            if let Some(s) = self.windows.get(&sibling_id)
-                && s.mapped
-            {
-                self.synthesize_expose(sibling_id, 0, 0, s.width, s.height);
-            }
-        }
+        let _ = siblings;
         Ok(())
     }
 
     fn map_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
         if let Some(window) = self.windows.get_mut(&host_xid) {
             window.mapped = true;
-            let w = window.width;
-            let h = window.height;
-            self.synthesize_expose(host_xid, 0, 0, w, h);
         }
         Ok(())
     }
@@ -2405,21 +2373,7 @@ impl Backend for KmsBackend {
             window.mapped = false;
         }
 
-        // Expose siblings at parent level that may have been uncovered
-        // For simplicity, expose all mapped siblings
-        if let Some(parent) = parent_xid
-            && let Some(p) = self.windows.get(&parent)
-        {
-            let children: Vec<u32> = p.children.clone();
-            for &sibling_id in &children {
-                if sibling_id != host_xid
-                    && let Some(s) = self.windows.get(&sibling_id)
-                    && s.mapped
-                {
-                    self.synthesize_expose(sibling_id, 0, 0, s.width, s.height);
-                }
-            }
-        }
+        let _ = parent_xid;
         Ok(())
     }
 
@@ -2476,10 +2430,7 @@ impl Backend for KmsBackend {
         if let Some(stack_mode) = config.stack_mode {
             self.restack_window(host_xid, stack_mode, config.sibling);
         }
-        // Mutable borrow on windows ends here, safe to call synthesize_expose
-        if resized && let Some(w) = self.windows.get(&host_xid) {
-            self.synthesize_expose(host_xid, 0, 0, w.width, w.height);
-        }
+        let _ = resized;
         Ok(())
     }
 
@@ -2555,8 +2506,7 @@ impl Backend for KmsBackend {
         nested_id: ResourceId,
         host_xid: u32,
     ) -> io::Result<()> {
-        let mut map = lock_recover(&self.xid_map);
-        map.insert(host_xid, nested_id);
+        self.xid_map.insert(host_xid, nested_id);
         Ok(())
     }
 
@@ -2566,22 +2516,16 @@ impl Backend for KmsBackend {
         nested_id: ResourceId,
         host_xid: u32,
     ) -> io::Result<()> {
-        let mut map = lock_recover(&self.xid_map);
-        map.insert(host_xid, nested_id);
+        self.xid_map.insert(host_xid, nested_id);
         Ok(())
     }
 
     fn unregister_host_window(&mut self, host_xid: u32) {
-        let mut map = lock_recover(&self.xid_map);
-        map.remove(&host_xid);
+        self.xid_map.remove(&host_xid);
     }
 
-    fn xid_map(&self) -> HostXidMap {
-        Arc::clone(&self.xid_map)
-    }
-
-    fn add_key_subscriber(&mut self, tx: Sender<HostKeyEvent>) {
-        lock_recover(&self.key_subscribers).push(tx);
+    fn xid_map(&self) -> &HostXidMap {
+        &self.xid_map
     }
 
     fn name_window_pixmap(
@@ -4844,21 +4788,25 @@ impl Backend for KmsBackend {
         first_keycode: u8,
         count: u8,
     ) -> io::Result<(u8, Vec<u32>)> {
-        let mut rows: Vec<Vec<u32>> = Vec::new();
-        let max_kc = (first_keycode as u16) + (count as u16);
-        for kc in first_keycode as u16..max_kc {
-            let xkb_kc = xkbcommon::xkb::Keycode::new(kc as u32);
-            let syms = self.xkb_keymap.0.key_get_syms_by_level(xkb_kc, 0, 0);
-            rows.push(syms.iter().map(|s| s.raw()).collect());
+        // X11 GetKeyboardMapping: per keycode, return a flat row of
+        // keysyms across shift levels in the order
+        // unshifted/shifted/mode-switch-unshifted/mode-switch-shifted.
+        // Apps combine the keycode they received with the modifier
+        // bits in the event's `state` field to pick the right slot.
+        // Returning only level 0 means apps can never produce
+        // shifted characters — typing Shift+a yields 'a' instead of
+        // 'A' because that's the only keysym we ever expose.
+        const LEVELS: usize = 4;
+        let max_kc = u16::from(first_keycode) + u16::from(count);
+        let mut flat = Vec::with_capacity(usize::from(count) * LEVELS);
+        for kc in u16::from(first_keycode)..max_kc {
+            let xkb_kc = xkbcommon::xkb::Keycode::new(u32::from(kc));
+            for level in 0..LEVELS as u32 {
+                let syms = self.xkb_keymap.0.key_get_syms_by_level(xkb_kc, 0, level);
+                flat.push(syms.first().map_or(0, |s| s.raw()));
+            }
         }
-        let max_levels = rows.iter().map(|r| r.len()).max().unwrap_or(1) as u8;
-        let mut flat = Vec::with_capacity((count as usize) * (max_levels as usize));
-        for row in &rows {
-            flat.extend_from_slice(row);
-            let pad = max_levels as usize - row.len();
-            flat.resize(flat.len() + pad, 0); // NoSymbol padding
-        }
-        Ok((max_levels, flat))
+        Ok((LEVELS as u8, flat))
     }
 
     fn get_modifier_mapping(
@@ -5142,11 +5090,7 @@ pub(super) fn composite_glyphs_onto(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        cell::RefCell,
-        collections::HashMap,
-        sync::{Arc, Mutex},
-    };
+    use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
     use pixman::{Color, FormatCode, Image, Operation, Rectangle16, Repeat};
     use yserver_core::{
@@ -5216,9 +5160,7 @@ mod tests {
             top_level_order: Vec::new(),
             window_id: 1,
             root_visual_xid: 0x21,
-            event_sink: None,
-            xid_map: HostXidMap::new(Mutex::new(HashMap::new())),
-            key_subscribers: Arc::new(Mutex::new(Vec::new())),
+            xid_map: HostXidMap::new(),
             xkb_context: ctx,
             xkb_keymap: super::XkbKeymap(keymap),
             xkb_state,

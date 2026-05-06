@@ -9,22 +9,18 @@ use std::{
     time::Instant,
 };
 
-use log::{debug, info, trace, warn};
+use log::trace;
 use yserver_protocol::x11::{
-    self, AtomId, ClientByteOrder, ClientId, ResourceId, SequenceNumber, randr as x11randr, shape,
-    xfixes,
+    self, AtomId, ClientByteOrder, ClientId, ResourceId, SequenceNumber, shape, xfixes,
 };
 
 use crate::{
-    backend::{BackendEvent, BackendEventSink},
-    host_x11::{HostConfigureEvent, HostEvent, HostXidMap},
     randr::RandrState,
     resources::{ROOT_WINDOW, ResourceTable},
 };
 
 pub const FIRST_CLIENT_BASE: u32 = 0x0010_0000;
 pub const PER_CLIENT_MASK: u32 = 0x000F_FFFF;
-const RANDR_FIRST_EVENT: u8 = 89;
 
 #[derive(Debug)]
 pub struct IdAllocator {
@@ -163,7 +159,7 @@ pub struct ActivePointerGrab {
 pub struct ServerState {
     pub atoms: AtomTable,
     pub resources: ResourceTable,
-    pub clients: HashMap<u32, ClientHandle>,
+    pub clients: HashMap<u32, ClientState>,
     pub id_allocator: IdAllocator,
     pub start_instant: Instant,
     pub randr: RandrState,
@@ -506,7 +502,7 @@ impl ShapeWindowState {
 }
 
 #[derive(Debug)]
-pub struct ClientHandle {
+pub struct ClientState {
     pub writer: Arc<Mutex<UnixStream>>,
     pub byte_order: ClientByteOrder,
     pub last_sequence: Arc<AtomicU16>,
@@ -519,6 +515,34 @@ pub struct ClientHandle {
     pub big_requests_enabled: bool,
     /// XI2 event masks: (window_id, device_id) -> mask
     pub xi2_masks: HashMap<(ResourceId, u16), u32>,
+    /// Outbound bytes buffered when the client write fd would block.
+    /// Populated in D2.
+    pub outbound: std::collections::VecDeque<u8>,
+    /// Whether the core's mio poller currently watches this client's
+    /// writer fd for WRITABLE.  Used in I2.
+    pub watching_writable: bool,
+    /// Window the client's pointer/key events route through; demoted off
+    /// `Arc<Mutex<ResourceId>>` in D3.
+    pub focused_window: ResourceId,
+    /// Control channel to the per-client reader thread; populated in D4
+    /// when the reader is spawned.
+    pub reader_control: Option<crossbeam_channel::Sender<ReaderControl>>,
+}
+
+/// Messages the core sends to a per-client reader thread.
+///
+/// `Apply`/`Ignore` are the BigRequests barrier: the reader pauses
+/// after sending an Enable request and resumes once the core processed
+/// it. `Shutdown` causes the reader to exit (also unparks any reader
+/// blocked on a barrier).
+#[derive(Debug)]
+pub enum ReaderControl {
+    /// Enable was processed; reader resumes with `big = true`.
+    ApplyBigRequests,
+    /// Enable was malformed or the reply path errored; reader
+    /// resumes with the previous `big` value.
+    IgnoreBigRequests,
+    Shutdown,
 }
 
 /// Snapshot of a client's writer for cross-client event fanout.
@@ -530,7 +554,7 @@ pub struct EventTarget {
 }
 
 impl ServerState {
-    fn event_target_for_client(client: &ClientHandle) -> EventTarget {
+    fn event_target_for_client(client: &ClientState) -> EventTarget {
         EventTarget {
             writer: client.writer.clone(),
             byte_order: client.byte_order,
@@ -753,7 +777,7 @@ pub fn fanout_raw_event(targets: &[EventTarget], event: &[u8; 32]) {
 
 #[must_use]
 pub(crate) fn xi2_mask_for_client(
-    client: &ClientHandle,
+    client: &ClientState,
     target: ResourceId,
     fallback: ResourceId,
     device_candidates: &[u16],
@@ -782,187 +806,6 @@ pub fn emit_window_event(
         Err(_) => return,
     };
     fanout_event(&targets, encode);
-}
-
-#[derive(Clone)]
-pub struct HostPumpEventSink {
-    server: Arc<Mutex<ServerState>>,
-    xid_map: HostXidMap,
-    container_window_id: u32,
-}
-
-pub fn host_pump_event_sink(
-    server: Arc<Mutex<ServerState>>,
-    xid_map: HostXidMap,
-    container_window_id: u32,
-) -> HostPumpEventSink {
-    HostPumpEventSink {
-        server,
-        xid_map,
-        container_window_id,
-    }
-}
-
-impl BackendEventSink for HostPumpEventSink {
-    fn handle_backend_event(&mut self, event: BackendEvent) {
-        match event {
-            BackendEvent::HostEvent(HostEvent::Key(_)) => {}
-            BackendEvent::HostEvent(HostEvent::Pointer(ev)) => {
-                pointer_event_fanout(&self.server, &self.xid_map, ev);
-            }
-            BackendEvent::HostEvent(HostEvent::Expose(ev)) => {
-                crate::nested::expose_event_fanout(&self.server, &self.xid_map, ev);
-            }
-            BackendEvent::HostEvent(HostEvent::Configure(ev)) => {
-                if ev.host_xid == self.container_window_id {
-                    handle_host_container_resize(&self.server, ev);
-                }
-            }
-            BackendEvent::HostEvent(HostEvent::Closed) => {
-                info!("host window closed, exiting");
-                std::process::exit(0);
-            }
-            BackendEvent::HostError { origin, error } => {
-                warn!("host backend error origin={origin:?}: {error}");
-            }
-        }
-    }
-}
-
-pub(crate) fn handle_host_container_resize(
-    server: &Arc<Mutex<ServerState>>,
-    ev: HostConfigureEvent,
-) {
-    #[allow(clippy::type_complexity)]
-    let update = {
-        let mut s = match server.lock() {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        if ev.width == 0
-            || ev.height == 0
-            || (s.randr.screen_width == ev.width && s.randr.screen_height == ev.height)
-        {
-            return;
-        }
-
-        let timestamp = s.timestamp_now();
-        s.randr.resize(timestamp, ev.width, ev.height);
-        if let Some(root) = s.resources.window_mut(ROOT_WINDOW) {
-            root.width = ev.width;
-            root.height = ev.height;
-        }
-
-        let width_mm = u16::try_from(s.randr.width_mm).unwrap_or(u16::MAX);
-        let height_mm = u16::try_from(s.randr.height_mm).unwrap_or(u16::MAX);
-        let targets = s
-            .randr_select_masks
-            .iter()
-            .filter_map(|((owner, window), mask)| {
-                s.client_target(ClientId(*owner))
-                    .map(|target| (target, *window, *mask))
-            })
-            .collect::<Vec<_>>();
-
-        Some((timestamp, ev.width, ev.height, width_mm, height_mm, targets))
-    };
-
-    let Some((timestamp, width, height, width_mm, height_mm, targets)) = update else {
-        return;
-    };
-
-    debug!(
-        "host container resized to {}x{} at {}, emitting RANDR updates",
-        width, height, timestamp
-    );
-
-    // Spec-correct: emit a core ConfigureNotify on root *before* the RANDR
-    // fanout so non-RANDR-aware clients (panels, "fill the screen" apps)
-    // reflow at the same point in the event stream that RANDR-aware toolkits
-    // see screen-change. Subscribers selected via StructureNotifyMask on root.
-    emit_window_event(
-        server,
-        ROOT_WINDOW,
-        0x0002_0000, // StructureNotifyMask
-        |buf, seq, order| {
-            x11::encode_configure_notify_event(
-                buf,
-                seq,
-                order,
-                ROOT_WINDOW,
-                ROOT_WINDOW,
-                x11::Geometry {
-                    root: ROOT_WINDOW,
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                    border_width: 0,
-                    depth: 24,
-                },
-                false,
-            );
-        },
-    );
-
-    for (target, request_window, mask) in targets {
-        let sequence = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
-        if mask & x11randr::NOTIFY_MASK_SCREEN_CHANGE != 0 {
-            let event = x11randr::encode_screen_change_notify_event(
-                RANDR_FIRST_EVENT,
-                sequence,
-                x11randr::ScreenChangeNotify {
-                    timestamp,
-                    config_timestamp: timestamp,
-                    root: ROOT_WINDOW.0,
-                    request_window: request_window.0,
-                    width,
-                    height,
-                    width_mm,
-                    height_mm,
-                },
-            );
-            if let Ok(mut writer) = target.writer.lock() {
-                let _ = writer.write_all(&event);
-            }
-        }
-        if mask & x11randr::NOTIFY_MASK_CRTC_CHANGE != 0 {
-            let event = x11randr::encode_crtc_change_notify_event(
-                RANDR_FIRST_EVENT,
-                sequence,
-                x11randr::CrtcChangeNotify {
-                    timestamp,
-                    request_window: request_window.0,
-                    crtc: crate::randr::CRTC_ID,
-                    mode: crate::randr::MODE_ID,
-                    x: ev.x,
-                    y: ev.y,
-                    width,
-                    height,
-                },
-            );
-            if let Ok(mut writer) = target.writer.lock() {
-                let _ = writer.write_all(&event);
-            }
-        }
-        if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
-            let event = x11randr::encode_output_change_notify_event(
-                RANDR_FIRST_EVENT,
-                sequence,
-                x11randr::OutputChangeNotify {
-                    timestamp,
-                    config_timestamp: timestamp,
-                    request_window: request_window.0,
-                    output: crate::randr::OUTPUT_ID,
-                    crtc: crate::randr::CRTC_ID,
-                    mode: crate::randr::MODE_ID,
-                },
-            );
-            if let Ok(mut writer) = target.writer.lock() {
-                let _ = writer.write_all(&event);
-            }
-        }
-    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1015,11 +858,7 @@ fn pointer_event_fanout_inner(
     // straightforward. Without this translation, clients placing popups or
     // tooltips at root_x/root_y end up off-screen by the container's host
     // offset.
-    let event = if let Some(top_level_id) = xid_map
-        .lock()
-        .ok()
-        .and_then(|m| m.get(&event.host_xid).copied())
-    {
+    let event = if let Some(top_level_id) = xid_map.get(&event.host_xid).copied() {
         let translated = state.lock().ok().and_then(|g| {
             g.resources
                 .window(top_level_id)
@@ -1078,6 +917,7 @@ fn pointer_event_fanout_inner(
                     root_y: event.root_y,
                     event_x,
                     event_y,
+                    child: ResourceId(0),
                     state: event.state,
                 },
             ),
@@ -1094,6 +934,7 @@ fn pointer_event_fanout_inner(
                     root_y: event.root_y,
                     event_x,
                     event_y,
+                    child: ResourceId(0),
                     state: event.state,
                 },
             ),
@@ -1110,6 +951,7 @@ fn pointer_event_fanout_inner(
                     root_y: event.root_y,
                     event_x,
                     event_y,
+                    child: ResourceId(0),
                     state: event.state,
                 },
             ),
@@ -1131,10 +973,7 @@ fn pointer_event_fanout_inner(
 
     // Passive button grab matching for ButtonPress events.
     if handle_grabs && event.kind == PointerEventKind::ButtonPress {
-        let top_level_id_opt = xid_map
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&event.host_xid).copied());
+        let top_level_id_opt = xid_map.get(&event.host_xid).copied();
         let matched = top_level_id_opt.and_then(|top| {
             let s = state.lock().ok()?;
             let (hit_window, _, _) = s
@@ -1172,6 +1011,7 @@ fn pointer_event_fanout_inner(
                         root_y: event.root_y,
                         event_x: event.event_x,
                         event_y: event.event_y,
+                        child: ResourceId(0),
                         state: event.state,
                     },
                 );
@@ -1183,12 +1023,9 @@ fn pointer_event_fanout_inner(
         }
     }
 
-    let top_level_id = match xid_map.lock() {
-        Ok(map) => match map.get(&event.host_xid).copied() {
-            Some(id) => id,
-            None => return,
-        },
-        Err(_) => return,
+    let top_level_id = match xid_map.get(&event.host_xid).copied() {
+        Some(id) => id,
+        None => return,
     };
     let mask_bit: u32 = match event.kind {
         PointerEventKind::ButtonPress => 0x0000_0004,
@@ -1327,6 +1164,7 @@ fn pointer_event_fanout_inner(
                     root_y: event.root_y,
                     event_x,
                     event_y,
+                    child: ResourceId(0),
                     state: event.state,
                 },
             ),
@@ -1343,6 +1181,7 @@ fn pointer_event_fanout_inner(
                     root_y: event.root_y,
                     event_x,
                     event_y,
+                    child: ResourceId(0),
                     state: event.state,
                 },
             ),
@@ -1359,6 +1198,7 @@ fn pointer_event_fanout_inner(
                     root_y: event.root_y,
                     event_x,
                     event_y,
+                    child: ResourceId(0),
                     state: event.state,
                 },
             ),
@@ -1566,7 +1406,7 @@ mod tests {
         let mut state = ServerState::new();
         state.clients.insert(
             1,
-            ClientHandle {
+            ClientState {
                 writer: make_test_writer(),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1576,11 +1416,15 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                outbound: std::collections::VecDeque::new(),
+                watching_writable: false,
+                focused_window: crate::resources::ROOT_WINDOW,
+                reader_control: None,
             },
         );
         state.clients.insert(
             2,
-            ClientHandle {
+            ClientState {
                 writer: make_test_writer(),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1590,6 +1434,10 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                outbound: std::collections::VecDeque::new(),
+                watching_writable: false,
+                focused_window: crate::resources::ROOT_WINDOW,
+                reader_control: None,
             },
         );
         // PropertyChange = 0x0040_0000
@@ -1602,7 +1450,7 @@ mod tests {
         let mut state = ServerState::new();
         state.clients.insert(
             1,
-            ClientHandle {
+            ClientState {
                 writer: make_test_writer(),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1612,6 +1460,10 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                outbound: std::collections::VecDeque::new(),
+                watching_writable: false,
+                focused_window: crate::resources::ROOT_WINDOW,
+                reader_control: None,
             },
         );
         let subs = state.subscribers(ResourceId(0x100), 0x0040_0000);
@@ -1621,7 +1473,7 @@ mod tests {
     #[test]
     fn xi2_pointer_mask_matches_exact_and_wildcard_devices() {
         for deviceid in [2u16, 1, 0] {
-            let client = ClientHandle {
+            let client = ClientState {
                 writer: make_test_writer(),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1631,6 +1483,10 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::from([((ResourceId(0x100), deviceid), 1 << 4)]),
+                outbound: std::collections::VecDeque::new(),
+                watching_writable: false,
+                focused_window: crate::resources::ROOT_WINDOW,
+                reader_control: None,
             };
 
             assert_eq!(
@@ -1643,7 +1499,7 @@ mod tests {
     #[test]
     fn xi2_keyboard_mask_matches_exact_and_wildcard_devices() {
         for deviceid in [3u16, 1, 0] {
-            let client = ClientHandle {
+            let client = ClientState {
                 writer: make_test_writer(),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1653,6 +1509,10 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::from([((ResourceId(0x100), deviceid), 1 << 2)]),
+                outbound: std::collections::VecDeque::new(),
+                watching_writable: false,
+                focused_window: crate::resources::ROOT_WINDOW,
+                reader_control: None,
             };
 
             assert_eq!(
@@ -1667,7 +1527,7 @@ mod tests {
         let mut state = ServerState::new();
         state.clients.insert(
             1,
-            ClientHandle {
+            ClientState {
                 writer: make_test_writer(),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1677,6 +1537,10 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                outbound: std::collections::VecDeque::new(),
+                watching_writable: false,
+                focused_window: crate::resources::ROOT_WINDOW,
+                reader_control: None,
             },
         );
         assert_eq!(state.subscribers(ResourceId(0x100), 0x0040_0000).len(), 1);
@@ -1689,7 +1553,7 @@ mod tests {
         let mut state = ServerState::new();
         state.clients.insert(
             1,
-            ClientHandle {
+            ClientState {
                 writer: make_test_writer(),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1699,11 +1563,15 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                outbound: std::collections::VecDeque::new(),
+                watching_writable: false,
+                focused_window: crate::resources::ROOT_WINDOW,
+                reader_control: None,
             },
         );
         state.clients.insert(
             2,
-            ClientHandle {
+            ClientState {
                 writer: make_test_writer(),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1713,6 +1581,10 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                outbound: std::collections::VecDeque::new(),
+                watching_writable: false,
+                focused_window: crate::resources::ROOT_WINDOW,
+                reader_control: None,
             },
         );
 
@@ -1740,7 +1612,7 @@ mod tests {
         let mut state = ServerState::new();
         state.clients.insert(
             7,
-            ClientHandle {
+            ClientState {
                 writer: make_test_writer(),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0x1234)),
@@ -1750,6 +1622,10 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                outbound: std::collections::VecDeque::new(),
+                watching_writable: false,
+                focused_window: crate::resources::ROOT_WINDOW,
+                reader_control: None,
             },
         );
 
@@ -1774,7 +1650,7 @@ mod tests {
         let mut state = ServerState::new();
         state.clients.insert(
             1,
-            ClientHandle {
+            ClientState {
                 writer: Arc::new(Mutex::new(a_writer_local)),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1784,11 +1660,15 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                outbound: std::collections::VecDeque::new(),
+                watching_writable: false,
+                focused_window: crate::resources::ROOT_WINDOW,
+                reader_control: None,
             },
         );
         state.clients.insert(
             2,
-            ClientHandle {
+            ClientState {
                 writer: Arc::new(Mutex::new(b_writer_local)),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1798,6 +1678,10 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                outbound: std::collections::VecDeque::new(),
+                watching_writable: false,
+                focused_window: crate::resources::ROOT_WINDOW,
+                reader_control: None,
             },
         );
 
@@ -1826,7 +1710,7 @@ mod tests {
         let mut state = ServerState::new();
         state.clients.insert(
             1,
-            ClientHandle {
+            ClientState {
                 writer: make_test_writer(),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1839,6 +1723,10 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                outbound: std::collections::VecDeque::new(),
+                watching_writable: false,
+                focused_window: crate::resources::ROOT_WINDOW,
+                reader_control: None,
             },
         );
         assert_eq!(state.subscribers(ResourceId(0x100), 0x0040_0000).len(), 1);
@@ -1909,7 +1797,7 @@ mod tests {
             let _ = s.resources.map_window(target_window);
             s.clients.insert(
                 1,
-                ClientHandle {
+                ClientState {
                     writer: Arc::new(Mutex::new(grab_writer_local)),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1919,11 +1807,15 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    outbound: std::collections::VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: crate::resources::ROOT_WINDOW,
+                    reader_control: None,
                 },
             );
             s.clients.insert(
                 2,
-                ClientHandle {
+                ClientState {
                     writer: Arc::new(Mutex::new(target_writer_local)),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1933,6 +1825,10 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    outbound: std::collections::VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: crate::resources::ROOT_WINDOW,
+                    reader_control: None,
                 },
             );
             s.pointer_grab = Some((ClientId(1), grab_window));
@@ -1953,7 +1849,7 @@ mod tests {
 
         let mut map = StdHashMap::new();
         map.insert(0xCAFE_u32, ResourceId(0x0020_0002));
-        let xid_map = Arc::new(StdMutex::new(map));
+        let xid_map = map;
 
         route_button_press_no_grab(
             &state,
@@ -2005,7 +1901,7 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.clients.insert(
                 1,
-                ClientHandle {
+                ClientState {
                     writer: Arc::new(Mutex::new(a_writer_local)),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
@@ -2015,11 +1911,15 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    outbound: std::collections::VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: crate::resources::ROOT_WINDOW,
+                    reader_control: None,
                 },
             );
             s.clients.insert(
                 2,
-                ClientHandle {
+                ClientState {
                     writer: Arc::new(Mutex::new(b_writer_local)),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
@@ -2029,11 +1929,15 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    outbound: std::collections::VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: crate::resources::ROOT_WINDOW,
+                    reader_control: None,
                 },
             );
             s.clients.insert(
                 3,
-                ClientHandle {
+                ClientState {
                     writer: Arc::new(Mutex::new(c_writer_local)),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
@@ -2043,13 +1947,17 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    outbound: std::collections::VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: crate::resources::ROOT_WINDOW,
+                    reader_control: None,
                 },
             );
         }
 
         let mut map = StdHashMap::new();
         map.insert(0xCAFE_u32, ResourceId(0x0010_0002));
-        let xid_map = Arc::new(StdMutex::new(map));
+        let xid_map = map;
 
         pointer_event_fanout(
             &state,
@@ -2125,7 +2033,7 @@ mod tests {
             let _ = s.resources.map_window(ResourceId(0x0010_0002));
             s.clients.insert(
                 1,
-                ClientHandle {
+                ClientState {
                     writer: Arc::new(Mutex::new(a_writer_local)),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
@@ -2135,11 +2043,15 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    outbound: std::collections::VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: crate::resources::ROOT_WINDOW,
+                    reader_control: None,
                 },
             );
             s.clients.insert(
                 2,
-                ClientHandle {
+                ClientState {
                     writer: Arc::new(Mutex::new(b_writer_local)),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
@@ -2149,13 +2061,17 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    outbound: std::collections::VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: crate::resources::ROOT_WINDOW,
+                    reader_control: None,
                 },
             );
         }
 
         let mut map = StdHashMap::new();
         map.insert(0xCAFE_u32, ResourceId(0x0010_0002));
-        let xid_map = Arc::new(StdMutex::new(map));
+        let xid_map = map;
 
         // Motion with button 1 held (state bit 8 == 0x100).
         pointer_event_fanout(
@@ -2226,7 +2142,7 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.clients.insert(
                 1,
-                ClientHandle {
+                ClientState {
                     writer: Arc::new(Mutex::new(a_writer_local)),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
@@ -2236,11 +2152,15 @@ mod tests {
                     save_set: HashSet::new(),
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
+                    outbound: std::collections::VecDeque::new(),
+                    watching_writable: false,
+                    focused_window: crate::resources::ROOT_WINDOW,
+                    reader_control: None,
                 },
             );
         }
 
-        let xid_map: crate::host_x11::HostXidMap = Arc::new(StdMutex::new(StdHashMap::new())); // empty
+        let xid_map: crate::host_x11::HostXidMap = StdHashMap::new(); // empty
 
         pointer_event_fanout(
             &state,
@@ -2334,7 +2254,7 @@ mod tests {
     fn add_test_client(state: &mut ServerState, client_id: u32, base: u32) {
         state.clients.insert(
             client_id,
-            ClientHandle {
+            ClientState {
                 writer: make_test_writer(),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -2344,6 +2264,10 @@ mod tests {
                 save_set: HashSet::new(),
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
+                outbound: std::collections::VecDeque::new(),
+                watching_writable: false,
+                focused_window: crate::resources::ROOT_WINDOW,
+                reader_control: None,
             },
         );
     }

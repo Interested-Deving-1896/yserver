@@ -5,7 +5,6 @@
 
 use std::io;
 
-use crossbeam_channel::Sender;
 use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, xfixes};
 
 use crate::backend::{
@@ -14,8 +13,8 @@ use crate::backend::{
 };
 
 use super::{
-    HostKeyEvent, HostSubwindowConfig, HostSubwindowVisual, HostX11Backend, HostXidMap,
-    OriginContext, PointerPosition,
+    HostSubwindowConfig, HostSubwindowVisual, HostX11Backend, HostXidMap, OriginContext,
+    PointerPosition,
 };
 
 impl Backend for HostX11Backend {
@@ -59,8 +58,20 @@ impl Backend for HostX11Backend {
         self.with_active_origin(origin, HostX11Backend::ping)
     }
 
-    fn set_event_sink(&mut self, sink: Option<Box<dyn crate::backend::BackendEventSink>>) {
-        HostX11Backend::set_event_sink(self, sink);
+    fn on_host_input(
+        &mut self,
+        _state: &mut crate::server::ServerState,
+        _ev: crate::core_loop::HostInputEvent,
+    ) {
+    }
+
+    /// Host-X11 backend never page-flips.
+    fn on_page_flip_ready(&mut self, _state: &mut crate::server::ServerState) {}
+
+    /// F2: host fd registered with the core's poller as
+    /// `HOST_X11_TOKEN`. Readiness drives `drain_host_socket`.
+    fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)> {
+        vec![(self.host_fd(), crate::backend::BackendFdKind::HostX11)]
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -201,12 +212,20 @@ impl Backend for HostX11Backend {
         HostX11Backend::unregister_host_window(self, host_xid);
     }
 
-    fn xid_map(&self) -> HostXidMap {
+    fn xid_map(&self) -> &HostXidMap {
         HostX11Backend::xid_map(self)
     }
 
-    fn add_key_subscriber(&mut self, tx: Sender<HostKeyEvent>) {
-        HostX11Backend::add_key_subscriber(self, tx);
+    fn drain_host_socket(&mut self) -> io::Result<crate::backend::HostSocketStatus> {
+        HostX11Backend::drain_host_socket(self)
+    }
+
+    fn pop_pending_host_event(&mut self) -> Option<crate::host_x11::HostEvent> {
+        HostX11Backend::pop_pending_host_event(self)
+    }
+
+    fn host_socket_eof(&self) -> bool {
+        HostX11Backend::host_socket_eof(self)
     }
 
     fn name_window_pixmap(

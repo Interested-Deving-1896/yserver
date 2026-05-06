@@ -1932,6 +1932,190 @@ Plan:
 - **VT_SETMODE / logind / suspend-resume / hotplug polish** — still
   open.
 
+### Phase 6.8 — Single-threaded core (complete)
+
+Goal: eliminate the `ServerState` ↔ `Backend` lock-inversion deadlock
+class by collapsing all core mutation onto one thread, reducing every
+other thread to an I/O-only `mpsc` producer. Land on the
+`single-threaded-core` branch with green workspace tests + full
+multi-WM smoke before merging to `master`.
+
+Spec:
+[`2026-05-05-single-threaded-core-design.md`](superpowers/specs/2026-05-05-single-threaded-core-design.md).
+Plan:
+[`2026-05-06-single-threaded-core.md`](superpowers/plans/2026-05-06-single-threaded-core.md).
+
+#### Architecture landed
+
+A single core thread owns a plain `ServerState` and `Box<dyn Backend>`
+(no `Arc<Mutex<>>`). The core's mio poller owns the listener fd, every
+client read+write fd, libinput fd, drm fd, signalfd, host-X11 fd, and
+a `Waker` for the message channel. Per-client *reader threads* are
+the only producers that turn raw bytes into `Message::Request`s;
+libinput, DRM page-flip, signalfd, and host-X11 all drive the core
+poller directly. Replies/events go out via per-client non-blocking
+write halves with bounded outbound buffers; on `EAGAIN` we register
+`WRITABLE` interest, on overflow we disconnect.
+
+#### Phases A → I (landed before Phase J smoke)
+
+- **A1**: rename `ClientHandle` → `ClientState`, add `outbound`,
+  `watching_writable`, `focused_window`, `reader_control` fields.
+- **B1–B4**: `Message` enum (with two-stage client lifecycle —
+  `SetupAllocate` round-trip + `ClientSetupComplete` hand-off),
+  `CoreSender`/`CoreReceiver` over `crossbeam-channel` + mio
+  `Waker`, reshape `Backend` trait (`on_host_input`,
+  `on_page_flip_ready`, `poll_fds`), `run_core` skeleton.
+- **C1–C3**: per-client outbound write helper (4 MB cap), setup
+  thread that owns the full handshake + teardown registry,
+  per-client reader thread with reader-side BigRequests barrier
+  via `ReaderControl::Apply/Ignore/Shutdown` and SCM_RIGHTS fd
+  pass-through.
+- **D1–D6**: lift every `process_request` opcode (1–127) plus all
+  13 extension dispatchers (RANDR, MIT-SHM, RENDER, BIG-REQUESTS,
+  XKB, XI2, GE, XFIXES, SHAPE, SYNC, DAMAGE, COMPOSITE, PRESENT)
+  to state-borrowing `&mut ServerState` + `&mut dyn Backend`,
+  delete the per-client keyboard forwarder thread, listener fd
+  owned by the core poller. Workspace stays green throughout.
+- **E1–E4**: KMS senders + libinput motion coalescing (latest
+  position wins per batch; non-motion events flush pending).
+  Delete `pending_pointer_events`, `BackendEventSink` impl on
+  `KmsBackend`, `key_subscribers` field. `yserver::run` rewritten
+  on top of `run_core`.
+- **F1–F2**: host-X11 dispatcher thread deleted; the core thread
+  owns the host fd and drives reads + reply waits directly via
+  `drain_host_socket` + `dispatch_pending_host_events`.
+  Reentrancy invariant: `drain_host_socket` only enqueues; event
+  fanout runs at the outer-loop boundary.
+  `nested::run` rewritten on top of `run_core`.
+- **G1–G3**: spec-correct implicit-grab crossings via
+  `crossings::implicit_grab_crossings` (path-walk between focus
+  and grab windows, NotifyGrab on press / NotifyUngrab on
+  release).
+- **I1–I5**: backpressure poller integration. Per-client tokens
+  + monotonic `ClientIdAllocator` (no reuse across
+  disconnect/connect). `WRITABLE` interest registered per
+  iteration via `reconcile_client_writable_interest` + a
+  proactive `drain_outbound` to avoid edge-triggered EPOLLOUT
+  races. Slow-client disconnect on `OUTBOUND_CAP` overflow.
+
+#### Phase H — dead-code deletion (complete)
+
+- **H1**: deleted `nested::handle_client` / `handle_request` /
+  `lock_server` and ~9.7k lines of legacy code that the
+  `process_request` lift superseded; ported the relevant tests
+  to the state-borrowing helpers.
+- **H2**: deleted `BackendEventSink` trait, `HostPumpEventSink`,
+  `host_pump_event_sink`, the `event_sink` field on
+  `KmsBackend`, and `synthesize_expose` (no production callers
+  since E4).
+- **H3**: dropped the dead `KmsBackend.key_subscribers` field
+  and stale comment references to `spawn_keyboard_forwarder`,
+  `add_key_subscriber`, `BackendEventSink`,
+  `process_one_input_event`, and `pending_pointer_events`.
+- **H4**: dropped the `pub type ClientHandle = ClientState`
+  alias; renamed all 25+ remaining `ClientHandle` references to
+  `ClientState`.
+- **H5**: lifted `server::handle_host_container_resize` into
+  `core_loop::run::handle_host_container_resize` (state-borrowing,
+  full RANDR ScreenChangeNotify / CrtcChangeNotify /
+  OutputChangeNotify fanout, now via `client_io::write_or_buffer`
+  for backpressure honouring). Final grep: zero
+  `Arc<Mutex<ServerState>>` production references, zero
+  `lock_server` references.
+
+#### Phase J — smoke matrix (run; bugs fixed inline; merge pending)
+
+Phase J shook out 9 protocol bugs that the lift surfaced once
+real WMs and apps started driving the new path. All fixed inline:
+
+- `process_disconnect` not idempotent (writer EPIPE racing
+  reader EOF could fire it twice).
+- `OUTBOUND_CAP` set to 64 KB → spurious slow-client disconnect
+  when a single legitimate large reply (e.g., ISO10646 font's
+  786 KB QueryFont reply) overflowed the buffer. Bumped to 4 MB.
+- Edge-triggered EPOLLOUT race in
+  `reconcile_client_writable_interest`: the kernel could
+  transition the fd writable before we registered for WRITABLE,
+  and we'd miss the edge. Fix: proactive `drain_outbound` at
+  the top of every iteration.
+- `PointerEvent.child` field always `0` — fvwm3's
+  `Mouse 1 R A Menu MainMenu` binding fired on every click
+  anywhere on the screen because every event looked like a
+  bare-root click. Threaded the propagation child through
+  `pointer_propagation_target_by_id` and the wire encoder.
+- XI2 events stolen by core grabs. After fvwm3 received a
+  propagated core ButtonPress and replied with XGrabPointer,
+  our active-grab path redirected ALL subsequent events
+  (Release, Motion) to fvwm3 via core; XI2 selectees got
+  nothing. Per X11 spec, XI2 grabs and core grabs are
+  independent. Fix: split `pointer_event_fanout_to_state` so
+  the XI2 fanout always runs, regardless of any active core
+  grab.
+- XI2 `buttons` mask wrong on Release: was always
+  `1 << (button-1)`; per spec it's the post-event button state.
+  Made gtk3 tree-view expanders work for the first click.
+- `SetInputFocus` not mirrored across clients. The per-client
+  `focused_window` field is documented as a global value
+  mirrored across every client's row, but the implementation
+  only updated the caller. Symptom: keyboard input didn't reach
+  xterm under wmaker because both wmaker and xterm called
+  SetInputFocus on their own internal windows; `current_focus`
+  picked whichever HashMap iteration visited first. Fix: in
+  `set_focused_window_to_state`, write the new focus into every
+  `state.clients[*].focused_window`.
+- `HostInputEvent::PointerButton.button` was `u8` but Linux
+  input button codes are u32 with `BTN_LEFT = 0x110` —
+  truncated to `0x10` on the wire and dropped by the KMS
+  backend's `0x110 => 1` mapping. Symptom on yserver: every
+  click logged `unmapped libinput button code 0x10, dropping`
+  and never reached the WM or apps. Widened to `u16`.
+- `compute_font_metrics` on KMS returned empty `properties`,
+  which Xt/Athena/fvwm3 menu code treats as "font unusable".
+  `handle_open_font` now synthesizes the standard XLFD property
+  set (FONT, FOUNDRY, FAMILY_NAME, …, CHARSET_ENCODING) when
+  the backend returns an empty list.
+
+#### Smoke matrix — current state
+
+| Backend          | WM     | Status |
+|------------------|--------|--------|
+| `ynest`          | fvwm3  | ✅ |
+| `ynest`          | wmaker | ✅ except keyboard regression after sustained interaction |
+| `ynest`          | e16    | ✅ |
+| `ynest`          | gtk3-demo | ✅ except tree-view expander quirk |
+| `yserver` (KMS)  | e16    | ✅ |
+| `yserver` (KMS)  | wmaker | ✅ same as pre-refactor |
+| `yserver` (KMS)  | fvwm3  | ⚠️ menus render with no text (font-rendering gate beyond properties) |
+
+Two regressions filed in
+[`known-issues.md`](known-issues.md): xterm KeyPress drops after
+focus / state-changing interaction (WM- and backend-independent —
+likely a regression from the refactor — needs a stuck-grab
+investigation), and yserver/KMS fvwm3 menu text. The original
+`ServerState ↔ Backend` lock-inversion deadlock class —
+the whole point of the refactor — is gone, and both backends
+boot every WM in the matrix.
+
+#### Phase 6.8 follow-ups (deferred)
+
+- merge to `master` (J5: codex review pass + squash, awaiting
+  user sign-off).
+- xterm KeyPress-stops bug (needs key tracing in
+  `host_x11/pump.rs::decode_host_event` + `key_event_fanout_to_state`'s
+  grab-activation / grab-release branches; suspect a stuck
+  `state.active_keyboard_grab` whose release condition only
+  fires on KeyRelease of the *exact* triggering keycode).
+- yserver/KMS fvwm3 empty-menus (font-rendering gate beyond
+  properties — needs a diff between xterm's QueryFont reply
+  path, which works, and fvwm3's, which doesn't).
+- gtk3-demo tree-view expander single-click toggle reliability.
+- legacy `&Mutex<ServerState>`-shaped fanout helpers in
+  `server.rs` (`pointer_event_fanout`, `route_button_press_no_grab`)
+  are dead in production but kept under `#[allow(dead_code)]`
+  for their test fixtures — fold those tests onto the
+  state-borrowing helpers and delete.
+
 ## Phase 7 — Security hardening
 
 Goal: per-client capabilities, permission prompts or launch-time

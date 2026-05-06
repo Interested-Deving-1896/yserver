@@ -51,9 +51,8 @@ pub struct Context {
 }
 
 /// Newtype wrapper around `Context` that implements `Send`.
-/// SAFETY: All access is serialized through `Arc<Mutex<dyn Backend>>`.
-/// The main thread owns the input context; libinput's raw pointers
-/// and Rc are safe because there's only one thread accessing them.
+/// SAFETY: The libinput thread is the sole owner. We need `Send` only
+/// because the context crosses the spawn boundary into that thread.
 pub struct SendContext(Context);
 unsafe impl Send for SendContext {}
 

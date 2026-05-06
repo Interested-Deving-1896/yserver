@@ -9,33 +9,63 @@ pub use pump::{
 };
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{self, ErrorKind, Read, Write},
-    os::unix::net::UnixStream,
-    sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicU64, Ordering},
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::net::UnixStream,
     },
-    thread,
 };
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
 use log::debug;
 use yserver_protocol::x11::ResourceId;
 
-use crate::backend::{BackendEvent, BackendEventSink, OriginContext, PixmapHandle, WindowHandle};
+use crate::backend::{OriginContext, PixmapHandle, WindowHandle};
+
+use crate::core_loop::client_reader::wait_readable;
 
 use pump::{HostSetup, connect_to_host, decode_host_event, read_setup_reply};
 use sequence_map::SequenceMap;
 
-pub(super) const POINTER_EVENT_MASK: u32 = 0x0000_0004 // ButtonPress
+/// Outcome of a single `drain_host_socket` pass.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum HostSocketStatus {
+    /// Read drained the kernel buffer; nothing more to read right now.
+    /// Frames decoded out of `read_buffer` have been classified.
+    WouldBlock,
+    /// Host closed the connection. The core's `HOST_X11_TOKEN` arm
+    /// posts `Message::Shutdown` in response.
+    Eof,
+}
+
+/// Pull a single complete X11 frame off the front of `buf` if one is
+/// fully buffered; otherwise return `None`. Reply (`header[0] == 1`)
+/// and GenericEvent (`header[0] == 35`) frames carry an extra-payload
+/// length in `header[4..8]` (in 4-byte units); everything else is a
+/// fixed 32-byte frame.
+fn try_extract_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if buf.len() < 32 {
+        return None;
+    }
+    let header_byte = buf[0];
+    let total = match header_byte {
+        1 | 35 => 32 + (u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize) * 4,
+        _ => 32,
+    };
+    if buf.len() < total {
+        return None;
+    }
+    Some(buf.drain(..total).collect())
+}
+
+pub(crate) const POINTER_EVENT_MASK: u32 = 0x0000_0004 // ButtonPress
     | 0x0000_0008 // ButtonRelease
     | 0x0000_0010 // EnterWindow
     | 0x0000_0020 // LeaveWindow
     | 0x0000_0040 // PointerMotion
     | 0x0000_8000; // Exposure
 
-pub(super) const SUBWINDOW_EVENT_MASK: u32 = 0x0000_8000; // Exposure
+pub(crate) const SUBWINDOW_EVENT_MASK: u32 = 0x0000_8000; // Exposure
 
 pub(super) enum ResponseMatch {
     Return,
@@ -50,140 +80,6 @@ pub(super) struct HostError {
     pub major_opcode: u8,
     pub minor_opcode: u16,
     pub bad_value: u32,
-}
-
-/// Producer is the dispatcher thread (or, before the dispatcher is up,
-/// the synchronous `read_until_response` path used during init). It
-/// inserts a response and signals the Condvar. Consumer is the request
-/// handler waiting for a specific 64-bit sequence in `wait_for_reply`.
-///
-/// The internal `Mutex<PendingRepliesState>` is a *separate* lock from
-/// the `Backend` mutex — by design, so the dispatcher can deliver
-/// replies (and wake waiters) while a request handler is still holding
-/// the Backend lock. Without that separation, the dispatcher would
-/// always block on the Backend lock during writes, and `wait_for_reply`
-/// would deadlock against itself.
-///
-/// `disconnected` flips when the host connection drops; pending waiters
-/// are then woken with an EOF error rather than hanging forever.
-pub(super) struct PendingReplies {
-    state: Mutex<PendingRepliesState>,
-    ready: Condvar,
-}
-
-struct PendingRepliesState {
-    replies: SequenceMap<HostResponse>,
-    disconnected: bool,
-}
-
-impl PendingReplies {
-    fn new(max_window: u64) -> Self {
-        Self {
-            state: Mutex::new(PendingRepliesState {
-                replies: SequenceMap::new(max_window),
-                disconnected: false,
-            }),
-            ready: Condvar::new(),
-        }
-    }
-
-    pub(super) fn insert(&self, response: HostResponse) {
-        let mut state = self.state.lock().expect("pending replies mutex poisoned");
-        state.replies.insert(response.sequence_full, response);
-        self.ready.notify_all();
-    }
-
-    pub(super) fn take(&self, seq_full: u64) -> Option<HostResponse> {
-        let mut state = self.state.lock().expect("pending replies mutex poisoned");
-        state.replies.take(seq_full)
-    }
-
-    /// Block until either `seq_full` is available or the host connection
-    /// drops. The Backend mutex MAY be held by the caller — the dispatcher
-    /// only ever locks `PendingReplies::state`, never the Backend mutex,
-    /// so there's no inversion.
-    pub(super) fn wait_for(&self, seq_full: u64) -> io::Result<HostResponse> {
-        let mut state = self.state.lock().expect("pending replies mutex poisoned");
-        loop {
-            if let Some(response) = state.replies.take(seq_full) {
-                return Ok(response);
-            }
-            if state.disconnected {
-                return Err(io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "host connection closed before reply arrived",
-                ));
-            }
-            state = self
-                .ready
-                .wait(state)
-                .expect("pending replies condvar poisoned");
-        }
-    }
-
-    /// Mark the host stream as disconnected and wake every waiter. After
-    /// this the next `wait_for` returns `UnexpectedEof` immediately.
-    pub(super) fn disconnect(&self) {
-        let mut state = self.state.lock().expect("pending replies mutex poisoned");
-        state.disconnected = true;
-        self.ready.notify_all();
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.state
-            .lock()
-            .expect("pending replies mutex poisoned")
-            .replies
-            .len()
-    }
-}
-
-/// Sliding-window cache of host errors that arrived without a waiter in
-/// `pending_replies`. Kept around so a synchronous reader can still pick
-/// up an error for an awaited request that the legacy single-threaded
-/// path queued before `wait_for_reply` was called. Once the dispatcher is
-/// the canonical producer, errors land in `pending_replies` directly and
-/// this map ends up mostly empty — but it's still consulted as a
-/// fallback.
-pub(super) struct PendingErrors {
-    state: Mutex<PendingErrorsState>,
-    ready: Condvar,
-}
-
-struct PendingErrorsState {
-    errors: SequenceMap<HostError>,
-}
-
-impl PendingErrors {
-    fn new(max_window: u64) -> Self {
-        Self {
-            state: Mutex::new(PendingErrorsState {
-                errors: SequenceMap::new(max_window),
-            }),
-            ready: Condvar::new(),
-        }
-    }
-
-    pub(super) fn insert(&self, error: HostError) {
-        let mut state = self.state.lock().expect("pending errors mutex poisoned");
-        state.errors.insert(error.sequence_full, error);
-        self.ready.notify_all();
-    }
-
-    pub(super) fn take(&self, seq_full: u64) -> Option<HostError> {
-        let mut state = self.state.lock().expect("pending errors mutex poisoned");
-        state.errors.take(seq_full)
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.state
-            .lock()
-            .expect("pending errors mutex poisoned")
-            .errors
-            .len()
-    }
 }
 
 impl HostError {
@@ -284,49 +180,41 @@ pub struct HostX11Backend {
     /// init. Required by `CreateWindow` whenever the child visual is
     /// not `CopyFromParent`.
     argb_colormap_xid: Option<u32>,
-    // Replies read while waiting on some other request and matched by full
-    // promoted sequence number. Async host errors are logged and dropped
-    // instead of being buffered as if they were replies. The `Arc`
-    // sharing lets the background dispatcher thread (`dispatch_loop`)
-    // be the producer side without taking the Backend mutex.
-    pending_replies: Arc<PendingReplies>,
-    pending_errors: Arc<PendingErrors>,
-    pending_origins: Arc<Mutex<SequenceMap<OriginContext>>>,
-    /// Latest issued 64-bit sequence, mirrored to an atomic so the
-    /// dispatcher thread can do 16→64 promotion without locking the
-    /// Backend mutex. Set by every `issue_sequence` and `advance_sequence`
-    /// after the local `next_seq_full` bumps.
-    seq_full_atomic: Arc<AtomicU64>,
-    /// Sender into the dispatcher → consumer channel. The dispatcher
-    /// owns its own clone (passed at spawn time); this side stays around
-    /// so `set_event_sink` / shutdown paths can synthesise events too.
-    event_tx: Sender<BackendEvent>,
-    event_rx: Option<Receiver<BackendEvent>>,
+    /// Replies/errors decoded from the host socket and not yet
+    /// consumed by `wait_for_reply`. Single-threaded core (F2): the
+    /// core thread is the only producer (via `drain_host_socket`) and
+    /// the only consumer (via `wait_for_reply` from inside
+    /// `process_request`), so no Arc/Mutex/Condvar.
+    pending_replies: SequenceMap<HostResponse>,
+    /// Sliding-window cache of host errors that arrived without a
+    /// waiter in `pending_replies`. After F2 errors land in
+    /// `pending_replies` directly and this is rarely populated; kept
+    /// around for the init-phase synchronous fallback.
+    pending_errors: SequenceMap<HostError>,
+    /// Origin context per outstanding request, looked up when a reply
+    /// or error frame arrives so we can attribute it back to the
+    /// nested client that issued the host request.
+    pending_origins: SequenceMap<OriginContext>,
+    /// Decoded async events the host has pushed but the core hasn't
+    /// fanned out yet. F2 reentrancy invariant: `drain_host_socket`
+    /// only enqueues; `dispatch_pending_host_events` (run at
+    /// outer-loop boundary) drains and fans out. This makes nested
+    /// `wait_for_reply` recursion impossible — a host method called
+    /// inside fanout cannot re-enter event dispatch.
+    pending_events: VecDeque<HostEvent>,
+    /// Partial-frame buffer for non-blocking reads from the host
+    /// socket. `drain_host_socket` keeps reading until `EAGAIN`,
+    /// extracting whole X11 frames as they become complete.
+    read_buffer: Vec<u8>,
+    /// Set once the host socket has signalled EOF; `drain_host_socket`
+    /// returns `Eof` from then on so the core posts `Shutdown`.
+    socket_eof: bool,
     host_event_masks: HashMap<u32, u32>,
-    /// Tracks the consumer thread spawned by `set_event_sink`. The
-    /// thread's lifetime is tied to the channel — when the last
-    /// `Sender` drops the consumer exits its drain loop. Phase 6.3
-    /// keeps the join handle so future tear-down can wait on it.
-    sink_consumer: Option<thread::JoinHandle<()>>,
-    /// Held alive for as long as the backend is alive. The thread reads
-    /// the host stream and routes responses into `pending_replies` /
-    /// `event_tx`. Phase 6.3 doesn't try to join it — process exit drops
-    /// the connection which makes the `read_response` call return EOF.
-    dispatcher: Option<thread::JoinHandle<()>>,
-    /// `host_xid → ResourceId` lookup table consulted by the sink's
-    /// pointer / expose fan-outs. Phase 6.3 Step 4 moves this off the
-    /// (now-removed) pump handle and onto the backend itself so the
-    /// dispatcher and the sink share the same Arc — adds remain O(1)
-    /// and the read side is uncontended with the dispatcher's
-    /// event-decode hot path.
+    /// `host_xid → ResourceId` lookup table consulted by host event
+    /// fanout (`pointer_event_fanout_to_state`,
+    /// `expose_event_fanout_to_state`). After F2 this is a plain
+    /// HashMap — only the core thread touches it.
     xid_map: HostXidMap,
-    /// Phase 6.3 Step 4: per-client keyboard forwarders register a
-    /// `Sender<HostKeyEvent>` here at connect-time so the dispatcher
-    /// can fan KeyPress / KeyRelease out to every connected client.
-    /// Each client's thread then applies its own focus state in
-    /// `spawn_keyboard_forwarder`. The list is append-only — pruning
-    /// disconnected senders happens lazily on the next add.
-    key_subscribers: Arc<Mutex<Vec<Sender<HostKeyEvent>>>>,
     // GCs cached per pixmap depth. The default `gc_id` is bound to a depth-24
     // drawable so PutImage onto pixmaps with a different depth (e.g. depth-8
     // alpha masks for RENDER) would BadMatch. We lazily create one GC per
@@ -407,7 +295,10 @@ impl HostSubwindowVisual {
     }
 }
 
-pub type HostXidMap = Arc<Mutex<HashMap<u32, ResourceId>>>;
+/// Host-XID → nested ResourceId lookup. F2 demoted this from
+/// `Arc<Mutex<HashMap>>` to a plain `HashMap` — only the core thread
+/// reads or writes it, so the lock is unnecessary.
+pub type HostXidMap = HashMap<u32, ResourceId>;
 
 impl HostX11Backend {
     pub fn open_from_env(width: u16, height: u16) -> io::Result<Self> {
@@ -429,19 +320,12 @@ impl HostX11Backend {
         map_window(&mut stream, window_id)?;
         stream.flush()?;
 
-        let pending_replies = Arc::new(PendingReplies::new(65_536));
-        let pending_errors = Arc::new(PendingErrors::new(65_536));
-        let pending_origins = Arc::new(Mutex::new(SequenceMap::new(65_536)));
-        let seq_full_atomic = Arc::new(AtomicU64::new(5));
-        let (event_tx, event_rx) = unbounded::<BackendEvent>();
-
         // Map the host container window to ynest's ROOT_WINDOW so that
         // Expose / pointer events on the container area route through
-        // ROOT_WINDOW in `expose_event_fanout` / `pointer_event_fanout`.
-        // Pre-Phase-6.3 this lived on the pump handle; the merged
-        // dispatcher needs the same translation.
-        let mut initial_xid_map = HashMap::new();
-        initial_xid_map.insert(window_id, crate::resources::ROOT_WINDOW);
+        // ROOT_WINDOW in `expose_event_fanout_to_state` /
+        // `pointer_event_fanout_to_state`.
+        let mut xid_map: HostXidMap = HashMap::new();
+        xid_map.insert(window_id, crate::resources::ROOT_WINDOW);
 
         let mut this = Self {
             stream,
@@ -472,27 +356,23 @@ impl HostX11Backend {
             shape_opcode: None,
             xfixes_opcode: None,
             composite_opcode: None,
-            pending_replies,
-            pending_errors,
-            pending_origins,
-            seq_full_atomic,
-            event_tx,
-            event_rx: Some(event_rx),
+            pending_replies: SequenceMap::new(65_536),
+            pending_errors: SequenceMap::new(65_536),
+            pending_origins: SequenceMap::new(65_536),
+            pending_events: VecDeque::new(),
+            read_buffer: Vec::new(),
+            socket_eof: false,
             host_event_masks: HashMap::new(),
-            sink_consumer: None,
-            dispatcher: None,
-            xid_map: Arc::new(Mutex::new(initial_xid_map)),
-            key_subscribers: Arc::new(Mutex::new(Vec::new())),
+            xid_map,
             depth_gcs: HashMap::new(),
             root_visual_xid: setup.root_visual,
             argb_visual_xid: setup.argb_visual,
             argb_colormap_xid: None,
         };
-        // Init paths run synchronously on the main connection — the
-        // dispatcher hasn't been spawned yet, so `read_until_response`
-        // is still the canonical reader. Once these complete we hand
-        // the read half to the dispatcher and never touch it from the
-        // main thread again.
+        // Init paths run synchronously on a still-blocking stream:
+        // `read_until_response` drains until each QueryExtension reply
+        // arrives. Once init completes we set the stream non-blocking
+        // and the core's `drain_host_socket` takes over.
         this.render = this.init_render().ok();
         this.xkb = this.init_xkb().ok();
         this.shape_opcode = this.query_extension_opcode(b"SHAPE").ok().flatten();
@@ -520,22 +400,22 @@ impl HostX11Backend {
         } else {
             log::info!("host advertises no depth-32 TrueColor visual — ARGB CreateWindow disabled");
         }
-        // Spawn the dispatcher. The clone of the read half lets the
-        // dispatcher block on `read_response` without contending with
-        // the main thread's writes; the OS-level socket is one stream,
-        // so flushes from the main thread still go to the same FD.
-        let read_stream = this.stream.try_clone()?;
-        let dispatcher = spawn_dispatch_thread(
-            read_stream,
-            Arc::clone(&this.pending_replies),
-            Arc::clone(&this.pending_errors),
-            Arc::clone(&this.pending_origins),
-            Arc::clone(&this.seq_full_atomic),
-            this.event_tx.clone(),
-            Arc::clone(&this.key_subscribers),
-        );
-        this.dispatcher = Some(dispatcher);
+        // F2: keep the stream *blocking* so `write_all` for large
+        // host requests (PutImage, server-issued ChangeGC, etc.)
+        // doesn't trip on EAGAIN. Reads use MSG_DONTWAIT per call
+        // in `drain_host_socket` so the core thread can drain
+        // without ever blocking on a stuck host. `wait_for_reply`
+        // alternates `wait_readable` (poll(2)) with
+        // `drain_host_socket` to wait for a specific reply without
+        // blocking the entire core.
         Ok(this)
+    }
+
+    /// Raw fd of the host X11 connection. The core registers this with
+    /// its mio poller (`HOST_X11_TOKEN`) so readiness wakes the core
+    /// to call `drain_host_socket`.
+    pub(super) fn host_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
     }
 
     /// Host XIDs the upper layer pushes into the visual / colormap
@@ -614,60 +494,6 @@ impl HostX11Backend {
         xid
     }
 
-    pub(super) fn set_event_sink(&mut self, sink: Option<Box<dyn BackendEventSink>>) {
-        // The dispatcher publishes BackendEvents into a crossbeam channel
-        // up-front, regardless of whether anyone has registered a sink.
-        // Setting a sink starts a consumer thread that drains the channel
-        // and calls into the sink. Lock order: consumer never reaches
-        // back into `HostX11Backend`, so we sidestep the inversion that
-        // would deadlock if the sink call had to relock the Backend
-        // mutex.
-        match sink {
-            Some(sink) => {
-                if self.sink_consumer.is_some() {
-                    log::warn!(
-                        "set_event_sink called twice; ignoring the second call (Phase 6.3 lifecycle expects exactly one sink)"
-                    );
-                    return;
-                }
-                let Some(rx) = self.event_rx.take() else {
-                    log::warn!("set_event_sink: no receiver available (already taken)");
-                    return;
-                };
-                let mut sink = sink;
-                let handle = thread::Builder::new()
-                    .name("hostx11-sink".into())
-                    .spawn(move || {
-                        // `recv` returns Err only when every Sender has
-                        // dropped — i.e. backend tear-down. That's our
-                        // exit signal; nothing else to clean up.
-                        for event in rx.iter() {
-                            sink.handle_backend_event(event);
-                        }
-                    })
-                    .expect("hostx11-sink thread spawn");
-                self.sink_consumer = Some(handle);
-            }
-            None => {
-                // Stop accepting new sinks for the remainder of the
-                // backend's life. Existing consumer (if any) keeps
-                // running; tearing it down requires dropping the
-                // backend itself.
-                self.event_rx = None;
-            }
-        }
-    }
-
-    /// Best-effort send into the dispatcher → consumer channel. The
-    /// channel is unbounded, so the only failure mode is "the consumer
-    /// thread has dropped its receiver" — which we treat as "no sink",
-    /// matching the pre-Phase-6.3 behaviour.
-    fn emit_backend_event(&self, event: BackendEvent) {
-        if let Err(err) = self.event_tx.send(event) {
-            log::trace!("backend event channel closed: {err}");
-        }
-    }
-
     pub(super) fn update_host_event_mask(
         &mut self,
         host_xid: u32,
@@ -710,41 +536,16 @@ impl HostX11Backend {
         Ok(())
     }
 
-    /// Phase 6.3 Step 4: clone of the shared `xid_map`. The dispatcher
-    /// hands one clone to the sink (so `pointer_event_fanout` /
-    /// `expose_event_fanout` can resolve `host_xid → ResourceId`), and
-    /// `register_top_level` / `register_subwindow` mutate it through
-    /// the same Arc.
-    pub(super) fn xid_map(&self) -> HostXidMap {
-        Arc::clone(&self.xid_map)
+    /// `host_xid → ResourceId` lookup table. F2: plain HashMap, no
+    /// locking — `pointer_event_fanout_to_state` /
+    /// `expose_event_fanout_to_state` borrow it immutably through the
+    /// backend.
+    pub(super) fn xid_map(&self) -> &HostXidMap {
+        &self.xid_map
     }
 
-    /// Phase 6.3 Step 4: per-client kb forwarder calls this once at
-    /// connect time to receive every host KeyPress / KeyRelease the
-    /// dispatcher decodes. The forwarder thread applies its own focus
-    /// state on the events it receives; the dispatcher fans the same
-    /// event out to every subscriber (mirrors the pre-Phase-6.3
-    /// "every kb pump sees every key event" shape, just on one
-    /// connection).
-    ///
-    /// Disconnected senders accumulate in the list — `crossbeam` only
-    /// surfaces a closed channel via `send()`'s `Err`, which the
-    /// dispatcher already discards. Periodic compaction is left for
-    /// Step 6 cleanup; with 1–10 clients the list never grows past
-    /// ~10 entries in practice.
-    pub(super) fn add_key_subscriber(&mut self, tx: Sender<HostKeyEvent>) {
-        let mut subs = self
-            .key_subscribers
-            .lock()
-            .expect("key subscribers mutex poisoned");
-        subs.push(tx);
-    }
-
-    /// Phase 6.3 Step 4: register a host top-level window so its
-    /// pointer / expose events can be routed to `nested_id`. Replaces
-    /// the deleted pump-handle `register_top_level` — same callers
-    /// (CreateWindow on root parent, ReparentWindow into root) but
-    /// now goes through the merged main connection.
+    /// Register a host top-level window so its pointer / expose
+    /// events route to `nested_id` in `dispatch_pending_host_events`.
     pub(super) fn register_top_level(
         &mut self,
         nested_id: ResourceId,
@@ -753,37 +554,29 @@ impl HostX11Backend {
         // Insert into the map *before* the wire write so any pointer
         // events arriving on this xid after the host commits the new
         // event-mask immediately resolve to the right ResourceId.
-        if let Ok(mut map) = self.xid_map.lock() {
-            map.insert(host_xid, nested_id);
-        }
+        self.xid_map.insert(host_xid, nested_id);
         let combined = self.update_host_event_mask(host_xid, POINTER_EVENT_MASK, true);
         self.write_event_mask(host_xid, combined)
     }
 
-    /// Phase 6.3 Step 4: counterpart of [`register_top_level`] for
-    /// sub-windows — registers `Exposure` only so pointer events bubble
-    /// up to the top-level ancestor (X11 propagation rule), keeping
-    /// dispatch on the top-level.
+    /// Counterpart of [`register_top_level`] for sub-windows —
+    /// registers `Exposure` only so pointer events bubble up to the
+    /// top-level ancestor (X11 propagation rule), keeping dispatch
+    /// on the top-level.
     pub(super) fn register_subwindow(
         &mut self,
         nested_id: ResourceId,
         host_xid: u32,
     ) -> io::Result<()> {
-        if let Ok(mut map) = self.xid_map.lock() {
-            map.insert(host_xid, nested_id);
-        }
+        self.xid_map.insert(host_xid, nested_id);
         let combined = self.update_host_event_mask(host_xid, SUBWINDOW_EVENT_MASK, true);
         self.write_event_mask(host_xid, combined)
     }
 
-    /// Phase 6.3 Step 4: drop the `host_xid → ResourceId` mapping at
-    /// DestroyWindow / Reparent-out. Errors are silent — the host
-    /// child is about to disappear; clearing the registry purely
-    /// prevents stale lookups in the dispatcher.
+    /// Drop the `host_xid → ResourceId` mapping at DestroyWindow /
+    /// Reparent-out. Prevents stale lookups in fanout helpers.
     pub(super) fn unregister_host_window(&mut self, host_xid: u32) {
-        if let Ok(mut map) = self.xid_map.lock() {
-            map.remove(&host_xid);
-        }
+        self.xid_map.remove(&host_xid);
         self.host_event_masks.remove(&host_xid);
     }
 
@@ -811,18 +604,12 @@ impl HostX11Backend {
 
     fn record_origin(&mut self, seq_full: u64) {
         if let Some(origin) = self.active_origin {
-            self.pending_origins
-                .lock()
-                .expect("pending origins mutex poisoned")
-                .insert(seq_full, origin);
+            self.pending_origins.insert(seq_full, origin);
         }
     }
 
     fn take_origin_for_sequence(&mut self, target_full: u64) -> Option<OriginContext> {
-        self.pending_origins
-            .lock()
-            .expect("pending origins mutex poisoned")
-            .take(target_full)
+        self.pending_origins.take(target_full)
     }
 
     pub(super) fn issue_sequence(&mut self) -> (u16, u64) {
@@ -831,11 +618,6 @@ impl HostX11Backend {
         self.record_origin(full);
         self.sequence = self.sequence.wrapping_add(1);
         self.next_seq_full = self.next_seq_full.wrapping_add(1);
-        // Mirror the new value into the atomic so the dispatcher thread
-        // sees the latest seq for 16→64 promotion. SeqCst keeps the
-        // ordering simple; this is not a hot path (one store per request).
-        self.seq_full_atomic
-            .store(self.next_seq_full, Ordering::SeqCst);
         (wire, full)
     }
 
@@ -859,10 +641,9 @@ impl HostX11Backend {
         Some(response)
     }
 
-    /// Pre-dispatcher buffering helper used by `init_render`, `init_xkb`,
-    /// and `query_extension_opcode`. After Phase 6.3 these run during
-    /// `open_from_env` *before* the dispatcher is spawned, which is why
-    /// they keep the synchronous read-loop shape.
+    /// Stash an init-time response into the pending tables (called
+    /// from the synchronous `read_until_response` path used during
+    /// `open_from_env`, before the socket is set non-blocking).
     pub(super) fn stash_or_log_response(&mut self, response: HostResponse) {
         if response.bytes[0] == 0 {
             let origin = self.take_origin_for_sequence(response.sequence_full);
@@ -875,63 +656,62 @@ impl HostX11Backend {
                 error.sequence,
                 error.sequence_full,
             );
-            self.emit_backend_event(BackendEvent::HostError {
-                origin,
-                error: error.into_io_error("async host request"),
-            });
-            self.pending_errors.insert(error);
+            self.pending_errors.insert(error.sequence_full, error);
             return;
         }
         self.take_origin_for_sequence(response.sequence_full);
-        self.pending_replies.insert(response);
+        self.pending_replies
+            .insert(response.sequence_full, response);
     }
 
-    /// Phase 6.3 pathway: block on the `PendingReplies` Condvar until
-    /// the dispatcher delivers `target_full`. The Backend mutex stays
-    /// locked while we wait — that's safe because the dispatcher thread
-    /// only locks `pending_replies.state`, not the Backend mutex (see
-    /// the `PendingReplies` doc-comment).
-    ///
-    /// The synchronous fallback (`read_target_reply`) is preserved for
-    /// the init phase when the dispatcher hasn't been spawned yet —
-    /// `init_render`, `init_xkb`, and `query_extension_opcode` go
-    /// through `read_until_response` directly. By the time the
-    /// constructor returns, every subsequent reply waiter goes through
-    /// the Condvar pathway.
+    /// Block until `target_full` lands in `pending_replies`. F2: the
+    /// core thread is the only reader of the host socket, so this
+    /// drives the socket directly. `wait_readable` blocks on `poll(2)`
+    /// when the kernel buffer is empty; `drain_host_socket` then
+    /// extracts whatever frames have arrived. Spontaneous host events
+    /// land in `pending_events` (drained later at the outer-loop
+    /// boundary, never recursively from inside this call — that's the
+    /// reentrancy invariant documented on `HostX11Backend`).
     pub(super) fn wait_for_reply(
         &mut self,
         target_full: u64,
     ) -> io::Result<Result<Vec<u8>, HostError>> {
-        // Fast path: dispatcher already produced the response.
+        // Fast path: a previous `drain_host_socket` already produced
+        // the response.
         if let Some(response) = self.take_buffered_reply(target_full) {
             return Ok(decode_reply_or_error(response));
         }
-        // Pre-dispatcher fallback: an error was queued in pending_errors
-        // by `stash_or_log_response` during init. After init this map
-        // stays empty, but we still consult it so the init-phase tests
-        // and the legacy synchronous read path keep working.
+        // Init-phase fallback: an error was queued in `pending_errors`
+        // by `stash_or_log_response` during the synchronous init.
         if let Some(error) = self.pending_errors.take(target_full) {
             self.take_origin_for_sequence(target_full);
             return Ok(Err(error));
         }
-        if self.dispatcher.is_some() {
-            // Background dispatcher will signal via the Condvar.
-            let response = self.pending_replies.wait_for(target_full)?;
-            self.take_origin_for_sequence(target_full);
-            return Ok(decode_reply_or_error(response));
-        }
-        // No dispatcher yet (init path). Fall back to draining the
-        // stream synchronously like the pre-Phase-6.3 code did.
-        let response = self.read_until_response(|response| {
-            if response.sequence_full == target_full {
-                ResponseMatch::Return
-            } else {
-                ResponseMatch::Buffer
+        // Drain whatever's currently buffered (non-blocking via
+        // MSG_DONTWAIT), poll for more, repeat. Reentrancy invariant:
+        // `drain_host_socket` only enqueues — it does not fan out
+        // events. A host method called inside fanout cannot
+        // recursively re-dispatch.
+        loop {
+            match self.drain_host_socket()? {
+                HostSocketStatus::WouldBlock => {}
+                HostSocketStatus::Eof => {
+                    return Err(io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "host connection closed before reply arrived",
+                    ));
+                }
             }
-        })?;
-        Ok(decode_reply_or_error(response))
+            if let Some(response) = self.take_buffered_reply(target_full) {
+                return Ok(decode_reply_or_error(response));
+            }
+            wait_readable(self.stream.as_raw_fd())?;
+        }
     }
 
+    /// Synchronous read-buffer drain used by the init path before the
+    /// socket goes non-blocking. After init, `drain_host_socket` is
+    /// the canonical reader.
     pub(super) fn read_until_response<F>(&mut self, mut matcher: F) -> io::Result<HostResponse>
     where
         F: FnMut(&HostResponse) -> ResponseMatch,
@@ -946,6 +726,122 @@ impl HostX11Backend {
                 ResponseMatch::Buffer => self.stash_or_log_response(response),
             }
         }
+    }
+
+    /// Read whatever bytes are currently available on the host socket
+    /// and decode complete X11 frames out of `read_buffer`. Replies
+    /// and errors land in `pending_replies`; events land in
+    /// `pending_events` (fanned out later at the outer-loop boundary).
+    ///
+    /// The stream stays in blocking mode so `write_all` for large
+    /// host requests doesn't trip on EAGAIN; reads here go through
+    /// `recv(MSG_DONTWAIT)` which bypasses the socket's blocking
+    /// flag for this one call. Returns `WouldBlock` when the kernel
+    /// buffer is drained, `Eof` when the host closed the connection.
+    pub(super) fn drain_host_socket(&mut self) -> io::Result<HostSocketStatus> {
+        if self.socket_eof {
+            return Ok(HostSocketStatus::Eof);
+        }
+        let fd = self.stream.as_raw_fd();
+        let mut tmp = [0u8; 4096];
+        loop {
+            // SAFETY: `recv(2)` with MSG_DONTWAIT on a connected
+            // Unix socket; `tmp` is a valid mutable slice.
+            let n = unsafe {
+                libc::recv(
+                    fd,
+                    tmp.as_mut_ptr().cast::<libc::c_void>(),
+                    tmp.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n == 0 {
+                self.socket_eof = true;
+                self.classify_buffered_frames();
+                return Ok(HostSocketStatus::Eof);
+            }
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                match err.kind() {
+                    ErrorKind::WouldBlock => {
+                        self.classify_buffered_frames();
+                        return Ok(HostSocketStatus::WouldBlock);
+                    }
+                    ErrorKind::Interrupted => continue,
+                    _ => return Err(err),
+                }
+            }
+            #[allow(clippy::cast_sign_loss)]
+            let n = n as usize;
+            self.read_buffer.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    fn classify_buffered_frames(&mut self) {
+        while let Some(frame) = try_extract_frame(&mut self.read_buffer) {
+            self.classify_frame(frame);
+        }
+    }
+
+    fn classify_frame(&mut self, frame: Vec<u8>) {
+        let header_byte = frame[0];
+        match header_byte {
+            0 => {
+                // Error
+                let sequence = u16::from_le_bytes([frame[2], frame[3]]);
+                let sequence_full = self.promote_sequence(sequence);
+                let response = HostResponse {
+                    sequence,
+                    sequence_full,
+                    bytes: frame,
+                };
+                if let Some(error) = HostError::from_response(&response) {
+                    let origin = self.take_origin_for_sequence(sequence_full);
+                    debug!(
+                        "host async error: code={} major={} minor={} seq={} seq_full={} origin={origin:?}",
+                        error.code,
+                        error.major_opcode,
+                        error.minor_opcode,
+                        error.sequence,
+                        error.sequence_full,
+                    );
+                }
+                self.pending_replies.insert(sequence_full, response);
+            }
+            1 => {
+                // Reply
+                let sequence = u16::from_le_bytes([frame[2], frame[3]]);
+                let sequence_full = self.promote_sequence(sequence);
+                let response = HostResponse {
+                    sequence,
+                    sequence_full,
+                    bytes: frame,
+                };
+                self.pending_replies.insert(sequence_full, response);
+            }
+            35 => {
+                // GenericEvent: not currently surfaced.
+            }
+            _ => {
+                if let Ok(header) = <[u8; 32]>::try_from(&frame[..32])
+                    && let Some(event) = decode_host_event(&header)
+                {
+                    self.pending_events.push_back(event);
+                }
+            }
+        }
+    }
+
+    /// Pop the next decoded host event for fanout. The core's
+    /// dispatcher loop calls this at the outer-loop boundary (after
+    /// each `Message` and each non-host-X11 token arm) so a host
+    /// request issued mid-fanout cannot recursively re-dispatch.
+    pub(super) fn pop_pending_host_event(&mut self) -> Option<HostEvent> {
+        self.pending_events.pop_front()
+    }
+
+    pub(super) fn host_socket_eof(&self) -> bool {
+        self.socket_eof
     }
 
     pub fn window_id(&self) -> u32 {
@@ -1350,112 +1246,10 @@ pub(super) fn promote_seq_from_atomic(next_full: u64, wire: u16) -> u64 {
     candidate
 }
 
-/// Spawn the background dispatcher. Owns a clone of the read half of
-/// the host UnixStream and is the *only* reader after `open_from_env`
-/// returns. Loops:
-///   1. Block on `read_response` until a reply (header[0]==1) or error
-///      (header[0]==0) arrives. Events (header[0]>=2) are skipped at
-///      the framing layer (`read_response`). Step 4 will flip that to
-///      route events through the channel too.
-///   2. Promote the 16-bit wire seq to 64-bit using `seq_full_atomic`.
-///   3. For both replies and errors: insert into `pending_replies` and
-///      signal the Condvar so any waiter in `wait_for_reply` wakes up.
-///   4. For errors: ALSO emit `BackendEvent::HostError` to the channel,
-///      with the `OriginContext` looked up from `pending_origins` (if
-///      present). This handles the async-error case where no waiter is
-///      blocked — the sink hears about it instead.
-///
-/// The thread exits on read error (host disconnected). It does NOT
-/// touch the Backend mutex, so it can't deadlock against any request
-/// handler that holds it.
-fn spawn_dispatch_thread(
-    mut read_stream: UnixStream,
-    pending_replies: Arc<PendingReplies>,
-    _pending_errors: Arc<PendingErrors>,
-    pending_origins: Arc<Mutex<SequenceMap<OriginContext>>>,
-    seq_full_atomic: Arc<AtomicU64>,
-    event_tx: Sender<BackendEvent>,
-    key_subscribers: Arc<Mutex<Vec<Sender<HostKeyEvent>>>>,
-) -> thread::JoinHandle<()> {
-    thread::Builder::new()
-        .name("hostx11-dispatch".into())
-        .spawn(move || {
-            loop {
-                let message = match read_dispatch_message(&mut read_stream) {
-                    Ok(msg) => msg,
-                    Err(err) => {
-                        log::info!("hostx11-dispatch: connection closed ({err}), exiting");
-                        pending_replies.disconnect();
-                        return;
-                    }
-                };
-                match message {
-                    HostMessage::Skip => continue,
-                    HostMessage::Event(event) => {
-                        // Phase 6.3 Step 4: per-client kb subscribers
-                        // get their own copy of every Key event so each
-                        // client's `spawn_keyboard_forwarder` can apply
-                        // its own focus state. The sink receives the
-                        // same event via `event_tx` for completeness;
-                        // sink fan-out drops Key events because routing
-                        // them lives in the per-client thread.
-                        if let HostEvent::Key(key) = event {
-                            let subs = key_subscribers
-                                .lock()
-                                .expect("key subscribers mutex poisoned");
-                            // Snapshot the current sender list — a
-                            // disconnected client's Sender returns
-                            // Err on send and we'd skip it without
-                            // mutating the list here. Periodic
-                            // pruning happens lazily via
-                            // `register_key_subscriber`.
-                            for tx in subs.iter() {
-                                let _ = tx.send(key);
-                            }
-                            drop(subs);
-                        }
-                        let _ = event_tx.send(BackendEvent::HostEvent(event));
-                        continue;
-                    }
-                    HostMessage::Response(mut response) => {
-                        let next_full = seq_full_atomic.load(Ordering::SeqCst);
-                        response.sequence_full =
-                            promote_seq_from_atomic(next_full, response.sequence);
-
-                        let is_error = response.bytes[0] == 0;
-                        if is_error {
-                            let error = HostError::from_response(&response)
-                                .expect("error response missing header");
-                            let origin = pending_origins
-                                .lock()
-                                .expect("pending origins mutex poisoned")
-                                .take(response.sequence_full);
-                            log::debug!(
-                                "hostx11-dispatch: host error code={} major={} minor={} seq={} seq_full={} origin={origin:?}",
-                                error.code,
-                                error.major_opcode,
-                                error.minor_opcode,
-                                error.sequence,
-                                error.sequence_full,
-                            );
-                            let _ = event_tx.send(BackendEvent::HostError {
-                                origin,
-                                error: error.into_io_error("async host request"),
-                            });
-                            // Also publish the response so any waiter in
-                            // `wait_for_reply` wakes up. Reply consumers
-                            // distinguish reply-vs-error by header[0].
-                            pending_replies.insert(response);
-                        } else {
-                            pending_replies.insert(response);
-                        }
-                    }
-                }
-            }
-        })
-        .expect("hostx11-dispatch thread spawn")
-}
-
+/// Read whatever-blocking-mode the stream is in: returns one host
+/// frame (reply / error / event). Used by the init-time synchronous
+/// loop in `read_until_response`. After init the core uses
+/// `drain_host_socket` instead.
 pub(super) fn read_response(stream: &mut UnixStream) -> io::Result<HostResponse> {
     let mut header = [0u8; 32];
     loop {
@@ -1508,101 +1302,25 @@ pub(super) fn read_response(stream: &mut UnixStream) -> io::Result<HostResponse>
     })
 }
 
-/// Variant returned by the dispatcher's [`read_dispatch_message`]. The
-/// merged main connection multiplexes replies/errors and asynchronous
-/// events on the same stream — splitting them at the read boundary
-/// keeps the dispatcher's branching shallow.
-pub(super) enum HostMessage {
-    Response(HostResponse),
-    Event(HostEvent),
-    /// Event class we don't care about (KeymapNotify, etc.) — drop
-    /// silently. The dispatcher loops back to `read_dispatch_message`.
-    Skip,
-}
-
-/// Phase 6.3 Step 4: replacement for `read_response` on the dispatcher
-/// side. Reads the next 32-byte X11 header, decodes events to
-/// `HostMessage::Event` (so the dispatcher can fan out to the sink and
-/// per-client subscribers), and returns reply/error bodies as
-/// `HostMessage::Response`.
-///
-/// `read_response` is preserved unchanged for the synchronous init
-/// path (`read_until_response`) where any event arriving mid-init is
-/// still dropped — the dispatcher hasn't been spawned yet, no sink is
-/// listening, and `init_render` / `init_xkb` only care about replies.
-pub(super) fn read_dispatch_message(stream: &mut UnixStream) -> io::Result<HostMessage> {
-    let mut header = [0u8; 32];
-    stream.read_exact(&mut header)?;
-    match header[0] {
-        0 => {
-            // Error — fixed 32 bytes.
-            let sequence = u16::from_le_bytes([header[2], header[3]]);
-            let mut bytes = Vec::with_capacity(32);
-            bytes.extend_from_slice(&header);
-            Ok(HostMessage::Response(HostResponse {
-                sequence,
-                sequence_full: 0,
-                bytes,
-            }))
-        }
-        1 => {
-            // Reply — header[4..8] is extra-length in 4-byte units.
-            let sequence = u16::from_le_bytes([header[2], header[3]]);
-            let extra =
-                u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize * 4;
-            let mut bytes = Vec::with_capacity(32 + extra);
-            bytes.extend_from_slice(&header);
-            if extra > 0 {
-                let mut tail = vec![0u8; extra];
-                stream.read_exact(&mut tail)?;
-                bytes.extend_from_slice(&tail);
-            }
-            Ok(HostMessage::Response(HostResponse {
-                sequence,
-                sequence_full: 0,
-                bytes,
-            }))
-        }
-        35 => {
-            // GenericEvent: skip the extra payload to keep stream aligned.
-            // We don't currently surface these to the sink — XInput2 lives
-            // on the per-client kb fanout below, not the host pump.
-            let extra =
-                u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize * 4;
-            if extra > 0 {
-                let mut tail = vec![0u8; extra];
-                stream.read_exact(&mut tail)?;
-            }
-            Ok(HostMessage::Skip)
-        }
-        _ => {
-            // Plain X11 event (KeyPress=2, KeyRelease=3, etc.). Decoder
-            // returns None for event classes we ignore.
-            match decode_host_event(&header) {
-                Some(event) => Ok(HostMessage::Event(event)),
-                None => Ok(HostMessage::Skip),
-            }
-        }
-    }
-}
+// `HostMessage` / `read_dispatch_message` were removed in F2 — the
+// dispatcher thread is gone; `drain_host_socket` is the canonical
+// reader and classifies frames inline (see `classify_frame`).
 
 #[cfg(test)]
 mod tests {
     use super::{
-        HostClipState, HostError, HostFillState, HostResponse, HostX11Backend, PendingErrors,
-        PendingReplies, SequenceMap, promote_seq_from_atomic, read_u16,
+        HostClipState, HostError, HostFillState, HostResponse, HostX11Backend, HostXidMap,
+        SequenceMap, promote_seq_from_atomic, read_u16, try_extract_frame,
     };
     use crate::backend::OriginContext;
     use std::{
-        collections::HashMap,
+        collections::{HashMap, VecDeque},
         os::unix::net::UnixStream,
-        sync::{Arc, Mutex, atomic::AtomicU64},
     };
     use yserver_protocol::x11::ClientId;
 
     fn dummy_backend() -> HostX11Backend {
         let (stream, _peer) = UnixStream::pair().expect("unix stream pair");
-        let (event_tx, event_rx) = crossbeam_channel::unbounded();
         HostX11Backend {
             stream,
             window_id: 1,
@@ -1635,17 +1353,14 @@ mod tests {
             root_visual_xid: 0,
             argb_visual_xid: None,
             argb_colormap_xid: None,
-            pending_replies: Arc::new(PendingReplies::new(65_536)),
-            pending_errors: Arc::new(PendingErrors::new(65_536)),
-            pending_origins: Arc::new(Mutex::new(SequenceMap::new(65_536))),
-            seq_full_atomic: Arc::new(AtomicU64::new(0x1_fffe)),
-            event_tx,
-            event_rx: Some(event_rx),
+            pending_replies: SequenceMap::new(65_536),
+            pending_errors: SequenceMap::new(65_536),
+            pending_origins: SequenceMap::new(65_536),
+            pending_events: VecDeque::new(),
+            read_buffer: Vec::new(),
+            socket_eof: false,
             host_event_masks: HashMap::new(),
-            sink_consumer: None,
-            dispatcher: None,
-            xid_map: Arc::new(Mutex::new(HashMap::new())),
-            key_subscribers: Arc::new(Mutex::new(Vec::new())),
+            xid_map: HostXidMap::new(),
             depth_gcs: HashMap::new(),
         }
     }
@@ -1677,7 +1392,7 @@ mod tests {
     }
 
     #[test]
-    fn async_error_logging_path_consumes_origin_without_buffering_reply() {
+    fn async_error_logging_path_consumes_origin_and_buffers_error() {
         let mut backend = dummy_backend();
         let origin = OriginContext {
             client_id: ClientId(3),
@@ -1696,7 +1411,11 @@ mod tests {
             sequence_full: full,
             bytes,
         });
+        // Errors land in pending_errors via the init-path stash;
+        // pending_replies stays empty for error frames.
         assert_eq!(backend.pending_replies.len(), 0);
+        assert_eq!(backend.pending_errors.len(), 1);
+        // The origin was consumed by stash_or_log_response.
         assert!(backend.take_origin_for_sequence(full).is_none());
         assert_eq!(read_u16(&[1, 0]), 1);
     }
@@ -1711,11 +1430,14 @@ mod tests {
         bytes[4..8].copy_from_slice(&0x00ab_cdefu32.to_le_bytes());
         bytes[8..10].copy_from_slice(&0x1234u16.to_le_bytes());
         bytes[10] = 62;
-        backend.pending_replies.insert(HostResponse {
-            sequence: 0x1234,
-            sequence_full: full,
-            bytes,
-        });
+        backend.pending_replies.insert(
+            full,
+            HostResponse {
+                sequence: 0x1234,
+                sequence_full: full,
+                bytes,
+            },
+        );
 
         let error = backend
             .wait_for_reply(full)
@@ -1736,30 +1458,6 @@ mod tests {
     }
 
     #[test]
-    fn async_error_path_buffers_structured_error() {
-        let mut backend = dummy_backend();
-        let origin = OriginContext {
-            client_id: ClientId(4),
-            nested_seq: 5,
-            opcode: 6,
-        };
-        backend.set_active_origin(Some(origin));
-        let (_wire, full) = backend.issue_sequence();
-        let mut bytes = vec![0; 32];
-        bytes[0] = 0;
-        bytes[1] = 11;
-        bytes[4..8].copy_from_slice(&0xdead_beefu32.to_le_bytes());
-        bytes[8..10].copy_from_slice(&0x0042u16.to_le_bytes());
-        bytes[10] = 17;
-        backend.stash_or_log_response(HostResponse {
-            sequence: 0x0042,
-            sequence_full: full,
-            bytes,
-        });
-        assert_eq!(backend.pending_errors.len(), 1);
-    }
-
-    #[test]
     fn update_host_event_mask_tracks_registry() {
         let mut backend = dummy_backend();
         assert_eq!(backend.update_host_event_mask(0x1234, 0x4, true), 0x4);
@@ -1772,109 +1470,61 @@ mod tests {
         assert_eq!(backend.host_event_mask(0x1234), 0);
     }
 
-    /// Wait_for_reply blocks on the Condvar; a parallel "dispatcher"
-    /// pushes the response into PendingReplies; the waiter wakes up
-    /// and returns Ok with the reply bytes. Exercises the post-Phase-6.3
-    /// pathway that no longer reads from the stream synchronously.
+    /// F2: `try_extract_frame` peels one complete X11 frame off a
+    /// non-blocking read buffer and leaves any partial trailer in
+    /// place. Reply frames carry an extra-payload length in
+    /// `header[4..8]` (in 4-byte units); errors and plain events are
+    /// fixed-32-byte.
     #[test]
-    fn wait_for_reply_blocks_on_condvar_until_dispatcher_signals() {
-        use std::{thread, time::Duration};
-
-        let backend = dummy_backend();
-        let pending = Arc::clone(&backend.pending_replies);
-        // Mark dispatcher as "running" so wait_for_reply takes the
-        // Condvar pathway instead of falling back to stream reads.
-        let mut backend = backend;
-        backend.dispatcher = Some(thread::spawn(|| {})); // placeholder JoinHandle
-        let target_full: u64 = 0x1_2345;
-
-        // Simulated dispatcher: 50ms later, insert a successful reply.
-        let pending_for_thread = Arc::clone(&pending);
-        let producer = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            let mut bytes = vec![0u8; 32];
-            bytes[0] = 1; // reply
-            bytes[1] = 0xab; // payload byte at offset 1
-            bytes[8..10].copy_from_slice(&0x2345u16.to_le_bytes());
-            pending_for_thread.insert(HostResponse {
-                sequence: 0x2345,
-                sequence_full: target_full,
-                bytes,
-            });
-        });
-
-        let reply = backend
-            .wait_for_reply(target_full)
-            .expect("wait_for_reply io result")
-            .expect("reply, not error");
-        producer.join().expect("producer thread join");
-        assert_eq!(reply[0], 1);
-        assert_eq!(reply[1], 0xab);
+    fn try_extract_frame_handles_reply_with_extra_payload() {
+        // Reply with 4 extra words = 16 extra bytes → 48-byte frame.
+        let mut buf = vec![0u8; 48 + 32];
+        buf[0] = 1;
+        buf[4..8].copy_from_slice(&4u32.to_le_bytes());
+        buf[48] = 2; // Next frame start (32-byte event)
+        let frame = try_extract_frame(&mut buf).expect("first frame extracted");
+        assert_eq!(frame.len(), 48);
+        assert_eq!(frame[0], 1);
+        assert_eq!(buf.len(), 32);
+        assert_eq!(buf[0], 2);
     }
 
-    /// Async-error path: dispatcher emits BackendEvent::HostError on
-    /// the channel for an error whose origin we previously recorded.
-    /// `set_event_sink` then drains the channel via the consumer
-    /// thread, so the sink sees the error with the right origin.
     #[test]
-    fn dispatcher_routes_async_error_to_sink_with_origin() {
-        use std::{sync::mpsc, time::Duration};
+    fn try_extract_frame_returns_none_on_partial_frame() {
+        // Reply header claims 8 extra bytes but only 16 buffered.
+        let mut buf = vec![0u8; 16];
+        buf[0] = 1;
+        buf[4..8].copy_from_slice(&2u32.to_le_bytes());
+        assert!(try_extract_frame(&mut buf).is_none());
+        // Fewer than 32 bytes — also None.
+        let mut tiny = vec![1u8; 8];
+        assert!(try_extract_frame(&mut tiny).is_none());
+    }
 
-        struct CaptureSink(mpsc::Sender<crate::backend::BackendEvent>);
-        impl crate::backend::BackendEventSink for CaptureSink {
-            fn handle_backend_event(&mut self, event: crate::backend::BackendEvent) {
-                let _ = self.0.send(event);
-            }
-        }
-
+    /// F2 reentrancy invariant: `drain_host_socket` only enqueues —
+    /// it never fans events out. Pushing a synthetic Expose frame
+    /// through the read buffer should land in `pending_events`, not
+    /// trigger any state mutation.
+    #[test]
+    fn drain_classifies_event_into_pending_events_queue() {
         let mut backend = dummy_backend();
-        let origin = OriginContext {
-            client_id: ClientId(11),
-            nested_seq: 22,
-            opcode: 33,
-        };
-        backend.set_active_origin(Some(origin));
-        let (_wire, full) = backend.issue_sequence();
+        // Expose event = 12, fixed 32 bytes.
+        let mut frame = vec![0u8; 32];
+        frame[0] = 12;
+        frame[4..8].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        backend.read_buffer.extend_from_slice(&frame);
+        backend.classify_buffered_frames();
+        assert_eq!(backend.pending_events.len(), 1);
+        assert_eq!(backend.read_buffer.len(), 0);
+    }
 
-        // Hand-craft an error event into the channel as if the
-        // dispatcher had decoded it. Verifies the consumer thread's
-        // wiring rather than the read-side framing — read-side framing
-        // is exercised by the live smoke test.
-        let mut error_bytes = vec![0u8; 32];
-        error_bytes[0] = 0; // error
-        error_bytes[1] = 7;
-        error_bytes[4..8].copy_from_slice(&0xfeed_face_u32.to_le_bytes());
-        error_bytes[8..10].copy_from_slice(&0xbeefu16.to_le_bytes());
-        error_bytes[10] = 99;
-        let error_resp = HostResponse {
-            sequence: 0xbeef,
-            sequence_full: full,
-            bytes: error_bytes,
-        };
-        let host_error = HostError::from_response(&error_resp).expect("host error");
-
-        // Hook up the sink before pushing the event.
-        let (tx, rx) = mpsc::channel();
-        crate::backend::Backend::set_event_sink(&mut backend, Some(Box::new(CaptureSink(tx))));
-
-        backend.emit_backend_event(crate::backend::BackendEvent::HostError {
-            origin: Some(origin),
-            error: host_error.into_io_error("simulated"),
-        });
-
-        // The consumer thread fans the event out to our CaptureSink.
-        let event = rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("backend event delivered");
-        match event {
-            crate::backend::BackendEvent::HostError {
-                origin: got_origin,
-                error: _,
-            } => {
-                assert_eq!(got_origin, Some(origin));
-            }
-            other => panic!("expected HostError, got {other:?}"),
-        }
+    /// F2: `pop_pending_host_event` is the only way the core lifts a
+    /// decoded event out of the backend; calling it on an empty
+    /// queue returns None (no fanout work to do).
+    #[test]
+    fn pop_pending_host_event_returns_none_when_empty() {
+        let mut backend = dummy_backend();
+        assert!(backend.pop_pending_host_event().is_none());
     }
 
     /// Sequence promotion edge cases: ancient seq, recent wrap, and
@@ -1909,29 +1559,23 @@ mod tests {
         assert_eq!(promote_seq_from_atomic(0, 0x0001), 0);
     }
 
-    /// Phase 6.3 Step 4: dispatcher decodes KeyPress (event type 2)
-    /// out of a 32-byte X11 event header into `HostEvent::Key` with
-    /// `pressed=true`. KeyRelease (event type 3) decodes the same
-    /// shape with `pressed=false`. This is the substitute for the
-    /// pre-Step-4 per-client kb pump's read path — so the merged
-    /// dispatcher can fan keys out to the registered subscribers.
     #[test]
     fn decode_host_event_translates_key_press_and_release() {
         use crate::host_x11::{HostEvent, pump::decode_host_event};
 
         let mut press = [0u8; 32];
         press[0] = 2; // KeyPress
-        press[1] = 0x39; // keycode
-        press[4..8].copy_from_slice(&0x0102_0304u32.to_le_bytes()); // time
-        press[20..22].copy_from_slice(&100i16.to_le_bytes()); // root_x
-        press[22..24].copy_from_slice(&200i16.to_le_bytes()); // root_y
-        press[24..26].copy_from_slice(&50i16.to_le_bytes()); // event_x
-        press[26..28].copy_from_slice(&60i16.to_le_bytes()); // event_y
-        press[28..30].copy_from_slice(&0x0001u16.to_le_bytes()); // state
+        press[1] = 0x39;
+        press[4..8].copy_from_slice(&0x0102_0304u32.to_le_bytes());
+        press[20..22].copy_from_slice(&100i16.to_le_bytes());
+        press[22..24].copy_from_slice(&200i16.to_le_bytes());
+        press[24..26].copy_from_slice(&50i16.to_le_bytes());
+        press[26..28].copy_from_slice(&60i16.to_le_bytes());
+        press[28..30].copy_from_slice(&0x0001u16.to_le_bytes());
 
         match decode_host_event(&press).expect("KeyPress decodes") {
             HostEvent::Key(key) => {
-                assert!(key.pressed, "KeyPress yields pressed=true");
+                assert!(key.pressed);
                 assert_eq!(key.keycode, 0x39);
                 assert_eq!(key.time, 0x0102_0304);
                 assert_eq!(key.root_x, 100);
@@ -1944,33 +1588,27 @@ mod tests {
         }
 
         let mut release = press;
-        release[0] = 3; // KeyRelease
+        release[0] = 3;
         match decode_host_event(&release).expect("KeyRelease decodes") {
             HostEvent::Key(key) => {
-                assert!(!key.pressed, "KeyRelease yields pressed=false");
+                assert!(!key.pressed);
                 assert_eq!(key.keycode, 0x39);
             }
             other => panic!("expected HostEvent::Key, got {other:?}"),
         }
     }
 
-    /// Phase 6.3 Step 4: dispatcher decodes a synthetic-flag-stripped
-    /// event type — bit 7 on event[0] marks events sent via
-    /// SendEvent. Decoding must mask it off before classifying.
     #[test]
     fn decode_host_event_strips_synthetic_flag() {
         use crate::host_x11::{HostEvent, pump::decode_host_event};
 
         let mut synthetic_press = [0u8; 32];
-        synthetic_press[0] = 2 | 0x80; // KeyPress with synthetic bit set
+        synthetic_press[0] = 2 | 0x80;
         synthetic_press[1] = 0x39;
         let event = decode_host_event(&synthetic_press).expect("synthetic key decodes");
         assert!(matches!(event, HostEvent::Key(_)));
     }
 
-    /// Phase 6.3 Step 4: events the dispatcher doesn't surface
-    /// (e.g. KeymapNotify = 11, MappingNotify = 34) decode to None,
-    /// so the dispatcher loop just continues.
     #[test]
     fn decode_host_event_drops_uninteresting_event_types() {
         use crate::host_x11::pump::decode_host_event;
@@ -1985,51 +1623,11 @@ mod tests {
         }
     }
 
-    /// Phase 6.3 Step 4: `add_key_subscriber` appends a Sender; the
-    /// dispatcher's send-loop later fans events to every entry. We
-    /// don't have a live dispatcher in this unit test, so we verify
-    /// the registration shape directly: a freshly-added Sender lives
-    /// in the shared list and a `send` from a simulated dispatcher
-    /// arrives on the matching Receiver.
+    /// F2: `register_top_level` inserts host_xid → nested_id into the
+    /// plain `xid_map` field. Pre-F2 this needed Mutex locking; now
+    /// the core is the only writer.
     #[test]
-    fn add_key_subscriber_appends_sender_visible_to_shared_list() {
-        use crate::host_x11::HostKeyEvent;
-        let mut backend = dummy_backend();
-        let (tx, rx) = crossbeam_channel::unbounded::<HostKeyEvent>();
-        backend.add_key_subscriber(tx);
-        // List has one entry, sending through it lands on rx.
-        let subs = backend
-            .key_subscribers
-            .lock()
-            .expect("key subscribers mutex poisoned");
-        assert_eq!(subs.len(), 1, "one subscriber registered");
-        let event = HostKeyEvent {
-            pressed: true,
-            keycode: 0x39,
-            time: 1,
-            root_x: 0,
-            root_y: 0,
-            event_x: 0,
-            event_y: 0,
-            state: 0,
-        };
-        for s in subs.iter() {
-            s.send(event).expect("send to live subscriber");
-        }
-        drop(subs);
-        let received = rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .expect("subscriber receives event");
-        assert_eq!(received.keycode, 0x39);
-    }
-
-    /// Phase 6.3 Step 4: register_top_level inserts host_xid →
-    /// nested_id into the shared xid_map. The wire-side write is
-    /// exercised in the live integration smoke (xterm under wmaker);
-    /// here we just confirm the registry shape that the sink relies
-    /// on through `Backend::xid_map()`.
-    #[test]
-    fn register_top_level_populates_shared_xid_map() {
+    fn register_top_level_populates_xid_map() {
         use yserver_protocol::x11::ResourceId;
         let mut backend = dummy_backend();
         let nested_id = ResourceId(0x100);
@@ -2037,9 +1635,17 @@ mod tests {
         // peer side just discards. We only assert the in-memory map.
         let _ = backend.register_top_level(nested_id, 0xabcd_1234);
         let map = HostX11Backend::xid_map(&backend);
-        assert_eq!(
-            map.lock().unwrap().get(&0xabcd_1234).copied(),
-            Some(nested_id),
-        );
+        assert_eq!(map.get(&0xabcd_1234).copied(), Some(nested_id));
+    }
+
+    /// `SequenceMap` len helper is `#[cfg(test)]` only — surface it
+    /// through a trivial test so the compiler doesn't dead-code-strip
+    /// it when these tests run.
+    #[test]
+    fn sequence_map_len_is_test_visible() {
+        let mut map: SequenceMap<u32> = SequenceMap::new(8);
+        assert_eq!(map.len(), 0);
+        map.insert(1, 1);
+        assert_eq!(map.len(), 1);
     }
 }
