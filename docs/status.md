@@ -2153,6 +2153,7 @@ the suite tell us where the real gaps are.
   | 2026-05-06 |   26 |   91 |   252 |    0 |     0 | BE client support phases 0+A+B+C+D+D1 (reader, setup, errors, replies, events, shared `wire_swap` module). |
   | 2026-05-06 |  195 |   78 |    97 |    0 |     0 | Phase E — per-opcode inbound request body swap. **PASS 26 → 195**. |
   | 2026-05-06 |  229 |   40 |    99 |    0 |     0 | Phases D2 + F — raw event templates per-recipient + content-aware BadLength. **PASS 195 → 229**. |
+  | 2026-05-06 |  337 |   25 |     7 |    0 |     0 | xproto branch — residual fixes (missing replies, BadAlloc/BadAccess/BadValue/BadIDChoice, Expose/GraphicsExpose, content-shape BadLength, max length, error-resilience). **PASS 229 → 337**. |
 
 - **`BadLength` enforcement landed.** A per-opcode length contract
   table covers all of opcodes 1–127 in

@@ -1273,6 +1273,55 @@ pub fn encode_expose_event(
     out.extend_from_slice(&[0; 14]);
 }
 
+/// GraphicsExpose (event type 13). Sent in response to CopyArea/CopyPlane
+/// when graphics-exposures is True for source regions that aren't
+/// guaranteed visible. We always emit a single event covering the full
+/// destination rectangle since we don't track source obscurity.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_graphics_expose_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    order: ClientByteOrder,
+    drawable: ResourceId,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    minor_opcode: u16,
+    count: u16,
+    major_opcode: u8,
+) {
+    out.push(13); // GraphicsExpose
+    out.push(0);
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, drawable.0);
+    write_u16(order, out, x);
+    write_u16(order, out, y);
+    write_u16(order, out, width);
+    write_u16(order, out, height);
+    write_u16(order, out, minor_opcode);
+    write_u16(order, out, count);
+    out.push(major_opcode);
+    out.extend_from_slice(&[0; 11]);
+}
+
+pub fn encode_no_exposure_event(
+    out: &mut Vec<u8>,
+    sequence: SequenceNumber,
+    order: ClientByteOrder,
+    drawable: ResourceId,
+    minor_opcode: u16,
+    major_opcode: u8,
+) {
+    out.push(14); // NoExposure
+    out.push(0);
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, drawable.0);
+    write_u16(order, out, minor_opcode);
+    out.push(major_opcode);
+    out.extend_from_slice(&[0; 21]);
+}
+
 pub fn encode_map_notify_event(
     out: &mut Vec<u8>,
     sequence: SequenceNumber,

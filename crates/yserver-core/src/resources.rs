@@ -261,6 +261,22 @@ impl ResourceTable {
         self.visuals.get(&id.0)
     }
 
+    /// Returns `true` if `id` corresponds to any allocated resource
+    /// (window, pixmap, gc, font, cursor, colormap, picture, or
+    /// glyphset). Used by `CreateXxx` opcodes to detect a
+    /// `BadIDChoice` violation when a client tries to reuse an ID.
+    pub fn xid_in_use(&self, id: ResourceId) -> bool {
+        let id = id.0;
+        self.windows.contains_key(&id)
+            || self.pixmaps.contains_key(&id)
+            || self.gcs.contains_key(&id)
+            || self.fonts.contains_key(&id)
+            || self.cursors.contains_key(&id)
+            || self.colormaps.contains_key(&id)
+            || self.pictures.contains_key(&id)
+            || self.glyphsets.contains_key(&id)
+    }
+
     pub fn visuals_iter(&self) -> impl Iterator<Item = &Visual> {
         self.visuals.values()
     }
@@ -277,6 +293,17 @@ impl ResourceTable {
             }
             None => false,
         }
+    }
+
+    pub fn create_colormap(&mut self, id: ResourceId, visual: ResourceId) {
+        self.colormaps.insert(
+            id.0,
+            Colormap {
+                id,
+                visual,
+                host_colormap_xid: None,
+            },
+        );
     }
 
     pub fn colormap(&self, id: ResourceId) -> Option<&Colormap> {
@@ -658,9 +685,25 @@ impl ResourceTable {
 
     #[must_use]
     pub fn map_window(&mut self, id: ResourceId) -> bool {
+        // A window is Viewable only if it is mapped AND all ancestors
+        // up to the root are also mapped (Viewable). If any ancestor
+        // is not Viewable, the window becomes Unviewable instead.
+        let parent_id = self.windows.get(&id.0).map(|w| w.parent);
+        let parent_viewable = match parent_id {
+            Some(pid) if pid.0 == id.0 => true, // root: mapping its parent (itself) is N/A
+            Some(pid) => self
+                .windows
+                .get(&pid.0)
+                .is_some_and(|p| p.map_state == MapState::Viewable),
+            None => false,
+        };
         if let Some(window) = self.windows.get_mut(&id.0) {
             let was_unmapped = window.map_state == MapState::Unmapped;
-            window.map_state = MapState::Viewable;
+            window.map_state = if parent_viewable {
+                MapState::Viewable
+            } else {
+                MapState::Unviewable
+            };
             was_unmapped
         } else {
             false

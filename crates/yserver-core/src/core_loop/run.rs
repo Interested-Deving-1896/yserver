@@ -170,7 +170,7 @@ pub fn run_core(
                                 body,
                                 attached_fd,
                             } => {
-                                let outcome = process_request(
+                                let outcome = match process_request(
                                     state,
                                     backend,
                                     id,
@@ -178,7 +178,23 @@ pub fn run_core(
                                     header,
                                     &body,
                                     attached_fd,
-                                )?;
+                                ) {
+                                    Ok(out) => out,
+                                    Err(err) => {
+                                        // A request handler errored — usually a
+                                        // backend-side limit (e.g., "too many
+                                        // points"). Log + continue rather than
+                                        // killing the server. Pre-existing bug:
+                                        // bogus client requests shouldn't be
+                                        // fatal.
+                                        log::warn!(
+                                            "request handler error (client {} opcode {}): {err}",
+                                            id.0,
+                                            header.opcode
+                                        );
+                                        RequestOutcome::Handled
+                                    }
+                                };
                                 if let RequestOutcome::Disconnect(disc_id) = outcome {
                                     crate::core_loop::process_disconnect::process_disconnect(
                                         state, backend, disc_id,

@@ -207,13 +207,14 @@ pub fn exact_required_length(opcode: u8, header_data: u8, body: &[u8]) -> Option
             Some(2 + pad_units(nlen))
         }
         // 18 ChangeProperty: 6 + pad_units(value_len * format / 8)
-        // header.data = format ∈ {8, 16, 32}. body[12..16] = value_len (u32, units).
-        18 if body.len() >= 16 => {
-            let format = u32::from(header_data);
+        // header.data = mode (Replace/Prepend/Append). format is at body[12]
+        // (u8), value_len at body[16..20] (u32).
+        18 if body.len() >= 20 => {
+            let format = u32::from(body[12]);
             if format != 8 && format != 16 && format != 32 {
                 return None;
             }
-            let value_len = read_u32_le(&body[12..16]);
+            let value_len = read_u32_le(&body[16..20]);
             let bytes = value_len.checked_mul(format / 8)?;
             Some(6 + pad_units(bytes))
         }
@@ -284,6 +285,89 @@ pub fn exact_required_length(opcode: u8, header_data: u8, body: &[u8]) -> Option
         116 => Some(1 + pad_units(u32::from(header_data))),
         // 118 SetModifierMapping: 1 + 2 * keycodes_per_modifier (header.data)
         118 => Some(1 + 2 * u32::from(header_data)),
+        // 59 SetClipRectangles: body = gc(4) + clip_x(2) + clip_y(2)
+        //                              + rects(8 × N). Body must be
+        //                              8 + 8k bytes; otherwise BadLength.
+        // (length_units already matches body.len() by construction in
+        // read_request; the constraint is on the body's *shape*.)
+        59 => {
+            if body.len() >= 8 && (body.len() - 8).is_multiple_of(8) {
+                None // shape is valid, length_units already passes
+            } else {
+                Some(u32::MAX) // sentinel: never matches, fires BadLength
+            }
+        }
+        // 89 StoreColors: body = cmap(4) + items(12 × N).
+        89 => {
+            if body.len() >= 4 && (body.len() - 4).is_multiple_of(12) {
+                None
+            } else {
+                Some(u32::MAX)
+            }
+        }
+        // 36 FreeColors: body = cmap(4) + plane_mask(4) + pixels(u32 × N).
+        36 => {
+            if body.len() >= 8 && (body.len() - 8).is_multiple_of(4) {
+                None
+            } else {
+                Some(u32::MAX)
+            }
+        }
+        // 64 PolyPoint: body = drawable(4) + gc(4) + points(4 × N)
+        // 65 PolyLine: same shape (points are 4 bytes each: i16 x + i16 y).
+        64 | 65 => {
+            if body.len() >= 8 && (body.len() - 8).is_multiple_of(4) {
+                None
+            } else {
+                Some(u32::MAX)
+            }
+        }
+        // 66 PolySegment: drawable(4) + gc(4) + segments(8 × N)
+        // 67 PolyRectangle: drawable(4) + gc(4) + rects(8 × N)
+        // 70 PolyFillRectangle: same shape.
+        66 | 67 | 70 => {
+            if body.len() >= 8 && (body.len() - 8).is_multiple_of(8) {
+                None
+            } else {
+                Some(u32::MAX)
+            }
+        }
+        // 68 PolyArc, 71 PolyFillArc: drawable(4) + gc(4) + arcs(12 × N)
+        68 | 71 => {
+            if body.len() >= 8 && (body.len() - 8).is_multiple_of(12) {
+                None
+            } else {
+                Some(u32::MAX)
+            }
+        }
+        // 76 ImageText8 / 77 ImageText16 / 74 PolyText8 / 75 PolyText16:
+        //   drawable(4) + gc(4) + x(2) + y(2) + text(opaque). header.data
+        //   carries the string length for ImageText*. Total body must be
+        //   at least 12 (header) + nbytes (rounded to 4).
+        76 if body.len() >= 12 => {
+            // ImageText8: nbytes = header.data, total body = 12 + ceil(nbytes/4)*4
+            let n = u32::from(header_data);
+            #[allow(clippy::cast_possible_truncation)]
+            let body_units = (body.len() / 4) as u32;
+            let expected_units = 4 + (n + 3) / 4; // total request length_units
+            if body_units == expected_units - 1 {
+                None
+            } else {
+                Some(u32::MAX)
+            }
+        }
+        77 if body.len() >= 12 => {
+            // ImageText16: nbytes = 2 * header.data, total body = 12 + ceil(2n/4)*4
+            let n = 2 * u32::from(header_data);
+            #[allow(clippy::cast_possible_truncation)]
+            let body_units = (body.len() / 4) as u32;
+            let expected_units = 4 + (n + 3) / 4;
+            if body_units == expected_units - 1 {
+                None
+            } else {
+                Some(u32::MAX)
+            }
+        }
         _ => None,
     }
 }
@@ -300,6 +384,55 @@ pub fn validate_exact_request_length(
     body: &[u8],
 ) -> bool {
     exact_required_length(opcode, header_data, body).map_or(true, |req| length_units == req)
+}
+
+/// For opcodes that carry a value-mask, returns `Some(bad_value)` if
+/// the mask has bits set beyond the spec-defined range. Returns
+/// `None` if the mask is valid or the opcode doesn't carry a mask.
+///
+/// The X11 spec requires the server to reply `BadValue` (not
+/// `BadMatch`) when an unused mask bit is set.
+#[must_use]
+pub fn invalid_value_mask(opcode: u8, body: &[u8]) -> Option<u32> {
+    fn check_u32(body: &[u8], offset: usize, valid_bits: u32) -> Option<u32> {
+        if body.len() < offset + 4 {
+            return None;
+        }
+        let mask = read_u32_le(&body[offset..offset + 4]);
+        if mask & !valid_bits != 0 {
+            Some(mask)
+        } else {
+            None
+        }
+    }
+    fn check_u16(body: &[u8], offset: usize, valid_bits: u16) -> Option<u32> {
+        if body.len() < offset + 2 {
+            return None;
+        }
+        let mask = read_u16_le(&body[offset..offset + 2]) as u16;
+        if mask & !valid_bits != 0 {
+            Some(u32::from(mask))
+        } else {
+            None
+        }
+    }
+    // Bit ranges from the X11 protocol value-mask definitions.
+    const CW_VALID: u32 = 0x7FFF; // CreateWindow / ChangeWindowAttributes: 15 bits
+    const CFG_VALID: u16 = 0x7F; // ConfigureWindow: 7 bits
+    const GC_VALID: u32 = 0x3F_FFFF; // CreateGC / ChangeGC / CopyGC: 22 bits
+
+    const KB_VALID: u32 = 0xFF; // ChangeKeyboardControl: 8 bits
+
+    match opcode {
+        1 => check_u32(body, 24, CW_VALID),  // CreateWindow
+        2 => check_u32(body, 4, CW_VALID),   // ChangeWindowAttributes
+        12 => check_u16(body, 4, CFG_VALID), // ConfigureWindow
+        55 => check_u32(body, 8, GC_VALID),  // CreateGC
+        56 => check_u32(body, 4, GC_VALID),  // ChangeGC
+        57 => check_u32(body, 8, GC_VALID),  // CopyGC
+        102 => check_u32(body, 0, KB_VALID), // ChangeKeyboardControl
+        _ => None,
+    }
 }
 
 #[cfg(test)]

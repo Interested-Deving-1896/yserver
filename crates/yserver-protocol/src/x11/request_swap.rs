@@ -94,18 +94,19 @@ const fn core_request_swap_table(opcode: u8) -> Option<&'static [FieldEntry]> {
         16 => &[u16f!(0), OpaqueTail { from: 4 }],
         // 17 GetAtomName: atom(u32 at 0)
         17 => &[u32f!(0)],
-        // 18 ChangeProperty: window(u32) property(u32) type(u32) format(u8 in
-        //     header.data) data_len(u32) data(opaque/u16/u32)
-        // The actual body is: window(u32) property(u32) type(u32) data_len(u32)
-        // followed by data. For BE swap, we treat the data as opaque — the
-        // format byte is needed to swap correctly, which is in header.data.
-        // Conservative: swap typed prefix only, leave data as-is (string-ish).
+        // 18 ChangeProperty: window(u32) property(u32) type(u32) format(u8)
+        //                   pad(u8 × 3) data_len(u32) data(opaque, format-
+        //                   dependent — swapping per format would belong in
+        //                   a Custom handler; for now treat as opaque so we
+        //                   don't corrupt e.g. format=32 data).
+        // The format byte at offset 12 is u8 — no swap needed. data_len
+        // at offset 16 is u32 — must be swapped.
         18 => &[
             u32f!(0),
             u32f!(4),
             u32f!(8),
-            u32f!(12),
-            OpaqueTail { from: 16 },
+            u32f!(16),
+            OpaqueTail { from: 20 },
         ],
         // 19 DeleteProperty: window(u32) property(u32)
         19 => &[u32f!(0), u32f!(4)],

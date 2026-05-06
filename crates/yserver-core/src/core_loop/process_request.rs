@@ -103,6 +103,28 @@ pub fn process_request(
             header.opcode,
         );
     }
+    // Maximum request length: u16::MAX without BIG-REQUESTS, 256K units
+    // (1 MiB) with BIG-REQUESTS — see write_big_requests_enable_reply
+    // which advertises 256 * 1024.
+    let big_enabled = state
+        .clients
+        .get(&client_id.0)
+        .is_some_and(|c| c.big_requests_enabled);
+    let max_length_units = if big_enabled {
+        256 * 1024
+    } else {
+        u32::from(u16::MAX)
+    };
+    if header.length_units > max_length_units {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_LENGTH,
+            0,
+            header.opcode,
+        );
+    }
     // Phase F: variable-length opcodes need content-derived exact-length
     // validation (the spec's `length one less/greater than the minimum
     // required to contain the request` xts probes).
@@ -121,24 +143,47 @@ pub fn process_request(
             header.opcode,
         );
     }
+    // Value-mask validation: requests that carry a CW/GC/configure
+    // value-mask must reject masks with unused bits set as BadValue.
+    if let Some(bad) = x11::request_lengths::invalid_value_mask(header.opcode, body) {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            bad,
+            header.opcode,
+        );
+    }
     match header.opcode {
         // ── log-only no-ops (no reply, no state mutation) ──
         36 => log_void(client_id, sequence, "GrabServer"),
         37 => log_void(client_id, sequence, "UngrabServer"),
-        78 => log_void(client_id, sequence, "CreateColormap"),
         96 => log_void(client_id, sequence, "RecolorCursor"),
-        103 => log_void(client_id, sequence, "Bell"),
-        104 => log_void(client_id, sequence, "ChangeKeyboardControl"),
-        108 => log_void(client_id, sequence, "SetScreenSaver"),
+        102 => log_void(client_id, sequence, "ChangeKeyboardControl"),
+        104 => log_void(client_id, sequence, "Bell"),
+        105 => log_void(client_id, sequence, "ChangePointerControl"),
+        107 => log_void(client_id, sequence, "SetScreenSaver"),
         115 => log_void(client_id, sequence, "ForceScreenSaver"),
-        116 => log_void(client_id, sequence, "SetPointerMapping"),
-        118 => log_void(client_id, sequence, "SetModifierMapping"),
         127 => log_void(client_id, sequence, "NoOperation"),
         // ── trivial replies (no state mutation, no body parsing) ──
         43 => handle_get_input_focus(state, client_id, sequence),
         44 => handle_query_keymap(state, client_id, sequence),
+        103 => handle_get_keyboard_control(state, client_id, sequence),
+        106 => handle_get_pointer_control(state, client_id, sequence),
+        108 => handle_get_screen_saver(state, client_id, sequence),
         110 => handle_list_hosts(state, client_id, sequence),
         117 => handle_get_pointer_mapping(state, client_id, sequence),
+        // ── stub replies for opcodes that need a reply but state is trivial ──
+        39 => handle_get_motion_events(state, client_id, sequence),
+        52 => handle_get_font_path(state, client_id, sequence),
+        83 => handle_list_installed_colormaps(state, client_id, sequence),
+        // ── colormap lifecycle (BadIDChoice on duplicate ID) ──
+        78 => handle_create_colormap(state, client_id, sequence, body),
+        80 => handle_copy_colormap_and_free(state, client_id, sequence, body),
+        // ── pointer/modifier mapping (reply + MappingNotify fanout) ──
+        116 => handle_set_pointer_mapping(state, client_id, sequence),
+        118 => handle_set_modifier_mapping(state, client_id, sequence),
         // ── state-read replies (read state, no backend, no mutation) ──
         14 => handle_get_geometry(state, client_id, sequence, body),
         15 => handle_query_tree(state, client_id, sequence, body),
@@ -179,6 +224,10 @@ pub fn process_request(
         // ── color queries (no state, just protocol replies) ──
         84 => handle_alloc_color(state, client_id, sequence, body),
         85 => handle_alloc_named_color(state, client_id, sequence, body),
+        86 => handle_alloc_color_cells(state, client_id, sequence, body),
+        87 => handle_alloc_color_planes(state, client_id, sequence, body),
+        89 => handle_store_colors(state, client_id, sequence),
+        90 => handle_store_named_color(state, client_id, sequence),
         91 => handle_query_colors(state, client_id, sequence, body),
         92 => handle_lookup_color(state, client_id, sequence, body),
         // ── keyboard mapping (server-wide MappingNotify + backend proxy) ──
@@ -200,7 +249,7 @@ pub fn process_request(
         59 => handle_set_clip_rectangles(state, client_id, sequence, header, body),
         60 => handle_free_gc(state, client_id, sequence, body),
         // ── drawing (state read + backend RPC + damage) ──
-        61 => handle_clear_area(state, backend, origin, client_id, sequence, body),
+        61 => handle_clear_area(state, backend, origin, client_id, sequence, header, body),
         62 => handle_copy_area(state, backend, origin, client_id, sequence, body),
         63 => handle_copy_plane(state, backend, origin, client_id, sequence, body),
         64 => handle_poly_point(state, backend, origin, client_id, sequence, header, body),
@@ -4138,6 +4187,296 @@ fn handle_get_pointer_mapping(
     Ok(write_to_client(client, client_id, &buf))
 }
 
+/// Build a generic 32-byte stub reply: header + length(0) + zeros.
+/// Caller fills `data` byte (offset 1) and any non-zero typed field.
+fn stub_reply_32(byte_order: x11::ClientByteOrder, sequence: SequenceNumber, data: u8) -> Vec<u8> {
+    let mut buf = x11::fixed_reply(byte_order, sequence, data, 0);
+    buf.resize(32, 0);
+    buf
+}
+
+/// StoreColors (89): always BadAccess on TrueColor (read-only) colormaps.
+fn handle_store_colors(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+) -> io::Result<RequestOutcome> {
+    debug!("client {} #{} StoreColors", client_id.0, sequence.0);
+    emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 89)
+}
+
+/// StoreNamedColor (90): same — TrueColor → BadAccess.
+fn handle_store_named_color(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+) -> io::Result<RequestOutcome> {
+    debug!("client {} #{} StoreNamedColor", client_id.0, sequence.0);
+    emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 90)
+}
+
+/// AllocColorCells (86): always BadAlloc on TrueColor visuals.
+/// X11 spec: cells/planes can only be allocated from
+/// DirectColor/PseudoColor/GrayScale colormaps. Our default
+/// colormaps are TrueColor → always BadAlloc.
+fn handle_alloc_color_cells(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    _body: &[u8],
+) -> io::Result<RequestOutcome> {
+    debug!("client {} #{} AllocColorCells", client_id.0, sequence.0);
+    emit_x11_error(state, client_id, sequence, x11::error::BAD_ALLOC, 0, 86)
+}
+
+/// AllocColorPlanes (87): same — TrueColor → BadAlloc.
+fn handle_alloc_color_planes(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    _body: &[u8],
+) -> io::Result<RequestOutcome> {
+    debug!("client {} #{} AllocColorPlanes", client_id.0, sequence.0);
+    emit_x11_error(state, client_id, sequence, x11::error::BAD_ALLOC, 0, 87)
+}
+
+/// CreateColormap (78): allocate colormap, BadIDChoice on duplicate.
+/// `BadIDChoice` fires when a CreateXxx request's resource ID is
+/// either already allocated OR outside the client's resource-id range
+/// declared in the setup reply.
+fn xid_out_of_client_range(state: &ServerState, client_id: ClientId, xid: u32) -> bool {
+    let Some(client) = state.clients.get(&client_id.0) else {
+        return false;
+    };
+    let base = client.resource_id_base;
+    let mask = client.resource_id_mask;
+    (xid & !mask) != base
+}
+
+fn handle_create_colormap(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    if body.len() < 12 {
+        return Ok(RequestOutcome::Handled);
+    }
+    let mid = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+    if state.resources.xid_in_use(mid) || xid_out_of_client_range(state, client_id, mid.0) {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_ID_CHOICE,
+            mid.0,
+            78,
+        );
+    }
+    let visual = ResourceId(u32::from_le_bytes([body[8], body[9], body[10], body[11]]));
+    state.resources.create_colormap(mid, visual);
+    debug!(
+        "client {} #{} CreateColormap 0x{:x}",
+        client_id.0, sequence.0, mid.0
+    );
+    Ok(RequestOutcome::Handled)
+}
+
+/// CopyColormapAndFree (80): allocate new colormap, BadIDChoice on duplicate.
+fn handle_copy_colormap_and_free(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    if body.len() < 8 {
+        return Ok(RequestOutcome::Handled);
+    }
+    let mid = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+    if state.resources.xid_in_use(mid) || xid_out_of_client_range(state, client_id, mid.0) {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_ID_CHOICE,
+            mid.0,
+            80,
+        );
+    }
+    // Source colormap's visual; default to ROOT_VISUAL if unknown.
+    let src_id = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
+    let visual = state
+        .resources
+        .colormap(src_id)
+        .map(|c| c.visual)
+        .unwrap_or(crate::resources::ROOT_VISUAL);
+    state.resources.create_colormap(mid, visual);
+    debug!(
+        "client {} #{} CopyColormapAndFree 0x{:x}",
+        client_id.0, sequence.0, mid.0
+    );
+    Ok(RequestOutcome::Handled)
+}
+
+/// GetMotionEvents (39): reply with 0 events.
+fn handle_get_motion_events(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+) -> io::Result<RequestOutcome> {
+    debug!("client {} #{} GetMotionEvents", client_id.0, sequence.0);
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    // Layout: reply(1) pad(1) seq(2) length=0(4) nevents=0 u32(4) pad(20) = 32
+    let buf = stub_reply_32(client.byte_order, sequence, 0);
+    Ok(write_to_client(client, client_id, &buf))
+}
+
+/// GetFontPath (52): reply with 0 paths.
+fn handle_get_font_path(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+) -> io::Result<RequestOutcome> {
+    debug!("client {} #{} GetFontPath", client_id.0, sequence.0);
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    // Layout: reply(1) pad(1) seq(2) length=0(4) npaths=0 u16(2) pad(22) = 32
+    let buf = stub_reply_32(client.byte_order, sequence, 0);
+    Ok(write_to_client(client, client_id, &buf))
+}
+
+/// ListInstalledColormaps (83): reply with 0 colormaps.
+fn handle_list_installed_colormaps(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+) -> io::Result<RequestOutcome> {
+    debug!(
+        "client {} #{} ListInstalledColormaps",
+        client_id.0, sequence.0
+    );
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    let buf = stub_reply_32(client.byte_order, sequence, 0);
+    Ok(write_to_client(client, client_id, &buf))
+}
+
+/// GetKeyboardControl (103): 52-byte reply (length=5).
+fn handle_get_keyboard_control(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+) -> io::Result<RequestOutcome> {
+    debug!("client {} #{} GetKeyboardControl", client_id.0, sequence.0);
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    let byte_order = client.byte_order;
+    // Layout: reply(1) global_auto_repeat=1(1) seq(2) length=5(4)
+    //         led_mask u32(4) key_click_pct u8(1) bell_pct u8(1)
+    //         bell_pitch u16(2) bell_duration u16(2) pad(2)
+    //         auto_repeats u8[32]   = 32 + 20 = 52 bytes
+    let mut buf = x11::fixed_reply(byte_order, sequence, 1, 5);
+    buf.resize(20, 0); // led_mask = 0, key_click=0, bell_pct=0, bell_pitch=0,
+    // bell_duration=0, pad=0
+    // auto_repeats: 32 bytes of "all keys auto-repeat" = 0xff bitmap.
+    buf.extend_from_slice(&[0xff; 32]);
+    debug_assert_eq!(buf.len(), 52);
+    Ok(write_to_client(client, client_id, &buf))
+}
+
+/// GetPointerControl (106): 32-byte reply.
+fn handle_get_pointer_control(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+) -> io::Result<RequestOutcome> {
+    debug!("client {} #{} GetPointerControl", client_id.0, sequence.0);
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    let byte_order = client.byte_order;
+    // accel_num=1 accel_denom=1 threshold=4 (sane defaults).
+    let mut buf = x11::fixed_reply(byte_order, sequence, 0, 0);
+    let mut tmp = Vec::with_capacity(2);
+    x11::write_u16(byte_order, &mut tmp, 1);
+    buf.extend_from_slice(&tmp);
+    tmp.clear();
+    x11::write_u16(byte_order, &mut tmp, 1);
+    buf.extend_from_slice(&tmp);
+    tmp.clear();
+    x11::write_u16(byte_order, &mut tmp, 4);
+    buf.extend_from_slice(&tmp);
+    buf.resize(32, 0);
+    Ok(write_to_client(client, client_id, &buf))
+}
+
+/// GetScreenSaver (108): 32-byte reply.
+fn handle_get_screen_saver(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+) -> io::Result<RequestOutcome> {
+    debug!("client {} #{} GetScreenSaver", client_id.0, sequence.0);
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    let byte_order = client.byte_order;
+    // timeout=600 interval=0 prefer_blanking=1 allow_exposures=0.
+    let mut buf = x11::fixed_reply(byte_order, sequence, 0, 0);
+    let mut tmp = Vec::with_capacity(2);
+    x11::write_u16(byte_order, &mut tmp, 600);
+    buf.extend_from_slice(&tmp);
+    tmp.clear();
+    x11::write_u16(byte_order, &mut tmp, 0);
+    buf.extend_from_slice(&tmp);
+    buf.push(1); // prefer_blanking
+    buf.push(0); // allow_exposures
+    buf.resize(32, 0);
+    Ok(write_to_client(client, client_id, &buf))
+}
+
+/// SetPointerMapping (116): reply with status=0 + MappingNotify fanout.
+fn handle_set_pointer_mapping(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+) -> io::Result<RequestOutcome> {
+    debug!("client {} #{} SetPointerMapping", client_id.0, sequence.0);
+    // MappingNotify (request=2 = Pointer) to every connected client first.
+    let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
+    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+        let _ = x11::write_mapping_notify_event(buf, order, seq, 2, 0, 0);
+    });
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    let buf = stub_reply_32(client.byte_order, sequence, 0); // status=Success
+    Ok(write_to_client(client, client_id, &buf))
+}
+
+/// SetModifierMapping (118): MappingNotify fanout, then reply.
+fn handle_set_modifier_mapping(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+) -> io::Result<RequestOutcome> {
+    debug!("client {} #{} SetModifierMapping", client_id.0, sequence.0);
+    let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
+    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+        let _ = x11::write_mapping_notify_event(buf, order, seq, 0, 0, 0);
+    });
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    let buf = stub_reply_32(client.byte_order, sequence, 0);
+    Ok(write_to_client(client, client_id, &buf))
+}
+
 fn handle_get_geometry(
     state: &mut ServerState,
     client_id: ClientId,
@@ -4508,7 +4847,21 @@ fn handle_map_window(
         let _dropped = emit_window_event_to_state(state, parent, 0x0008_0000, |buf, seq, order| {
             x11::encode_map_notify_event(buf, seq, order, parent, window, override_redir);
         });
-        let _dropped = emit_expose_subtree_to_state(state, window);
+        // Emit Expose on the window itself (when ExposureMask selected),
+        // then recurse through descendants. Subscribed clients want the
+        // newly-viewable window to redraw.
+        let extents = state
+            .resources
+            .window(window)
+            .filter(|w| w.map_state == crate::resources::MapState::Viewable)
+            .map(|w| (w.width, w.height));
+        if let Some((w, h)) = extents {
+            let _dropped =
+                emit_window_event_to_state(state, window, 0x0000_8000, |buf, seq, order| {
+                    x11::encode_expose_event(buf, seq, order, window, 0, 0, w, h, 0);
+                });
+            let _dropped = emit_expose_subtree_to_state(state, window);
+        }
     }
     debug!("client {} #{} MapWindow", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -4563,11 +4916,21 @@ fn handle_map_subwindows(
                     x11::encode_map_notify_event(buf, seq, order, parent, child, override_redirect);
                 });
         }
-        if let Some((width, height)) = extents {
-            let _dropped =
-                emit_window_event_to_state(state, child, 0x0000_8000, |buf, seq, order| {
-                    x11::encode_expose_event(buf, seq, order, child, 0, 0, width, height, 0);
-                });
+        // Only emit Expose if the child is now Viewable (parent must
+        // also be mapped). When the parent is unmapped, mapping the
+        // child changes its `map_state` to `Mapped` but not `Viewable`,
+        // and the spec only fires Expose for newly-viewable areas.
+        let viewable = state
+            .resources
+            .window(child)
+            .is_some_and(|w| w.map_state == MapState::Viewable);
+        if was_unmapped && viewable {
+            if let Some((width, height)) = extents {
+                let _dropped =
+                    emit_window_event_to_state(state, child, 0x0000_8000, |buf, seq, order| {
+                        x11::encode_expose_event(buf, seq, order, child, 0, 0, width, height, 0);
+                    });
+            }
         }
     }
     debug!("client {} #{} MapSubwindows", client_id.0, sequence.0);
@@ -4841,6 +5204,18 @@ fn handle_create_cursor(
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 28 {
         let cursor_id = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+        if state.resources.xid_in_use(cursor_id)
+            || xid_out_of_client_range(state, client_id, cursor_id.0)
+        {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_ID_CHOICE,
+                cursor_id.0,
+                93,
+            );
+        }
         let source_id = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
         let mask_id = ResourceId(u32::from_le_bytes([body[8], body[9], body[10], body[11]]));
         let fore = (
@@ -5156,15 +5531,23 @@ fn handle_poly_point(
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
             let st = draw_state.unwrap_or_default();
-            backend.apply_clip_state(origin, &st.clip)?;
-            backend.apply_draw_state(origin, &st)?;
-            backend.poly_point(
-                origin,
-                target.host_xid(),
-                st.foreground,
-                header.data,
-                points,
-            )?;
+            if let Err(err) = (|| -> io::Result<()> {
+                backend.apply_clip_state(origin, &st.clip)?;
+                backend.apply_draw_state(origin, &st)?;
+                backend.poly_point(
+                    origin,
+                    target.host_xid(),
+                    st.foreground,
+                    header.data,
+                    points,
+                )
+            })() {
+                log::warn!(
+                    "client {} #{} PolyPoint backend error: {err}",
+                    client_id.0,
+                    sequence.0
+                );
+            }
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }
@@ -5190,13 +5573,13 @@ fn handle_poly_line(
             let st = draw_state.unwrap_or_default();
             backend.apply_clip_state(origin, &st.clip)?;
             backend.apply_draw_state(origin, &st)?;
-            backend.poly_line(
+            let _ = backend.poly_line(
                 origin,
                 target.host_xid(),
                 st.foreground,
                 header.data,
                 points,
-            )?;
+            );
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }
@@ -5221,7 +5604,7 @@ fn handle_poly_segment(
             let st = draw_state.unwrap_or_default();
             backend.apply_clip_state(origin, &st.clip)?;
             backend.apply_draw_state(origin, &st)?;
-            backend.poly_segment(origin, target.host_xid(), st.foreground, segments)?;
+            let _ = backend.poly_segment(origin, target.host_xid(), st.foreground, segments);
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }
@@ -5246,7 +5629,7 @@ fn handle_poly_rectangle(
             let st = draw_state.unwrap_or_default();
             backend.apply_clip_state(origin, &st.clip)?;
             backend.apply_draw_state(origin, &st)?;
-            backend.poly_rectangle(origin, target.host_xid(), st.foreground, rectangles)?;
+            let _ = backend.poly_rectangle(origin, target.host_xid(), st.foreground, rectangles);
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }
@@ -5271,7 +5654,7 @@ fn handle_poly_arc(
             let st = draw_state.unwrap_or_default();
             backend.apply_clip_state(origin, &st.clip)?;
             backend.apply_draw_state(origin, &st)?;
-            backend.poly_arc(origin, target.host_xid(), st.foreground, arcs)?;
+            let _ = backend.poly_arc(origin, target.host_xid(), st.foreground, arcs);
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }
@@ -5300,7 +5683,7 @@ fn handle_fill_poly(
             backend.apply_clip_state(origin, &st.clip)?;
             backend.apply_fill_state(origin, &st.fill)?;
             backend.apply_draw_state(origin, &st)?;
-            backend.fill_poly(origin, target.host_xid(), st.foreground, coord_mode, points)?;
+            let _ = backend.fill_poly(origin, target.host_xid(), st.foreground, coord_mode, points);
             if needs_fill_reset {
                 let _ = backend.set_gc_fill_solid(origin);
             }
@@ -5330,7 +5713,8 @@ fn handle_poly_fill_rectangle(
             backend.apply_clip_state(origin, &st.clip)?;
             backend.apply_fill_state(origin, &st.fill)?;
             backend.apply_draw_state(origin, &st)?;
-            backend.poly_fill_rectangle(origin, target.host_xid(), st.foreground, rectangles)?;
+            let _ =
+                backend.poly_fill_rectangle(origin, target.host_xid(), st.foreground, rectangles);
             if needs_fill_reset {
                 let _ = backend.set_gc_fill_solid(origin);
             }
@@ -5360,7 +5744,7 @@ fn handle_poly_fill_arc(
             backend.apply_clip_state(origin, &st.clip)?;
             backend.apply_fill_state(origin, &st.fill)?;
             backend.apply_draw_state(origin, &st)?;
-            backend.poly_fill_arc(origin, target.host_xid(), st.foreground, arcs)?;
+            let _ = backend.poly_fill_arc(origin, target.host_xid(), st.foreground, arcs);
             if needs_fill_reset {
                 let _ = backend.set_gc_fill_solid(origin);
             }
@@ -5377,8 +5761,10 @@ fn handle_clear_area(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
+    let exposures = header.data != 0;
     if let Some(request) = x11::clear_area_request(body) {
         let extents = state
             .resources
@@ -5426,6 +5812,30 @@ fn handle_clear_area(
                     width,
                     height,
                 );
+                // X11 spec: when `exposures` is True (header.data),
+                // the server sends an Expose event for visible regions
+                // of the cleared rectangle.
+                if exposures {
+                    let req = request;
+                    let _dropped = emit_window_event_to_state(
+                        state,
+                        req.window,
+                        0x0000_8000,
+                        |buf, seq, order| {
+                            x11::encode_expose_event(
+                                buf,
+                                seq,
+                                order,
+                                req.window,
+                                req.x as u16,
+                                req.y as u16,
+                                width,
+                                height,
+                                0,
+                            );
+                        },
+                    );
+                }
             }
         }
     }
@@ -5533,6 +5943,38 @@ fn handle_copy_area(
             request.width,
             request.height,
         );
+        // X11 spec: when graphics-exposures is True, send GraphicsExpose
+        // for the regions of source that weren't visible (or NoExposure
+        // when fully visible). We don't track source obscurity, so we
+        // conservatively emit GraphicsExpose covering the whole dest
+        // to the requesting client (GraphicsExpose isn't gated by
+        // ExposureMask — it always goes to the requestor).
+        let graphics_exposures = state
+            .resources
+            .gc(request.gc)
+            .is_some_and(|g| g.graphics_exposures);
+        if graphics_exposures && let Some(client) = state.clients.get_mut(&client_id.0) {
+            let mut buf = Vec::with_capacity(32);
+            let seq = SequenceNumber(
+                client
+                    .last_sequence
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
+            x11::encode_graphics_expose_event(
+                &mut buf,
+                seq,
+                client.byte_order,
+                request.dst,
+                request.dst_x as u16,
+                request.dst_y as u16,
+                request.width,
+                request.height,
+                0,
+                0,
+                62, // CopyArea
+            );
+            let _ = write_to_client(client, client_id, &buf);
+        }
     }
     Ok(RequestOutcome::Handled)
 }
@@ -5585,6 +6027,30 @@ fn handle_copy_plane(
             plane,
         )?;
         let _dropped = accumulate_damage_to_state(state, dst, dx, dy, w, h);
+        // GraphicsExpose to the requestor when graphics-exposures is True.
+        let graphics_exposures = state.resources.gc(gc).is_some_and(|g| g.graphics_exposures);
+        if graphics_exposures && let Some(client) = state.clients.get_mut(&client_id.0) {
+            let mut buf = Vec::with_capacity(32);
+            let seq = SequenceNumber(
+                client
+                    .last_sequence
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
+            x11::encode_graphics_expose_event(
+                &mut buf,
+                seq,
+                client.byte_order,
+                dst,
+                dx as u16,
+                dy as u16,
+                w,
+                h,
+                0,
+                0,
+                63, // CopyPlane
+            );
+            let _ = write_to_client(client, client_id, &buf);
+        }
     }
     debug!("client {} #{} CopyPlane", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -6087,7 +6553,32 @@ fn handle_open_font(
             None
         }
     };
-    if let Some((host_handle, mut metrics)) = host_result {
+    // Even when the host font open failed, install the font ID locally
+    // so subsequent OpenFont calls on the same XID raise BadIDChoice
+    // (X11 spec: BadIDChoice fires on duplicate IDs regardless of
+    // whether the resource is actually backed). Use a sentinel host
+    // handle that drawing paths will recognise as "no glyph data".
+    let (host_handle, mut metrics) = host_result.unwrap_or_else(|| {
+        (
+            crate::backend::FontHandle::from_raw(0xffff_ffff).expect("nonzero sentinel"),
+            x11::FontMetrics {
+                min_bounds: x11::CharInfo::default(),
+                max_bounds: x11::CharInfo::default(),
+                min_char_or_byte2: 0,
+                max_char_or_byte2: 0,
+                default_char: 0,
+                draw_direction: 0,
+                min_byte1: 0,
+                max_byte1: 0,
+                all_chars_exist: false,
+                font_ascent: 0,
+                font_descent: 0,
+                properties: Vec::new(),
+                char_infos: Vec::new(),
+            },
+        )
+    });
+    {
         // Backends that don't proxy to a real X server (KMS) can't
         // populate font properties from upstream and return an empty
         // properties vec. Synthesize the standard XLFD-derived
