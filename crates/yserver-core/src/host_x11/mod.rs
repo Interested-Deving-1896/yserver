@@ -11,10 +11,7 @@ pub use pump::{
 use std::{
     collections::{HashMap, VecDeque},
     io::{self, ErrorKind, Read, Write},
-    os::{
-        fd::{AsRawFd, RawFd},
-        unix::net::UnixStream,
-    },
+    os::fd::{AsRawFd, RawFd},
 };
 
 use log::debug;
@@ -24,7 +21,7 @@ use crate::backend::{OriginContext, PixmapHandle, WindowHandle};
 
 use crate::core_loop::client_reader::wait_readable;
 
-use pump::{HostSetup, connect_to_host, decode_host_event, read_setup_reply};
+use pump::{HostSetup, HostStream, connect_to_host, decode_host_event, read_setup_reply};
 use sequence_map::SequenceMap;
 
 /// Outcome of a single `drain_host_socket` pass.
@@ -125,7 +122,7 @@ struct HostXkbInfo {
 }
 
 pub struct HostX11Backend {
-    stream: UnixStream,
+    stream: HostStream,
     window_id: u32,
     gc_id: u32,
     current_foreground: u32,
@@ -1040,7 +1037,7 @@ impl HostX11Backend {
 }
 
 fn create_window(
-    stream: &mut UnixStream,
+    stream: &mut HostStream,
     setup: &HostSetup,
     window_id: u32,
     width: u16,
@@ -1096,7 +1093,7 @@ const CONTAINER_EVENT_MASK: u32 = 0x0000_0001 // KeyPress
     | 0x0002_0000; // StructureNotify
 
 fn create_gc(
-    stream: &mut UnixStream,
+    stream: &mut HostStream,
     drawable: u32,
     gc_id: u32,
     foreground: u32,
@@ -1116,7 +1113,7 @@ fn create_gc(
     stream.write_all(&out)
 }
 
-fn open_font(stream: &mut UnixStream, font_id: u32, name: &[u8]) -> io::Result<()> {
+fn open_font(stream: &mut HostStream, font_id: u32, name: &[u8]) -> io::Result<()> {
     let padded_name_len = padded_len(name.len());
     let length_units = 3 + u16::try_from(padded_name_len / 4)
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "font name is too long"))?;
@@ -1137,7 +1134,7 @@ fn open_font(stream: &mut UnixStream, font_id: u32, name: &[u8]) -> io::Result<(
     stream.write_all(&out)
 }
 
-fn map_window(stream: &mut UnixStream, window_id: u32) -> io::Result<()> {
+fn map_window(stream: &mut HostStream, window_id: u32) -> io::Result<()> {
     let mut out = Vec::new();
     out.push(8);
     out.push(0);
@@ -1257,7 +1254,7 @@ pub(super) fn promote_seq_from_atomic(next_full: u64, wire: u16) -> u64 {
 /// frame (reply / error / event). Used by the init-time synchronous
 /// loop in `read_until_response`. After init the core uses
 /// `drain_host_socket` instead.
-pub(super) fn read_response(stream: &mut UnixStream) -> io::Result<HostResponse> {
+pub(super) fn read_response(stream: &mut HostStream) -> io::Result<HostResponse> {
     let mut header = [0u8; 32];
     loop {
         stream.read_exact(&mut header)?;
@@ -1316,8 +1313,8 @@ pub(super) fn read_response(stream: &mut UnixStream) -> io::Result<HostResponse>
 #[cfg(test)]
 mod tests {
     use super::{
-        HostClipState, HostError, HostFillState, HostResponse, HostX11Backend, HostXidMap,
-        SequenceMap, promote_seq_from_atomic, read_u16, try_extract_frame,
+        HostClipState, HostError, HostFillState, HostResponse, HostStream, HostX11Backend,
+        HostXidMap, SequenceMap, promote_seq_from_atomic, read_u16, try_extract_frame,
     };
     use crate::backend::OriginContext;
     use std::{
@@ -1328,6 +1325,7 @@ mod tests {
 
     fn dummy_backend() -> HostX11Backend {
         let (stream, _peer) = UnixStream::pair().expect("unix stream pair");
+        let stream = HostStream::Unix(stream);
         HostX11Backend {
             stream,
             window_id: 1,

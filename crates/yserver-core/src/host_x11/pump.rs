@@ -16,7 +16,11 @@
 use std::{
     env, fs,
     io::{self, ErrorKind, Read, Write},
-    os::unix::net::UnixStream,
+    net::TcpStream,
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::net::UnixStream,
+    },
     path::PathBuf,
 };
 
@@ -24,18 +28,89 @@ use super::{pad4, padded_len, read_i16, read_u16, read_u32, write_u16};
 
 const MIT_MAGIC_COOKIE: &str = "MIT-MAGIC-COOKIE-1";
 
-pub(super) fn connect_to_host() -> io::Result<UnixStream> {
+/// Wraps either a Unix-domain socket (the default `/tmp/.X11-unix/Xn`
+/// transport) or a TCP socket (used when `DISPLAY` declares a
+/// non-empty, non-"unix" hostname — most commonly `localhost:N` from
+/// SSH X11 forwarding). `Read`, `Write`, and `AsRawFd` delegate to
+/// the inner type so the rest of the host-X11 code can stay
+/// transport-agnostic.
+///
+/// Note: SCM_RIGHTS-based fd-passing (used by MIT-SHM `AttachFd`)
+/// only works on the Unix variant. The TCP variant simply can't
+/// forward fd-mode shm to the host server; that path stays
+/// fd-passing-disabled when the host connection is TCP.
+pub enum HostStream {
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+impl Read for HostStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            HostStream::Unix(s) => s.read(buf),
+            HostStream::Tcp(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for HostStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            HostStream::Unix(s) => s.write(buf),
+            HostStream::Tcp(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            HostStream::Unix(s) => s.flush(),
+            HostStream::Tcp(s) => s.flush(),
+        }
+    }
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        match self {
+            HostStream::Unix(s) => s.write_all(buf),
+            HostStream::Tcp(s) => s.write_all(buf),
+        }
+    }
+}
+
+impl AsRawFd for HostStream {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            HostStream::Unix(s) => s.as_raw_fd(),
+            HostStream::Tcp(s) => s.as_raw_fd(),
+        }
+    }
+}
+
+pub(super) fn connect_to_host() -> io::Result<HostStream> {
     let display = env::var("DISPLAY").map_err(|_| {
         io::Error::new(
             ErrorKind::NotFound,
             "DISPLAY is not set for host X11 backend",
         )
     })?;
-    let display_number = parse_display_number(&display)?;
-    let socket_path = format!("/tmp/.X11-unix/X{display_number}");
+    let (host, display_number) = parse_display(&display)?;
 
     let auth = XAuthority::load(display_number).unwrap_or_default();
-    let mut stream = UnixStream::connect(socket_path)?;
+    let mut stream = match host.as_deref() {
+        // Empty host or "unix" → AF_UNIX at /tmp/.X11-unix/Xn.
+        None | Some("") | Some("unix") => {
+            let socket_path = format!("/tmp/.X11-unix/X{display_number}");
+            HostStream::Unix(UnixStream::connect(socket_path)?)
+        }
+        // Otherwise TCP at host:(6000+display_number). Most commonly
+        // localhost:6010 for SSH X11 forwarding (DISPLAY=localhost:10.0).
+        Some(host) => {
+            let port: u16 = 6000u16.checked_add(display_number).ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "DISPLAY number too large for TCP port",
+                )
+            })?;
+            HostStream::Tcp(TcpStream::connect((host, port))?)
+        }
+    };
     write_setup_request(&mut stream, auth.as_ref())?;
     Ok(stream)
 }
@@ -224,9 +299,28 @@ struct XAuthority {
 
 impl XAuthority {
     fn load(display_number: u16) -> io::Result<Option<Self>> {
-        let path = env::var_os("XAUTHORITY")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".Xauthority")))
+        // Search order:
+        //   1. $XAUTHORITY if set
+        //   2. $HOME/.Xauthority
+        //   3. $HOME/realhome/.Xauthority — bwrap-style sandboxes mount the
+        //      caller's real home there; the bwrap'd $HOME is empty and the
+        //      cookie file the SSH client wrote lives in the original home.
+        let candidates: Vec<PathBuf> = std::iter::empty()
+            .chain(env::var_os("XAUTHORITY").map(PathBuf::from))
+            .chain(
+                env::var_os("HOME")
+                    .map(|home| PathBuf::from(&home).join(".Xauthority"))
+                    .into_iter(),
+            )
+            .chain(
+                env::var_os("HOME")
+                    .map(|home| PathBuf::from(&home).join("realhome").join(".Xauthority"))
+                    .into_iter(),
+            )
+            .collect();
+        let path = candidates
+            .into_iter()
+            .find(|p| p.exists())
             .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "no Xauthority path"))?;
 
         let bytes = fs::read(path)?;
@@ -280,20 +374,35 @@ pub(super) struct HostSetup {
     pub(super) argb_visual: Option<u32>,
 }
 
-fn parse_display_number(display: &str) -> io::Result<u16> {
-    let display = display
-        .rsplit_once(':')
-        .map_or(display, |(_, suffix)| suffix);
-    let number = display.split('.').next().unwrap_or(display);
-    number.parse::<u16>().map_err(|err| {
+/// Parse `DISPLAY` into `(host, display_number)`.
+///
+/// Examples:
+/// * `:0` → `(None, 0)` — Unix-socket transport.
+/// * `:10.0` → `(None, 10)` — Unix socket, screen 0 (stripped).
+/// * `unix:0` → `(Some("unix"), 0)` — explicit Unix.
+/// * `localhost:10.0` → `(Some("localhost"), 10)` — TCP at localhost:6010
+///   (SSH X11-forwarding sets this).
+fn parse_display(display: &str) -> io::Result<(Option<String>, u16)> {
+    let (host_part, number_part) = match display.rsplit_once(':') {
+        Some((h, n)) => (h, n),
+        None => ("", display),
+    };
+    let number = number_part.split('.').next().unwrap_or(number_part);
+    let display_number = number.parse::<u16>().map_err(|err| {
         io::Error::new(
             ErrorKind::InvalidInput,
             format!("unsupported DISPLAY value {display:?}: {err}"),
         )
-    })
+    })?;
+    let host = if host_part.is_empty() {
+        None
+    } else {
+        Some(host_part.to_string())
+    };
+    Ok((host, display_number))
 }
 
-fn write_setup_request(stream: &mut UnixStream, auth: Option<&XAuthority>) -> io::Result<()> {
+fn write_setup_request(stream: &mut HostStream, auth: Option<&XAuthority>) -> io::Result<()> {
     let (name, data) = auth
         .map(|auth| (auth.name.as_slice(), auth.data.as_slice()))
         .unwrap_or((&[][..], &[][..]));
@@ -313,7 +422,7 @@ fn write_setup_request(stream: &mut UnixStream, auth: Option<&XAuthority>) -> io
     stream.write_all(&out)
 }
 
-pub(super) fn read_setup_reply(stream: &mut UnixStream) -> io::Result<HostSetup> {
+pub(super) fn read_setup_reply(stream: &mut HostStream) -> io::Result<HostSetup> {
     let mut header = [0; 8];
     stream.read_exact(&mut header)?;
     if header[0] != 1 {

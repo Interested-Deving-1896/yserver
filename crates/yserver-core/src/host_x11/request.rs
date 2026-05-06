@@ -13,10 +13,9 @@
 //! file size and reviewability — Rust merges all `impl HostX11Backend { ... }`
 //! blocks across the module's files.
 
-use std::{
-    io::{self, ErrorKind, Write},
-    os::unix::net::UnixStream,
-};
+use std::io::{self, ErrorKind, Write};
+
+use super::pump::HostStream;
 
 use yserver_protocol::x11::{self, ClipRectangles, FontMetrics};
 
@@ -2190,11 +2189,11 @@ fn build_shape_rectangles(
     Some(out)
 }
 
-fn write_open_font(stream: &mut UnixStream, font_id: u32, name: &[u8]) -> io::Result<()> {
+fn write_open_font(stream: &mut HostStream, font_id: u32, name: &[u8]) -> io::Result<()> {
     open_font(stream, font_id, name)
 }
 
-fn write_query_font(stream: &mut UnixStream, font_id: u32) -> io::Result<()> {
+fn write_query_font(stream: &mut HostStream, font_id: u32) -> io::Result<()> {
     let mut out = Vec::new();
     out.push(47);
     out.push(0);
@@ -2204,7 +2203,7 @@ fn write_query_font(stream: &mut UnixStream, font_id: u32) -> io::Result<()> {
 }
 
 fn write_list_fonts(
-    stream: &mut UnixStream,
+    stream: &mut HostStream,
     opcode: u8,
     max_names: u16,
     pattern: &[u8],
