@@ -595,7 +595,7 @@ pub fn write_setup_success(
     write_u16(byte_order, &mut extra, vendor.len() as u16);
     write_u16(byte_order, &mut extra, setup.maximum_request_length);
     extra.push(1); // roots
-    extra.push(5); // pixmap formats: depth=1, depth=4, depth=8, depth=24, depth=32
+    extra.push(7); // pixmap formats: depth=1, 4, 8, 15, 16, 24, 32
     extra.push(byte_order_value(setup.image_byte_order));
     extra.push(byte_order_value(setup.bitmap_format_bit_order));
     extra.push(setup.bitmap_format_scanline_unit);
@@ -622,6 +622,18 @@ pub fn write_setup_success(
     // pixmap format: depth=8, bits-per-pixel=8, scanline-pad=32
     extra.push(8);
     extra.push(8);
+    extra.push(32);
+    extra.extend_from_slice(&[0; 5]);
+
+    // pixmap format: depth=15, bits-per-pixel=16, scanline-pad=32
+    extra.push(15);
+    extra.push(16);
+    extra.push(32);
+    extra.extend_from_slice(&[0; 5]);
+
+    // pixmap format: depth=16, bits-per-pixel=16, scanline-pad=32
+    extra.push(16);
+    extra.push(16);
     extra.push(32);
     extra.extend_from_slice(&[0; 5]);
 

@@ -181,6 +181,8 @@ pub fn process_request(
         // ── colormap lifecycle (BadIDChoice on duplicate ID) ──
         78 => handle_create_colormap(state, client_id, sequence, body),
         80 => handle_copy_colormap_and_free(state, client_id, sequence, body),
+        // ── SetCloseDownMode: validate mode (0/1/2 valid) ──
+        112 => handle_set_close_down_mode(state, client_id, sequence, header),
         // ── pointer/modifier mapping (reply + MappingNotify fanout) ──
         116 => handle_set_pointer_mapping(state, client_id, sequence),
         118 => handle_set_modifier_mapping(state, client_id, sequence),
@@ -4213,6 +4215,33 @@ fn handle_store_named_color(
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} StoreNamedColor", client_id.0, sequence.0);
     emit_x11_error(state, client_id, sequence, x11::error::BAD_ACCESS, 0, 90)
+}
+
+/// SetCloseDownMode (112): mode is in header.data. Valid values are
+/// 0 (Destroy), 1 (RetainPermanent), 2 (RetainTemporary). Any other
+/// value is BadValue. We don't actually implement Retain* (resources
+/// are always destroyed on disconnect) but we do validate the input.
+fn handle_set_close_down_mode(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+) -> io::Result<RequestOutcome> {
+    debug!(
+        "client {} #{} SetCloseDownMode mode={}",
+        client_id.0, sequence.0, header.data
+    );
+    if header.data > 2 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(header.data),
+            112,
+        );
+    }
+    Ok(RequestOutcome::Handled)
 }
 
 /// AllocColorCells (86): always BadAlloc on TrueColor visuals.

@@ -2155,6 +2155,13 @@ the suite tell us where the real gaps are.
   | 2026-05-06 |  229 |   40 |    99 |    0 |     0 | Phases D2 + F — raw event templates per-recipient + content-aware BadLength. **PASS 195 → 229**. |
   | 2026-05-06 |  337 |   25 |     7 |    0 |     0 | xproto branch — residual fixes (missing replies, BadAlloc/BadAccess/BadValue/BadIDChoice, Expose/GraphicsExpose, content-shape BadLength, max length, error-resilience). **PASS 229 → 337**. |
 
+  Xlib3 scenario (162 tests / 109 cases):
+
+  | Date       | PASS | FAIL | UNRES | Change |
+  |------------|-----:|-----:|------:|--------|
+  | 2026-05-06 |   96 |   31 |     3 | First Xlib3 run on top of all Xproto fixes. |
+  | 2026-05-06 |  110 |   17 |     3 | xts-xlib3 branch — vendor string, release_number, 7 pixmap formats, screen mm dimensions, SetCloseDownMode validation. **PASS 96 → 110**. |
+
 - **`BadLength` enforcement landed.** A per-opcode length contract
   table covers all of opcodes 1–127 in
   `crates/yserver-protocol/src/x11/request_lengths.rs`: `Fixed(n)`

@@ -35,6 +35,13 @@ flavour of not-passing.
 | 2026-05-06 |  229 |   40 |    99 |    0 |     0 | Phases D2 (raw event templates re-encode per recipient) + F (content-aware `BadLength` for variable-length opcodes). **PASS 195 → 229** (+34); FAIL 78 → 40 (-38). End-to-end **PASS 1 → 229** for the full BE branch. |
 | 2026-05-06 |  337 |   25 |     7 |    0 |     0 | `xproto` branch — residual fixes on top of BE: 6 missing reply implementations (GetMotionEvents/GetFontPath/GetKeyboardControl/GetPointerControl/GetScreenSaver/ListInstalledColormaps), MappingNotify fanout on Set{Pointer,Modifier}Mapping (event before reply per spec), AllocColorCells/AllocColorPlanes BadAlloc on TrueColor, StoreColors/StoreNamedColor BadAccess on read-only colormap, BadValue mask validation (CW/GC/configure/keyboard), BadIDChoice on duplicate or out-of-range XIDs (CreateColormap/CopyColormapAndFree/CreateCursor/OpenFont), MapWindow self-Expose + parent-tracked Viewable/Unviewable, ClearArea Expose, CopyArea/CopyPlane GraphicsExpose, PolyPoint/Line/Segment/Rectangle/Arc content-shape BadLength, ChangeProperty swap-table fix (format byte at body[12] is u8, not u32), max_request_length enforcement (256K units BIG-REQUESTS, u16::MAX otherwise), error-resilience on backend draw failures. **PASS 229 → 337** (+108). |
 
+## Run history (ynest, `Xlib3` scenario)
+
+| Date       | PASS | FAIL | UNRES | UNTST | UNSUP | Notes |
+|------------|-----:|-----:|------:|------:|------:|-------|
+| 2026-05-06 |   96 |   31 |     3 |    25 |     6 | First Xlib3 run (162 tests / 109 cases) on top of all the Xproto fixes. |
+| 2026-05-06 |  110 |   17 |     3 |    25 |     6 | `xts-xlib3` branch — vendor string ("The X.Org Foundation"), release_number (12_401_011), 7 pixmap formats (added depth=15, depth=16), screen mm dimensions (677×381 reference), SetCloseDownMode validates header.data ∈ {0,1,2}. **PASS 96 → 110** (+14). Remaining FAILs are mostly XCloseDisplay subtests requiring full resource-lifecycle accounting and a couple of colormap-install limit tests. |
+
 (Total tests: 122 cases / 389 purposes throughout.)
 
 The full scenario completes in ~4 minutes. **The headline is that

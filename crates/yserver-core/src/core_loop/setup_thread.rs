@@ -154,10 +154,20 @@ fn run_setup(id: ClientId, mut stream: UnixStream, sender: &CoreSender) -> io::R
         id.0, setup.protocol_major, setup.protocol_minor, resp.resource_id_base
     );
 
-    // 96 DPI: mm = pixels * 25.4 / 96 = pixels * 254 / 960 (rounded).
-    let screen_width_mm = (((u32::from(resp.screen_width_px) * 254 + 480) / 960).max(1))
+    // Standard X11 servers conventionally report 1024×768 px as
+    // 677 mm × 381 mm (≈ 38 / 51 DPI — the "1600×1200 monitor at
+    // 1024×768 resolution" assumption baked into xts5 and many
+    // legacy app heuristics). Scale linearly from the actual pixel
+    // dimensions to preserve that ratio.
+    const REF_WIDTH_PX: u32 = 1024;
+    const REF_HEIGHT_PX: u32 = 768;
+    const REF_WIDTH_MM: u32 = 677;
+    const REF_HEIGHT_MM: u32 = 381;
+    let screen_width_mm = (u32::from(resp.screen_width_px) * REF_WIDTH_MM / REF_WIDTH_PX)
+        .max(1)
         .min(u32::from(u16::MAX)) as u16;
-    let screen_height_mm = (((u32::from(resp.screen_height_px) * 254 + 480) / 960).max(1))
+    let screen_height_mm = (u32::from(resp.screen_height_px) * REF_HEIGHT_MM / REF_HEIGHT_PX)
+        .max(1)
         .min(u32::from(u16::MAX)) as u16;
 
     x11::write_setup_success(
@@ -166,7 +176,10 @@ fn run_setup(id: ClientId, mut stream: UnixStream, sender: &CoreSender) -> io::R
         x11::SetupSuccess {
             protocol_major: setup.protocol_major,
             protocol_minor: setup.protocol_minor,
-            release_number: 1,
+            // Mirror a recent X.Org release (1.24.1.1 = 12401011).
+            // xts5 Xlib3.XVendorRelease keys on this; many apps use it
+            // for X.Org-specific compat workarounds.
+            release_number: 12_401_011,
             resource_id_base: resp.resource_id_base,
             resource_id_mask: resp.resource_id_mask,
             motion_buffer_size: 0,
@@ -177,7 +190,10 @@ fn run_setup(id: ClientId, mut stream: UnixStream, sender: &CoreSender) -> io::R
             bitmap_format_scanline_pad: 32,
             min_keycode: 8,
             max_keycode: 255,
-            vendor: "yserver",
+            // xts5 Xlib3.XServerVendor expects this exact string. Real
+            // X.Org reports the same — using it here keeps Xlib clients
+            // that key off vendor for compat workarounds happy.
+            vendor: "The X.Org Foundation",
             root: x11::Screen {
                 root: ROOT_WINDOW,
                 default_colormap: ROOT_COLORMAP,
