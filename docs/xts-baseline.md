@@ -182,30 +182,95 @@ Xproto 337 + Xlib3 110 + Xlib4–17 889 + ShapeExt 11 = **1347 PASS**
 
 ### Top blockers driving the remaining FAIL
 
-The "first-case hang" class is gone. The residual ~1.4k FAIL across
-Xlib4-17 falls into a few buckets:
+The "first-case hang" class is gone. The residual ~2.6k FAIL across
+the full battery sit at **34% PASS (1347 / 3971)**. To get the
+unique `REPORT:` lines and counts for the buckets below, sum across
+all the post-fix journals:
 
-1. **`ChangeWindowAttributes` doesn't persist most fields.** The
-   `Window` struct stores background-pixel / background-pixmap /
-   override-redirect / cursor; CW value-mask bits for bit-gravity,
-   win-gravity, backing-store, backing-planes, backing-pixel,
-   save-under, colormap, do-not-propagate-mask are accepted but
-   discarded. Tests that set then read fail with "got default,
-   expected <set value>".
-2. **Missing protocol errors on bad inputs.** `did not generate
-   BadAccess / BadColor / BadCursor / BadMatch / BadPixmap /
-   BadValue / BadWindow` is a recurring `REPORT:` line. Many
-   handlers blindly succeed. Adding spec-required error returns
-   would lift FAIL → PASS without functional changes.
-3. **Pixel-mismatch in image / fill / area tests.** "A total of
-   N out of 9000 pixels were bad" appears across the geometry
-   tests — likely backing-pixel default propagation, plus Expose
-   mishandling, plus border-pixel defaults.
-4. **Expose-region tracking gaps.** Xlib9's 388 UNRES is mostly
-   tests that issue a structural change (Destroy/Resize/Map/
-   Configure) and time-out waiting for an `Expose` covering the
-   newly-uncovered area. Need a proper expose-region tracker that
-   fires on those transitions.
+```sh
+for d in $(ls -1dt /home/jos/Projects/xts/results/2026-05-07-10:* | head -14); do
+    grep "REPORT:" "$d/journal" | sed 's/^[^|]*|[^|]*|//'
+done | sort | uniq -c | sort -rn | head -40
+```
+
+Top buckets (rough estimate of distinct affected tests in parens):
+
+1. **Drawing-on-uninitialised-pixmap-source semantics** (≈100-200
+   tests, ~3000 raw `REPORT` lines). xts's `functest()` (in
+   `xts5/lib/gc/function.mc`) sets up a source/dest drawable pair,
+   fills the dest, runs `XCopyArea(src, dst, ...)`, then walks the
+   dest looking for any non-zero pixel. Our basic round-trip works
+   (`XCreatePixmap → XFillRectangle → XGetImage` returns the right
+   pixel — see `/tmp/draw_test.c`-style probe), but the xts-specific
+   setup-pair pattern leaves the destination black on ynest only.
+   "No pixel set in drawable" / "Nothing was drawn with a gc function
+   of GXcopy" / "Setup error in functest" all chain from the same
+   root. Investigation needed — likely a specific drawable/visual
+   combination we don't pass through correctly. Fixing this single
+   bug would likely lift the largest single chunk of the suite.
+2. **Per-opcode value validation** (≈500 tests, ~559 missing
+   `BadValue`/`BadMatch` errors). Today
+   `request_lengths::invalid_value_mask` checks which BITS of a
+   value-mask are valid for CreateWindow/ChangeWindowAttributes/
+   ConfigureWindow/CreateGC/ChangeGC/CopyGC/ChangeKeyboardControl —
+   but no handler checks the VALUES inside the value-list. xts
+   probes `bit_gravity ∉ [0,10]`, `backing_store ∉ {NotUseful,
+   WhenMapped, Always}`, grab modes, line/cap/join styles, etc.
+   Mechanical to add: ~20 opcodes need per-value range tables,
+   following the existing CW_VALID/GC_VALID pattern. Probably the
+   single highest-leverage remaining work item by tests-per-hour.
+   Top offending cases:
+
+   ```
+   28 XChangeWindowAttributes 46
+   22 XChangeKeyboardControl 20
+   20 XCreatePixmap 6
+   20 XCopyPlane 43
+   19 XGrabButton 39
+   17 XGrabKey 16
+   15 XGrabPointer 34
+   12 XSetLineAttributes 6
+   12 XGrabKeyboard 25
+   12 XChangePointerControl 11
+   ```
+
+3. **`ChangeWindowAttributes` field persistence** (≈300 tests).
+   The `Window` struct stores background-pixel / background-pixmap /
+   override-redirect / cursor only. CW value-mask bits for
+   bit-gravity, win-gravity, backing-store, backing-planes,
+   backing-pixel, save-under, colormap, do-not-propagate-mask are
+   accepted (no error) but discarded. Tests that set-then-read fail
+   with "got default, expected <set value>". Half-day refactor:
+   extend `Window` struct, parse all CW values, return them in
+   `GetWindowAttributes`. The hardcoded defaults in
+   `process_request.rs::window_attributes` go away.
+4. **Pixel-mismatch in image / fill / area tests** (≈500 tests,
+   "A total of N out of 9000 pixels were bad" and "Pixel mismatch
+   in image"). Likely entangled with bucket #1 plus a separate
+   issue around backing-pixel default propagation, border-pixel
+   defaults, and possibly `XYBitmap`/`XYPixmap` PutImage formats
+   (currently only ZPixmap is handled).
+5. **Depth-N pixmap support for N ∉ {1, 24, 32}** (≈400 tests,
+   "Incorrect depth (24 != N)" appears as 158/78/78/78 for N=32/8/4/1).
+   `supported_pixmap_depth` rejects everything outside a small set;
+   tests that allocate depth 2/4/8/15/16-bit pixmaps then read back
+   get the host's default depth (24). Extend the supported-depth
+   list and let host-X allocate; about half a day.
+6. **Expose-region tracking after Destroy/Resize/Map/Configure**
+   (≈400 tests, mostly Xlib9 UNRES). Tests that issue a structural
+   change and time-out waiting for an `Expose` covering the
+   newly-uncovered area. Multi-day — needs a real region tracker;
+   probably the largest scope item remaining.
+
+Quick-win order (by tests-per-hour-of-work, declining):
+**(2) value validation** → **(3) CW persistence** → **(5) more
+depths** → **(1) drawing-setup investigation** → **(6) expose
+tracking**.
+
+Bucket (1) is the biggest payoff if it turns out to be a single
+small bug, but the investigation is open-ended. Buckets (2) and
+(3) are the safe next steps with predictable scope and clear
+endpoints.
 
 ### Pre-fix snapshot (kept for context — single-ynest, no root
 protection, no XKB minor 15)
