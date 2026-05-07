@@ -164,6 +164,34 @@ harness-check:
         --qemu-opts="-display gtk -vga none -device virtio-gpu-pci -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- bash -c "Xorg :1 vt1 -logfile /tmp/xorg-test.log & sleep 5 && DISPLAY=:1 xterm"
 
+# Phase 4 spike step 1: Vulkan inside vng with the legacy virtio-gpu-pci
+# device. Expected to find no Vulkan device (the 2D device exposes no GPU
+# context) — confirms the negative before we go looking for a positive.
+vulkan-check-baseline:
+    vng -r {{KERNEL}} --disable-microvm --rw \
+        --qemu-opts="-device virtio-gpu-pci" \
+        -- bash -c 'vulkaninfo --summary 2>&1 | head -60; echo "---ICDs---"; ls /usr/share/vulkan/icd.d/ 2>&1'
+
+# Phase 4 spike step 2: software Vulkan via lavapipe (llvmpipe ICD).
+# Requires `vulkan-swrast` installed on the host so the guest sees
+# `/usr/share/vulkan/icd.d/lvp_icd.json` (no .x86_64 suffix on Arch).
+# Verified 2026-05-07: one llvmpipe device, Vulkan 1.4.335 — proves
+# the loader+ICD plumbing works end-to-end inside vng.
+vulkan-check-lavapipe:
+    vng -r {{KERNEL}} --disable-microvm --rw \
+        --qemu-opts="-device virtio-gpu-pci" \
+        -- bash -c 'VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json vulkaninfo --summary 2>&1 | head -80'
+
+# Phase 4 spike step 3: real GPU via virtio-gpu Venus passthrough.
+# Requires `vulkan-virtio` on the host (provides the Venus ICD inside
+# the guest). Verified 2026-05-07: exposes host AMD Radeon 680M as
+# "Virtio-GPU Venus (RADV REMBRANDT)" at Vulkan 1.4.307 (conformance
+# 1.4.0.0), plus a llvmpipe-backed Venus fallback device.
+vulkan-check-venus:
+    vng -r {{KERNEL}} --disable-microvm --rw \
+        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true" \
+        -- bash -c 'vulkaninfo --summary 2>&1 | head -80'
+
 # Bring up yserver + fvwm3 + xterm in one QEMU window. The WM starts
 # before xterm so the terminal gets framed. Logs to yserver.log on the
 # host side via the shared cwd. Override resolution with `mode=WxH`.
@@ -221,3 +249,21 @@ rendercheck-ynest display="99" geometry="1024x768" timeout="600" tests="fill,dco
         trap "kill $pid 2>/dev/null; wait" INT TERM EXIT; \
         sleep 1; \
         tools/rendercheck.sh :{{display}} {{timeout}} {{tests}}
+
+# Run an xts5 scenario against yserver (KMS) inside virtme-ng.
+# Boots vng once with yserver in the background (headless QEMU,
+# virtio-gpu KMS), polls for the X socket on :7, then runs the same
+# xts harness ynest uses. Result tree lands in xts/results/ on the
+# host because vng mounts the host rootfs --rw.
+xts-yserver scenario="Xproto" timeout="600":
+    cargo build --release --bin yserver
+    vng -r {{KERNEL}} --disable-microvm --rw \
+        --qemu-opts="-device virtio-gpu-pci -display none" \
+        -- tools/yserver-vng-run.sh xts {{scenario}} {{timeout}}
+
+# Run rendercheck against yserver (KMS) inside virtme-ng.
+rendercheck-yserver timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
+    cargo build --release --bin yserver
+    vng -r {{KERNEL}} --disable-microvm --rw \
+        --qemu-opts="-device virtio-gpu-pci -display none" \
+        -- tools/yserver-vng-run.sh rendercheck {{timeout}} {{tests}}

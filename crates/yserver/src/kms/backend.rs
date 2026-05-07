@@ -223,6 +223,45 @@ fn composite_trapezoids(
     }
 }
 
+/// Composite a triangle list onto `dst` using pixman. `pixman_triangle_t`
+/// is layout-identical to RENDER's `XTriangle` (three `XPointFixed`s),
+/// and pixman uses the same operator numbers as RENDER.
+fn composite_triangles(
+    op: u32,
+    src_ptr: *mut pixman::ffi::pixman_image_t,
+    dst: &mut PixmanImage,
+    mask_format: pixman::ffi::pixman_format_code_t,
+    x_src: i32,
+    y_src: i32,
+    x_dst: i32,
+    y_dst: i32,
+    tris: &[pixman::ffi::pixman_triangle_t],
+) {
+    if src_ptr.is_null() {
+        log::warn!("composite_triangles: src is null, skipping");
+        return;
+    }
+    if tris.is_empty() {
+        return;
+    }
+    let dst_ptr = dst.ffi_ptr();
+    // SAFETY: same contract as composite_trapezoids — see that function.
+    unsafe {
+        pixman::ffi::pixman_composite_triangles(
+            op,
+            src_ptr,
+            dst_ptr,
+            mask_format,
+            x_src,
+            y_src,
+            x_dst,
+            y_dst,
+            tris.len() as std::os::raw::c_int,
+            tris.as_ptr(),
+        );
+    }
+}
+
 /// Geometry + raw pixel pointer for a window or pixmap drawable.
 ///
 /// `data_ptr` is a byte-granularity pointer; cast to `*mut u32` for 32bpp
@@ -3600,49 +3639,95 @@ impl Backend for KmsBackend {
         height: u16,
         _plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>> {
+        let depth = self.drawable_depth(host_xid).unwrap_or(24);
         let Some(geom) = self.drawable_geometry(host_xid) else {
             return Ok(None);
         };
-        // GetImage currently only supports 32bpp source drawables (the
-        // only kind the rest of the backend uses for windows / regular
-        // pixmaps); A8 cursor masks etc. would need a separate path.
-        let stride_words = geom.stride_bytes / 4;
-        let src_words = geom.data_ptr as *const u32;
-        let pixel_bytes = (width as usize) * (height as usize) * 4;
+        // bits_per_pixel for a ZPixmap reply: depth-1 packs to 1 bpp,
+        // depth-4 to 4 bpp, depth-8 to 8 bpp, depth-15/16 to 16 bpp,
+        // depth-24/32 both to 32 bpp (32 bpp = X8R8G8B8 / A8R8G8B8).
+        // Each scanline is padded to 4 bytes (scanline_pad = 32).
+        let bpp = match depth {
+            1 => 1u32,
+            4 => 4,
+            8 => 8,
+            15 | 16 => 16,
+            24 | 32 => 32,
+            _ => 32,
+        };
+        let row_bytes = (((width as u32) * bpp).div_ceil(32) * 4) as usize;
+        let pixel_bytes = row_bytes * (height as usize);
         // X11 GetImage reply: 32-byte fixed header followed by the
-        // pixel payload (already 4-byte-aligned for ZPixmap depth-24).
-        // The header is partly populated by nested.rs (sequence at
-        // bytes 2..4 and visual at 8..12 are patched there); we
-        // populate everything else so byte 0 = 1 (Reply), byte 1 =
-        // depth, and bytes 4..8 = reply length in 4-byte units.
-        // Without this, callers like wmaker treat byte 0 = whatever
-        // the first pixel is (often 0) as an error reply, abort
-        // mid-setup, and leave windows unmapped.
+        // pixel payload (already 4-byte-aligned for ZPixmap). The
+        // header is partly populated by nested.rs (sequence at bytes
+        // 2..4 and visual at 8..12 are patched there); we populate
+        // everything else: byte 0 = 1 (Reply), byte 1 = depth, bytes
+        // 4..8 = length in 4-byte units. Without byte 0 = 1, callers
+        // like wmaker treat byte 0 = first pixel as an error reply,
+        // abort, and leave windows unmapped.
         let mut result = Vec::with_capacity(32 + pixel_bytes);
         let reply_length_units = (pixel_bytes / 4) as u32;
         result.push(1); // 0: Reply
-        result.push(24); // 1: depth (X8R8G8B8 / A8R8G8B8 → 24-bit RGB visible)
+        result.push(depth); // 1: actual drawable depth
         result.extend_from_slice(&[0u8; 2]); // 2..4: sequence (patched by nested.rs)
         result.extend_from_slice(&reply_length_units.to_le_bytes()); // 4..8: length in u32 units
         result.extend_from_slice(&[0u8; 4]); // 8..12: visual (patched by nested.rs)
         result.extend_from_slice(&[0u8; 20]); // 12..32: padding
         debug_assert_eq!(result.len(), 32);
+
+        // Row-by-row copy. We have real read paths for 8 bpp (depth 8)
+        // and 32 bpp (depth 24/32). Other depths (1, 4, 15, 16) emit
+        // a correctly-sized row of zeros so the wire stream stays
+        // aligned even if the data is wrong — better than scrambling
+        // it with mismatched per-pixel byte counts.
+        let row_data_bytes = (((width as u32) * bpp).div_ceil(8)) as usize;
+        let row_pad_bytes = row_bytes - row_data_bytes;
         for row in 0..height as isize {
             let dy = y as isize + row;
             if dy < 0 || dy >= geom.height as isize {
-                result.resize(result.len() + width as usize * 4, 0);
+                result.resize(result.len() + row_bytes, 0);
                 continue;
             }
-            for col in 0..width as isize {
-                let dx = x as isize + col;
-                if dx < 0 || dx >= geom.width as isize {
-                    result.extend_from_slice(&[0; 4]);
-                } else {
-                    // SAFETY: bounds-checked against geom.width/height;
-                    // geom borrows self so the pointer is valid.
-                    let pixel = unsafe { *src_words.add(dy as usize * stride_words + dx as usize) };
-                    result.extend_from_slice(&pixel.to_le_bytes());
+            let row_ptr = unsafe { geom.data_ptr.add(dy as usize * geom.stride_bytes) };
+            match bpp {
+                32 => {
+                    for col in 0..width as isize {
+                        let dx = x as isize + col;
+                        if dx >= 0 && dx < geom.width as isize {
+                            // SAFETY: bounds-checked against geom.width/height;
+                            // geom borrows self so the pointer is valid.
+                            let pixel: u32 = unsafe {
+                                std::ptr::read_unaligned(
+                                    row_ptr.add((dx as usize) * 4) as *const u32
+                                )
+                            };
+                            result.extend_from_slice(&pixel.to_le_bytes());
+                        } else {
+                            result.extend_from_slice(&[0u8; 4]);
+                        }
+                    }
                 }
+                8 => {
+                    for col in 0..width as isize {
+                        let dx = x as isize + col;
+                        if dx >= 0 && dx < geom.width as isize {
+                            let byte: u8 = unsafe { *row_ptr.add(dx as usize) };
+                            result.push(byte);
+                        } else {
+                            result.push(0);
+                        }
+                    }
+                }
+                _ => {
+                    // No real read path for this depth; emit a full
+                    // row's worth of zeros (data + pad together) and
+                    // skip the per-row pad below.
+                    result.extend(std::iter::repeat_n(0u8, row_bytes));
+                    continue;
+                }
+            }
+            if row_pad_bytes > 0 {
+                result.extend(std::iter::repeat_n(0u8, row_pad_bytes));
             }
         }
         Ok(Some(result))
@@ -5037,6 +5122,211 @@ impl Backend for KmsBackend {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn render_triangles_op(
+        &mut self,
+        _origin: Option<OriginContext>,
+        minor: u8,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
+        _host_mask_format: u32,
+        src_x: i16,
+        src_y: i16,
+        primitives: &[u8],
+        x_off: i16,
+        y_off: i16,
+    ) -> io::Result<()> {
+        // Decode the per-minor primitive array into a flat triangle list.
+        // pixman_triangle_t is layout-identical to RENDER's XTriangle, and
+        // XPointFixed is two consecutive i32 fixed-point coords (X then Y).
+        let read_point = |off: usize, chunk: &[u8]| pixman::ffi::pixman_point_fixed_t {
+            x: i32::from_le_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]),
+            y: i32::from_le_bytes([
+                chunk[off + 4],
+                chunk[off + 5],
+                chunk[off + 6],
+                chunk[off + 7],
+            ]),
+        };
+        let mk_tri = |a: pixman::ffi::pixman_point_fixed_t,
+                      b: pixman::ffi::pixman_point_fixed_t,
+                      c: pixman::ffi::pixman_point_fixed_t| {
+            pixman::ffi::pixman_triangle_t {
+                p1: a,
+                p2: b,
+                p3: c,
+            }
+        };
+
+        let mut tris: Vec<pixman::ffi::pixman_triangle_t> = match minor {
+            11 => {
+                // Triangles: array of XTriangle (24 B = 3 XPointFixed each).
+                if !primitives.len().is_multiple_of(24) {
+                    return Ok(());
+                }
+                primitives
+                    .chunks_exact(24)
+                    .map(|c| mk_tri(read_point(0, c), read_point(8, c), read_point(16, c)))
+                    .collect()
+            }
+            12 => {
+                // TriStrip: N points → N-2 triangles
+                // (p0,p1,p2), (p1,p2,p3), (p2,p3,p4), ...
+                if !primitives.len().is_multiple_of(8) || primitives.len() < 24 {
+                    return Ok(());
+                }
+                let pts: Vec<pixman::ffi::pixman_point_fixed_t> = primitives
+                    .chunks_exact(8)
+                    .map(|c| read_point(0, c))
+                    .collect();
+                (0..pts.len() - 2)
+                    .map(|i| mk_tri(pts[i], pts[i + 1], pts[i + 2]))
+                    .collect()
+            }
+            13 => {
+                // TriFan: N points → N-2 triangles fanned from p0
+                // (p0,p1,p2), (p0,p2,p3), (p0,p3,p4), ...
+                if !primitives.len().is_multiple_of(8) || primitives.len() < 24 {
+                    return Ok(());
+                }
+                let pts: Vec<pixman::ffi::pixman_point_fixed_t> = primitives
+                    .chunks_exact(8)
+                    .map(|c| read_point(0, c))
+                    .collect();
+                (1..pts.len() - 1)
+                    .map(|i| mk_tri(pts[0], pts[i], pts[i + 1]))
+                    .collect()
+            }
+            _ => return Ok(()),
+        };
+        if tris.is_empty() {
+            return Ok(());
+        }
+        // Apply the per-call (x_off, y_off) pixel offset onto every
+        // FIXED-point coord. (Identical pattern to render_trapezoids.)
+        let dx = i32::from(x_off) << 16;
+        let dy = i32::from(y_off) << 16;
+        if dx != 0 || dy != 0 {
+            for t in &mut tris {
+                t.p1.x = t.p1.x.wrapping_add(dx);
+                t.p1.y = t.p1.y.wrapping_add(dy);
+                t.p2.x = t.p2.x.wrapping_add(dx);
+                t.p2.y = t.p2.y.wrapping_add(dy);
+                t.p3.x = t.p3.x.wrapping_add(dx);
+                t.p3.y = t.p3.y.wrapping_add(dy);
+            }
+        }
+
+        let pixman_op = u32::from(op);
+
+        // Resolve the source picture into a pixman_image_t pointer.
+        // RENDER triangle ops accept any source picture — SolidFill,
+        // Gradient, or another drawable (rendercheck uses 1×1 pixmap
+        // sources). Same shape as render_composite.
+        let (src_ptr, src_drawable_xid, src_repeat, src_transform): (
+            *mut pixman::ffi::pixman_image_t,
+            Option<u32>,
+            Repeat,
+            Option<pixman::ffi::pixman_transform_t>,
+        ) = match self.pictures.get(&host_src) {
+            Some(PictureState::SolidFill { image, repeat, .. }) => {
+                (image.borrow().0.as_ptr(), None, *repeat, None)
+            }
+            Some(PictureState::Gradient {
+                image,
+                repeat,
+                transform,
+            }) => (image.0.as_ptr(), None, *repeat, *transform),
+            Some(PictureState::Drawable {
+                host_xid,
+                repeat,
+                transform,
+                ..
+            }) => {
+                let xid = *host_xid;
+                match self.image_ptr_for_xid(xid) {
+                    Some(ptr) => (ptr, Some(xid), *repeat, *transform),
+                    None => {
+                        log::debug!(
+                            "render_triangles_op: src drawable 0x{xid:x} has no image; skipping"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            None => {
+                log::debug!("render_triangles_op: host_src 0x{host_src:x} not found; skipping");
+                return Ok(());
+            }
+        };
+
+        let (drawable_xid, clip) = match self.pictures.get(&host_dst) {
+            Some(PictureState::Drawable { host_xid, clip, .. }) => (*host_xid, clip.clone()),
+            _ => {
+                log::debug!(
+                    "render_triangles_op: host_dst 0x{host_dst:x} is not a Drawable picture; skipping"
+                );
+                return Ok(());
+            }
+        };
+
+        // Same anti-self-composite guard render_composite uses: pixman
+        // is undefined if src aliases dst.
+        if src_drawable_xid == Some(drawable_xid) {
+            log::debug!(
+                "render_triangles_op: src and dst are the same drawable 0x{drawable_xid:x}; skipping"
+            );
+            return Ok(());
+        }
+
+        // Apply repeat/transform to source — same as render_composite.
+        unsafe {
+            pixman::ffi::pixman_image_set_repeat(src_ptr, src_repeat.into());
+            pixman::ffi::pixman_image_set_transform(
+                src_ptr,
+                src_transform
+                    .as_ref()
+                    .map_or(std::ptr::null(), |t| t as *const _),
+            );
+        }
+
+        self.with_image_mut(drawable_xid, |dst| {
+            if let Some(ref rects) = clip {
+                use pixman::{Box32, Region32};
+                let boxes: Vec<Box32> = rects
+                    .iter()
+                    .map(|r| Box32 {
+                        x1: i32::from(r.x),
+                        y1: i32::from(r.y),
+                        x2: i32::from(r.x) + i32::from(r.width),
+                        y2: i32::from(r.y) + i32::from(r.height),
+                    })
+                    .collect();
+                let region = Region32::init_rects(boxes.as_slice());
+                let _ = dst.0.set_clip_region32(Some(&region));
+            }
+
+            composite_triangles(
+                pixman_op,
+                src_ptr,
+                dst,
+                pixman::ffi::pixman_format_code_t_PIXMAN_a8,
+                i32::from(src_x),
+                i32::from(src_y),
+                0,
+                0,
+                &tris,
+            );
+
+            if clip.is_some() {
+                let _ = dst.0.set_clip_region32(None);
+            }
+        });
+
+        Ok(())
+    }
+
     fn render_create_solid_fill(
         &mut self,
         _origin: Option<OriginContext>,
@@ -5392,7 +5682,9 @@ impl Backend for KmsBackend {
     }
 
     fn render_query_version(&mut self, _origin: Option<OriginContext>) -> io::Result<(u32, u32)> {
-        Ok((1, 1))
+        // RENDER protocol versions are major=0, minor=N. Current
+        // upstream is 0.11; rendercheck rejects anything with major≠0.
+        Ok((0, 11))
     }
 
     fn xkb_proxy(
