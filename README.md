@@ -27,10 +27,11 @@ drives input via libinput, and renders via pixman + freetype. e16
 and Window Maker work; fvwm3 boots but its core-font menu rendering
 has a known gap (see [`docs/known-issues.md`](docs/known-issues.md)).
 
-See [`docs/status.md`](docs/status.md) for per-phase progress,
-[`docs/known-issues.md`](docs/known-issues.md) for current gaps, and
-[`docs/xts-baseline.md`](docs/xts-baseline.md) for the X Test Suite
-(xts5) baseline that drives ongoing regression coverage.
+See [`docs/test-status.md`](docs/test-status.md) for the latest xts5
++ rendercheck pass numbers, [`docs/status.md`](docs/status.md) for
+per-phase progress, [`docs/known-issues.md`](docs/known-issues.md)
+for current gaps, and [`docs/xts-baseline.md`](docs/xts-baseline.md)
+for the run-by-run xts working log.
 
 ## Layout
 
@@ -171,7 +172,7 @@ via [`tools/xts-run.sh`](tools/xts-run.sh) (which wraps `xts/check.sh`
 + `xts-report`), and tears down `ynest` on exit. Results land in
 `/home/jos/Projects/xts/results/<timestamp>/summary` — a
 `CASES TESTS PASS UNSUP UNTST NOTIU WARN FIP FAIL UNRES UNIN ABORT`
-table per scenario. The baseline at
-[`docs/xts-baseline.md`](docs/xts-baseline.md) captures the first run
-and ranks dominant failure modes by REPORT-line frequency to identify
-high-ROI fixes.
+table per scenario. Latest pass numbers per scenario live in
+[`docs/test-status.md`](docs/test-status.md);
+[`docs/xts-baseline.md`](docs/xts-baseline.md) is the run-by-run
+working log with debugging notes and dominant failure-mode buckets.
