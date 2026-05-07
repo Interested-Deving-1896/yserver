@@ -404,6 +404,17 @@ impl ResourceTable {
     }
 
     fn destroy_window_inner(&mut self, id: ResourceId, destroyed: &mut Vec<ResourceId>) {
+        // X11 spec: "If the argument window is a root window, then this
+        // request has no effect." Without this guard a misbehaved client
+        // (or xts5 Xlib4/XDestroyWindow assertion 5, which calls
+        // `XDestroyWindow(root)` and verifies the root and a sibling
+        // window are still valid) would silently delete the root entry
+        // from the windows table — leaving every subsequent client to
+        // receive `BadWindow` from `GetGeometry` / `QueryTree` /
+        // `GetWindowAttributes` on `ROOT_WINDOW`.
+        if id == ROOT_WINDOW {
+            return;
+        }
         let Some(window) = self.windows.remove(&id.0) else {
             return;
         };
