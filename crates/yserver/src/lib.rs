@@ -27,9 +27,21 @@ use crate::kms::KmsBackend;
 const DISPLAY: u16 = 7;
 
 pub fn run() -> io::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    panic!("yserver only supports Linux (DRM/KMS, libinput, evdev, virtual consoles)");
+
     log::info!("yserver: Phase 6.4 KMS bootstrap — startup (single-threaded core)");
 
     let signal_fd = block_termination_signals()?;
+
+    // Take over the console TTY before opening anything else: stops the
+    // kernel keyboard driver from delivering Ctrl-C / Ctrl-Z / etc. as
+    // signals to the controlling TTY's foreground process group, which
+    // would otherwise kill the whole session when the user hits Ctrl-C
+    // inside an X client. Skipped silently when not on a Linux VC (pty
+    // under SSH or a graphical terminal emulator).
+    #[cfg(target_os = "linux")]
+    let _console_guard = crate::kms::console::ConsoleGuard::acquire()?;
     let device_path = resolve_drm_device()?;
     log::info!("yserver: opening DRM device {device_path}");
 

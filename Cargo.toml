@@ -26,7 +26,7 @@ env_logger = "0.11"
 libc = "0.2"
 drm = "0.15"
 input = "0.10"
-nix = { version = "0.31", features = ["event", "fs", "ioctl", "mman", "poll", "signal"] }
+nix = { version = "0.31", features = ["event", "fs", "ioctl", "mman", "poll", "signal", "term"] }
 signal-hook = "0.4"
 crossbeam-channel = "0.5"
 mio = { version = "1", features = ["os-poll", "net", "os-ext"] }
