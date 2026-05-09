@@ -90,6 +90,7 @@ impl AsFd for SendContext {
 
 impl Context {
     pub fn new() -> io::Result<Self> {
+        log_input_devnodes();
         let mut libinput = Libinput::new_with_udev(Interface);
         libinput.udev_assign_seat("seat0").map_err(|()| {
             io::Error::other(
@@ -131,6 +132,37 @@ impl Context {
 impl AsFd for Context {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.libinput.as_fd()
+    }
+}
+
+/// Best-effort `/dev/input/` enumeration logged at startup. Lets us
+/// tell from the log whether the input nodes exist and whether our
+/// process can stat / open them. udev rules from logind grant ACL on
+/// `event*` to the active session; if we see `open: ok` here but
+/// libinput's `open_restricted` fails, the seat is the wrong one.
+fn log_input_devnodes() {
+    let dir = match std::fs::read_dir("/dev/input") {
+        Ok(d) => d,
+        Err(err) => {
+            log::warn!("/dev/input: read_dir failed: {err}");
+            return;
+        }
+    };
+    let mut nodes: Vec<_> = dir.flatten().collect();
+    nodes.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in nodes {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.starts_with("event") {
+            continue;
+        }
+        let path = entry.path();
+        match OpenOptions::new().read(true).open(&path) {
+            Ok(_f) => log::info!("/dev/input/{name_str}: open(O_RDONLY) ok"),
+            Err(err) => log::warn!("/dev/input/{name_str}: open(O_RDONLY) failed: {err}"),
+        }
     }
 }
 
