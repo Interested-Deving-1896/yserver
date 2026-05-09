@@ -314,14 +314,9 @@ yserver-fvwm3-xterm-hw scanout="vk_composite" log="debug":
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > /tmp/yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        DISPLAY=:7 fvwm3 > /tmp/fvwm3-hw.log 2>&1 &\
-        fvwm3_pid=$!;\
-        sleep 1;\
-        strace -f -tt -T -y -s 256 -p $fvwm3_pid -o /tmp/fvwm3.strace 2>/dev/null &\
-        strace_pid=$!;\
-        sleep 1;\
+        DISPLAY=:7 strace -f -tt -T -y -s 256 -o /tmp/fvwm3.strace fvwm3 > /tmp/fvwm3-hw.log 2>&1 &\
+        sleep 3;\
         DISPLAY=:7 xterm;\
-        kill -TERM $strace_pid 2>/dev/null;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         echo "yserver log:    /tmp/yserver-hw.log";\
