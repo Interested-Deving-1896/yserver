@@ -1,8 +1,9 @@
 # Yserver
 
 ## instructions for all agents
-* Read AGENTS.md
+
+- Read AGENTS.md
 
 ## specific instructions for claude code
-* use codex command for all reviews (for work that YOU did) as you are burning too many tokens
 
+- use codex command/skill for reviews of specs/plans
