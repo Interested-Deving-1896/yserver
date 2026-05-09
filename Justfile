@@ -311,11 +311,11 @@ yserver-wmaker-xterm mode="1024x768" log="trace":
 yserver-fvwm3-xterm-hw scanout="vk_composite" log="debug":
     cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > /tmp/yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > /home/jos/Projects/yserver/yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        DISPLAY=:7 strace -f -tt -T -y -s 256 -o /tmp/fvwm3.strace fvwm3 > /tmp/fvwm3-hw.log 2>&1 &\
-        sleep 3;\
+        DISPLAY=:7 strace -f -tt -T -y -s 256 -o /home/jos/Projects/yserver/fvwm3.strace fvwm3 > /home/jos/Projects/yserver/fvwm3-hw.log 2>&1 &\
+        sleep 8;\
         DISPLAY=:7 xterm;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
