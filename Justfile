@@ -322,6 +322,22 @@ yserver-fvwm3-xterm-hw scanout="vk_composite" log="debug":
         echo "yserver log: /tmp/yserver-hw.log";\
         echo "fvwm3 log:   /tmp/fvwm3-hw.log"'
 
+# No-WM hw smoke: just xterm against yserver. Lets us tell whether
+# fvwm3 specifically is the blocker or whether the compositor / input
+# pipeline itself is broken on hw. Without a WM xterm won't get a
+# frame, but it should still render its own content + the cursor
+# should track the mouse.
+yserver-xterm-only-hw scanout="vk_composite" log="debug":
+    cargo build --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_VK_SCANOUT={{scanout}} target/debug/yserver > /tmp/yserver-hw.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 xterm;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "yserver log: /tmp/yserver-hw.log"'
+
 yserver-wmaker-xterm-hw scanout="vk_composite" log="debug":
     cargo build --bin yserver
     bash -c '\

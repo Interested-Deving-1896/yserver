@@ -5416,6 +5416,12 @@ impl KmsBackend {
                 .unwrap_or(false);
             let dumb_flip_pending = self.outputs[layout_idx].swapchain.submitted_idx().is_some();
             if vk_flip_pending || dumb_flip_pending {
+                log::debug!(
+                    "composite: skip output {} (vk_flip_pending={} dumb_flip_pending={})",
+                    self.outputs[layout_idx].output.connector_name,
+                    vk_flip_pending,
+                    dumb_flip_pending
+                );
                 continue;
             }
 
@@ -5424,9 +5430,15 @@ impl KmsBackend {
             // fallback. The next pageflip-complete event will retrigger
             // composite_and_flip.
             if !self.try_vulkan_composite_flip(layout_idx, visible) {
-                log::trace!(
-                    "vk composite: deferring frame on output {} until a Free bo is available",
+                log::debug!(
+                    "composite: deferring frame on output {} until a Free bo is available",
                     self.outputs[layout_idx].output.connector_name
+                );
+            } else {
+                log::debug!(
+                    "composite: submitted flip on output {} (visible={})",
+                    self.outputs[layout_idx].output.connector_name,
+                    visible.len()
                 );
             }
         }
@@ -5903,19 +5915,22 @@ impl KmsBackend {
         let mut flipped: Vec<crtc::Handle> = Vec::new();
         drm::page_flip::drain_events(&self.device, |c| flipped.push(c))?;
 
-        // Diagnostic: log the very first pageflip-complete per output.
-        // If we never see this for an output, the kernel never told us
-        // its flip latched — typical cause: IN_FENCE_FD never signals
-        // because the GPU semaphore is stuck.
+        // Log every pageflip-complete at debug; first one per output at
+        // info so quiet runs still show the cycle started.
         for c in &flipped {
-            if let Some(idx) = self.outputs.iter().position(|o| &o.output.crtc == c)
-                && !self.first_pageflip_logged[idx]
-            {
-                log::info!(
-                    "pageflip-complete: first event on output {} (CRTC {c:?})",
-                    self.outputs[idx].output.connector_name
-                );
-                self.first_pageflip_logged[idx] = true;
+            if let Some(idx) = self.outputs.iter().position(|o| &o.output.crtc == c) {
+                if !self.first_pageflip_logged[idx] {
+                    log::info!(
+                        "pageflip-complete: first event on output {} (CRTC {c:?})",
+                        self.outputs[idx].output.connector_name
+                    );
+                    self.first_pageflip_logged[idx] = true;
+                } else {
+                    log::debug!(
+                        "pageflip-complete on output {}",
+                        self.outputs[idx].output.connector_name
+                    );
+                }
             }
         }
 

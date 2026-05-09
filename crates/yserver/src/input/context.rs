@@ -20,6 +20,7 @@ use std::{
 use input::{
     Event, Libinput, LibinputInterface,
     event::{
+        EventTrait,
         keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait},
         pointer::{ButtonState, PointerEvent},
     },
@@ -96,6 +97,18 @@ impl Context {
         self.libinput.dispatch()?;
         let mut out = Vec::new();
         for event in &mut self.libinput {
+            // Log device add/remove unconditionally so we can tell from
+            // the server log whether libinput is seeing input hardware.
+            // No devices ever logged → seat permission / udev issue.
+            match &event {
+                Event::Device(input::event::DeviceEvent::Added(d)) => {
+                    log::info!("libinput: device added: {:?}", d.device().name());
+                }
+                Event::Device(input::event::DeviceEvent::Removed(d)) => {
+                    log::info!("libinput: device removed: {:?}", d.device().name());
+                }
+                _ => {}
+            }
             if let Some(translated) = translate(&event) {
                 out.push(translated);
             }
