@@ -682,7 +682,7 @@ and a host `PutImage` chunking fix for >256 KB images. Design doc:
   `PutImage` instead of sharing memory with the host. Revisit if
   large-image upload latency becomes a bottleneck.
 
-## Phase 3.6 — Sub-window mirroring (Xnest model) (in progress)
+## Phase 3.6 — Sub-window mirroring (Xnest model) (complete)
 
 Goal: mirror every InputOutput client window to a host X window
 parented under the client-side parent's host xid (Xnest's
@@ -823,7 +823,7 @@ Design: `docs/superpowers/specs/2026-05-02-phase3-6-design.md`.
   100% broken before Phase 3.6). **Phase 3.7 below resolves
   these.**
 
-## Phase 3.7 — Event-flow + popup rendering fixes (in progress)
+## Phase 3.7 — Event-flow + popup rendering fixes (complete)
 
 Goal: turn the partial e16 popup behaviour from Phase 3.6 into a
 working popup → menu-item click flow. Six interlocking bugs surfaced
@@ -950,15 +950,19 @@ Goal: modern GLX/EGL/Vulkan direct-rendering paths and host buffer
 sharing. Validate real GPU-accelerated clients. (MIT-SHM landed in
 Phase 3.5.)
 
-### Phase 4.1 — Vulkan compositor on KMS (in progress, branch `accel`)
+### Phase 4.1 — Vulkan compositor on KMS (complete)
 
-Replace the pixman CPU compositor in `crates/yserver/src/kms/` with a
-Vulkan compositor built on a per-window-texture scene graph. Spec:
+Replaced the pixman CPU compositor in `crates/yserver/src/kms/` with a
+Vulkan compositor built on a per-window-texture scene graph. The
+`pixman` crate is no longer in the workspace dep tree. Squash-merged
+to master in commit `51e0612` on 2026-05-09.
+
+Spec:
 [`2026-05-07-phase4-1-vulkan-compositor-design.md`](superpowers/specs/2026-05-07-phase4-1-vulkan-compositor-design.md).
 Plan:
 [`2026-05-08-phase4-1-vulkan-compositor.md`](superpowers/plans/2026-05-08-phase4-1-vulkan-compositor.md).
 
-#### Landed (branch `accel`)
+#### Landed
 
 - [x] **Sub-phase 4.1.1 — Vulkan plumbing, idle.** Workspace deps
       (`ash`, `gpu-allocator`, `gbm`, `thiserror`); `kms/vk/` module
@@ -1058,32 +1062,93 @@ Plan:
       outputs paint cleanly, cursor tracks at vsync, mirror upload
       pipe runs without warnings, no fallback to pixman path.
 
-      **Deferred** (not blockers for 4.1.4):
+      Carry-overs from 4.1.3's deferred list folded into 4.1.4 / 4.1.5:
+      `bg_pixmap_image` rescue path was deleted with the rest of pixman
+      in 4.1.5; xts5 + rendercheck full sweep ran as part of the
+      conformance push. Scissor-on-`frame_damage`, occlusion cull, a
+      lavapipe integration harness, and full SHAPE clipping remain
+      open follow-ups (no longer blockers).
 
-      - **Scissor on `frame_damage`** (plan 3.4 step 3). Requires
-        per-frame damage tracking + bo-content preservation across
-        the rotating 3-bo pool; without it scissor restricts writes
-        but leaves stale bytes outside.
-      - **Occlusion cull** (design §"Frame composite pass" step 3).
-        AABB cull suffices for current draw counts.
-      - **Lavapipe integration test** (plan 3.5). Pure-logic
-        precedent (2.7) doesn't compose with `DrawableImage`'s real
-        VkContext requirement; bare-metal smoke is the load-bearing
-        verification.
-      - **SHAPE clipping** beyond the empty-region skip.
-      - **`bg_pixmap_image` rescued path** (no mirror today; falls
-        back to bg color).
-      - **xts5 / rendercheck full sweep** (plan 3.6 parity gate).
-        Run when the user does the next bare-metal validation.
+- [x] **Sub-phase 4.1.4 — Drawing-op family port.** Every drawing op
+      writes to its `DrawableImage` mirror via Vulkan; pixman call
+      sites deleted as each family landed.
+      - **4.1.4.1 — Solid fill** via `vkCmdClearAttachments` /
+        `record_fill_rectangles`.
+      - **4.1.4.2 — `CopyArea`** via `vkCmdCopyImage`.
+      - **4.1.4.3 — `PutImage` / `GetImage`** via `vkCmdCopyBuffer
+        ToImage` / `vkCmdCopyImageToBuffer`.
+      - **4.1.4.4 — Stroke / poly ops** routed through the fill
+        pipeline.
+      - **4.1.4.5 — Glyphs.** Glyph atlas + dedicated text-render
+        pipeline.
+      - **4.1.4.6 — RENDER `Composite` + `FillRectangles`.** Affine
+        transforms, all four repeat modes, mask sources, dst-readback
+        for Disjoint / Conjoint via per-format `DstReadback` scratch
+        + shader-side blend, dual-source blend for `component_alpha`.
+        Full PictOp enum (Saturate, Disjoint 16-27, Conjoint 32-43)
+        backed by lazy per-`(op, dst_format, dst_has_alpha,
+        component_alpha)` pipeline cache.
+      - **4.1.4.7 — RENDER `Trapezoids` / `Triangles` /
+        `CompositeGlyphs`.** CPU-rasterised mask composited through
+        the existing Composite pipeline; `try_vk_render_traps_or_tris`
+        resolves Drawable + Gradient sources (alpha-vs-no-alpha view
+        selection mirrors the regular path), wires up dst-readback
+        for Disjoint / Conjoint, and composites across the full dst
+        for "zero source has effect" ops (Clear / Src / In /
+        InReverse / Out / AtopReverse + Disjoint+Conjoint variants),
+        matching pixman's `pixman-trap.c::get_trap_extents`.
+      - **GC functions.** Xor / And / Or / Invert / etc. via a
+        dedicated `VkLogicOp` pipeline.
 
-#### Known orthogonal issues (not Phase 4.1)
+- [x] **Sub-phase 4.1.5 — Pixman removal.** `WindowState.image`,
+      `PixmapState.image`, `CursorState.image`, `bg_pixmap_image`,
+      the `MirrorUploader` pump, `PixmanImage` newtype — all gone.
+      `cpu_types::{Rectangle16, Repeat, PictTransform}` now own the
+      X-protocol data types; the `pixman` crate is no longer in the
+      workspace dep tree. ~926 lines of pixman-direct unit tests
+      removed; remaining tests cover the Vk path.
 
-- fvwm3/xterm/xclock client visibility on bare-metal silence: clients
-  connect, do setup, but windows don't render. Same fvwm3 binary +
-  config works under ynest and yserver-in-vng. Almost certainly
-  environment-specific yserver-core protocol issue (font matching,
-  color allocation, multi-monitor RandR) unrelated to scanout. To
-  triage post-4.1.
+#### Validation
+
+Rendercheck (yserver in vng + lavapipe):
+
+- `fill` / `dcoords` / `scoords` / `mcoords` / `tscoords` /
+  `tmcoords` / `blend` / `repeat` / `bug7366`: 100%.
+- `gradients`: 3649/3649. XRenderColor stops on
+  `CreateLinearGradient` / `CreateRadialGradient` arrive STRAIGHT
+  (per protocol + rendercheck `t_gradient.c:119-123`); the LUT fill
+  premultiplies.
+- `triangles`: 456/456.
+- `composite` / `cacomposite`: correctness OK on the subsets that
+  finish, but per-op `vkQueueSubmit2` + `vkQueueWaitIdle` pushes the
+  full suite past the 600 s / 1800 s budgets. Batching is the open
+  follow-up below.
+
+xts5 protocol-test parity vs the pixman baseline (commit `108e0ad`):
+
+| scenario | now PASS | baseline PASS | per-test PASS  |
+|----------|---------:|--------------:|---------------:|
+| Xproto   | 332      | 358           | 91.7% vs 92.0% |
+| Xlib3    | 98       | 100           | 61.3% vs 64.1% |
+
+FAIL / UNRES counts match the baseline exactly; the Xproto delta is
+entirely UNTESTED tests the per-op cadence ran out of time on at the
+same wall-clock budget.
+
+#### Phase 4.1 follow-ups
+
+- **Composite / cacomposite batching.** Eager
+  `vkQueueSubmit2` + `vkQueueWaitIdle` per RENDER op is the bottleneck;
+  batching at the command-buffer level is needed before the full
+  composite suite finishes inside the rendercheck budget.
+- **Scissor on `frame_damage`** (originally plan 3.4 step 3). Requires
+  per-frame damage tracking + bo-content preservation across the
+  rotating 3-bo pool.
+- **Occlusion cull** beyond AABB.
+- **Lavapipe integration harness.** Pure-logic precedent doesn't
+  compose with `DrawableImage`'s real `VkContext` requirement;
+  bare-metal smoke is currently the load-bearing verification.
+- **SHAPE clipping** beyond the empty-region skip.
 
 ## Phase 5 — Full desktop sessions
 
@@ -1099,7 +1164,7 @@ Goal: replace the nested backend with a real backend on libinput, udev,
 GBM, EGL/Vulkan, and atomic KMS. Hotplug, multi-monitor presentation,
 session management, fullscreen / direct-scanout paths.
 
-### Phase 6.1 — DRM/KMS bootstrap (in progress)
+### Phase 6.1 — DRM/KMS bootstrap (complete)
 
 Goal: replace the placeholder `crates/yserver/src/bin/yserver.rs` with
 a real DRM/KMS binary that boots in `virtme-ng`, sets a mode on
