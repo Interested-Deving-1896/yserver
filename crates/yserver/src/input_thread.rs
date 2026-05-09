@@ -169,6 +169,29 @@ pub fn run(input_ctx: SendContext, sender: CoreSender, fb_w: u32, fb_h: u32) -> 
         .add(borrow, EpollEvent::new(EpollFlags::EPOLLIN, 0))
         .map_err(|err| io::Error::other(format!("input thread epoll_add: {err}")))?;
 
+    // Drain udev's initial device enumeration before waiting on
+    // epoll. udev_assign_seat queues DeviceAdded events synchronously
+    // but dispatch() must be called once to consume them. Without this
+    // first dispatch, the very first epoll_wait blocks until any input
+    // arrives, and the seat enumeration is silently held back. This is
+    // also where `libinput: device added` first lands in the log.
+    {
+        let initial = match input_ctx.dispatch() {
+            Ok(evs) => evs,
+            Err(err) => {
+                log::warn!("input thread: initial libinput dispatch: {err}");
+                Vec::new()
+            }
+        };
+        if !initial.is_empty() {
+            let time_ms = current_time_ms();
+            process_batch(&mut state, &sender, &mut pending_motion, initial, time_ms)?;
+            if let Some(m) = pending_motion.take() {
+                sender.send(Message::HostInput(m))?;
+            }
+        }
+    }
+
     let mut buf = [EpollEvent::empty(); 4];
     loop {
         match input_epoll.wait(&mut buf, EpollTimeout::NONE) {

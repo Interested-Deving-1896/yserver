@@ -33,13 +33,24 @@ struct Interface;
 
 impl LibinputInterface for Interface {
     fn open_restricted(&mut self, path: &Path, flags: i32) -> Result<OwnedFd, i32> {
-        OpenOptions::new()
+        let result = OpenOptions::new()
             .custom_flags(flags)
             .read((flags & O_ACCMODE == O_RDONLY) | (flags & O_ACCMODE == O_RDWR))
             .write((flags & O_ACCMODE == O_WRONLY) | (flags & O_ACCMODE == O_RDWR))
-            .open(path)
-            .map(|file| file.into())
-            .map_err(|err| err.raw_os_error().unwrap_or(libc::EIO))
+            .open(path);
+        match result {
+            Ok(file) => {
+                log::info!("libinput: open_restricted ok: {}", path.display());
+                Ok(file.into())
+            }
+            Err(err) => {
+                log::warn!(
+                    "libinput: open_restricted failed: {} -> {err}",
+                    path.display()
+                );
+                Err(err.raw_os_error().unwrap_or(libc::EIO))
+            }
+        }
     }
 
     fn close_restricted(&mut self, fd: OwnedFd) {
