@@ -3080,6 +3080,41 @@ each `just yserver-…-hw` smoke.
   — used to narrow whether the failure is no-DefineCursor-issued,
   xid-mismatch, or render-side. Not a fix.
 
+- **Core CreateCursor rasterization (commit `c7f0ed6`).**
+  `KmsBackend::create_cursor` was a stub — allocated a host xid
+  and returned without inserting into `self.cursors`. DefineCursor
+  on that xid then silently bailed out of the composite let-chain
+  (`self.cursors.get(&cursor_xid) → None`). Now reads the source
+  (and optional mask) depth-1 pixmap mirrors back via
+  `read_mirror_pixels` (R8_UNORM, 0xFF/0x00 per pixel), composes
+  BGRA per X11 semantics — visible iff mask bit set (or always if
+  no mask), fore where source bit set else back — and uploads to
+  a fresh cursor mirror. Defensive on size mismatch (warn + treat
+  as no-mask); proper BadMatch validation deferred to the core
+  layer.
+
+- **Core CreateGlyphCursor through FreeType (commit `1757918`).**
+  `handle_create_glyph_cursor` used to register the cursor
+  resource and return — never calling the backend, leaving
+  `host_xid` unset so the CWA cursor handler quietly skipped
+  `backend.define_cursor`. Every WM that uses
+  `XCreateFontCursor` (almost all of them: e16, fvwm3, wmaker,
+  xterm-without-Xcursor-theme) hit this path. New
+  `Backend::create_glyph_cursor` trait method carries
+  `(source_font, mask_font, source_char, mask_char, fore, back)`;
+  `host_x11` forwards the wire request, KMS rasterizes both
+  glyphs through `FontLoader` (FreeType `RENDER` mode), aligns
+  them at glyph origins, and walks each cursor pixel placing
+  source bits as fore/back inside the mask region. No-mask case
+  treats source as both source and mask per spec (visible iff src
+  bit set, color always fore). Hotspot is the source-glyph origin
+  in pixmap coords, matching Xorg `dix/cursor.c::AllocGlyphCursor`.
+
+  Together with `c7f0ed6`, both core cursor-creation opcodes now
+  produce real cursor mirrors. Per-window I-beams over xterm text
+  and resize cursors over WM frames now actually display on bare
+  HW — confirmed on AMD APU (bee).
+
 - **Justfile cleanup (commits `1a5c235`, `860b967`).** Dropped
   dead `scanout` parameter and `YSERVER_VK_SCANOUT={{scanout}}`
   plumbing — the env var stopped being consulted in `51739cc`
@@ -3089,16 +3124,6 @@ each `just yserver-…-hw` smoke.
   shape.
 
 ### Open issues
-
-- **Cursor stays as default arrow on bare HW** (under triage,
-  diagnostics committed). Cursor moves correctly with the pointer
-  but never switches shape (e.g. xterm I-beam over text). One of:
-  no client is actually issuing `DefineCursor` for the windows
-  involved; core forwards the request but the backend sees an
-  unknown cursor xid; or selection works and the bug is in the
-  rescued-mirror copy in `render_create_cursor` (every cursor
-  rendering the same pixmap content). Next bare-HW run with the
-  3577d6d log lines will distinguish them.
 
 - **xeyes-on-e16 window drag is sluggish on bare HW** — captured in
   [`known-issues.md`](known-issues.md) under the KMS section.
