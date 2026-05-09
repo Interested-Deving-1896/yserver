@@ -1758,6 +1758,13 @@ fn handle_shape_request(
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
+    debug!(
+        "client {} #{} SHAPE::minor={} body_len={}",
+        client_id.0,
+        sequence.0,
+        minor,
+        body.len()
+    );
     match minor {
         x11shape::QUERY_VERSION => {
             let reply = x11shape::encode_query_version_reply(byte_order, sequence);
@@ -1770,6 +1777,16 @@ fn handle_shape_request(
         x11shape::RECTANGLES => {
             if let Some((req, rects)) = x11shape::parse_rectangles_request(body) {
                 let window = ResourceId(req.dest);
+                debug!(
+                    "client {} SHAPE::Rectangles dest=0x{:x} kind={} op={} off=({},{}) nrects={}",
+                    client_id.0,
+                    req.dest,
+                    req.dest_kind,
+                    req.op,
+                    req.x_off,
+                    req.y_off,
+                    rects.len(),
+                );
                 let source = crate::nested::offset_rects(rects, req.x_off, req.y_off);
                 let current = crate::nested::shape_rects_for(state, window, req.dest_kind);
                 let new_rects = crate::nested::apply_shape_op(current, source, req.op);
@@ -1780,6 +1797,10 @@ fn handle_shape_request(
         x11shape::MASK => {
             if let Some(req) = x11shape::parse_mask_request(body) {
                 let window = ResourceId(req.dest);
+                debug!(
+                    "client {} SHAPE::Mask dest=0x{:x} kind={} op={} src=0x{:x} off=({},{})",
+                    client_id.0, req.dest, req.dest_kind, req.op, req.src, req.x_off, req.y_off,
+                );
                 if req.src == 0 {
                     crate::nested::clear_shape_rects(state, window, req.dest_kind);
                     mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
@@ -1797,6 +1818,17 @@ fn handle_shape_request(
             if let Some(req) = x11shape::parse_combine_request(body) {
                 let dest = ResourceId(req.dest);
                 let src = ResourceId(req.src);
+                debug!(
+                    "client {} SHAPE::Combine dest=0x{:x} dest_kind={} src=0x{:x} src_kind={} op={} off=({},{})",
+                    client_id.0,
+                    req.dest,
+                    req.dest_kind,
+                    req.src,
+                    req.src_kind,
+                    req.op,
+                    req.x_off,
+                    req.y_off,
+                );
                 let source = crate::nested::offset_rects(
                     crate::nested::shape_rects_for(state, src, req.src_kind),
                     req.x_off,
@@ -5442,6 +5474,19 @@ fn handle_change_window_attributes(
         debug!(
             "client {} CWA cursor: window 0x{:x} ← cursor 0x{:x}",
             client_id.0, request.window.0, cursor.0
+        );
+    }
+    if let Some(bg_pixmap) = request.background_pixmap {
+        debug!(
+            "client {} CWA bg_pixmap: window 0x{:x} ← 0x{:x} ({})",
+            client_id.0,
+            request.window.0,
+            bg_pixmap.0,
+            match bg_pixmap.0 {
+                0 => "None",
+                1 => "ParentRelative",
+                _ => "pixmap",
+            },
         );
     }
     if let Some(event_mask) = request.event_mask {
