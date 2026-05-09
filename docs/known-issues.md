@@ -272,6 +272,15 @@ that the host hides for us.
       fix unblocked e16 startup, so this audit is now actionable. Run
       e16 for ~60s, capture all RENDER opcodes touched, compare against
       the implemented set in status.md's RENDER section.
+- [ ] **xclock "Missing charsets in String to FontSet conversion"
+      warning at startup.** Benign and matches stock Xorg behaviour
+      without CJK bitmap fonts installed — libXt walks the locale's
+      full charset wishlist (jisx*/gb2312*/ksc*/big5*/various
+      iso8859-N) and warns for those it can't load, then proceeds
+      with whatever it found (iso8859-1 + iso10646-1). Fix would be
+      to probe each font's `FcCharSet` in `build_font_catalog` and
+      emit jisx*/gb2312*/ksc*/big5 entries when a real CJK font is
+      installed. Defer until a CJK rendering client matters.
 - [ ] **MIT-SHM `XShmPutImage` host fast path.** Currently we chunk
       regular `PutImage` because the 16-bit length field caps a single
       image at ~262 KB. `XShmPutImage` against a host-shared shm

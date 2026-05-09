@@ -3123,24 +3123,9 @@ each `just yserver-…-hw` smoke.
   matching the existing `-fvwm3-xterm-hw` / `-wmaker-xterm-hw`
   shape.
 
-### Open issues
+### Follow-ups
 
-- **xeyes-on-e16 window drag is sluggish on bare HW** — captured in
-  [`known-issues.md`](known-issues.md) under the KMS section.
-  Compositor saturates vblank but only ~20 ConfigureWindow/s reach
-  the WM despite continuous pointer motion; needs targeted timing
-  instrumentation on (libinput motion → MotionNotify dispatched)
-  and (composite start → flip submitted) to distinguish input-
-  delivery rate, e16 throttling, or per-frame compositor wall-time.
-
-- **xclock "Missing charsets in String to FontSet conversion"
-  warning at startup.** Benign and matches stock Xorg behaviour
-  without CJK bitmap fonts installed — libXt walks the locale's
-  full charset wishlist (jisx*/gb2312*/ksc*/big5*/various
-  iso8859-N) and warns for those it can't load, then proceeds with
-  whatever it found (iso8859-1 + iso10646-1 in our case). Fix
-  would be to probe each font's `FcCharSet` in `build_font_catalog`
-  and emit jisx*/gb2312*/ksc*/big5 entries when a real CJK font is
-  installed; deferred because it only matters for clients
-  rendering CJK text and most desktops don't have CJK bitmap fonts
-  anyway.
+Open items moved to [`known-issues.md`](known-issues.md): the
+xeyes-on-e16 drag latency lives under the KMS-backend section
+(already there since Phase 6.10); the benign xclock CJK-charset
+warning lives under "Extension polish".
