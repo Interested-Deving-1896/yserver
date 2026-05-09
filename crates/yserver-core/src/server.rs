@@ -196,8 +196,18 @@ pub struct ServerState {
     pub shape_windows: HashMap<ResourceId, ShapeWindowState>,
     /// SHAPE select-input state: (client, window) -> enabled.
     pub shape_select_masks: HashMap<(u32, ResourceId), bool>,
+    /// Present extension scheduler (Phase 4.2.3). Per-window FIFO of
+    /// queued PresentPixmap / PresentPixmapSynced requests. Enqueued
+    /// at request time; drained at vblank by the KMS backend
+    /// (live integration lands with §5.5 hardware coverage).
+    pub present_scheduler: crate::present_scheduler::PresentScheduler,
     pub sync_counters: HashMap<u32, SyncCounter>,
     pub sync_alarms: HashMap<u32, SyncAlarm>,
+    /// XSync `Fence` resources (Phase 4.2.2). Phase 4.2.2 first cut
+    /// stores only the triggered bit + owner; the underlying
+    /// `VkSemaphore` for fences imported via DRI3 `FenceFromFD`
+    /// (Task 19) lives on the KMS backend's `dri3_sync_resources` map.
+    pub sync_fences: HashMap<u32, SyncFence>,
     pub damage_objects: HashMap<u32, DamageObject>,
     pub composite_redirects: HashMap<(ResourceId, bool), u8>,
     pub present_event_selections: HashMap<u32, PresentEventSelection>,
@@ -241,8 +251,10 @@ impl ServerState {
             xfixes_cursor_masks: HashMap::new(),
             shape_windows: HashMap::new(),
             shape_select_masks: HashMap::new(),
+            present_scheduler: crate::present_scheduler::PresentScheduler::default(),
             sync_counters: HashMap::new(),
             sync_alarms: HashMap::new(),
+            sync_fences: HashMap::new(),
             damage_objects: HashMap::new(),
             composite_redirects: HashMap::new(),
             present_event_selections: HashMap::new(),
@@ -301,6 +313,16 @@ pub struct ShapeWindowState {
 pub struct SyncCounter {
     pub owner: ClientId,
     pub value: i64,
+}
+
+/// XSync `Fence` resource. Phase 4.2.2 first cut: server-only
+/// triggered bit; the VkSemaphore-backed variant is added by Task 19
+/// when `FenceFromFD` imports a sync_file fd. Both flavours share the
+/// `triggered` field so QueryFence has a uniform answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncFence {
+    pub owner: ClientId,
+    pub triggered: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

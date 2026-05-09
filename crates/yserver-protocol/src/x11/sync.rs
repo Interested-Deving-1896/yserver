@@ -17,6 +17,19 @@ pub const QUERY_ALARM: u8 = 10;
 pub const DESTROY_ALARM: u8 = 11;
 pub const SET_PRIORITY: u8 = 12;
 pub const GET_PRIORITY: u8 = 13;
+pub const CREATE_FENCE: u8 = 14;
+pub const DESTROY_FENCE: u8 = 15;
+pub const TRIGGER_FENCE: u8 = 18;
+pub const RESET_FENCE: u8 = 19;
+pub const QUERY_FENCE: u8 = 20;
+pub const AWAIT_FENCE: u8 = 21;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreateFenceRequest {
+    pub drawable: u32,
+    pub fence: u32,
+    pub initially_triggered: bool,
+}
 
 pub const MAJOR_VERSION: u8 = 3;
 pub const MINOR_VERSION: u8 = 0;
@@ -81,6 +94,41 @@ pub fn parse_alarm_with_mask(body: &[u8]) -> Option<(u32, u32)> {
         return None;
     }
     Some((read_u32_le(body), read_u32_le(&body[4..])))
+}
+
+#[must_use]
+pub fn parse_create_fence(body: &[u8]) -> Option<CreateFenceRequest> {
+    // Body: drawable(4) fence(4) initially_triggered(1) pad(3) = 12B.
+    if body.len() < 12 {
+        return None;
+    }
+    Some(CreateFenceRequest {
+        drawable: read_u32_le(body),
+        fence: read_u32_le(&body[4..]),
+        initially_triggered: body[8] != 0,
+    })
+}
+
+#[must_use]
+pub fn parse_await_fence(body: &[u8]) -> Option<Vec<u32>> {
+    // Body: u32[n] fences. n is implicit from the body length /4.
+    if !body.len().is_multiple_of(4) {
+        return None;
+    }
+    Some(body.chunks_exact(4).map(read_u32_le).collect())
+}
+
+#[must_use]
+pub fn encode_query_fence_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    triggered: bool,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, 0);
+    out.push(u8::from(triggered));
+    out.extend_from_slice(&[0u8; 23]);
+    debug_assert_eq!(out.len(), 32);
+    out
 }
 
 #[must_use]
@@ -182,6 +230,42 @@ mod tests {
         assert_eq!(reply.len(), 32);
         assert_eq!(i32::from_le_bytes(reply[8..12].try_into().unwrap()), 0);
         assert_eq!(u32::from_le_bytes(reply[12..16].try_into().unwrap()), 5);
+    }
+
+    #[test]
+    fn create_fence_parses() {
+        let mut body = vec![0u8; 12];
+        body[0..4].copy_from_slice(&0x100u32.to_le_bytes());
+        body[4..8].copy_from_slice(&0x500u32.to_le_bytes());
+        body[8] = 1;
+        let req = parse_create_fence(&body).unwrap();
+        assert_eq!(req.drawable, 0x100);
+        assert_eq!(req.fence, 0x500);
+        assert!(req.initially_triggered);
+    }
+
+    #[test]
+    fn await_fence_parses_list() {
+        let mut body = vec![0u8; 12];
+        body[0..4].copy_from_slice(&0x100u32.to_le_bytes());
+        body[4..8].copy_from_slice(&0x200u32.to_le_bytes());
+        body[8..12].copy_from_slice(&0x300u32.to_le_bytes());
+        let list = parse_await_fence(&body).unwrap();
+        assert_eq!(list, vec![0x100, 0x200, 0x300]);
+    }
+
+    #[test]
+    fn await_fence_rejects_misaligned() {
+        assert!(parse_await_fence(&[0u8; 7]).is_none());
+    }
+
+    #[test]
+    fn query_fence_reply_shape() {
+        let reply =
+            encode_query_fence_reply(ClientByteOrder::LittleEndian, SequenceNumber(8), true);
+        assert_eq!(reply.len(), 32);
+        assert_eq!(reply[0], 1, "Reply opcode");
+        assert_eq!(reply[8], 1, "triggered byte");
     }
 
     #[test]

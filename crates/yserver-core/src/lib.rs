@@ -1,8 +1,10 @@
 pub mod backend;
 pub mod core_loop;
 pub mod crossings;
+pub(crate) mod dri3;
 pub mod host_x11;
 pub mod nested;
+pub mod present_scheduler;
 pub mod properties;
 pub mod randr;
 mod resources;

@@ -13,7 +13,7 @@ pub(super) fn reply_use_extension() -> Vec<u8> {
     r
 }
 
-/// XKB GetControls reply (minor=24). Fixed 92 bytes.
+/// XKB GetControls reply (minor=6). Fixed 92 bytes.
 /// Reports repeat delay/interval and enable flags.
 pub(super) fn reply_get_controls(_keymap: &Keymap) -> Vec<u8> {
     let mut r = vec![0u8; 92];
@@ -31,19 +31,26 @@ pub(super) fn reply_get_controls(_keymap: &Keymap) -> Vec<u8> {
     r
 }
 
-/// XKB GetMap reply (minor=8). Reports min/max keycode; present=0 (no tables).
-/// Clients that only need keycode range (e.g. for event validation) are unblocked.
+/// XKB GetMap reply (minor=8). Per xkbproto, fixed 40 bytes —
+/// `sz_xkbGetMapReply`. Reports min/max keycode and present=0 so
+/// no type/sym/mod tables follow. xcb-rs (used by wezterm) is
+/// strict about the 40-byte size; libxcb is more lenient.
 pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
+    #[allow(clippy::cast_possible_truncation)]
     let min_kc = keymap.min_keycode().raw() as u8;
+    #[allow(clippy::cast_possible_truncation)]
     let max_kc = keymap.max_keycode().raw() as u8;
-    // 32-byte header; present=0 means no type/sym/mod tables follow.
-    let mut r = vec![0u8; 32];
+    let mut r = vec![0u8; 40];
     r[0] = 1; // reply type
-    // [4..8] extra length = 0
-    r[4] = 1; // deviceID=1
-    r[8] = min_kc;
-    r[9] = max_kc;
-    // [10..12] present bitmask = 0 (no tables)
+    r[1] = 1; // deviceID = 1
+    // [4..8] extra length = (40-32)/4 = 2
+    r[4..8].copy_from_slice(&2u32.to_le_bytes());
+    // [8..10] pad0[2]
+    r[10] = min_kc;
+    r[11] = max_kc;
+    // [12..14] present = 0 (no tables follow)
+    // [14..38] all the firstX/nX/totalX fields = 0
+    // [38..40] virtualMods = 0
     r
 }
 
@@ -55,16 +62,40 @@ pub(super) fn reply_get_names(_keymap: &Keymap) -> Vec<u8> {
     r
 }
 
-/// XKB GetCompatMap reply (minor=20). Empty compat map.
+/// XKB GetCompatMap reply (minor=10). Per xkbproto, fixed 32 bytes
+/// — `sz_xkbGetCompatMapReply`. Empty compat map (no SI entries
+/// follow).
 pub(super) fn reply_get_compat_map() -> Vec<u8> {
-    // Header + 4 bytes for n_si_rtrn=0, groups_rtrn=0xff (all groups unchanged)
-    let mut r = vec![0u8; 36];
-    r[0] = 1;
-    // [4..8] extra length = (36-32)/4 = 1
-    r[4] = 1;
-    // [8] deviceID=1, [9] groupsRtrn=0
-    r[8] = 1;
-    // [10..12] firstSIRtrn=0, [12..14] nSIRtrn=0 (no SI entries follow)
+    let mut r = vec![0u8; 32];
+    r[0] = 1; // reply type
+    r[1] = 1; // deviceID = 1
+    // [4..8] extra length = 0
+    // [8] groupsRtrn = 0
+    // [9] pad1
+    // [10..12] firstSIRtrn = 0
+    // [12..14] nSIRtrn = 0
+    // [14..16] nTotalSI = 0
+    // [16..32] pad2[16] = 0
+    r
+}
+
+/// XKB GetDeviceInfo reply (minor=24). Per xkbproto, fixed 32 bytes
+/// — `sz_xkbGetDeviceInfoReply`. Empty: no LED feedbacks, no
+/// buttons, no name. Verified via `sizeof` against the real header.
+pub(super) fn reply_get_device_info() -> Vec<u8> {
+    let mut r = vec![0u8; 32];
+    r[0] = 1; // reply
+    r[1] = 1; // deviceID = 1
+    // [4..8] extra length = 0
+    // [8..10] present, [10..12] supported, [12..14] unsupported = 0
+    // [14..16] nDeviceLedFBs = 0
+    // [16] firstBtnWanted, [17] nBtnsWanted
+    // [18] firstBtnRtrn, [19] nBtnsRtrn
+    // [20..22] totalBtns = 0
+    // [22] hasOwnState
+    // [23] (padding/alignment)
+    // [24..26] dfltKbdFB, [26..28] dfltLedFB
+    // [28..32] devType atom = 0
     r
 }
 
@@ -124,12 +155,20 @@ mod tests {
     }
 
     #[test]
-    fn get_map_min_max_keycode() {
+    fn get_map_reply_size_40() {
         let km = test_keymap();
         let r = reply_get_map(&km);
-        assert!(r.len() >= 10);
-        let min = r[8];
-        let max = r[9];
-        assert!(min <= max, "min_keycode must be <= max_keycode");
+        assert_eq!(r.len(), 40, "sz_xkbGetMapReply = 40 per xkbproto");
+        assert!(r[10] <= r[11], "min_keycode <= max_keycode");
+    }
+
+    #[test]
+    fn get_compat_map_reply_size_32() {
+        assert_eq!(reply_get_compat_map().len(), 32);
+    }
+
+    #[test]
+    fn get_device_info_reply_size_32() {
+        assert_eq!(reply_get_device_info().len(), 32);
     }
 }

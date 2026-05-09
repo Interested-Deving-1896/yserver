@@ -14,6 +14,8 @@ pub use wire::*;
 
 pub mod composite;
 pub mod damage;
+pub mod dri3;
+pub mod glx;
 pub mod mit_shm;
 pub mod present;
 pub mod randr;

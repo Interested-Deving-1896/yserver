@@ -68,11 +68,22 @@ const MIT_SHM_FIRST_ERROR: u8 = 160;
 
 const XTEST_MAJOR_OPCODE: u8 = 146;
 
+pub(crate) const DRI3_MAJOR_OPCODE: u8 = 147;
+
+pub(crate) const GLX_MAJOR_OPCODE: u8 = 148;
+pub(crate) const GLX_FIRST_EVENT: u8 = 97;
+pub(crate) const GLX_FIRST_ERROR: u8 = 161;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExtensionAvailability {
     Always,
     HostRender,
     HostXkb,
+    /// DRI3 — gated on `Backend::dri3_capabilities().version != (0, 0)`.
+    /// Task 5 treats this as always-true (DRI3 surface is wired but the
+    /// backend has no real caps yet). Task 11 will narrow this to the
+    /// real capability check.
+    Dri3,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,6 +212,22 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         major_opcode: XTEST_MAJOR_OPCODE,
         first_event: 0,
         first_error: 0,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "DRI3",
+        major_opcode: DRI3_MAJOR_OPCODE,
+        first_event: 0,
+        first_error: 0,
+        availability: ExtensionAvailability::Dri3,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "GLX",
+        major_opcode: GLX_MAJOR_OPCODE,
+        first_event: GLX_FIRST_EVENT,
+        first_error: GLX_FIRST_ERROR,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
     },

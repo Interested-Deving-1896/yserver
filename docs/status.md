@@ -1135,6 +1135,197 @@ FAIL / UNRES counts match the baseline exactly; the Xproto delta is
 entirely UNTESTED tests the per-op cadence ran out of time on at the
 same wall-clock budget.
 
+### Phase 4.2 — DRI3 + Present + GLX (code complete; smoke deferred)
+
+Wire surface and KMS-side machinery for accelerated direct-rendering
+clients (vkcube, glxgears, glxinfo) on top of the Phase 4.1 Vulkan
+compositor.
+
+Spec:
+[`2026-05-09-phase4-2-dri3-present-glx-design.md`](superpowers/specs/2026-05-09-phase4-2-dri3-present-glx-design.md).
+Plan:
+[`2026-05-09-phase4-2-dri3-present-glx.md`](superpowers/plans/2026-05-09-phase4-2-dri3-present-glx.md).
+
+#### Sub-phase 4.2.1 — DRI3 wire surface + dma-buf import
+
+Code-complete; live smoke deferred until vng + Venus run picks up the
+new code path.
+
+- [x] DRI3 v1.4 wire encoders / decoders
+      (`yserver-protocol::x11::dri3`).
+- [x] Extension registration with major opcode 147; capability-aware
+      `extension_query_reply` / `advertised_extension_names` so DRI3
+      hides when `Dri3Caps::version == (0, 0)`.
+- [x] Render-node fd inventory at backend init via sysfs walk +
+      `/dev/dri/renderD*` enumeration fallback (no hardcoded
+      `/dev/dri/renderD128`).
+- [x] `Backend::dri3_open` dups the render-node fd for each `Open`
+      call; SCM_RIGHTS reply path verified.
+- [x] `kms::vk::dri3::supported_modifiers` queries
+      `vkGetPhysicalDeviceImageFormatProperties2` with chained
+      `VkPhysicalDeviceExternalImageFormatInfo` and
+      `VkPhysicalDeviceImageDrmFormatModifierInfoEXT`. LINEAR-only
+      fallback when `VK_EXT_image_drm_format_modifier` is missing.
+- [x] `DrawableImage::from_dmabuf` — explicit-modifier import chain;
+      §3.2 fd-ownership rule (close on every error path between dup
+      and successful `vkAllocateMemory`).
+- [x] Dispatcher: `PixmapFromBuffer`, single-plane `PixmapFromBuffers`,
+      `BufferFromPixmap` (export via `vkGetMemoryFdKHR`),
+      `GetSupportedModifiers` (per-window vs per-screen split).
+      Multi-plane `PixmapFromBuffers` and `BuffersFromPixmap` BadAlloc
+      stubs per design scope.
+- [x] Per-request capability gates: `fence_fd` /  `syncobj` cap unset
+      → `BadImplementation` for `FenceFromFD`/`FDFromFence` /
+      `ImportSyncobj`/`FreeSyncobj`. Real handlers arrive in 4.2.2.
+- [x] fd-leak harness scaffold (`tests/dri3_fd_leak.rs`,
+      `#[ignore]`-marked pending live ICD).
+
+Smoke pending: a custom xcb client `PixmapFromBuffers`-ing a
+checkerboard, then `xcb_copy_area`-ing to a window and asserting
+pixel readback under vng + Venus.
+
+#### Sub-phase 4.2.2 — XSync fences + DRI3 syncobj
+
+Code-complete; live smoke deferred until vng + Venus run picks up the
+new code path.
+
+- [x] XSync handler audit
+      ([note](superpowers/notes/2026-05-09-sync-audit.md)).
+- [x] `Fence` resource lifecycle (CreateFence / DestroyFence /
+      TriggerFence / ResetFence / QueryFence / AwaitFence) with a
+      server-side triggered bit on `ServerState::sync_fences`.
+      AwaitFence is a non-blocking stub for first cut.
+- [x] `kms::vk::sync` — `import_sync_file` (binary semaphore from
+      sync_file fd, TEMPORARY semantics), `import_drm_syncobj`
+      (timeline semaphore from DRM_SYNCOBJ fd, PERMANENT), and
+      `export_sync_file`. fd-ownership rule per design §3.2.
+      `VK_KHR_timeline_semaphore` enabled at device init.
+- [x] DRI3 `FenceFromFD` / `FDFromFence` round-trip: imports back the
+      VkSemaphore stash on `KmsBackend::dri3_sync_resources`,
+      dispatcher mirrors the fence onto the XSync resource table so
+      `TriggerFence`/`QueryFence` keep working.
+- [x] DRI3 `ImportSyncobj` / `FreeSyncobj` (gated on
+      `Dri3Caps::syncobj`, currently false until the kernel-side
+      DRM_SYNCOBJ ioctls are wired in 4.2.3+).
+
+Smoke pending: two-client `FenceFromFD` import → `TriggerFence` →
+`AwaitFence` round trip; `FenceFromFD` → `FDFromFence` export
+round-trip with fd signalled in lockstep.
+
+#### Sub-phase 4.2.3 — Present v1.4 Copy path
+
+Code-complete; live smoke deferred until vng + Venus run picks up
+the new code path.
+
+- [x] `PresentPixmapSynced` v1.4 wire decoder (timeline syncobj +
+      acquire/release values).
+- [x] `PresentCaps` (`flip_path`, `async_may_tear`, `syncobj`) on
+      Backend trait. `KmsBackend` overrides; conservative defaults
+      until Tasks 30-32 wire alien-BO scanout. `QueryCapabilities`
+      reply uses `PresentCaps::encode()`.
+- [x] `present_scheduler::PresentScheduler` — per-window FIFO,
+      `pick_at_vblank` collapses to latest + emits skipped tail,
+      `record_flipped` for the presentproto retention rule, schedule
+      predicate per §3.3.3.
+- [x] `choose_path` selector per §3.3.1 decision table; flip_path
+      cap short-circuits to Copy.
+- [x] `IdleNotify` (32-byte) and `CompleteNotify` (40-byte) GE
+      event encoders.
+- [x] PIXMAP dispatcher enqueues + drains synchronously (live
+      vblank-driven path lands with KMS integration); fans
+      CompleteNotify { mode: Copy } / IdleNotify to all matching
+      `present_event_selections`. AsyncMayTear silent-clear at
+      ingress per design §4.
+
+Smoke pending: `vkcube --present-mode fifo` rendering through the
+Copy path under vng + Venus, with `RUST_LOG=present=debug`
+confirming Copy is chosen and `IdleNotify` / `CompleteNotify` arrive
+at the test client.
+
+#### Sub-phase 4.2.4 — Flip + Direct-scanout
+
+Wire surface and decision logic in place; live alien-BO scanout
+integration with KMS atomic commit deferred until §5.5 hardware
+coverage smoke picks it up.
+
+- [x] `ScanoutBo::is_alien` flag and `ScanoutBoPool::register_alien`
+      / `unregister_alien` shapes (live registration stubs Err today).
+- [x] `choose_path` already covers Flip / DirectScanout decisions
+      (Task 25); the dispatcher's defensive `alien_bo_for()`
+      fallback selects Copy when registration isn't wired.
+- [x] AsyncMayTear silent-clear at request ingress per design §4.
+- [x] DestroyWindow teardown drains
+      `state.present_scheduler.drain_window` for every destroyed
+      window. No IdleNotify/CompleteNotify because the window is
+      gone (design §3.3.2 row 1).
+
+Smoke pending: `vkcube --present-mode mailbox` (Flip), fullscreen
+`vkcube` (DirectScanout) under vng + Venus once the alien-BO
+registration bridge from VkDeviceMemory → DRM GEM handle is wired.
+
+#### Sub-phase 4.2.5 — GLX framing
+
+Code complete. `glxinfo` should report `direct rendering: Yes`,
+vendor `yserver`, and the §3.5 extensions list under vng + Venus.
+
+- [x] GLX wire-protocol module — opcodes per `glxproto.h`,
+      QueryVersion / QueryServerString / QueryExtensionsString /
+      IsDirect / GetFBConfigs / GetVisualConfigs / context-lifecycle /
+      VendorPrivate stubs / GLXBadRequest for indirect rendering.
+- [x] Major opcode 148 (per Codex plan-review correction;
+      upstream X.Org 149 collides with the local table).
+- [x] `handle_glx_request` dispatcher per design §3.5
+      (identification + bookkeeping; never executes GL).
+
+Smoke pending: `glxinfo` reports `direct rendering: Yes` + vendor
+`yserver`; `glxgears` runs at vsync under vng + Venus with DRI3 /
+Present integration smoke from Sub-phases 4.2.1-4.2.4.
+
+#### Phase 4.2 live-smoke (2026-05-09) — vkcube renders
+
+`vkcube --c 30` under vng + Venus passthrough runs end-to-end:
+30 `PRESENT::Pixmap` calls, clean exit (`rc=0`). Full code path:
+DRI3 1.4 negotiation, real Venus modifier list (1 window + 7
+screen mods at 1024×768 B8G8R8A8_UNORM), 3 dma-buf-backed
+swapchain pixmaps (500×500 LINEAR), `IdleNotify` + `CompleteNotify`
+fanout per frame.
+
+**Key finding:** Mesa's `loader_dri3` uses **xshmfence**
+(memfd-backed shared memory + futex) for `FenceFromFD`, *not*
+sync_file or DRM_SYNCOBJ. `vkImportSemaphoreFdKHR(SYNC_FD_BIT)`
+rejects the fd because it isn't a sync_file — Xorg's reference
+goes through its internal `misync` layer. yserver now mmaps the
+fd via `libxshmfence` (FFI in `crates/yserver/src/kms/xshmfence.rs`)
+and calls `xshmfence_trigger` on `idle_fence` when the synchronous
+CopyArea completes. That's the wakeup Mesa's WSI thread needs;
+without it `vkAcquireNextImage` blocks on the futex forever.
+
+The Vulkan-import path is kept as a fallback for clients that
+genuinely send sync_file or DRM_SYNCOBJ fds.
+
+#### Phase 4.2 deferred follow-ups
+
+- **Live KMS Flip / DirectScanout integration** — the wire surface
+  and dispatcher path-selection are in place; the alien-BO →
+  framebuffer registration bridge (VkDeviceMemory → DRM GEM handle
+  → `add_fb2`) lands when the §5.5 hardware coverage smoke picks up
+  the new code path.
+- **DRI3 syncobj support** — `Dri3Caps::syncobj` stays false until
+  the kernel-side DRM_SYNCOBJ ioctls are wired through Present's
+  submit-time handshake.
+- **GetFBConfigs population** — ~30 (visual × double_buffered ×
+  depth × stencil × samples) configs synthesised from the X visual
+  table. Mesa survives an empty list today.
+- **AwaitFence blocking semantics** — non-blocking stub; full
+  implementation needs per-client wait queues hooked into the
+  core-loop event scheduler.
+- **`BuffersFromPixmap` (multi-plane export)** — BadAlloc stub
+  (design §6 open question).
+- **Multi-plane (YCbCr) `PixmapFromBuffers`** — out of scope per
+  design §1; rejected with BadAlloc.
+- **Indirect GLX** — out of scope per design §1; rejected with
+  GLXBadRequest.
+
 #### Phase 4.1 follow-ups
 
 - **Composite / cacomposite batching.** Eager

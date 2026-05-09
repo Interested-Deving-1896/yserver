@@ -11,7 +11,7 @@ pub const QUERY_CAPABILITIES: u8 = 4;
 pub const PIXMAP_SYNCED: u8 = 5;
 
 pub const MAJOR_VERSION: u32 = 1;
-pub const MINOR_VERSION: u32 = 0;
+pub const MINOR_VERSION: u32 = 4;
 
 pub const CAPABILITY_NONE: u32 = 0;
 
@@ -33,6 +33,33 @@ pub struct PixmapRequest {
     pub target_crtc: u32,
     pub wait_fence: u32,
     pub idle_fence: u32,
+    pub options: u32,
+    pub target_msc: u64,
+    pub divisor: u64,
+    pub remainder: u64,
+    pub notifies: Vec<Notify>,
+}
+
+/// `PresentPixmapSynced` (v1.4): timeline-syncobj-driven Present.
+/// Identical to `PresentPixmap` except the `(wait_fence, idle_fence)`
+/// XID pair is replaced by `(acquire_syncobj, release_syncobj,
+/// acquire_value, release_value)` — both syncobjs are timeline
+/// `Sync::Syncobj` resources (DRI3 1.4) and the values are the
+/// timeline points to wait/signal at.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PixmapSyncedRequest {
+    pub window: u32,
+    pub pixmap: u32,
+    pub serial: u32,
+    pub valid: u32,
+    pub update: u32,
+    pub x_off: i16,
+    pub y_off: i16,
+    pub target_crtc: u32,
+    pub acquire_syncobj: u32,
+    pub release_syncobj: u32,
+    pub acquire_value: u64,
+    pub release_value: u64,
     pub options: u32,
     pub target_msc: u64,
     pub divisor: u64,
@@ -112,6 +139,46 @@ pub fn parse_pixmap(body: &[u8]) -> Option<PixmapRequest> {
 }
 
 #[must_use]
+pub fn parse_pixmap_synced(body: &[u8]) -> Option<PixmapSyncedRequest> {
+    // Body: window(4) pixmap(4) serial(4) valid(4) update(4) x_off(2)
+    //   y_off(2) target_crtc(4) acquire_syncobj(4) release_syncobj(4)
+    //   pad(4) acquire_value(8) release_value(8) options(4) pad(4)
+    //   target_msc(8) divisor(8) remainder(8) notifies[N](8 each).
+    // Fixed prefix = 92 bytes; trailing notifies are 8 each.
+    if body.len() < 92 || !(body.len() - 92).is_multiple_of(8) {
+        return None;
+    }
+    let notifies = body[92..]
+        .chunks_exact(8)
+        .map(|chunk| Notify {
+            window: read_u32_le(chunk),
+            serial: read_u32_le(&chunk[4..]),
+        })
+        .collect();
+    Some(PixmapSyncedRequest {
+        window: read_u32_le(body),
+        pixmap: read_u32_le(&body[4..]),
+        serial: read_u32_le(&body[8..]),
+        valid: read_u32_le(&body[12..]),
+        update: read_u32_le(&body[16..]),
+        x_off: read_i16_le(&body[20..]),
+        y_off: read_i16_le(&body[22..]),
+        target_crtc: read_u32_le(&body[24..]),
+        acquire_syncobj: read_u32_le(&body[28..]),
+        release_syncobj: read_u32_le(&body[32..]),
+        // 4 bytes pad at offset 36
+        acquire_value: read_u64_le(&body[40..]),
+        release_value: read_u64_le(&body[48..]),
+        options: read_u32_le(&body[56..]),
+        // 4 bytes pad at offset 60
+        target_msc: read_u64_le(&body[64..]),
+        divisor: read_u64_le(&body[72..]),
+        remainder: read_u64_le(&body[80..]),
+        notifies,
+    })
+}
+
+#[must_use]
 pub fn parse_notify_msc(body: &[u8]) -> Option<NotifyMscRequest> {
     if body.len() < 36 {
         return None;
@@ -160,6 +227,120 @@ pub fn encode_query_version_reply(
     write_u32(byte_order, &mut out, major);
     write_u32(byte_order, &mut out, minor);
     out.extend_from_slice(&[0u8; 16]);
+    debug_assert_eq!(out.len(), 32);
+    out
+}
+
+/// `presentproto` event-type constants for GE-mode dispatch.
+pub const EVENT_CONFIGURE_NOTIFY: u8 = 0;
+pub const EVENT_COMPLETE_NOTIFY: u8 = 1;
+pub const EVENT_IDLE_NOTIFY: u8 = 2;
+pub const EVENT_REDIRECT_NOTIFY: u8 = 3;
+
+/// `CompleteNotify.mode` per `presentproto`.
+pub const COMPLETE_MODE_COPY: u8 = 0;
+pub const COMPLETE_MODE_FLIP: u8 = 1;
+pub const COMPLETE_MODE_SKIP: u8 = 2;
+pub const COMPLETE_MODE_SUBOPTIMAL_COPY: u8 = 3;
+
+/// `CompleteNotify.kind` per `presentproto`.
+pub const COMPLETE_KIND_PIXMAP: u8 = 0;
+pub const COMPLETE_KIND_NOTIFY_MSC: u8 = 1;
+
+/// Encode a `CompleteNotify` GE event. Phase 4.2 design §3.3. Per
+/// `presentproto` the event is 40 bytes total — 32-byte fixed slot
+/// + 8 bytes extra (so `length` = `(40-32)/4` = 2).
+///
+/// ```text
+/// 1   GenericEvent (35)
+/// 1   extension major opcode
+/// 2   sequence number
+/// 4   length = 2
+/// 2   evtype (1 = CompleteNotify)
+/// 1   kind
+/// 1   mode
+/// 4   eid (event id from SelectInput)
+/// 4   window
+/// 4   serial
+/// 8   ust (microseconds; 0 if unknown)
+/// 8   msc
+/// ```
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn encode_complete_notify(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    extension_major: u8,
+    eid: u32,
+    window: u32,
+    serial: u32,
+    kind: u8,
+    mode: u8,
+    ust: u64,
+    msc: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(40);
+    out.push(35);
+    out.push(extension_major);
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 2); // length = 2 (8 extra bytes)
+    write_u16(byte_order, &mut out, EVENT_COMPLETE_NOTIFY.into());
+    out.push(kind);
+    out.push(mode);
+    write_u32(byte_order, &mut out, eid);
+    write_u32(byte_order, &mut out, window);
+    write_u32(byte_order, &mut out, serial);
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        write_u32(byte_order, &mut out, (ust & 0xFFFF_FFFF) as u32);
+        write_u32(byte_order, &mut out, (ust >> 32) as u32);
+        write_u32(byte_order, &mut out, (msc & 0xFFFF_FFFF) as u32);
+        write_u32(byte_order, &mut out, (msc >> 32) as u32);
+    }
+    debug_assert_eq!(out.len(), 40);
+    out
+}
+
+/// Encode an `IdleNotify` GE event. Layout per `presentproto`:
+///
+/// ```text
+/// 1   GenericEvent (35)
+/// 1   extension major opcode
+/// 2   sequence number
+/// 4   length (in 4-byte units past the 32-byte header)
+/// 2   evtype (2 = IdleNotify)
+/// 2   pad
+/// 4   eid
+/// 4   window
+/// 4   serial
+/// 4   pixmap
+/// 4   idle_fence
+/// ```
+///
+/// Total 32 bytes.
+#[must_use]
+pub fn encode_idle_notify(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    extension_major: u8,
+    eid: u32,
+    window: u32,
+    serial: u32,
+    pixmap: u32,
+    idle_fence: u32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32);
+    out.push(35);
+    out.push(extension_major);
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0);
+    write_u16(byte_order, &mut out, EVENT_IDLE_NOTIFY.into());
+    write_u16(byte_order, &mut out, 0); // pad
+    write_u32(byte_order, &mut out, eid);
+    write_u32(byte_order, &mut out, window);
+    write_u32(byte_order, &mut out, serial);
+    write_u32(byte_order, &mut out, pixmap);
+    write_u32(byte_order, &mut out, idle_fence);
     debug_assert_eq!(out.len(), 32);
     out
 }
@@ -275,6 +456,95 @@ mod tests {
         assert_eq!(req.target_msc, 3);
         assert_eq!(req.divisor, 4);
         assert_eq!(req.remainder, 5);
+    }
+
+    #[test]
+    fn complete_notify_event_shape() {
+        let ev = encode_complete_notify(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(7),
+            145,
+            0xEEE,
+            0xBEEF,
+            42,
+            COMPLETE_KIND_PIXMAP,
+            COMPLETE_MODE_COPY,
+            0xFEED_FACE,
+            12345,
+        );
+        assert_eq!(ev.len(), 40);
+        assert_eq!(ev[0], 35); // GenericEvent
+        assert_eq!(ev[1], 145);
+        assert_eq!(u16::from_le_bytes(ev[2..4].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(ev[4..8].try_into().unwrap()), 2); // length
+        assert_eq!(u16::from_le_bytes(ev[8..10].try_into().unwrap()), 1);
+        assert_eq!(ev[10], COMPLETE_KIND_PIXMAP);
+        assert_eq!(ev[11], COMPLETE_MODE_COPY);
+        assert_eq!(u32::from_le_bytes(ev[12..16].try_into().unwrap()), 0xEEE);
+        assert_eq!(u32::from_le_bytes(ev[16..20].try_into().unwrap()), 0xBEEF);
+        assert_eq!(u32::from_le_bytes(ev[20..24].try_into().unwrap()), 42);
+        assert_eq!(
+            u64::from_le_bytes(ev[24..32].try_into().unwrap()),
+            0xFEED_FACE
+        );
+        assert_eq!(u64::from_le_bytes(ev[32..40].try_into().unwrap()), 12345);
+    }
+
+    #[test]
+    fn idle_notify_event_shape() {
+        let ev = encode_idle_notify(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(3),
+            145,
+            0xEE0,
+            0xBEEF,
+            7,
+            0xCAFE,
+            0,
+        );
+        assert_eq!(ev.len(), 32);
+        assert_eq!(ev[0], 35);
+        assert_eq!(ev[1], 145);
+        assert_eq!(u16::from_le_bytes(ev[8..10].try_into().unwrap()), 2); // evtype
+        assert_eq!(u32::from_le_bytes(ev[12..16].try_into().unwrap()), 0xEE0);
+        assert_eq!(u32::from_le_bytes(ev[16..20].try_into().unwrap()), 0xBEEF);
+        assert_eq!(u32::from_le_bytes(ev[20..24].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(ev[24..28].try_into().unwrap()), 0xCAFE);
+        assert_eq!(u32::from_le_bytes(ev[28..32].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn pixmap_synced_parses_minimum_body() {
+        // 92-byte fixed prefix; no notifies.
+        let mut body = vec![0u8; 92];
+        body[0..4].copy_from_slice(&0x100u32.to_le_bytes()); // window
+        body[4..8].copy_from_slice(&0x200u32.to_le_bytes()); // pixmap
+        body[8..12].copy_from_slice(&7u32.to_le_bytes()); // serial
+        body[28..32].copy_from_slice(&0x300u32.to_le_bytes()); // acquire_syncobj
+        body[32..36].copy_from_slice(&0x400u32.to_le_bytes()); // release_syncobj
+        body[40..48].copy_from_slice(&42u64.to_le_bytes()); // acquire_value
+        body[48..56].copy_from_slice(&43u64.to_le_bytes()); // release_value
+        body[64..72].copy_from_slice(&100u64.to_le_bytes()); // target_msc
+        let req = parse_pixmap_synced(&body).unwrap();
+        assert_eq!(req.window, 0x100);
+        assert_eq!(req.pixmap, 0x200);
+        assert_eq!(req.serial, 7);
+        assert_eq!(req.acquire_syncobj, 0x300);
+        assert_eq!(req.release_syncobj, 0x400);
+        assert_eq!(req.acquire_value, 42);
+        assert_eq!(req.release_value, 43);
+        assert_eq!(req.target_msc, 100);
+        assert!(req.notifies.is_empty());
+    }
+
+    #[test]
+    fn pixmap_synced_rejects_misaligned_notifies() {
+        assert!(parse_pixmap_synced(&[0u8; 95]).is_none());
+    }
+
+    #[test]
+    fn pixmap_synced_rejects_short_body() {
+        assert!(parse_pixmap_synced(&[0u8; 91]).is_none());
     }
 
     #[test]

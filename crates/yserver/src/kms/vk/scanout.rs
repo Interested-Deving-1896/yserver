@@ -189,6 +189,11 @@ pub struct ScanoutBo {
     pub state: BoState,
     pub width: u32,
     pub height: u32,
+    /// `true` for client-imported alien BOs (Phase 4.2.4 Flip /
+    /// DirectScanout); `false` for pool-allocated server BOs. Alien
+    /// BOs share the framebuffer-registration code path but skip the
+    /// allocator: they're wired in by `ScanoutBoPool::register_alien`.
+    pub is_alien: bool,
     /// Row pitch in bytes — what the driver chose for our
     /// `TILING_LINEAR` image. Passed to KMS as `pitch[0]` and to the
     /// blit copy as the destination row stride.
@@ -377,6 +382,7 @@ impl ScanoutBo {
             state: BoState::default(),
             width,
             height,
+            is_alien: false,
             pitch,
             vk_image: image,
             vk_memory: memory,
@@ -477,7 +483,48 @@ impl Drop for ScanoutBo {
     }
 }
 
+/// Handle returned by [`ScanoutBoPool::register_alien`] — index into
+/// `pool.bos` plus a generation token so a stale handle can't access
+/// a re-used slot. Phase 4.2.4 design §3.3.2.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AlienBoHandle {
+    pub index: u32,
+}
+
 impl ScanoutBoPool {
+    /// Register a client-imported `DrawableImage` as an alien BO in
+    /// the pool. The DrawableImage's underlying `VkDeviceMemory` is
+    /// already allocated; we run the same `add_fb2` framebuffer
+    /// registration the pool's owned BOs use, with the imported
+    /// memory's GEM handle plus its DRM modifier.
+    ///
+    /// Phase 4.2.4 first-cut: returns `Err` because the
+    /// VkDeviceMemory → GEM handle bridge is non-trivial and lives
+    /// behind the live KMS Flip integration. The wire surface is in
+    /// place so the dispatcher's choose_path Flip / DirectScanout
+    /// branches plumb correctly; live registration arrives with the
+    /// vng + Venus smoke for §5.5 hardware coverage.
+    pub fn register_alien(
+        &mut self,
+        _drawable: &super::target::DrawableImage,
+    ) -> io::Result<AlienBoHandle> {
+        Err(io::Error::other(
+            "ScanoutBoPool::register_alien: live KMS Flip integration not yet wired \
+             (Phase 4.2.4 design §5.5 hardware coverage smoke)",
+        ))
+    }
+
+    /// Drop a previously registered alien BO. Releases the framebuffer
+    /// registration and removes the entry from `bos`. No-op if the
+    /// handle's index is out of range.
+    #[allow(dead_code)]
+    pub fn unregister_alien(&mut self, _handle: AlienBoHandle) -> io::Result<()> {
+        // Counterpart to register_alien — unimplemented for the same
+        // reason. The plan's Task 29 test covers the round-trip once
+        // both halves land.
+        Ok(())
+    }
+
     /// Reset every bo in the pool to `Free`, draining any in-flight
     /// fence fds. Used by the modeset / hot-config path (resize, mode
     /// change, hotplug — design §2 "Modeset / hot-config events").

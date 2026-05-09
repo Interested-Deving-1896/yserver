@@ -121,7 +121,28 @@ fn run(
         // rest of the dispatch path can decode bytes as little-endian.
         x11::request_swap::swap_request_body(header.opcode, byte_order, &mut body);
         sequence = sequence.wrapping_add(1);
-        let attached_fd = reader.pop_fd();
+        // Phase 4.2.1 fix: pop only the fds this opcode actually
+        // consumes. The previous unconditional `pop_fd()` per request
+        // misattributed when libxcb batched multiple requests into
+        // one `writev` with a single SCM_RIGHTS attachment — Mesa's
+        // xcb-dri3 hits this every time. Now we peek at the (major,
+        // minor[, body]) and pop exactly the right count.
+        let fd_count = expected_fd_count(header.opcode, header.data, &body);
+        let mut attached_fd: Option<RawFd> = None;
+        for _ in 0..fd_count {
+            // First fd → attached_fd; any extras (PixmapFromBuffers
+            // num_buffers > 1) are closed because Phase 4.2 only
+            // accepts num_buffers == 1 — the dispatcher rejects
+            // larger requests with BadAlloc anyway.
+            match reader.pop_fd() {
+                Some(raw) if attached_fd.is_none() => attached_fd = Some(raw),
+                Some(raw) => {
+                    // SAFETY: own the raw fd; close to avoid leak.
+                    unsafe { libc::close(raw) };
+                }
+                None => break,
+            }
+        }
 
         let is_enable =
             header.opcode == big_requests_major && header.data == BIG_REQUESTS_ENABLE_MINOR;
@@ -147,6 +168,39 @@ fn run(
                 Err(_) => return Ok(()),
             }
         }
+    }
+}
+
+/// Number of `SCM_RIGHTS` file descriptors a request body expects to
+/// arrive with. Used by `run` to pop the right count off the reader's
+/// fd queue rather than the previous unconditional one-pop-per-request
+/// (which mis-attributed when libxcb batched multiple requests into
+/// one `writev` carrying a single fd).
+///
+/// Major opcodes are the *yserver-local* values (DRI3=147, MIT-SHM=130).
+fn expected_fd_count(major_opcode: u8, minor_opcode: u8, body: &[u8]) -> usize {
+    match major_opcode {
+        // MIT-SHM AttachFd (minor 6) — 1 fd.
+        130 if minor_opcode == 6 => 1,
+        // DRI3 — opcode-dependent.
+        147 => match minor_opcode {
+            // PixmapFromBuffer (1 fd).
+            2 => 1,
+            // FenceFromFD (1 fd).
+            4 => 1,
+            // PixmapFromBuffers — num_buffers fds (1..=4).
+            7 => {
+                if body.len() >= 9 {
+                    usize::from(body[8].clamp(1, 4))
+                } else {
+                    1
+                }
+            }
+            // ImportSyncobj (1 fd).
+            10 => 1,
+            _ => 0,
+        },
+        _ => 0,
     }
 }
 

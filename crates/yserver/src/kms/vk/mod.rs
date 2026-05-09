@@ -9,6 +9,7 @@
 pub mod compositor;
 pub mod copy_scratch;
 pub mod device;
+pub mod dri3;
 pub mod dst_readback;
 pub mod glyph;
 pub mod gradient;
@@ -20,6 +21,7 @@ pub mod ops;
 pub mod pipeline;
 pub mod render_pipeline;
 pub mod scanout;
+pub mod sync;
 pub mod target;
 pub mod text_pipeline;
 // `pub mod upload;` retired in 4.1.5 — pixman → mirror upload pump

@@ -251,22 +251,194 @@ impl DrawableImage {
     }
 
     /// Import a client-supplied dma-buf (DRI3) as the backing of a
-    /// drawable. Phase 4.2 territory — not called yet. Stubbed
-    /// `unimplemented!()` to keep the constructor surface complete
-    /// from day one (per design spec: "exists from day one so 4.2
-    /// doesn't have to retrofit a new ctor onto a sealed type").
-    #[allow(dead_code)]
+    /// drawable. Phase 4.2 design §3.2.
+    ///
+    /// **fd ownership rule.** This function takes ownership of
+    /// `dma_buf_fd` and transfers it to the resulting `VkDeviceMemory`
+    /// on success. On any error path before `vkAllocateMemory` returns
+    /// `SUCCESS`, the fd is closed (via the `OwnedFd` drop). On
+    /// success, fd lifetime is owned by `VkDeviceMemory` —
+    /// `Drop for DrawableImage` calls `vkFreeMemory` which releases it.
     pub fn from_dmabuf(
-        _vk: Arc<VkContext>,
-        _dma_buf_fd: std::os::fd::OwnedFd,
-        _width: u32,
-        _height: u32,
-        _format: vk::Format,
-        _modifier: u64,
-        _plane_offsets: &[u64],
-        _plane_pitches: &[u32],
+        vk: Arc<VkContext>,
+        dma_buf_fd: std::os::fd::OwnedFd,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        modifier: u64,
+        plane_offsets: &[u64],
+        plane_pitches: &[u32],
     ) -> Result<Self, DrawableImageError> {
-        unimplemented!("DrawableImage::from_dmabuf — Phase 4.2 (DRI3 / Present) territory");
+        use std::os::fd::IntoRawFd as _;
+        if plane_offsets.len() != plane_pitches.len() {
+            return Err(DrawableImageError::Vk(
+                vk::Result::ERROR_INITIALIZATION_FAILED,
+            ));
+        }
+        if plane_offsets.is_empty() || plane_offsets.len() > 4 {
+            return Err(DrawableImageError::Vk(
+                vk::Result::ERROR_INITIALIZATION_FAILED,
+            ));
+        }
+
+        let use_explicit_modifier =
+            vk.image_drm_format_modifier && modifier != crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR;
+
+        // Build VkSubresourceLayout array for the explicit-modifier chain
+        // (only used when use_explicit_modifier is true).
+        let plane_layouts: Vec<vk::SubresourceLayout> = plane_offsets
+            .iter()
+            .zip(plane_pitches.iter())
+            .map(|(&offset, &pitch)| vk::SubresourceLayout {
+                offset,
+                size: 0,
+                row_pitch: u64::from(pitch),
+                array_pitch: 0,
+                depth_pitch: 0,
+            })
+            .collect();
+        let mut modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .plane_layouts(&plane_layouts);
+
+        let mut external_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        if use_explicit_modifier {
+            external_info.p_next =
+                std::ptr::from_mut(&mut modifier_info).cast::<std::ffi::c_void>();
+        }
+
+        let tiling = if use_explicit_modifier {
+            vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT
+        } else {
+            vk::ImageTiling::LINEAR
+        };
+
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(tiling)
+            .usage(
+                vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut external_info);
+
+        let image = unsafe { vk.device.create_image(&image_info, None)? };
+
+        // Per design §3.2 fd ownership rule: dup the fd before handing
+        // to vkAllocateMemory so that on any vkAllocateMemory failure
+        // we can close ours and let the caller's `dma_buf_fd` drop
+        // separately. On vkAllocateMemory SUCCESS the dup'd fd is
+        // owned by the VkDeviceMemory; `into_raw_fd` releases the
+        // OwnedFd's drop responsibility.
+        let server_fd_owned = dma_buf_fd.try_clone().map_err(|_| {
+            unsafe { vk.device.destroy_image(image, None) };
+            DrawableImageError::Vk(vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+        })?;
+        let server_fd_raw = server_fd_owned.into_raw_fd();
+
+        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(server_fd_raw);
+
+        let mem_reqs = unsafe { vk.device.get_image_memory_requirements(image) };
+        let mem_props = unsafe {
+            vk.instance
+                .get_physical_device_memory_properties(vk.physical_device)
+        };
+        let memory_type_index = pick_memory_type(
+            &mem_props,
+            mem_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::empty(),
+        );
+        let memory_type_index = match memory_type_index {
+            Some(i) => i,
+            None => {
+                unsafe {
+                    vk.device.destroy_image(image, None);
+                    libc::close(server_fd_raw);
+                }
+                return Err(DrawableImageError::NoMemoryType);
+            }
+        };
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_reqs.size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut import_info)
+            .push_next(&mut dedicated);
+        let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
+            Ok(m) => m,
+            Err(e) => {
+                unsafe {
+                    vk.device.destroy_image(image, None);
+                    // vkAllocateMemory consumed the fd only on SUCCESS.
+                    libc::close(server_fd_raw);
+                }
+                return Err(e.into());
+            }
+        };
+        // server_fd_raw is now owned by `memory`. Caller's
+        // `dma_buf_fd` is still owned by the OwnedFd we received; it
+        // will be re-stashed on the Imported variant so the original
+        // fd survives at least until DrawableImage drop.
+        if let Err(e) = unsafe { vk.device.bind_image_memory(image, memory, 0) } {
+            unsafe {
+                vk.device.free_memory(memory, None);
+                vk.device.destroy_image(image, None);
+            }
+            return Err(e.into());
+        }
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            );
+        let view = match unsafe { vk.device.create_image_view(&view_info, None) } {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe {
+                    vk.device.free_memory(memory, None);
+                    vk.device.destroy_image(image, None);
+                }
+                return Err(e.into());
+            }
+        };
+
+        Ok(Self {
+            vk_image: image,
+            vk_image_view: view,
+            mask_view: None,
+            no_alpha_src_view: None,
+            extent: vk::Extent2D { width, height },
+            format,
+            backing: ImageBacking::Imported {
+                dma_buf_fd,
+                vk_memory: memory,
+            },
+            damage: MirrorDamage::default(),
+            current_layout: vk::ImageLayout::UNDEFINED,
+            vk,
+        })
     }
 
     fn new_server_owned(
@@ -368,6 +540,18 @@ impl DrawableImage {
             current_layout: vk::ImageLayout::UNDEFINED,
             vk,
         })
+    }
+
+    /// Backing `VkDeviceMemory` handle. Used by the DRI3 export path
+    /// (Task 13) to call `vkGetMemoryFdKHR` against either the
+    /// server-allocated memory (ServerOwned) or the previously
+    /// imported memory (Imported). Both variants carry the field;
+    /// callers don't need to know which.
+    pub fn backing_memory(&self) -> vk::DeviceMemory {
+        match &self.backing {
+            ImageBacking::ServerOwned { vk_memory } => *vk_memory,
+            ImageBacking::Imported { vk_memory, .. } => *vk_memory,
+        }
     }
 
     /// Image view to bind when this BGRA mirror is sampled as a

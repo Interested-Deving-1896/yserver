@@ -220,6 +220,56 @@ yserver-fvwm3-xterm mode="1024x768" log="trace":
             DISPLAY=:7 xterm &\
             wait $yserver_pid'
 
+# Phase 4.2 smoke: yserver + vkcube under Venus passthrough.
+# Verifies DRI3 / Present extension discovery + handshake.
+#
+# Pin VK_DRIVER_FILES to virtio_icd.json so the loader doesn't
+# probe radeon_icd inside the guest (no PCI passthrough → spurious
+# segfault at vkCreateInstance time on some stacks).
+#
+# Wait for /tmp/.X11-unix/X7 to materialise before launching the
+# client (yserver's modeset takes ~20s under the cold-cache vng
+# boot). vkcube --c N exits after N frames; we use 5.
+yserver-vkcube mode="1024x768" log="info" frames="5":
+    cargo build --bin yserver
+    vng -r {{KERNEL}} --disable-microvm --rw \
+        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        -- bash -c '\
+            export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.json;\
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
+            yserver_pid=$!;\
+            for i in $(seq 30); do if [ -e /tmp/.X11-unix/X7 ]; then break; fi; sleep 1; done;\
+            DISPLAY=:7 vkcube --c {{frames}} > vkcube.log 2>&1;\
+            echo "===VKCUBE rc=$?===";\
+            sleep 1;\
+            kill $yserver_pid 2>/dev/null;\
+            wait $yserver_pid 2>/dev/null;\
+            echo "===YSERVER LOG TAIL===";\
+            tail -50 yserver.log;\
+            echo "===VKCUBE LOG===";\
+            cat vkcube.log'
+
+# Phase 4.2 GLX smoke. glxgears exercises GLX framing + DRI3 +
+# Present.
+yserver-glxgears mode="1024x768" log="info":
+    cargo build --bin yserver
+    vng -r {{KERNEL}} --disable-microvm --rw \
+        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        -- bash -c '\
+            export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.json;\
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
+            yserver_pid=$!;\
+            for i in $(seq 30); do if [ -e /tmp/.X11-unix/X7 ]; then break; fi; sleep 1; done;\
+            DISPLAY=:7 timeout 10 glxgears > glxgears.log 2>&1;\
+            echo "===GLXGEARS rc=$?===";\
+            sleep 1;\
+            kill $yserver_pid 2>/dev/null;\
+            wait $yserver_pid 2>/dev/null;\
+            echo "===YSERVER LOG TAIL===";\
+            tail -50 yserver.log;\
+            echo "===GLXGEARS LOG===";\
+            cat glxgears.log'
+
 yserver-e16-xterm mode="1024x768" log="trace":
     cargo build --bin yserver
     vng -r {{KERNEL}} --disable-microvm --rw \

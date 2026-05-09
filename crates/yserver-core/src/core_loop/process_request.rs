@@ -346,6 +346,18 @@ pub fn process_request(
         133 => handle_render_request(state, backend, origin, client_id, sequence, header, body),
         // ── XTEST extension dispatcher ──
         146 => handle_xtest_request(state, backend, client_id, sequence, header, body),
+        // ── DRI3 extension dispatcher ──
+        147 => handle_dri3_request(
+            state,
+            backend,
+            client_id,
+            sequence,
+            header,
+            body,
+            attached_fd,
+        ),
+        // ── GLX extension dispatcher ──
+        148 => handle_glx_request(state, client_id, sequence, header, body),
         opcode => {
             debug!(
                 "client {} #{} unsupported opcode {} ({} bytes)",
@@ -554,6 +566,22 @@ fn destroy_window_subtree(
         });
     }
     let bg_pixmap_xids = state.resources.collect_bg_pixmap_host_xids(root);
+    // Phase 4.2.4 design §3.3.2 teardown rules. Drain queued
+    // PresentPixmap requests for every destroyed window — no
+    // IdleNotify/CompleteNotify because the window is gone, but the
+    // attached idle-fence/idle-syncobj semaphores need their wait
+    // chains released. Phase 4.2.4 first cut just drains; the
+    // semaphore-signal step lands when KMS submission is wired.
+    for window in &order {
+        let drained = state.present_scheduler.drain_window(*window);
+        if !drained.is_empty() {
+            log::debug!(
+                "PRESENT teardown: drained {} queued frame(s) from destroyed window 0x{:x}",
+                drained.len(),
+                window.0
+            );
+        }
+    }
     let _ = state.resources.destroy_window(root);
     state.drop_window_subscriptions(&order);
 
@@ -1553,6 +1581,74 @@ fn handle_sync_request(
         x11sync::DESTROY_ALARM => {
             if let Some(alarm) = x11sync::parse_resource(body) {
                 state.sync_alarms.remove(&alarm);
+            }
+        }
+        x11sync::CREATE_FENCE => {
+            if let Some(req) = x11sync::parse_create_fence(body) {
+                state.sync_fences.insert(
+                    req.fence,
+                    crate::server::SyncFence {
+                        owner: client_id,
+                        triggered: req.initially_triggered,
+                    },
+                );
+                debug!(
+                    "client {} #{} SYNC::CreateFence fence=0x{:x} initially_triggered={}",
+                    client_id.0, sequence.0, req.fence, req.initially_triggered
+                );
+            }
+        }
+        x11sync::DESTROY_FENCE => {
+            if let Some(fence) = x11sync::parse_resource(body) {
+                state.sync_fences.remove(&fence);
+                debug!(
+                    "client {} #{} SYNC::DestroyFence fence=0x{:x}",
+                    client_id.0, sequence.0, fence
+                );
+            }
+        }
+        x11sync::TRIGGER_FENCE => {
+            if let Some(fence) = x11sync::parse_resource(body)
+                && let Some(f) = state.sync_fences.get_mut(&fence)
+            {
+                f.triggered = true;
+                debug!(
+                    "client {} #{} SYNC::TriggerFence fence=0x{:x}",
+                    client_id.0, sequence.0, fence
+                );
+            }
+        }
+        x11sync::RESET_FENCE => {
+            if let Some(fence) = x11sync::parse_resource(body)
+                && let Some(f) = state.sync_fences.get_mut(&fence)
+            {
+                f.triggered = false;
+            }
+        }
+        x11sync::QUERY_FENCE => {
+            let fence = x11sync::parse_resource(body).unwrap_or(0);
+            let triggered = state.sync_fences.get(&fence).is_some_and(|f| f.triggered);
+            let reply = x11sync::encode_query_fence_reply(byte_order, sequence, triggered);
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11sync::AWAIT_FENCE => {
+            // Phase 4.2.2 stub: returns immediately. Real blocking
+            // implementation requires per-client wait queues hooked
+            // into the core loop's event scheduler. The two-client
+            // smoke from §5.2 still works because TriggerFence
+            // updates state synchronously and the second client
+            // observes the triggered bit on the next QueryFence /
+            // AwaitFence dispatch.
+            if let Some(fences) = x11sync::parse_await_fence(body) {
+                debug!(
+                    "client {} #{} SYNC::AwaitFence n={} (non-blocking stub)",
+                    client_id.0,
+                    sequence.0,
+                    fences.len()
+                );
             }
         }
         x11sync::SET_PRIORITY => {
@@ -3100,16 +3196,13 @@ fn handle_present_request(
             return Ok(write_to_client(client, client_id, &reply));
         }
         x11present::QUERY_CAPABILITIES => {
-            let _target = x11present::parse_query_capabilities(body).unwrap_or(0);
+            let target = x11present::parse_query_capabilities(body).unwrap_or(0);
+            let caps = backend.present_capabilities(target).encode();
             debug!(
-                "client {} #{} PRESENT::QueryCapabilities -> none",
+                "client {} #{} PRESENT::QueryCapabilities target=0x{target:x} -> 0x{caps:x}",
                 client_id.0, sequence.0
             );
-            let reply = x11present::encode_query_capabilities_reply(
-                byte_order,
-                sequence,
-                x11present::CAPABILITY_NONE,
-            );
+            let reply = x11present::encode_query_capabilities_reply(byte_order, sequence, caps);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -3118,6 +3211,10 @@ fn handle_present_request(
         }
         x11present::SELECT_INPUT => {
             if let Some(req) = x11present::parse_select_input(body) {
+                debug!(
+                    "client {} #{} PRESENT::SelectInput eid=0x{:x} window=0x{:x} mask=0x{:x}",
+                    client_id.0, sequence.0, req.eid, req.window, req.event_mask
+                );
                 state.present_event_selections.insert(
                     req.eid,
                     crate::server::PresentEventSelection {
@@ -3126,11 +3223,14 @@ fn handle_present_request(
                         event_mask: req.event_mask,
                     },
                 );
+            } else {
+                debug!(
+                    "client {} #{} PRESENT::SelectInput parse failed body_len={}",
+                    client_id.0,
+                    sequence.0,
+                    body.len()
+                );
             }
-            debug!(
-                "client {} #{} PRESENT::SelectInput",
-                client_id.0, sequence.0
-            );
         }
         x11present::PIXMAP => {
             let Some(req) = x11present::parse_pixmap(body) else {
@@ -3143,21 +3243,10 @@ fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             };
-            if req.wait_fence != 0 || req.idle_fence != 0 {
-                let bad = if req.wait_fence != 0 {
-                    req.wait_fence
-                } else {
-                    req.idle_fence
-                };
-                return emit_x11_error(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_IMPLEMENTATION,
-                    bad,
-                    PRESENT_MAJOR_OPCODE,
-                );
-            }
+            // Phase 4.2.3: wait_fence / idle_fence are accepted. The
+            // scheduler enqueue below carries them as PresentSync::Binary,
+            // and the dispatcher mirrors the result onto state.sync_fences
+            // via the XSync resource table for QueryFence / TriggerFence.
             let window_exists = state.resources.window(ResourceId(req.window)).is_some();
             let pixmap_exists = state.resources.pixmap(ResourceId(req.pixmap)).is_some();
             let src = state.resources.host_drawable_target(ResourceId(req.pixmap));
@@ -3220,6 +3309,87 @@ fn handle_present_request(
                 .entry(ResourceId(req.window))
                 .and_modify(|msc| *msc = msc.saturating_add(1))
                 .or_insert(1);
+            // Phase 4.2.3 + xshmfence wake. For Mesa's loader_dri3
+            // (which uses xshmfence-backed fences via FenceFromFD),
+            // triggering idle_fence is what wakes vkAcquireNextImage.
+            // The X-side IdleNotify event alone isn't enough — Mesa's
+            // WSI thread blocks on the xshmfence futex.
+            if req.idle_fence != 0
+                && let Err(e) = backend.dri3_trigger_fence(req.idle_fence)
+            {
+                log::warn!(
+                    "PRESENT::Pixmap idle_fence 0x{:x} trigger failed: {e}",
+                    req.idle_fence
+                );
+            }
+            // Mirror onto state.sync_fences so QueryFence sees triggered.
+            if req.idle_fence != 0
+                && let Some(f) = state.sync_fences.get_mut(&req.idle_fence)
+            {
+                f.triggered = true;
+            }
+            // Phase 4.2.3 enqueue + fire events. We mirror the
+            // request onto the scheduler queue so a follow-up
+            // vblank-driven submission path can pick it up; for now
+            // the synchronous copy_area above already produced the
+            // visible result, and we fire CompleteNotify { mode: Copy }
+            // and IdleNotify immediately. Per presentproto §3.3.2 a
+            // Copy makes the pixmap idle as soon as the GPU has
+            // finished reading the source — the synchronous backend
+            // already serialised that.
+            //
+            // Per design §4 AsyncMayTear silent-clear: mask the bit
+            // off here when the cap isn't advertised.
+            let caps = backend.present_capabilities(req.window);
+            let masked_options = if caps.async_may_tear {
+                req.options
+            } else {
+                const PRESENT_OPTION_ASYNC_MAY_TEAR: u32 = 0x8;
+                req.options & !PRESENT_OPTION_ASYNC_MAY_TEAR
+            };
+            // PresentScheduler enqueue. choose_path with flip_path=false
+            // (Phase 4.2.3) always returns Copy so this is the only
+            // branch wired for now.
+            state
+                .present_scheduler
+                .enqueue(crate::present_scheduler::QueuedPresent {
+                    serial: req.serial,
+                    pixmap: ResourceId(req.pixmap),
+                    window: ResourceId(req.window),
+                    options: masked_options,
+                    target_msc: req.target_msc,
+                    divisor: req.divisor,
+                    remainder: req.remainder,
+                    wait: crate::present_scheduler::PresentSync::Binary {
+                        fence: req.wait_fence,
+                    },
+                    idle: crate::present_scheduler::PresentSync::Binary {
+                        fence: req.idle_fence,
+                    },
+                    path: crate::present_scheduler::PresentPath::Copy,
+                    valid_region: req.valid,
+                    update_region: req.update,
+                });
+            // Drain the just-enqueued frame (synchronous Copy path —
+            // vblank-driven scheduling lands when KMS integrates with
+            // PresentScheduler::pick_at_vblank).
+            let current_msc = state
+                .present_msc
+                .get(&ResourceId(req.window))
+                .copied()
+                .unwrap_or(0);
+            let (chosen, _skipped) = state
+                .present_scheduler
+                .pick_at_vblank(ResourceId(req.window), current_msc);
+            if let Some(frame) = chosen {
+                fire_present_completion_events(
+                    state,
+                    byte_order,
+                    PRESENT_MAJOR_OPCODE,
+                    &frame,
+                    current_msc,
+                );
+            }
             debug!(
                 "client {} #{} PRESENT::Pixmap serial={} notifies={}",
                 client_id.0,
@@ -3239,19 +3409,1035 @@ fn handle_present_request(
             debug!("client {} #{} PRESENT::NotifyMSC", client_id.0, sequence.0);
         }
         x11present::PIXMAP_SYNCED => {
-            return emit_x11_error(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_IMPLEMENTATION,
-                0,
-                PRESENT_MAJOR_OPCODE,
+            let Some(req) = x11present::parse_pixmap_synced(body) else {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    PRESENT_MAJOR_OPCODE,
+                );
+            };
+            let caps = backend.present_capabilities(req.window);
+            let masked_options = if caps.async_may_tear {
+                req.options
+            } else {
+                const PRESENT_OPTION_ASYNC_MAY_TEAR: u32 = 0x8;
+                req.options & !PRESENT_OPTION_ASYNC_MAY_TEAR
+            };
+            let window_exists = state.resources.window(ResourceId(req.window)).is_some();
+            let pixmap_exists = state.resources.pixmap(ResourceId(req.pixmap)).is_some();
+            let src = state.resources.host_drawable_target(ResourceId(req.pixmap));
+            let dst = state.resources.host_drawable_target(ResourceId(req.window));
+            if !window_exists {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_WINDOW,
+                    req.window,
+                    PRESENT_MAJOR_OPCODE,
+                );
+            }
+            if !pixmap_exists {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_DRAWABLE,
+                    req.pixmap,
+                    PRESENT_MAJOR_OPCODE,
+                );
+            }
+            if let (
+                Some(crate::resources::HostDrawableTarget::Pixmap {
+                    host_xid,
+                    width,
+                    height,
+                    depth: src_depth,
+                    ..
+                }),
+                Some(dst),
+            ) = (src, dst)
+                && src_depth == dst.depth()
+            {
+                let _ = backend.copy_area(
+                    origin,
+                    host_xid.as_raw(),
+                    dst.host_xid(),
+                    req.x_off,
+                    req.y_off,
+                    0,
+                    0,
+                    width,
+                    height,
+                );
+            }
+            // Per design §3.3.2 Copy path: signal the client's
+            // release_syncobj at release_value once the GPU has
+            // finished reading the source. The synchronous CopyArea
+            // above is the GPU read; host-signal immediately.
+            if req.release_syncobj != 0
+                && let Err(e) = backend.dri3_signal_syncobj(req.release_syncobj, req.release_value)
+            {
+                log::warn!(
+                    "PRESENT::PixmapSynced: signalling release_syncobj 0x{:x} @ {} failed: {e}",
+                    req.release_syncobj,
+                    req.release_value
+                );
+            }
+            state
+                .present_msc
+                .entry(ResourceId(req.window))
+                .and_modify(|msc| *msc = msc.saturating_add(1))
+                .or_insert(1);
+            state
+                .present_scheduler
+                .enqueue(crate::present_scheduler::QueuedPresent {
+                    serial: req.serial,
+                    pixmap: ResourceId(req.pixmap),
+                    window: ResourceId(req.window),
+                    options: masked_options,
+                    target_msc: req.target_msc,
+                    divisor: req.divisor,
+                    remainder: req.remainder,
+                    wait: crate::present_scheduler::PresentSync::Timeline {
+                        syncobj: req.acquire_syncobj,
+                        value: req.acquire_value,
+                    },
+                    idle: crate::present_scheduler::PresentSync::Timeline {
+                        syncobj: req.release_syncobj,
+                        value: req.release_value,
+                    },
+                    path: crate::present_scheduler::PresentPath::Copy,
+                    valid_region: req.valid,
+                    update_region: req.update,
+                });
+            let current_msc = state
+                .present_msc
+                .get(&ResourceId(req.window))
+                .copied()
+                .unwrap_or(0);
+            let (chosen, _skipped) = state
+                .present_scheduler
+                .pick_at_vblank(ResourceId(req.window), current_msc);
+            if let Some(frame) = chosen {
+                fire_present_completion_events(
+                    state,
+                    byte_order,
+                    PRESENT_MAJOR_OPCODE,
+                    &frame,
+                    current_msc,
+                );
+            }
+            debug!(
+                "client {} #{} PRESENT::PixmapSynced serial={} acquire=0x{:x}@{} release=0x{:x}@{}",
+                client_id.0,
+                sequence.0,
+                req.serial,
+                req.acquire_syncobj,
+                req.acquire_value,
+                req.release_syncobj,
+                req.release_value
             );
         }
         _ => {
             debug!(
                 "client {} #{} PRESENT unsupported minor {}",
                 client_id.0, sequence.0, minor,
+            );
+        }
+    }
+    Ok(RequestOutcome::Handled)
+}
+
+/// Fan out `CompleteNotify { mode: Copy }` and `IdleNotify` to every
+/// `present_event_selections` entry that subscribed to the window
+/// with the matching event-mask bit. Phase 4.2.3 design §3.3.2.
+fn fire_present_completion_events(
+    state: &mut ServerState,
+    byte_order: yserver_protocol::x11::ClientByteOrder,
+    extension_major: u8,
+    frame: &crate::present_scheduler::QueuedPresent,
+    current_msc: u64,
+) {
+    use yserver_protocol::x11::present as x11present;
+    /// `PresentEventMaskCompleteNotify` per `presentproto`.
+    const COMPLETE_NOTIFY_MASK: u32 = 0x2;
+    /// `PresentEventMaskIdleNotify`.
+    const IDLE_NOTIFY_MASK: u32 = 0x4;
+
+    // Gather the matching (eid, owning client, mask) tuples up front
+    // so we can iterate state.clients without holding a borrow on
+    // present_event_selections.
+    let mut targets: Vec<(u32, ClientId, u32)> = Vec::new();
+    for (eid, sel) in &state.present_event_selections {
+        if sel.window == frame.window {
+            targets.push((*eid, sel.owner, sel.event_mask));
+        }
+    }
+    debug!(
+        "PRESENT events: window=0x{:x} serial={} pixmap=0x{:x} targets={:?}",
+        frame.window.0,
+        frame.serial,
+        frame.pixmap.0,
+        targets
+            .iter()
+            .map(|(e, c, m)| format!("eid=0x{e:x}/client={}/mask=0x{m:x}", c.0))
+            .collect::<Vec<_>>()
+    );
+
+    for (eid, owner, mask) in targets {
+        let Some(client) = state.clients.get_mut(&owner.0) else {
+            continue;
+        };
+        let seq = SequenceNumber(
+            client
+                .last_sequence
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        // Per Xorg's present_execute_copy: IdleNotify fires *first*
+        // (the pixmap is idle as soon as the GPU finishes reading,
+        // which on our synchronous CopyArea path is immediately),
+        // CompleteNotify fires on vblank afterwards. Mesa's
+        // loader_dri3 expects this order — flipping it makes
+        // vkAcquireNextImage hang on the second frame.
+        if mask & IDLE_NOTIFY_MASK != 0 {
+            let idle_fence = match frame.idle {
+                crate::present_scheduler::PresentSync::Binary { fence } => fence,
+                crate::present_scheduler::PresentSync::Timeline { syncobj, .. } => syncobj,
+            };
+            let ev = x11present::encode_idle_notify(
+                byte_order,
+                seq,
+                extension_major,
+                eid,
+                frame.window.0,
+                frame.serial,
+                frame.pixmap.0,
+                idle_fence,
+            );
+            let outcome = write_to_client(client, owner, &ev);
+            debug!(
+                "PRESENT IdleNotify -> client {} eid=0x{eid:x} pixmap=0x{:x} fence=0x{idle_fence:x} ({} bytes) outcome={:?} outbound_len={}",
+                owner.0,
+                frame.pixmap.0,
+                ev.len(),
+                outcome,
+                client.outbound.len(),
+            );
+        }
+        if mask & COMPLETE_NOTIFY_MASK != 0 {
+            let ev = x11present::encode_complete_notify(
+                byte_order,
+                seq,
+                extension_major,
+                eid,
+                frame.window.0,
+                frame.serial,
+                x11present::COMPLETE_KIND_PIXMAP,
+                x11present::COMPLETE_MODE_COPY,
+                0, // ust unknown without a real vblank timestamp
+                current_msc,
+            );
+            debug!(
+                "PRESENT CompleteNotify -> client {} eid=0x{eid:x} ({} bytes)",
+                owner.0,
+                ev.len()
+            );
+            let _ = write_to_client(client, owner, &ev);
+        }
+    }
+}
+
+fn handle_dri3_request(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+    attached_fd: Option<OwnedFd>,
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::{ClientByteOrder, dri3 as x11dri3};
+    const DRI3_MAJOR_OPCODE: u8 = 147;
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
+    let caps = backend.dri3_capabilities();
+    let minor = header.data;
+    match minor {
+        x11dri3::QUERY_VERSION => {
+            let (cmaj, cmin) = x11dri3::parse_query_version(body).unwrap_or((0, 0));
+            // Server caps the version per Dri3Caps::version. Without
+            // syncobj support, version is (1, 3); fence_fd governs
+            // individual request availability rather than the version
+            // reply.
+            let server_major = caps.version.0;
+            let server_minor = caps.version.1;
+            let major = cmaj.min(server_major);
+            let minor = cmin.min(server_minor);
+            debug!(
+                "client {} #{} DRI3::QueryVersion client={cmaj}.{cmin} -> {major}.{minor}",
+                client_id.0, sequence.0
+            );
+            let reply = x11dri3::encode_query_version_reply(byte_order, sequence, major, minor);
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11dri3::OPEN => {
+            let req = x11dri3::parse_open(body);
+            let drawable = req.map_or(0, |r| r.drawable);
+            match backend.dri3_open(drawable) {
+                Ok(fd) => {
+                    debug!(
+                        "client {} #{} DRI3::Open drawable=0x{drawable:x} -> fd={}",
+                        client_id.0,
+                        sequence.0,
+                        std::os::fd::AsRawFd::as_raw_fd(&fd)
+                    );
+                    let reply = x11dri3::encode_open_reply(byte_order, sequence);
+                    let Some(client) = state.clients.get_mut(&client_id.0) else {
+                        return Ok(RequestOutcome::Handled);
+                    };
+                    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+                    if let Err(e) = send_reply_with_fd(client, &reply, raw) {
+                        log::warn!("DRI3::Open SCM_RIGHTS dispatch failed: {e}");
+                        return Ok(RequestOutcome::Disconnect(client_id));
+                    }
+                    drop(fd);
+                    return Ok(RequestOutcome::Handled);
+                }
+                Err(err) => {
+                    debug!(
+                        "client {} #{} DRI3::Open drawable=0x{drawable:x} -> BadAlloc ({err})",
+                        client_id.0, sequence.0
+                    );
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ALLOC,
+                        0,
+                        DRI3_MAJOR_OPCODE,
+                    );
+                }
+            }
+        }
+        x11dri3::PIXMAP_FROM_BUFFER => {
+            let Some(req) = x11dri3::parse_pixmap_from_buffer(body) else {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    DRI3_MAJOR_OPCODE,
+                );
+            };
+            let Some(fd) = attached_fd else {
+                debug!(
+                    "client {} #{} DRI3::PixmapFromBuffer no SCM_RIGHTS fd attached -> BadAlloc",
+                    client_id.0, sequence.0
+                );
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ALLOC,
+                    req.pixmap,
+                    DRI3_MAJOR_OPCODE,
+                );
+            };
+            match backend.dri3_import_pixmap(
+                fd,
+                req.width,
+                req.height,
+                u32::from(req.stride),
+                0,
+                0, // PixmapFromBuffer always implies LINEAR (no modifier).
+                req.depth,
+                req.bpp,
+            ) {
+                Ok(handle) => {
+                    debug!(
+                        "client {} #{} DRI3::PixmapFromBuffer pixmap=0x{:x} {}x{} stride={} depth={} bpp={} -> imported",
+                        client_id.0,
+                        sequence.0,
+                        req.pixmap,
+                        req.width,
+                        req.height,
+                        req.stride,
+                        req.depth,
+                        req.bpp,
+                    );
+                    state.resources.create_pixmap(
+                        client_id,
+                        yserver_protocol::x11::CreatePixmapRequest {
+                            pixmap: ResourceId(req.pixmap),
+                            drawable: ResourceId(req.drawable),
+                            width: req.width,
+                            height: req.height,
+                            depth: req.depth,
+                        },
+                    );
+                    let _ = state
+                        .resources
+                        .set_pixmap_host_xid(ResourceId(req.pixmap), handle);
+                }
+                Err(err) => {
+                    debug!(
+                        "client {} #{} DRI3::PixmapFromBuffer pixmap=0x{:x} -> BadAlloc ({err})",
+                        client_id.0, sequence.0, req.pixmap,
+                    );
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ALLOC,
+                        req.pixmap,
+                        DRI3_MAJOR_OPCODE,
+                    );
+                }
+            }
+        }
+        x11dri3::PIXMAP_FROM_BUFFERS => {
+            let Some(req) = x11dri3::parse_pixmap_from_buffers(body) else {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    DRI3_MAJOR_OPCODE,
+                );
+            };
+            // Phase 4.2 scope: single-plane RGB only. num_buffers > 1
+            // is wire-decoded (so logging is accurate) but rejected.
+            if req.num_buffers != 1 {
+                debug!(
+                    "client {} #{} DRI3::PixmapFromBuffers num_buffers={} -> BadAlloc \
+                     (multi-plane out of scope for Phase 4.2)",
+                    client_id.0, sequence.0, req.num_buffers
+                );
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ALLOC,
+                    req.pixmap,
+                    DRI3_MAJOR_OPCODE,
+                );
+            }
+            let Some(fd) = attached_fd else {
+                debug!(
+                    "client {} #{} DRI3::PixmapFromBuffers no SCM_RIGHTS fd attached -> BadAlloc",
+                    client_id.0, sequence.0
+                );
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ALLOC,
+                    req.pixmap,
+                    DRI3_MAJOR_OPCODE,
+                );
+            };
+            match backend.dri3_import_pixmap(
+                fd,
+                req.width,
+                req.height,
+                req.strides[0],
+                req.offsets[0],
+                req.modifier,
+                req.depth,
+                req.bpp,
+            ) {
+                Ok(handle) => {
+                    debug!(
+                        "client {} #{} DRI3::PixmapFromBuffers pixmap=0x{:x} {}x{} stride={} offset={} modifier=0x{:x} depth={} bpp={} -> imported",
+                        client_id.0,
+                        sequence.0,
+                        req.pixmap,
+                        req.width,
+                        req.height,
+                        req.strides[0],
+                        req.offsets[0],
+                        req.modifier,
+                        req.depth,
+                        req.bpp,
+                    );
+                    // Register the X resource id so subsequent
+                    // CopyArea / PresentPixmap can resolve it. Mirror
+                    // what handle_create_pixmap does.
+                    state.resources.create_pixmap(
+                        client_id,
+                        yserver_protocol::x11::CreatePixmapRequest {
+                            pixmap: ResourceId(req.pixmap),
+                            drawable: ResourceId(req.window),
+                            width: req.width,
+                            height: req.height,
+                            depth: req.depth,
+                        },
+                    );
+                    let _ = state
+                        .resources
+                        .set_pixmap_host_xid(ResourceId(req.pixmap), handle);
+                }
+                Err(err) => {
+                    debug!(
+                        "client {} #{} DRI3::PixmapFromBuffers pixmap=0x{:x} -> BadAlloc ({err})",
+                        client_id.0, sequence.0, req.pixmap,
+                    );
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ALLOC,
+                        req.pixmap,
+                        DRI3_MAJOR_OPCODE,
+                    );
+                }
+            }
+        }
+        x11dri3::BUFFER_FROM_PIXMAP => {
+            let Some(pixmap) = x11dri3::parse_buffer_from_pixmap(body) else {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    DRI3_MAJOR_OPCODE,
+                );
+            };
+            let host_xid = match state
+                .resources
+                .pixmap(yserver_protocol::x11::ResourceId(pixmap))
+                .and_then(|p| p.host_xid.map(|h| h.as_raw()))
+            {
+                Some(h) => h,
+                None => {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_DRAWABLE,
+                        pixmap,
+                        DRI3_MAJOR_OPCODE,
+                    );
+                }
+            };
+            match backend.dri3_export_pixmap(host_xid) {
+                Ok((size, width, height, stride, depth, bpp, fd)) => {
+                    debug!(
+                        "client {} #{} DRI3::BufferFromPixmap pixmap=0x{pixmap:x} size={size} {width}x{height} stride={stride} depth={depth} bpp={bpp}",
+                        client_id.0, sequence.0
+                    );
+                    let reply = x11dri3::encode_buffer_from_pixmap_reply(
+                        byte_order, sequence, size, width, height, stride, depth, bpp,
+                    );
+                    let Some(client) = state.clients.get_mut(&client_id.0) else {
+                        return Ok(RequestOutcome::Handled);
+                    };
+                    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+                    if let Err(e) = send_reply_with_fd(client, &reply, raw) {
+                        log::warn!("DRI3::BufferFromPixmap SCM_RIGHTS dispatch failed: {e}");
+                        return Ok(RequestOutcome::Disconnect(client_id));
+                    }
+                    drop(fd);
+                    return Ok(RequestOutcome::Handled);
+                }
+                Err(err) => {
+                    debug!(
+                        "client {} #{} DRI3::BufferFromPixmap pixmap=0x{pixmap:x} -> BadAlloc ({err})",
+                        client_id.0, sequence.0
+                    );
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ALLOC,
+                        pixmap,
+                        DRI3_MAJOR_OPCODE,
+                    );
+                }
+            }
+        }
+        x11dri3::BUFFERS_FROM_PIXMAP => {
+            // Phase 4.2 deferred per design §6 open question. The only
+            // realistic consumer is multi-plane screen recording;
+            // single-plane export uses BufferFromPixmap above.
+            debug!(
+                "client {} #{} DRI3::BuffersFromPixmap (deferred — single-plane only via BufferFromPixmap)",
+                client_id.0, sequence.0
+            );
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_ALLOC,
+                0,
+                DRI3_MAJOR_OPCODE,
+            );
+        }
+        x11dri3::GET_SUPPORTED_MODIFIERS => {
+            let req = match x11dri3::parse_get_supported_modifiers(body) {
+                Some(r) => r,
+                None => {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_LENGTH,
+                        0,
+                        DRI3_MAJOR_OPCODE,
+                    );
+                }
+            };
+            let (window_mods, screen_mods) =
+                backend.dri3_supported_modifiers(req.window, req.depth, req.bpp);
+            debug!(
+                "client {} #{} DRI3::GetSupportedModifiers w=0x{:x} d={} bpp={} -> {} window mods, {} screen mods",
+                client_id.0,
+                sequence.0,
+                req.window,
+                req.depth,
+                req.bpp,
+                window_mods.len(),
+                screen_mods.len(),
+            );
+            let reply = x11dri3::encode_get_supported_modifiers_reply(
+                byte_order,
+                sequence,
+                &window_mods,
+                &screen_mods,
+            );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11dri3::FENCE_FROM_FD => {
+            if !caps.fence_fd {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_IMPLEMENTATION,
+                    0,
+                    DRI3_MAJOR_OPCODE,
+                );
+            }
+            let Some(req) = x11dri3::parse_fence_from_fd(body) else {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    DRI3_MAJOR_OPCODE,
+                );
+            };
+            let Some(fd) = attached_fd else {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ALLOC,
+                    req.fence,
+                    DRI3_MAJOR_OPCODE,
+                );
+            };
+            // Best-effort import: many clients (Mesa included) send an
+            // fd that doesn't import cleanly via SYNC_FD on Venus
+            // passthrough. Per design §3.4 the GPU-side semaphore is
+            // an optimisation; XSync trigger/await semantics still
+            // work server-side via the fence resource. Always mirror
+            // onto state.sync_fences so QueryFence / TriggerFence /
+            // ResetFence behave correctly.
+            match backend.dri3_fence_from_fd(req.fence, fd) {
+                Ok(()) => {
+                    debug!(
+                        "client {} #{} DRI3::FenceFromFD 0x{:x} initially_triggered={} -> imported (semaphore-backed)",
+                        client_id.0, sequence.0, req.fence, req.initially_triggered
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "DRI3::FenceFromFD 0x{:x}: VkSemaphore import failed ({e}); \
+                         falling back to server-only fence (XSync trigger/await still works)",
+                        req.fence
+                    );
+                }
+            }
+            state.sync_fences.insert(
+                req.fence,
+                crate::server::SyncFence {
+                    owner: client_id,
+                    triggered: req.initially_triggered,
+                },
+            );
+        }
+        x11dri3::FD_FROM_FENCE => {
+            if !caps.fence_fd {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_IMPLEMENTATION,
+                    0,
+                    DRI3_MAJOR_OPCODE,
+                );
+            }
+            let Some(req) = x11dri3::parse_fd_from_fence(body) else {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    DRI3_MAJOR_OPCODE,
+                );
+            };
+            match backend.dri3_fd_from_fence(req.fence) {
+                Ok(fd) => {
+                    let reply = x11dri3::encode_fd_from_fence_reply(byte_order, sequence);
+                    let Some(client) = state.clients.get_mut(&client_id.0) else {
+                        return Ok(RequestOutcome::Handled);
+                    };
+                    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+                    if let Err(e) = send_reply_with_fd(client, &reply, raw) {
+                        log::warn!("DRI3::FDFromFence SCM_RIGHTS dispatch failed: {e}");
+                        return Ok(RequestOutcome::Disconnect(client_id));
+                    }
+                    drop(fd);
+                    return Ok(RequestOutcome::Handled);
+                }
+                Err(e) => {
+                    debug!(
+                        "client {} #{} DRI3::FDFromFence 0x{:x} -> BadAlloc ({e})",
+                        client_id.0, sequence.0, req.fence
+                    );
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ALLOC,
+                        req.fence,
+                        DRI3_MAJOR_OPCODE,
+                    );
+                }
+            }
+        }
+        x11dri3::IMPORT_SYNCOBJ => {
+            if !caps.syncobj {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_IMPLEMENTATION,
+                    0,
+                    DRI3_MAJOR_OPCODE,
+                );
+            }
+            let Some(req) = x11dri3::parse_import_syncobj(body) else {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    DRI3_MAJOR_OPCODE,
+                );
+            };
+            let Some(fd) = attached_fd else {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ALLOC,
+                    req.syncobj,
+                    DRI3_MAJOR_OPCODE,
+                );
+            };
+            if let Err(e) = backend.dri3_import_syncobj(req.syncobj, fd) {
+                debug!(
+                    "client {} #{} DRI3::ImportSyncobj 0x{:x} -> BadAlloc ({e})",
+                    client_id.0, sequence.0, req.syncobj
+                );
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ALLOC,
+                    req.syncobj,
+                    DRI3_MAJOR_OPCODE,
+                );
+            }
+        }
+        x11dri3::FREE_SYNCOBJ => {
+            if !caps.syncobj {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_IMPLEMENTATION,
+                    0,
+                    DRI3_MAJOR_OPCODE,
+                );
+            }
+            let Some(syncobj) = x11dri3::parse_free_syncobj(body) else {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    DRI3_MAJOR_OPCODE,
+                );
+            };
+            if let Err(e) = backend.dri3_free_syncobj(syncobj) {
+                debug!(
+                    "client {} #{} DRI3::FreeSyncobj 0x{:x} (warn: {e})",
+                    client_id.0, sequence.0, syncobj
+                );
+            }
+        }
+        x11dri3::SET_DRM_DEVICE_IN_USE => {
+            // Acknowledged but ignored — single-GPU only per design §1.
+            debug!(
+                "client {} #{} DRI3::SetDRMDeviceInUse (single-GPU; ignored)",
+                client_id.0, sequence.0
+            );
+        }
+        other => {
+            debug!(
+                "client {} #{} DRI3 minor={other} (stub, no-op)",
+                client_id.0, sequence.0
+            );
+        }
+    }
+    Ok(RequestOutcome::Handled)
+}
+
+/// Build the FBConfig list returned by `GetFBConfigs`. We synthesise
+/// from each X visual (depth-24 RGB and depth-32 ARGB) × single/
+/// double buffered, both with depth=24 stencil=8 (the universal
+/// default for OpenGL apps). 4 configs × 25 properties is enough
+/// for Mesa to pick a match for any common glXChooseFBConfig call
+/// without paying for the full ~30-cell sweep the design mentions.
+fn synthesise_glx_fb_configs() -> Vec<Vec<(u32, u32)>> {
+    use yserver_protocol::x11::glx as g;
+    let mut out = Vec::with_capacity(4);
+    let depth = 24;
+    let stencil = 8;
+    let mut next_fbconfig_id: u32 = 0x101;
+    for &(visual_id, alpha_size, total_buffer_size) in &[
+        // (X visual id, alpha bits, total color buffer bits)
+        (0x102_u32, 0_u32, 24_u32), // ROOT_VISUAL — TrueColor RGB
+        (0x103_u32, 8_u32, 32_u32), // ARGB_VISUAL — TrueColor RGBA
+    ] {
+        for &double_buffered in &[1u32, 0u32] {
+            let fbconfig_id = next_fbconfig_id;
+            next_fbconfig_id += 1;
+            out.push(vec![
+                (g::GLX_VISUAL_ID, visual_id),
+                (g::GLX_FBCONFIG_ID, fbconfig_id),
+                (g::GLX_X_VISUAL_TYPE, g::GLX_TRUE_COLOR),
+                (g::GLX_DRAWABLE_TYPE, g::GLX_WINDOW_BIT | g::GLX_PIXMAP_BIT),
+                (g::GLX_RENDER_TYPE, g::GLX_RGBA_BIT),
+                (g::GLX_X_RENDERABLE, 1),
+                (g::GLX_BUFFER_SIZE, total_buffer_size),
+                (g::GLX_LEVEL, 0),
+                (g::GLX_DOUBLEBUFFER, double_buffered),
+                (g::GLX_STEREO, 0),
+                (g::GLX_AUX_BUFFERS, 0),
+                (g::GLX_RED_SIZE, 8),
+                (g::GLX_GREEN_SIZE, 8),
+                (g::GLX_BLUE_SIZE, 8),
+                (g::GLX_ALPHA_SIZE, alpha_size),
+                (g::GLX_DEPTH_SIZE, depth),
+                (g::GLX_STENCIL_SIZE, stencil),
+                (g::GLX_ACCUM_RED_SIZE, 0),
+                (g::GLX_ACCUM_GREEN_SIZE, 0),
+                (g::GLX_ACCUM_BLUE_SIZE, 0),
+                (g::GLX_ACCUM_ALPHA_SIZE, 0),
+                (g::GLX_CONFIG_CAVEAT, g::GLX_NONE),
+                (g::GLX_TRANSPARENT_TYPE, g::GLX_NONE),
+                (g::GLX_SAMPLE_BUFFERS, 0),
+                (g::GLX_SAMPLES, 0),
+            ]);
+        }
+    }
+    out
+}
+
+fn handle_glx_request(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::{ClientByteOrder, glx as x11glx};
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
+    let minor = header.data;
+    match minor {
+        x11glx::QUERY_VERSION => {
+            let (cmaj, cmin) = x11glx::parse_query_version(body).unwrap_or((0, 0));
+            let major = cmaj.min(x11glx::MAJOR_VERSION);
+            let minor = cmin.min(x11glx::MINOR_VERSION);
+            debug!(
+                "client {} #{} GLX::QueryVersion client={cmaj}.{cmin} -> {major}.{minor}",
+                client_id.0, sequence.0
+            );
+            let reply = x11glx::encode_query_version_reply(byte_order, sequence, major, minor);
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11glx::QUERY_SERVER_STRING => {
+            let req = x11glx::parse_query_server_string(body);
+            let name = req.map_or(0, |r| r.name);
+            let s = match name {
+                x11glx::STRING_VENDOR => "yserver",
+                x11glx::STRING_VERSION => "1.4",
+                x11glx::STRING_EXTENSIONS => "",
+                _ => "",
+            };
+            let reply = x11glx::encode_string_reply(byte_order, sequence, s);
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11glx::QUERY_EXTENSIONS_STRING => {
+            // Per design §3.5 — list of GLX extensions Mesa probes for.
+            let exts = "GLX_ARB_create_context GLX_ARB_create_context_profile \
+                GLX_EXT_create_context_es2_profile GLX_EXT_buffer_age GLX_EXT_swap_control \
+                GLX_INTEL_swap_event GLX_ARB_fbconfig_float GLX_EXT_visual_info \
+                GLX_EXT_visual_rating GLX_EXT_import_context";
+            let reply = x11glx::encode_string_reply(byte_order, sequence, exts);
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11glx::CLIENT_INFO | x11glx::SET_CLIENT_INFO_ARB | x11glx::SET_CLIENT_INFO_2_ARB => {
+            // Drop on the floor — Mesa sends one of these on connect
+            // carrying its GL/GLX/GLES versions; we don't act on them.
+            debug!(
+                "client {} #{} GLX::ClientInfo* minor={} body_len={}",
+                client_id.0,
+                sequence.0,
+                minor,
+                body.len()
+            );
+        }
+        x11glx::IS_DIRECT => {
+            // We always claim direct rendering; the actual GL execution
+            // happens client-side via libGLX_mesa hitting our DRI3
+            // backend.
+            let reply = x11glx::encode_is_direct_reply(byte_order, sequence, true);
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11glx::GET_FB_CONFIGS => {
+            // Synthesise FBConfigs from each X visual × singleBuf /
+            // doubleBuf. Mesa picks one matching the app's request
+            // via glXChooseFBConfig.
+            let configs = synthesise_glx_fb_configs();
+            let config_refs: Vec<&[(u32, u32)]> = configs.iter().map(|c| c.as_slice()).collect();
+            let reply = x11glx::encode_get_fb_configs_reply(byte_order, sequence, &config_refs);
+            debug!(
+                "client {} #{} GLX::GetFBConfigs -> {} configs × {} props",
+                client_id.0,
+                sequence.0,
+                config_refs.len(),
+                config_refs.first().map_or(0, |c| c.len()),
+            );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11glx::GET_VISUAL_CONFIGS => {
+            // GLX 1.2 GetVisualConfigs uses a different reply shape
+            // (fixed-size xVisualConfig structs, not GetFBConfigs's
+            // attrib/value pair grid). For Phase 4.2 first cut we
+            // reply empty — Mesa falls through to GetFBConfigs which
+            // now returns real data.
+            let reply = x11glx::encode_get_fb_configs_empty_reply(byte_order, sequence);
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11glx::CREATE_NEW_CONTEXT
+        | x11glx::CREATE_CONTEXT_ATTRIBS_ARB
+        | x11glx::CREATE_CONTEXT
+        | x11glx::DESTROY_CONTEXT
+        | x11glx::MAKE_CURRENT
+        | x11glx::MAKE_CONTEXT_CURRENT => {
+            // Bookkeeping only — the design specifies we never execute
+            // GL. Phase 4.2.5 first cut just logs; a future commit can
+            // allocate a `GlxContext` resource and track
+            // (context, drawable) pairs per client if any client cares.
+            debug!(
+                "client {} #{} GLX context op minor={}",
+                client_id.0, sequence.0, minor
+            );
+        }
+        x11glx::WAIT_GL | x11glx::WAIT_X => {
+            // No-op for direct contexts.
+            debug!(
+                "client {} #{} GLX::Wait{}",
+                client_id.0,
+                sequence.0,
+                if minor == x11glx::WAIT_GL { "GL" } else { "X" }
+            );
+        }
+        x11glx::VENDOR_PRIVATE | x11glx::VENDOR_PRIVATE_WITH_REPLY => {
+            // Modern Mesa direct-rendering doesn't go this route.
+            debug!(
+                "client {} #{} GLX::VendorPrivate (rejected: GLXUnsupportedPrivateRequest)",
+                client_id.0, sequence.0
+            );
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                crate::nested::GLX_FIRST_ERROR
+                    + yserver_protocol::x11::glx::ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST,
+                0,
+                crate::nested::GLX_MAJOR_OPCODE,
+            );
+        }
+        other => {
+            // Indirect-rendering opcodes 1..=198 + anything else we
+            // don't handle → GLXBadRequest.
+            debug!(
+                "client {} #{} GLX unsupported minor={other} -> GLXBadRequest",
+                client_id.0, sequence.0
+            );
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                crate::nested::GLX_FIRST_ERROR + yserver_protocol::x11::glx::ERROR_GLX_BAD_REQUEST,
+                0,
+                crate::nested::GLX_MAJOR_OPCODE,
             );
         }
     }
@@ -4132,6 +5318,7 @@ fn extension_query_reply(name: &str, backend: &mut dyn Backend) -> Option<(u8, u
         ExtensionAvailability::Always => true,
         ExtensionAvailability::HostRender => backend.render_opcode().is_some(),
         ExtensionAvailability::HostXkb => backend.xkb_opcode().is_some(),
+        ExtensionAvailability::Dri3 => backend.dri3_capabilities().version != (0, 0),
     };
     if !available {
         return None;
@@ -4147,12 +5334,14 @@ fn advertised_extension_names(backend: &mut dyn Backend) -> Vec<&'static str> {
     use crate::nested::{EXTENSIONS, ExtensionAvailability};
     let render_available = backend.render_opcode().is_some();
     let xkb_available = backend.xkb_opcode().is_some();
+    let dri3_available = backend.dri3_capabilities().version != (0, 0);
     EXTENSIONS
         .iter()
         .filter(|ext| match ext.availability {
             ExtensionAvailability::Always => true,
             ExtensionAvailability::HostRender => render_available,
             ExtensionAvailability::HostXkb => xkb_available,
+            ExtensionAvailability::Dri3 => dri3_available,
         })
         .map(|ext| ext.name)
         .collect()
@@ -7986,6 +9175,225 @@ mod tests {
         peer.read_exact(&mut buf).unwrap();
         assert_eq!(buf[0], 1, "Reply opcode");
         assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 11);
+    }
+
+    #[test]
+    fn dri3_hidden_when_caps_unsupported() {
+        // Default RecordingBackend returns Dri3Caps::unsupported()
+        // (version (0, 0)), so DRI3 must not appear in QueryExtension /
+        // ListExtensions output. KmsBackend overrides
+        // dri3_capabilities() and the Phase 4.2 vng smoke covers the
+        // advertised path.
+        let mut backend = RecordingBackend::new();
+        assert!(extension_query_reply("DRI3", &mut backend).is_none());
+        let names = advertised_extension_names(&mut backend);
+        assert!(
+            !names.contains(&"DRI3"),
+            "DRI3 should be hidden when caps unsupported, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn sync_create_trigger_query_fence_round_trip() {
+        let mut state = ServerState::new();
+        let peer_a = install_client(&mut state, 1);
+        let mut peer_b = install_client(&mut state, 2);
+        let mut backend = RecordingBackend::new();
+
+        // Client A: CreateFence(fence=0x42, initially_triggered=false).
+        let mut create_body = vec![0u8; 12];
+        create_body[0..4].copy_from_slice(&0u32.to_le_bytes()); // drawable=0
+        create_body[4..8].copy_from_slice(&0x42u32.to_le_bytes());
+        create_body[8] = 0;
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 142,
+                data: 14, // CREATE_FENCE
+                length_units: 4,
+            },
+            &create_body,
+            None,
+        )
+        .unwrap();
+
+        // Client B: QueryFence -> triggered=false initially.
+        let mut q_body = vec![0u8; 4];
+        q_body[0..4].copy_from_slice(&0x42u32.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 142,
+                data: 20, // QUERY_FENCE
+                length_units: 2,
+            },
+            &q_body,
+            None,
+        )
+        .unwrap();
+        peer_b.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer_b.read_exact(&mut buf).unwrap();
+        assert_eq!(buf[0], 1); // Reply
+        assert_eq!(buf[8], 0, "fence not yet triggered");
+
+        // Client A: TriggerFence.
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 142,
+                data: 18, // TRIGGER_FENCE
+                length_units: 2,
+            },
+            &q_body,
+            None,
+        )
+        .unwrap();
+
+        // Client B: QueryFence -> triggered=true now.
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(2),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 142,
+                data: 20,
+                length_units: 2,
+            },
+            &q_body,
+            None,
+        )
+        .unwrap();
+        let mut buf2 = [0u8; 32];
+        peer_b.read_exact(&mut buf2).unwrap();
+        assert_eq!(buf2[8], 1, "fence triggered after Client A's trigger");
+
+        // Stash peer_a so it doesn't drop and close the writer mid-test.
+        let _ = peer_a;
+    }
+
+    #[test]
+    fn dri3_get_supported_modifiers_default_window_subset_screen() {
+        // Default Backend::dri3_supported_modifiers returns
+        // ([LINEAR], [LINEAR]); the window list must always be a
+        // subset of the screen list per design §3.2.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let mut body = vec![0u8; 8];
+        body[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes()); // window
+        body[4] = 24;
+        body[5] = 32;
+        let outcome = process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(11),
+            RequestHeader {
+                opcode: 147,
+                data: 6, // GET_SUPPORTED_MODIFIERS
+                length_units: 3,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(outcome, RequestOutcome::Handled));
+        peer.set_nonblocking(true).unwrap();
+        // Reply: 32-byte header + 8*nwin + 8*nscr; nwin=nscr=1.
+        let mut buf = [0u8; 48];
+        peer.read_exact(&mut buf).expect("reply bytes delivered");
+        assert_eq!(buf[0], 1, "expected Reply, got opcode {}", buf[0]);
+        let nwin = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let nscr = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+        assert!(nwin <= nscr, "window-list must be subset: {nwin} > {nscr}");
+        assert_eq!(nwin, 1);
+        assert_eq!(nscr, 1);
+        let m_win = u64::from_le_bytes(buf[32..40].try_into().unwrap());
+        let m_scr = u64::from_le_bytes(buf[40..48].try_into().unwrap());
+        assert_eq!(m_win, 0); // LINEAR
+        assert_eq!(m_scr, 0);
+    }
+
+    #[test]
+    fn dri3_pixmap_from_buffers_rejects_multi_plane() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // 60-byte body with num_buffers=2 (multi-plane). Phase 4.2
+        // accepts only num_buffers==1; everything else returns
+        // BadAlloc per design "single-plane RGB only" scope.
+        let mut body = vec![0u8; 60];
+        body[0..4].copy_from_slice(&0xAAAA_AAAAu32.to_le_bytes()); // pixmap xid
+        body[4..8].copy_from_slice(&0xBBBB_BBBBu32.to_le_bytes()); // window xid
+        body[8] = 2; // num_buffers
+        let outcome = process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(5),
+            RequestHeader {
+                opcode: 147,
+                data: 7, // PIXMAP_FROM_BUFFERS
+                length_units: 16,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(outcome, RequestOutcome::Handled));
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).expect("error bytes delivered");
+        assert_eq!(buf[0], 0, "expected Error, got opcode {}", buf[0]);
+        assert_eq!(buf[1], 11, "expected BadAlloc (11), got {}", buf[1]);
+    }
+
+    #[test]
+    fn dri3_open_emits_bad_alloc_when_backend_unsupported() {
+        // RecordingBackend's default Backend::dri3_open returns Err
+        // (DRI3 unsupported). The dispatcher must convert that to a
+        // BadAlloc error event, not a successful reply.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let mut body = vec![0u8; 8];
+        body[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes()); // drawable
+        body[4..8].copy_from_slice(&0u32.to_le_bytes()); // provider
+        let outcome = process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 147,
+                data: 1, // OPEN
+                length_units: 3,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(outcome, RequestOutcome::Handled));
+        // Read 32 bytes from the peer end of the client's UnixStream:
+        // X errors are 32-byte fixed-size messages with opcode 0 in
+        // byte 0 and the error code in byte 1.
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf)
+            .expect("error bytes delivered to peer");
+        assert_eq!(buf[0], 0, "expected Error (opcode 0), got {}", buf[0]);
+        assert_eq!(buf[1], 11, "expected BadAlloc (11), got {}", buf[1]);
     }
 
     #[test]

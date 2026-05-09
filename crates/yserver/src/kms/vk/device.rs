@@ -27,6 +27,11 @@ pub struct VkContext {
     pub device: ash::Device,
     pub external_semaphore_fd: ash::khr::external_semaphore_fd::Device,
     pub external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
+    /// True when `VK_EXT_image_drm_format_modifier` is enabled on the
+    /// device. Phase 4.2 DRI3 import needs this for non-LINEAR tilings;
+    /// when false, `kms::vk::dri3::supported_modifiers` returns
+    /// `[DRM_FORMAT_MOD_LINEAR]` per design §4 fallback matrix.
+    pub image_drm_format_modifier: bool,
     pub graphics_queue_family: u32,
     pub graphics_queue: vk::Queue,
     pub debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
@@ -112,12 +117,15 @@ impl VkContext {
         // - VK_KHR_external_semaphore_fd: vkGetSemaphoreFdKHR(SYNC_FD)
         //   for the IN_FENCE_FD handoff to KMS.
         //
+        // Phase 4.2 reintroduction: VK_EXT_image_drm_format_modifier
+        // is now requested for DRI3 tiled-image import. Drivers that
+        // lack it (notably lavapipe at the time of writing) will still
+        // function — `supported_modifiers` returns `[LINEAR]` per the
+        // design §4 fallback matrix.
+        //
         // Intentionally NOT requested:
         // - VK_KHR_swapchain — WSI is out of scope (design §1); KMS
         //   pageflip is our presentation path.
-        // - VK_EXT_image_drm_format_modifier — Vulkan-first uses
-        //   TILING_LINEAR, no modifier handle to communicate to KMS.
-        //   Will be reintroduced if 4.1.4+ wants tiled scanout images.
         // - VK_KHR_dynamic_rendering_local_read — only Phase 4.1.4.6
         //   ShaderRMW PictOps need this; deferred until that lands.
         //
@@ -129,6 +137,7 @@ impl VkContext {
             ash::khr::external_memory_fd::NAME,
             ash::ext::external_memory_dma_buf::NAME,
             ash::khr::external_semaphore_fd::NAME,
+            ash::ext::image_drm_format_modifier::NAME,
         ];
         let supported_device_exts =
             match unsafe { instance.enumerate_device_extension_properties(physical_device) } {
@@ -186,8 +195,13 @@ impl VkContext {
         // pad and the natural alignment of `RenderPushConsts` /
         // `CompositePushConsts` keep std430 layout intact and stay
         // compatible.
-        let mut features12 =
-            vk::PhysicalDeviceVulkan12Features::default().scalar_block_layout(true);
+        // `timelineSemaphore` is core in Vulkan 1.2 and is required by
+        // Phase 4.2.2's `import_drm_syncobj` (DRI3 ImportSyncobj path).
+        // Harmless when the syncobj cap is false because the dispatcher
+        // gate rejects requests before they reach the import call.
+        let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
+            .scalar_block_layout(true)
+            .timeline_semaphore(true);
 
         // `logicOp` enables the per-attachment logical-op state used
         // by the Phase 4.1.5 GC-function fill path (Xor / And / Or
@@ -232,6 +246,8 @@ impl VkContext {
         } else {
             None
         };
+        let image_drm_format_modifier =
+            device_extension_names.contains(&ash::ext::image_drm_format_modifier::NAME);
 
         // Driver-id query. Diagnostic-only after the Vulkan-first
         // pivot — no path branches on it. Kept so future quirks can
@@ -251,6 +267,7 @@ impl VkContext {
             device,
             external_semaphore_fd,
             external_memory_fd,
+            image_drm_format_modifier,
             graphics_queue_family,
             graphics_queue,
             debug_messenger,

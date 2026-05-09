@@ -46,6 +46,126 @@ pub enum BackendFdKind {
 /// without depending on the host module.
 pub use crate::host_x11::HostSocketStatus;
 
+/// Present capability surface. Phase 4.2 design §4. Per-window
+/// because Present's `QueryCapabilities` is per-window in the wire
+/// protocol; in single-output single-GPU configurations the same
+/// values are returned for every window.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PresentCaps {
+    /// Both KMS plane `IN_FENCE_FD` property *and* CRTC `OUT_FENCE_PTR`
+    /// are available; explicit-fence flip handshake works. When
+    /// false, the path selector short-circuits to `Copy` regardless
+    /// of pixmap/window match per design §3.3.1.
+    pub flip_path: bool,
+    /// `DRM_MODE_ATOMIC_NONBLOCK` accepted by the kernel — the
+    /// `PresentOptionAsyncMayTear` bit is honourable. When false,
+    /// the bit is **silently cleared** on incoming requests (per
+    /// design §4 row "Kernel rejects DRM_MODE_ATOMIC_NONBLOCK"),
+    /// not folded into `PresentOptionAsync`.
+    pub async_may_tear: bool,
+    /// `Dri3Caps::syncobj` mirror — Present syncobj cap requires
+    /// DRI3 syncobj support to be useful, so we don't advertise it
+    /// without DRI3-side timeline plumbing.
+    pub syncobj: bool,
+}
+
+impl PresentCaps {
+    /// Encode as a `u32` for the `QueryCapabilities` reply.
+    /// `presentproto` bit assignments:
+    ///  - `Async` (0x1)        — Phase 4.2 advertises if `flip_path`.
+    ///  - `Fence` (0x2)        — XSync `Fence` always supported once
+    ///    DRI3 fence_fd cap is true; Phase 4.2 always advertises.
+    ///  - `UST` (0x4)          — vblank UST timestamps; Phase 4.1's
+    ///    pageflip path already produces these.
+    ///  - `AsyncMayTear` (0x8) — `async_may_tear`.
+    ///  - `Syncobj` (0x10)     — `syncobj`.
+    #[must_use]
+    pub fn encode(self) -> u32 {
+        const ASYNC: u32 = 0x1;
+        const FENCE: u32 = 0x2;
+        const UST: u32 = 0x4;
+        const ASYNC_MAY_TEAR: u32 = 0x8;
+        const SYNCOBJ: u32 = 0x10;
+        let mut out = FENCE | UST;
+        if self.flip_path {
+            out |= ASYNC;
+        }
+        if self.async_may_tear {
+            out |= ASYNC_MAY_TEAR;
+        }
+        if self.syncobj {
+            out |= SYNCOBJ;
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod present_caps_tests {
+    use super::PresentCaps;
+
+    #[test]
+    fn default_advertises_fence_and_ust() {
+        // Default = all-false: still advertises Fence + UST per
+        // Phase 4.2 (Fence is from XSync, UST from existing pageflip
+        // path), but not Async / AsyncMayTear / Syncobj.
+        let bits = PresentCaps::default().encode();
+        assert_eq!(bits & 0x1, 0, "Async unset without flip_path");
+        assert_eq!(bits & 0x2, 0x2, "Fence advertised");
+        assert_eq!(bits & 0x4, 0x4, "UST advertised");
+        assert_eq!(bits & 0x8, 0, "AsyncMayTear unset");
+        assert_eq!(bits & 0x10, 0, "Syncobj unset");
+    }
+
+    #[test]
+    fn full_caps_set_all_bits() {
+        let caps = PresentCaps {
+            flip_path: true,
+            async_may_tear: true,
+            syncobj: true,
+        };
+        assert_eq!(caps.encode(), 0x1 | 0x2 | 0x4 | 0x8 | 0x10);
+    }
+}
+
+/// DRI3 capability surface. Phase 4.2 design §4. `version == (0, 0)`
+/// is the "DRI3 unsupported" sentinel; any other value advertises
+/// DRI3 to clients. The other booleans gate individual request types
+/// rather than the whole extension.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Dri3Caps {
+    /// Max DRI3 version this backend can serve. `(0, 0)` = unsupported.
+    pub version: (u32, u32),
+    /// `VK_EXT_image_drm_format_modifier` enabled — non-LINEAR
+    /// modifiers can be imported. When false, `GetSupportedModifiers`
+    /// only advertises `DRM_FORMAT_MOD_LINEAR`.
+    pub modifiers: bool,
+    /// `VK_KHR_external_semaphore_fd` with `SYNC_FD` handle type
+    /// available — XSync `Fence` import via `FenceFromFD` works.
+    /// When false, those requests reject with `BadImplementation`
+    /// per the §4 fallback matrix.
+    pub fence_fd: bool,
+    /// `VK_KHR_external_semaphore_fd` `OPAQUE_FD` +
+    /// `VK_KHR_timeline_semaphore` + DRM_SYNCOBJ ioctls all
+    /// available. When false, `ImportSyncobj` / `FreeSyncobj` reject
+    /// and the advertised version caps at `(1, 3)`.
+    pub syncobj: bool,
+}
+
+impl Dri3Caps {
+    /// The "DRI3 unsupported" sentinel. Used as the default-impl
+    /// return value on backends that don't speak DRI3.
+    #[must_use]
+    pub const fn unsupported() -> Self {
+        Self {
+            version: (0, 0),
+            modifiers: false,
+            fence_fd: false,
+            syncobj: false,
+        }
+    }
+}
+
 /// The dynamic backend surface. `Send` is required so that
 /// `Arc<Mutex<dyn Backend>>` is `Send + Sync` (`Mutex<T>` is Sync iff
 /// `T: Send`). `Sync` on the trait itself is not required because all
@@ -679,6 +799,143 @@ pub trait Backend: Send {
     ) -> io::Result<()>;
 
     fn render_query_version(&mut self, origin: Option<OriginContext>) -> io::Result<(u32, u32)>;
+
+    // ──────────────────────────────────────────────────────────────
+    // DRI3 (Phase 4.2)
+    // ──────────────────────────────────────────────────────────────
+
+    /// Hand the client a render-node fd matching the scanout device.
+    /// Default impl: DRI3 unsupported on this backend (HostX11Backend
+    /// and `RecordingBackend` keep the default; KmsBackend overrides).
+    /// On success the returned fd's ownership transfers to the caller,
+    /// which dispatches it to the client via `SCM_RIGHTS`.
+    ///
+    /// `_drawable` is currently unused (single-GPU only — the fd is
+    /// the same regardless of which drawable triggered the request).
+    fn dri3_open(&mut self, _drawable: u32) -> io::Result<std::os::fd::OwnedFd> {
+        Err(io::Error::other("DRI3 unsupported on this backend"))
+    }
+
+    /// DRI3 capability surface. The `(0, 0)` sentinel for `version`
+    /// signals "DRI3 entirely unsupported"; the dispatcher's
+    /// extension-query path filters DRI3 out of `EXTENSIONS` in that
+    /// case. `modifiers`, `fence_fd`, `syncobj` are sub-capabilities
+    /// that gate individual requests rather than the whole extension
+    /// — see the §4 fallback matrix.
+    fn dri3_capabilities(&self) -> Dri3Caps {
+        Dri3Caps::unsupported()
+    }
+
+    /// Import a client-supplied dma-buf as a server-owned pixmap and
+    /// return the host xid the dispatcher should bind. The `fd`
+    /// ownership transfers into the backend on success; on Err the
+    /// fd is dropped (closed) by the OwnedFd's normal drop path.
+    ///
+    /// Phase 4.2 only handles single-plane (RGB) imports; the
+    /// multi-plane variant of `PixmapFromBuffers` is rejected at the
+    /// dispatcher.
+    #[allow(clippy::too_many_arguments)]
+    fn dri3_import_pixmap(
+        &mut self,
+        _fd: std::os::fd::OwnedFd,
+        _width: u16,
+        _height: u16,
+        _stride: u32,
+        _offset: u32,
+        _modifier: u64,
+        _depth: u8,
+        _bpp: u8,
+    ) -> io::Result<PixmapHandle> {
+        Err(io::Error::other("DRI3 import unsupported on this backend"))
+    }
+
+    /// Return `(window_modifiers, screen_modifiers)` for the
+    /// `(depth, bpp)` X format under the given window. Per design
+    /// §3.2: screen list is the full GPU-supported set; window list
+    /// is the subset that the window's output can flip-scanout (so
+    /// `window_modifiers ⊆ screen_modifiers` always holds).
+    ///
+    /// Default impl returns `[LINEAR]` for both lists — backends
+    /// that lack `VK_EXT_image_drm_format_modifier` end up here per
+    /// the design §4 fallback matrix row 1.
+    fn dri3_supported_modifiers(&self, _window: u32, _depth: u8, _bpp: u8) -> (Vec<u64>, Vec<u64>) {
+        // 0 == DRM_FORMAT_MOD_LINEAR.
+        (vec![0], vec![0])
+    }
+
+    /// Export an existing pixmap's backing memory as a fresh dma-buf
+    /// fd plus the metadata `BufferFromPixmap` reply needs. Phase 4.2
+    /// design §3.2. Returns `(size, width, height, stride, depth, bpp,
+    /// fd)`. The fd's ownership transfers to the caller.
+    ///
+    /// Default impl is unsupported.
+    fn dri3_export_pixmap(
+        &mut self,
+        _host_xid: u32,
+    ) -> io::Result<(u32, u16, u16, u16, u8, u8, std::os::fd::OwnedFd)> {
+        Err(io::Error::other("DRI3 export unsupported on this backend"))
+    }
+
+    /// Import a `sync_file` fd as the backing of an XSync `Fence`
+    /// resource. The fd ownership transfers into the backend; on
+    /// success the backend owns a `VkSemaphore` keyed by `fence_xid`.
+    ///
+    /// Default impl is unsupported.
+    fn dri3_fence_from_fd(&mut self, _fence_xid: u32, _fd: std::os::fd::OwnedFd) -> io::Result<()> {
+        Err(io::Error::other("DRI3 FenceFromFD unsupported"))
+    }
+
+    /// Export the `VkSemaphore` backing `fence_xid` as a fresh
+    /// `sync_file` fd. Returned fd's ownership transfers to the
+    /// caller.
+    ///
+    /// Default impl is unsupported.
+    fn dri3_fd_from_fence(&mut self, _fence_xid: u32) -> io::Result<std::os::fd::OwnedFd> {
+        Err(io::Error::other("DRI3 FDFromFence unsupported"))
+    }
+
+    /// Import a `DRM_SYNCOBJ` fd as a timeline `VkSemaphore` keyed by
+    /// `syncobj_xid`. fd ownership transfers in.
+    ///
+    /// Default impl is unsupported.
+    fn dri3_import_syncobj(
+        &mut self,
+        _syncobj_xid: u32,
+        _fd: std::os::fd::OwnedFd,
+    ) -> io::Result<()> {
+        Err(io::Error::other("DRI3 ImportSyncobj unsupported"))
+    }
+
+    /// Drop the timeline `VkSemaphore` keyed by `syncobj_xid`.
+    fn dri3_free_syncobj(&mut self, _syncobj_xid: u32) -> io::Result<()> {
+        Err(io::Error::other("DRI3 FreeSyncobj unsupported"))
+    }
+
+    /// Host-signal the timeline `VkSemaphore` keyed by `syncobj_xid`
+    /// to `value`. Used by `PresentPixmapSynced`'s Copy path: when
+    /// the synchronous CopyArea completes, signal the client's
+    /// `release_syncobj` so Mesa's `vkAcquireNextImage` wakes up.
+    /// Phase 4.2 design §3.3.2.
+    fn dri3_signal_syncobj(&mut self, _syncobj_xid: u32, _value: u64) -> io::Result<()> {
+        Err(io::Error::other("DRI3 SignalSyncobj unsupported"))
+    }
+
+    /// Trigger an XSync `Fence` resource imported via DRI3
+    /// `FenceFromFD`. For xshmfence-backed fences (Mesa's
+    /// loader_dri3) this calls `xshmfence_trigger`, atomically
+    /// setting the shared counter and waking any process waiting on
+    /// the futex. Used by `PresentPixmap`'s Copy path to signal
+    /// `idle_fence` when the GPU finishes reading.
+    fn dri3_trigger_fence(&mut self, _fence_xid: u32) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Per-window Present capability surface. Default impl: all-false
+    /// (Copy-only, no syncobj). KmsBackend overrides;
+    /// `HostX11Backend` and `RecordingBackend` keep the default.
+    fn present_capabilities(&self, _window: u32) -> PresentCaps {
+        PresentCaps::default()
+    }
 
     // ──────────────────────────────────────────────────────────────
     // Other extensions
