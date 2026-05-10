@@ -307,9 +307,9 @@ yserver-wmaker-xterm mode="1024x768" log="trace":
 # Closing xterm terminates the recipe; yserver is then SIGTERMed and
 # the DRM master is released cleanly.
 yserver-fvwm3-xterm-hw log="debug":
-    cargo build --release --bin yserver
+    cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 fvwm3 > fvwm3-hw.log 2>&1 &\
@@ -324,9 +324,9 @@ yserver-fvwm3-xterm-hw log="debug":
 # frame, but it should still render its own content + the cursor
 # should track the mouse.
 yserver-xterm-only-hw log="debug":
-    cargo build --release --bin yserver
+    cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 xterm;\
@@ -335,9 +335,9 @@ yserver-xterm-only-hw log="debug":
         echo "yserver log: yserver-hw.log"'
 
 yserver-e16-xterm-hw log="debug":
-    cargo build --release --bin yserver
+    cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/release/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 e16 > e16-hw.log 2>&1 &\
@@ -349,9 +349,9 @@ yserver-e16-xterm-hw log="debug":
         echo "e16 log:   e16-hw.log"'
 
 yserver-wmaker-xterm-hw log="debug":
-    cargo build --release --bin yserver
+    cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 wmaker > wmaker-hw.log 2>&1 &\
@@ -363,9 +363,9 @@ yserver-wmaker-xterm-hw log="debug":
         echo "wmaker log:   wmaker-hw.log"'
 
 yserver-xfce-hw log="debug":
-    cargo build --release --bin yserver
+    cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 dbus-run-session xfce4-session --display :7 > xfce.log 2>&1;\
@@ -380,9 +380,9 @@ yserver-xfce-hw log="debug":
 # with the yserver log to correlate Mesa's expectations against the
 # DRI3 / GLX requests we actually see.
 yserver-glxgears-hw log="debug":
-    cargo build --release --bin yserver
+    cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 LIBGL_DEBUG=verbose MESA_DEBUG=1 glxgears > glxgears.log 2>&1;\

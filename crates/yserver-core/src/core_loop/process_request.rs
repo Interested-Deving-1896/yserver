@@ -3303,6 +3303,13 @@ fn handle_present_request(
         .get(&client_id.0)
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
+    debug!(
+        "client {} #{} PRESENT dispatch minor={} body.len()={}",
+        client_id.0,
+        sequence.0,
+        minor,
+        body.len()
+    );
     match minor {
         x11present::QUERY_VERSION => {
             let _ = x11present::parse_query_version(body);

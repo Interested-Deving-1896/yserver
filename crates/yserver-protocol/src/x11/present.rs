@@ -140,15 +140,16 @@ pub fn parse_pixmap(body: &[u8]) -> Option<PixmapRequest> {
 
 #[must_use]
 pub fn parse_pixmap_synced(body: &[u8]) -> Option<PixmapSyncedRequest> {
-    // Body: window(4) pixmap(4) serial(4) valid(4) update(4) x_off(2)
+    // Layout per /usr/share/xcb/present.xml `PixmapSynced` (opcode 5):
+    //   window(4) pixmap(4) serial(4) valid(4) update(4) x_off(2)
     //   y_off(2) target_crtc(4) acquire_syncobj(4) release_syncobj(4)
-    //   pad(4) acquire_value(8) release_value(8) options(4) pad(4)
+    //   acquire_point(8) release_point(8) options(4) pad(4)
     //   target_msc(8) divisor(8) remainder(8) notifies[N](8 each).
-    // Fixed prefix = 92 bytes; trailing notifies are 8 each.
-    if body.len() < 92 || !(body.len() - 92).is_multiple_of(8) {
+    // Fixed prefix = 84 bytes; trailing notifies are 8 each.
+    if body.len() < 84 || !(body.len() - 84).is_multiple_of(8) {
         return None;
     }
-    let notifies = body[92..]
+    let notifies = body[84..]
         .chunks_exact(8)
         .map(|chunk| Notify {
             window: read_u32_le(chunk),
@@ -166,14 +167,13 @@ pub fn parse_pixmap_synced(body: &[u8]) -> Option<PixmapSyncedRequest> {
         target_crtc: read_u32_le(&body[24..]),
         acquire_syncobj: read_u32_le(&body[28..]),
         release_syncobj: read_u32_le(&body[32..]),
-        // 4 bytes pad at offset 36
-        acquire_value: read_u64_le(&body[40..]),
-        release_value: read_u64_le(&body[48..]),
-        options: read_u32_le(&body[56..]),
-        // 4 bytes pad at offset 60
-        target_msc: read_u64_le(&body[64..]),
-        divisor: read_u64_le(&body[72..]),
-        remainder: read_u64_le(&body[80..]),
+        acquire_value: read_u64_le(&body[36..]),
+        release_value: read_u64_le(&body[44..]),
+        options: read_u32_le(&body[52..]),
+        // 4 bytes pad at offset 56
+        target_msc: read_u64_le(&body[60..]),
+        divisor: read_u64_le(&body[68..]),
+        remainder: read_u64_le(&body[76..]),
         notifies,
     })
 }
@@ -515,16 +515,16 @@ mod tests {
 
     #[test]
     fn pixmap_synced_parses_minimum_body() {
-        // 92-byte fixed prefix; no notifies.
-        let mut body = vec![0u8; 92];
+        // 84-byte fixed prefix per xcb present.xml; no notifies.
+        let mut body = vec![0u8; 84];
         body[0..4].copy_from_slice(&0x100u32.to_le_bytes()); // window
         body[4..8].copy_from_slice(&0x200u32.to_le_bytes()); // pixmap
         body[8..12].copy_from_slice(&7u32.to_le_bytes()); // serial
         body[28..32].copy_from_slice(&0x300u32.to_le_bytes()); // acquire_syncobj
         body[32..36].copy_from_slice(&0x400u32.to_le_bytes()); // release_syncobj
-        body[40..48].copy_from_slice(&42u64.to_le_bytes()); // acquire_value
-        body[48..56].copy_from_slice(&43u64.to_le_bytes()); // release_value
-        body[64..72].copy_from_slice(&100u64.to_le_bytes()); // target_msc
+        body[36..44].copy_from_slice(&42u64.to_le_bytes()); // acquire_value
+        body[44..52].copy_from_slice(&43u64.to_le_bytes()); // release_value
+        body[60..68].copy_from_slice(&100u64.to_le_bytes()); // target_msc
         let req = parse_pixmap_synced(&body).unwrap();
         assert_eq!(req.window, 0x100);
         assert_eq!(req.pixmap, 0x200);
@@ -539,12 +539,12 @@ mod tests {
 
     #[test]
     fn pixmap_synced_rejects_misaligned_notifies() {
-        assert!(parse_pixmap_synced(&[0u8; 95]).is_none());
+        assert!(parse_pixmap_synced(&[0u8; 87]).is_none());
     }
 
     #[test]
     fn pixmap_synced_rejects_short_body() {
-        assert!(parse_pixmap_synced(&[0u8; 91]).is_none());
+        assert!(parse_pixmap_synced(&[0u8; 83]).is_none());
     }
 
     #[test]

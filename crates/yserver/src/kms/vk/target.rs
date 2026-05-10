@@ -281,8 +281,14 @@ impl DrawableImage {
             ));
         }
 
-        let use_explicit_modifier =
-            vk.image_drm_format_modifier && modifier != crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR;
+        // Use the explicit-modifier path whenever the extension is
+        // available — including LINEAR. VK_IMAGE_TILING_LINEAR alone
+        // makes the driver compute its own row pitch from format/width
+        // and ignores the client-supplied stride, which silently
+        // corrupts imports whose stride doesn't match the driver's
+        // alignment (e.g. Mesa anv allocates 300×BGRA8888 with
+        // stride=1280, not the 1200 a tight LINEAR layout would use).
+        let use_explicit_modifier = vk.image_drm_format_modifier;
 
         // Build VkSubresourceLayout array for the explicit-modifier chain
         // (only used when use_explicit_modifier is true).
