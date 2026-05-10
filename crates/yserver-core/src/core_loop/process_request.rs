@@ -225,7 +225,7 @@ pub fn process_request(
         20 => handle_get_property(state, client_id, sequence, header, body),
         // ── backend-proxy replies (state-light, host-RPC) ──
         17 => handle_get_atom_name(state, backend, origin, client_id, sequence, body),
-        38 => handle_query_pointer(state, backend, origin, client_id, sequence),
+        38 => handle_query_pointer(state, backend, origin, client_id, sequence, body),
         41 => handle_warp_pointer(state, backend, origin, client_id, sequence, body),
         119 => handle_get_modifier_mapping(state, backend, origin, client_id, sequence),
         // ── selections + SendEvent (cross-client fanout) ──
@@ -1826,18 +1826,59 @@ fn handle_shape_request(
                 let banded = if let Some(host) = host_xid {
                     match backend.read_depth1_pixmap(origin, host.as_raw()) {
                         Ok(Some((w, h, bytes))) => {
-                            Some(crate::nested::bitmap_to_yx_banded_rects(&bytes, w, h))
+                            let rects = crate::nested::bitmap_to_yx_banded_rects(&bytes, w, h);
+                            log::debug!(
+                                "shape diag: MASK src=0x{:x} read_depth1_pixmap ok ({}x{} \
+                                 bytes={}) banded_rects={}",
+                                req.src,
+                                w,
+                                h,
+                                bytes.len(),
+                                rects.len()
+                            );
+                            Some(rects)
                         }
-                        _ => None,
+                        Ok(None) => {
+                            log::debug!(
+                                "shape diag: MASK src=0x{:x} read_depth1_pixmap returned None \
+                                 (no pixmap mirror)",
+                                req.src
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            log::debug!(
+                                "shape diag: MASK src=0x{:x} read_depth1_pixmap err: {e}",
+                                req.src
+                            );
+                            None
+                        }
                     }
                 } else {
+                    log::debug!(
+                        "shape diag: MASK src=0x{:x} no host_xid for source pixmap (fallback to \
+                         bounding-box rect)",
+                        req.src
+                    );
                     None
                 };
                 let source =
                     banded.unwrap_or_else(|| crate::nested::shape_mask_source_rects(state, src_id));
+                let pre_off_count = source.len();
                 let source = crate::nested::offset_rects(source, req.x_off, req.y_off);
                 let current = crate::nested::shape_rects_for(state, window, req.dest_kind);
+                let current_count = current.len();
                 let new_rects = crate::nested::apply_shape_op(current, source, req.op);
+                log::debug!(
+                    "shape diag: MASK dest=0x{:x} kind={} op={} source_rects(pre_offset)={} \
+                     current_rects={} new_rects={}",
+                    req.dest,
+                    req.dest_kind,
+                    req.op,
+                    pre_off_count,
+                    current_count,
+                    new_rects.len()
+                );
                 crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
             }
@@ -1857,13 +1898,23 @@ fn handle_shape_request(
                     req.x_off,
                     req.y_off,
                 );
-                let source = crate::nested::offset_rects(
-                    crate::nested::shape_rects_for(state, src, req.src_kind),
-                    req.x_off,
-                    req.y_off,
-                );
+                let src_rects = crate::nested::shape_rects_for(state, src, req.src_kind);
+                let src_count = src_rects.len();
+                let source = crate::nested::offset_rects(src_rects, req.x_off, req.y_off);
                 let current = crate::nested::shape_rects_for(state, dest, req.dest_kind);
+                let current_count = current.len();
                 let new_rects = crate::nested::apply_shape_op(current, source, req.op);
+                let new_count = new_rects.len();
+                log::debug!(
+                    "shape diag: COMBINE dest=0x{:x} src=0x{:x} op={} src_rects={} \
+                     current_rects={} new_rects={}",
+                    req.dest,
+                    req.src,
+                    req.op,
+                    src_count,
+                    current_count,
+                    new_count,
+                );
                 crate::nested::set_shape_rects(state, dest, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
             }
@@ -8873,17 +8924,37 @@ fn handle_query_pointer(
     origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
+    body: &[u8],
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} QueryPointer", client_id.0, sequence.0);
+    let queried_window = if body.len() >= 4 {
+        ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
+    } else {
+        ROOT_WINDOW
+    };
     let pointer = backend.query_pointer(origin).ok().filter(|p| p.same_screen);
     let reply_data = if let Some(pointer) = pointer {
+        // The KMS backend's PointerPosition carries cursor coordinates
+        // in root-absolute screen space (win_x/win_y are misnamed
+        // historical fields). Compute win-relative by subtracting the
+        // queried window's absolute origin. Without this xeyes (and
+        // any other client doing per-window pointer queries) sees
+        // win_x/win_y unchanged after the WM moves the window, so
+        // the iris locks to a fixed offset and stops tracking.
+        let (origin_x, origin_y) = state.resources.window_absolute_position(queried_window);
+        let root_x = pointer.win_x;
+        let root_y = pointer.win_y;
+        let win_x = i16::try_from(i32::from(root_x).saturating_sub(origin_x))
+            .unwrap_or(i16::MAX);
+        let win_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y))
+            .unwrap_or(i16::MAX);
         x11::QueryPointerReply {
             root: ROOT_WINDOW,
             child: ROOT_WINDOW,
-            root_x: pointer.win_x,
-            root_y: pointer.win_y,
-            win_x: pointer.win_x,
-            win_y: pointer.win_y,
+            root_x,
+            root_y,
+            win_x,
+            win_y,
             mask: pointer.mask,
         }
     } else {

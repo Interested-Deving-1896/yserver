@@ -2446,9 +2446,18 @@ impl KmsBackend {
             (Map::Window, Map::Window) => {
                 let [s_state, d_state] = self.windows.get_disjoint_mut([&src_xid, &dst_xid]);
                 let (Some(s), Some(d)) = (s_state, d_state) else {
+                    log::debug!(
+                        "vk copy diag: W->W lookup failed src={src_xid:#x} dst={dst_xid:#x}"
+                    );
                     return false;
                 };
+                let s_has = s.vk_mirror.is_some();
+                let d_has = d.vk_mirror.is_some();
                 let (Some(s_m), Some(d_m)) = (s.vk_mirror.as_mut(), d.vk_mirror.as_mut()) else {
+                    log::debug!(
+                        "vk copy diag: W->W missing mirror src={src_xid:#x}(mirror={s_has}) \
+                         dst={dst_xid:#x}(mirror={d_has})"
+                    );
                     return false;
                 };
                 (s_m, d_m)
@@ -2456,14 +2465,31 @@ impl KmsBackend {
             (Map::Pixmap, Map::Pixmap) => {
                 let [s_state, d_state] = self.pixmaps.get_disjoint_mut([&src_xid, &dst_xid]);
                 let (Some(s), Some(d)) = (s_state, d_state) else {
+                    log::debug!(
+                        "vk copy diag: P->P lookup failed src={src_xid:#x} dst={dst_xid:#x}"
+                    );
                     return false;
                 };
+                let s_has = s.vk_mirror.is_some();
+                let d_has = d.vk_mirror.is_some();
                 let (Some(s_m), Some(d_m)) = (s.vk_mirror.as_mut(), d.vk_mirror.as_mut()) else {
+                    log::debug!(
+                        "vk copy diag: P->P missing mirror src={src_xid:#x}(mirror={s_has}) \
+                         dst={dst_xid:#x}(mirror={d_has})"
+                    );
                     return false;
                 };
                 (s_m, d_m)
             }
             (Map::Window, Map::Pixmap) => {
+                let s_has = self
+                    .windows
+                    .get(&src_xid)
+                    .is_some_and(|w| w.vk_mirror.is_some());
+                let d_has = self
+                    .pixmaps
+                    .get(&dst_xid)
+                    .is_some_and(|p| p.vk_mirror.is_some());
                 let s = self
                     .windows
                     .get_mut(&src_xid)
@@ -2473,11 +2499,23 @@ impl KmsBackend {
                     .get_mut(&dst_xid)
                     .and_then(|p| p.vk_mirror.as_mut());
                 let (Some(s), Some(d)) = (s, d) else {
+                    log::debug!(
+                        "vk copy diag: W->P missing mirror src_window={src_xid:#x}(mirror={s_has}) \
+                         dst_pixmap={dst_xid:#x}(mirror={d_has})"
+                    );
                     return false;
                 };
                 (s, d)
             }
             (Map::Pixmap, Map::Window) => {
+                let s_has = self
+                    .pixmaps
+                    .get(&src_xid)
+                    .is_some_and(|p| p.vk_mirror.is_some());
+                let d_has = self
+                    .windows
+                    .get(&dst_xid)
+                    .is_some_and(|w| w.vk_mirror.is_some());
                 let s = self
                     .pixmaps
                     .get_mut(&src_xid)
@@ -2487,14 +2525,28 @@ impl KmsBackend {
                     .get_mut(&dst_xid)
                     .and_then(|w| w.vk_mirror.as_mut());
                 let (Some(s), Some(d)) = (s, d) else {
+                    log::debug!(
+                        "vk copy diag: P->W missing mirror src_pixmap={src_xid:#x}(mirror={s_has}) \
+                         dst_window={dst_xid:#x}(mirror={d_has})"
+                    );
                     return false;
                 };
                 (s, d)
             }
-            _ => return false,
+            _ => {
+                log::debug!(
+                    "vk copy diag: src/dst not registered src={src_xid:#x} dst={dst_xid:#x}"
+                );
+                return false;
+            }
         };
 
         if src_mirror.format != dst_mirror.format {
+            log::debug!(
+                "vk copy diag: format mismatch src={src_xid:#x}({:?}) dst={dst_xid:#x}({:?})",
+                src_mirror.format,
+                dst_mirror.format,
+            );
             // vkCmdCopyImage requires matching formats; format
             // conversion needs a shader (out of scope for 4.1.4.2).
             return false;
@@ -2595,12 +2647,18 @@ impl KmsBackend {
 
         let extent_w = mirror.extent.width;
         let extent_h = mirror.extent.height;
-        let color = [
-            ((fg >> 16) & 0xFF) as f32 / 255.0,
-            ((fg >> 8) & 0xFF) as f32 / 255.0,
-            (fg & 0xFF) as f32 / 255.0,
-            1.0,
-        ];
+        // Same R8_UNORM / BGRA8 distinction as `try_vk_solid_fill` —
+        // depth-1 / depth-8 mirrors need fg in color[0].
+        let color = if mirror.format == ash::vk::Format::R8_UNORM {
+            [(fg & 0xFF) as f32 / 255.0, 0.0, 0.0, 1.0]
+        } else {
+            [
+                ((fg >> 16) & 0xFF) as f32 / 255.0,
+                ((fg >> 8) & 0xFF) as f32 / 255.0,
+                (fg & 0xFF) as f32 / 255.0,
+                1.0,
+            ]
+        };
 
         let vk_rects: Vec<ash::vk::Rect2D> = rects
             .iter()
@@ -2680,12 +2738,25 @@ impl KmsBackend {
 
         let extent_w = mirror.extent.width;
         let extent_h = mirror.extent.height;
-        let color = [
-            ((fg >> 16) & 0xFF) as f32 / 255.0,
-            ((fg >> 8) & 0xFF) as f32 / 255.0,
-            (fg & 0xFF) as f32 / 255.0,
-            1.0,
-        ];
+        // Vulkan's vkCmdClearAttachments interprets the [f32; 4] in
+        // RGBA order regardless of the image's swizzle, so for
+        // BGRA8_UNORM mirrors we unpack X11's 0xRRGGBB into [R,G,B,A].
+        // For R8_UNORM mirrors (depth-1 shape masks, depth-8 alpha
+        // masks) only color[0] is used, and the foreground is a
+        // single byte — putting the RGB-unpacked R into color[0]
+        // would leave depth-1 bit-1 fills as byte=0 (since fg=1 has
+        // no bits in 16..23). xeyes's PolyFillArc onto its shape
+        // mask hit exactly this trap.
+        let color = if mirror.format == ash::vk::Format::R8_UNORM {
+            [(fg & 0xFF) as f32 / 255.0, 0.0, 0.0, 1.0]
+        } else {
+            [
+                ((fg >> 16) & 0xFF) as f32 / 255.0,
+                ((fg >> 8) & 0xFF) as f32 / 255.0,
+                (fg & 0xFF) as f32 / 255.0,
+                1.0,
+            ]
+        };
 
         // Convert request rects to vk::Rect2D, clamping to the
         // mirror extent so cmd_clear_attachments doesn't see
@@ -5665,9 +5736,11 @@ impl KmsBackend {
     ) {
         use crate::kms::vk::compositor::CompositeDraw;
         let Some(window) = self.windows.get(&window_id) else {
+            log::debug!("walk diag: skip xid={window_id:#x} (not in windows map)");
             return;
         };
         if !window.mapped {
+            log::debug!("walk diag: skip xid={window_id:#x} (unmapped)");
             return;
         }
         // Skip windows with an explicitly-empty SHAPE region (rare).
@@ -5676,6 +5749,7 @@ impl KmsBackend {
             .get(&window_id)
             .is_some_and(|r| r.is_empty())
         {
+            log::debug!("walk diag: skip xid={window_id:#x} (shape_bounding empty)");
             return;
         }
         let abs_x = i32::from(window.x) + ox;
