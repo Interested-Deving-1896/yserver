@@ -21,7 +21,8 @@ pub const INVERT_REGION: u8 = 16;
 pub const TRANSLATE_REGION: u8 = 17;
 pub const REGION_EXTENTS: u8 = 18;
 pub const FETCH_REGION: u8 = 19;
-pub const CHANGE_CURSOR_BY_NAME: u8 = 23;
+pub const SET_CURSOR_NAME: u8 = 23;
+pub const CHANGE_CURSOR_BY_NAME: u8 = 27;
 pub const HIDE_CURSOR: u8 = 29;
 pub const SHOW_CURSOR: u8 = 30;
 
@@ -269,6 +270,25 @@ mod tests {
             MAJOR_VERSION
         );
         assert_eq!(u32::from_le_bytes(reply[12..16].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn opcodes_match_xfixes_xml() {
+        // Pinned against /usr/share/xcb/xfixes.xml. Today's session
+        // shipped CHANGE_CURSOR_BY_NAME=23, which is actually
+        // SetCursorName. Real ChangeCursorByName is opcode 27.
+        assert_eq!(QUERY_VERSION, 0);
+        assert_eq!(SELECT_SELECTION_INPUT, 2);
+        assert_eq!(SELECT_CURSOR_INPUT, 3);
+        assert_eq!(GET_CURSOR_IMAGE, 4);
+        assert_eq!(CREATE_REGION, 5);
+        assert_eq!(DESTROY_REGION, 10);
+        assert_eq!(COPY_REGION, 12);
+        assert_eq!(FETCH_REGION, 19);
+        assert_eq!(SET_CURSOR_NAME, 23);
+        assert_eq!(CHANGE_CURSOR_BY_NAME, 27);
+        assert_eq!(HIDE_CURSOR, 29);
+        assert_eq!(SHOW_CURSOR, 30);
     }
 
     #[test]

@@ -4906,7 +4906,8 @@ fn handle_glx_request(
                 state,
                 client_id,
                 sequence,
-                crate::nested::GLX_FIRST_ERROR + yserver_protocol::x11::glx::ERROR_GLX_BAD_REQUEST,
+                crate::nested::GLX_FIRST_ERROR
+                    + yserver_protocol::x11::glx::ERROR_GLX_BAD_RENDER_REQUEST,
                 0,
                 crate::nested::GLX_MAJOR_OPCODE,
             );

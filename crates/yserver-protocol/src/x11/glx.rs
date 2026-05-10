@@ -36,7 +36,7 @@ pub const DESTROY_CONTEXT: u8 = 4;
 pub const MAKE_CURRENT: u8 = 5;
 pub const IS_DIRECT: u8 = 6;
 pub const SWAP_BUFFERS: u8 = 11;
-pub const COPY_CONTEXT: u8 = 12;
+pub const COPY_CONTEXT: u8 = 10;
 pub const CREATE_NEW_CONTEXT: u8 = 24;
 pub const CREATE_CONTEXT_ATTRIBS_ARB: u8 = 34; // GLX_ARB_create_context
 pub const QUERY_EXTENSIONS_STRING: u8 = 18;
@@ -60,13 +60,15 @@ pub const DELETE_WINDOW: u8 = 32;
 pub const MAJOR_VERSION: u32 = 1;
 pub const MINOR_VERSION: u32 = 4;
 
-/// `GLXBadRequest` error code for indirect-rendering opcodes that we
-/// don't implement. Per glxproto: error codes start at the extension's
-/// `first_error` allocation; the dispatcher resolves the absolute
-/// number from `nested.rs::GLX_FIRST_ERROR`.
-pub const ERROR_GLX_BAD_REQUEST: u8 = 0;
-pub const ERROR_GLX_BAD_CONTEXT: u8 = 1;
-pub const ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST: u8 = 11;
+/// GLX error codes per /usr/share/xcb/glx.xml `errorcopy` entries.
+/// Numbers are extension-relative; the dispatcher resolves the
+/// absolute code via `nested.rs::GLX_FIRST_ERROR + N`.
+///
+/// `BadRenderRequest` is the canonical reply for an indirect-rendering
+/// minor opcode the server doesn't implement; `UnsupportedPrivateRequest`
+/// is for `VendorPrivate`/`VendorPrivateWithReply` we don't handle.
+pub const ERROR_GLX_BAD_RENDER_REQUEST: u8 = 6;
+pub const ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST: u8 = 8;
 
 fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
@@ -484,18 +486,49 @@ mod tests {
 
     #[test]
     fn opcodes_match_glxproto() {
-        assert_eq!(QUERY_VERSION, 7);
-        assert_eq!(QUERY_SERVER_STRING, 19);
-        assert_eq!(QUERY_EXTENSIONS_STRING, 18);
-        assert_eq!(IS_DIRECT, 6);
+        // Pinned against /usr/share/xcb/glx.xml.
+        assert_eq!(RENDER, 1);
+        assert_eq!(CREATE_CONTEXT, 3);
+        assert_eq!(DESTROY_CONTEXT, 4);
         assert_eq!(MAKE_CURRENT, 5);
-        assert_eq!(MAKE_CONTEXT_CURRENT, 26);
-        assert_eq!(CREATE_NEW_CONTEXT, 24);
-        assert_eq!(CREATE_CONTEXT_ATTRIBS_ARB, 34);
-        assert_eq!(SET_CLIENT_INFO_ARB, 33);
-        assert_eq!(SET_CLIENT_INFO_2_ARB, 35);
-        assert_eq!(GET_FB_CONFIGS, 21);
+        assert_eq!(IS_DIRECT, 6);
+        assert_eq!(QUERY_VERSION, 7);
+        assert_eq!(WAIT_GL, 8);
+        assert_eq!(WAIT_X, 9);
+        assert_eq!(COPY_CONTEXT, 10);
+        assert_eq!(SWAP_BUFFERS, 11);
+        // 12 is UseXFont — we don't model it; ensure we didn't shadow it.
         assert_eq!(GET_VISUAL_CONFIGS, 14);
+        assert_eq!(VENDOR_PRIVATE, 16);
+        assert_eq!(VENDOR_PRIVATE_WITH_REPLY, 17);
+        assert_eq!(QUERY_EXTENSIONS_STRING, 18);
+        assert_eq!(QUERY_SERVER_STRING, 19);
+        assert_eq!(CLIENT_INFO, 20);
+        assert_eq!(GET_FB_CONFIGS, 21);
+        assert_eq!(CREATE_PIXMAP, 22);
+        assert_eq!(DESTROY_PIXMAP, 23);
+        assert_eq!(CREATE_NEW_CONTEXT, 24);
+        assert_eq!(QUERY_CONTEXT, 25);
+        assert_eq!(MAKE_CONTEXT_CURRENT, 26);
+        assert_eq!(CREATE_PBUFFER, 27);
+        assert_eq!(DESTROY_PBUFFER, 28);
+        assert_eq!(GET_DRAWABLE_ATTRIBUTES, 29);
+        assert_eq!(CHANGE_DRAWABLE_ATTRIBUTES, 30);
+        assert_eq!(CREATE_WINDOW, 31);
+        assert_eq!(DELETE_WINDOW, 32);
+        assert_eq!(SET_CLIENT_INFO_ARB, 33);
+        assert_eq!(CREATE_CONTEXT_ATTRIBS_ARB, 34);
+        assert_eq!(SET_CLIENT_INFO_2_ARB, 35);
+    }
+
+    #[test]
+    fn error_codes_match_glxproto() {
+        // Pinned against /usr/share/xcb/glx.xml `errorcopy` entries.
+        // Shipped wrong all of today: BAD_REQUEST=0 was actually
+        // BadContext, UNSUPPORTED_PRIVATE_REQUEST=11 was
+        // BadCurrentDrawable.
+        assert_eq!(ERROR_GLX_BAD_RENDER_REQUEST, 6);
+        assert_eq!(ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST, 8);
     }
 
     #[test]

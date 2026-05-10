@@ -2268,17 +2268,14 @@ impl HostX11Backend {
 
 #[must_use]
 pub(crate) fn xkb_minor_has_reply(minor: u8) -> bool {
-    // Reply-producing XKB minor requests. Source: X11/extensions/XKB.h
-    // (X_kb*) cross-referenced with the Xlib call sites that enter
-    // `_XReply()`. xset q's request stream (GetNamedIndicator =
-    // minor 15) hung indefinitely until 15 was added — the previous
-    // list missed 13 / 15 / 19 / 23 (all reply-required) and carried
-    // a few stale entries (26, 28, 30, 33) that don't map to real
-    // XKB minors. Conservative kept-as-is entries (14, 20) are
-    // tolerated by the host: if the host doesn't reply we'd block,
-    // but the tests in `xkb_reply_minor_audit_*` lock the contract,
-    // so leaving them is safer than removing them and triggering a
-    // different regression.
+    // Reply-producing XKB minor requests per /usr/share/xcb/xkb.xml
+    // (every minor with a `<reply>` block). xset q's request stream
+    // (GetNamedIndicator = minor 15) hung indefinitely until 15 was
+    // added. Today's audit confirmed that minors 14 / 16 / 18 / 20
+    // (SetIndicatorMap / SetNamedIndicator / SetNames / SetGeometry)
+    // are void per canonical xkb.xml — they were previously kept on
+    // this list as "conservative legacy entries" but would block
+    // waiting on replies the host can't generate.
     matches!(
         minor,
         0  // UseExtension
@@ -2288,16 +2285,12 @@ pub(crate) fn xkb_minor_has_reply(minor: u8) -> bool {
         | 10 // GetCompatMap
         | 12 // GetIndicatorState
         | 13 // GetIndicatorMap
-        | 14 // (legacy entry — see comment)
-        | 15 // GetNamedIndicator           ← previously missing
-        | 16 // SetNamedIndicator
+        | 15 // GetNamedIndicator
         | 17 // GetNames
-        | 18 // (legacy entry — see comment)
-        | 19 // GetGeometry                 ← previously missing
-        | 20 // (legacy entry — see comment)
+        | 19 // GetGeometry
         | 21 // PerClientFlags
         | 22 // ListComponents
-        | 23 // GetKbdByName                ← previously missing
+        | 23 // GetKbdByName
         | 24 // GetDeviceInfo
         | 101 // SetDebuggingFlags
     )
@@ -2442,12 +2435,12 @@ mod tests {
 
     #[test]
     fn xkb_reply_minor_audit_includes_known_blocking_requests() {
-        // Reply-required minors per X11/extensions/XKB.h. Adding 15
+        // Reply-required minors per /usr/share/xcb/xkb.xml (every
+        // minor that has a `<reply>` block). Adding 15
         // (`GetNamedIndicator`), 19 (`GetGeometry`), 23 (`GetKbdByName`)
         // and 13 (`GetIndicatorMap`) was load-bearing for `xset q`,
-        // GTK keyboard layout queries, and any libxkbcommon
-        // configuration probe.
-        for minor in [0, 4, 6, 8, 10, 12, 13, 15, 16, 17, 19, 21, 22, 23, 24, 101] {
+        // GTK keyboard layout queries, and libxkbcommon probes.
+        for minor in [0, 4, 6, 8, 10, 12, 13, 15, 17, 19, 21, 22, 23, 24, 101] {
             assert!(
                 xkb_minor_has_reply(minor),
                 "minor {minor} must wait for reply"
@@ -2457,10 +2450,15 @@ mod tests {
 
     #[test]
     fn xkb_void_minor_audit_keeps_select_events_fire_and_forget() {
+        // Per canonical xkb.xml these have no <reply> block.
         assert!(!xkb_minor_has_reply(1)); // SelectEvents
         assert!(!xkb_minor_has_reply(2)); // (no-op — Bell is core minor 3)
-        assert!(!xkb_minor_has_reply(3)); // Bell — fire-and-forget per spec
-        assert!(!xkb_minor_has_reply(5)); // LatchLockState — fire-and-forget
+        assert!(!xkb_minor_has_reply(3)); // Bell
+        assert!(!xkb_minor_has_reply(5)); // LatchLockState
+        assert!(!xkb_minor_has_reply(14)); // SetIndicatorMap
+        assert!(!xkb_minor_has_reply(16)); // SetNamedIndicator
+        assert!(!xkb_minor_has_reply(18)); // SetNames
+        assert!(!xkb_minor_has_reply(20)); // SetGeometry
     }
 
     #[test]
@@ -2483,7 +2481,7 @@ mod tests {
         // header(4) + cursor(4) + nbytes(2)+pad(2) + name(8) = 20 bytes = 5 units
         assert_eq!(bytes.len(), 20);
         assert_eq!(bytes[0], 140, "major = XFIXES");
-        assert_eq!(bytes[1], 23, "minor = ChangeCursorByName");
+        assert_eq!(bytes[1], 27, "minor = ChangeCursorByName per xfixes.xml");
         assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 5);
         assert_eq!(
             u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
