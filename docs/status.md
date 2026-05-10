@@ -3177,3 +3177,99 @@ Open items moved to [`known-issues.md`](known-issues.md): the
 xeyes-on-e16 drag latency lives under the KMS-backend section
 (already there since Phase 6.10); the benign xclock CJK-charset
 warning lives under "Extension polish".
+
+## Perf retrospective — `perf` branch experiment (2026-05-10)
+
+Attempted to remove the per-RENDER-op `vkQueueWaitIdle` from
+`run_one_shot_op` ("Cause 2" of the perf investigation) by
+chaining submits via a per-context timeline semaphore (each submit
+waits on the prior ticket and signals the next). Composite joined
+the same chain. Eight commits on branch `perf` (kept as a
+reference checkpoint).
+
+### Cause-1 (idle composite gate)
+
+- Status: **shipped on master** (`d56c63f`).
+- Hardware A/B: 9.6 % → 0 % yserver CPU at idle, 0.6 % with an
+  idle xterm. Confirmed live on TTY3.
+
+### Cause-2 (per-op `wait_idle`) — negative result
+
+- **Throughput**: indistinguishable from master on xts-Xproto
+  (4 m04 s safe-mode vs 4 m06 s chain). rendercheck composite/
+  cacomposite TIMEOUT in **both** modes — they're GPU-bound on
+  this hardware regardless of CPU-side stalls.
+- **Interactivity under load**: chain noticeably better — under
+  rendercheck composite, mouse pointer was responsive in chain
+  mode and visibly laggy in safe mode. Real second-order benefit
+  but not enough to outweigh the correctness regression.
+- **Correctness**: chain broke staging-buffer readback paths
+  (`read_mirror_pixels`, `try_vk_get_image_pixels`). The
+  `wait_ticket(returned_ticket)` after `run_one_shot_op` evidently
+  doesn't actually block long enough for the GPU copy to finish
+  on this driver — bytes are read pre-copy. Cascades into:
+  - `xwd` returns all-white for windows that visibly contain
+    text on screen.
+  - SHAPE::Mask handling (which calls `read_depth1_pixmap`
+    → `bitmap_to_yx_banded_rects`) decomposes garbage bytes
+    into hundreds of phantom rects per window. Composite scene
+    inflates from ~10 quads to 4000–8000+, blows past the
+    `MAX_DESCRIPTOR_SETS_PER_FRAME = 1024` cap, every quad
+    after slot 1024 silently dropped → only the first one or
+    two windows render visibly.
+  - Text rendering shows wrong glyphs (likely sampling stale
+    glyph atlas via the same broken readback path).
+
+### What we'd do differently
+
+1. **Profile first**. The chain experiment proceeded on
+   theory (per-op stall is the bottleneck) without measuring.
+   `perf record -g` against rendercheck composite would've shown
+   that the actual cost driver isn't `vkQueueWaitIdle` —
+   composite/cacomposite are GPU-bound. The chain spent days
+   addressing a non-bottleneck.
+2. **Run with `YSERVER_VK_VALIDATION=1`** for any sync change.
+   The diagnostic toggle (now on master) surfaces VUIDs in the
+   release build at acceptable overhead. Would've caught the
+   readback bug on the first hw run.
+3. **Smaller scope, narrower intervention**. The chain touched
+   every `run_one_shot_op` call site at once. A safer rollout
+   would gate one specific request handler (e.g. `Composite`)
+   on a feature flag, prove it works, then expand.
+4. **Validation in real WM session, not synthetic**. xts and
+   rendercheck both passed on the chain branch's release build
+   in vng — neither caught the SHAPE::Mask cascade. The user's
+   e16+xterm session did, instantly. Acceptance criteria for any
+   future Phase-4.1.4.6-style work needs to include a real-WM
+   smoke ("does e16+xterm look right after 30 s") before
+   merging.
+
+### Surface left on master
+
+- `YSERVER_VK_VALIDATION=1` — opt-in Vulkan validation in release
+  builds (`de0da83`).
+- SIGUSR1 → `./yserver-scanout-N.ppm` dump (`a3e3e2b` +
+  `ccb9f2a`). Useful for any future diagnosis of "what's actually
+  in the scanout BO".
+- known-issues entries for the K_OFF-after-crash recovery and
+  VT-switch-blocked-while-running (both
+  [`docs/known-issues.md`](known-issues.md)).
+
+### Real next steps for perf
+
+Open in [`known-issues.md`](known-issues.md) under "KMS backend":
+
+1. `perf record -g` against rendercheck composite + xts-Xlib9 on
+   hw, build a flame graph, pick the top hot path. Until that
+   exists, all "the bottleneck is X" claims are guesses.
+2. Persistent CB pool — `vkAllocateCommandBuffers` /
+   `vkFreeCommandBuffers` per op is wasted CPU regardless of
+   sync model. A small ring of reusable CBs cuts measurable cost
+   without touching synchronisation.
+3. Per-window descriptor caching — composite reallocates a fresh
+   descriptor set per draw, but the `image_view` for a given
+   window doesn't change between frames. A `(image_view → set)`
+   cache + reset only on view-invalidation.
+4. If a follow-up wants to retry the per-op-wait-removal idea, do
+   it incrementally + with validation enabled + against an
+   e16-style real session, not synthetic test suites.
