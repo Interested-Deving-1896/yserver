@@ -200,6 +200,27 @@ pub trait Backend: Send {
     /// drain completion events and submit the next composite/flip.
     fn on_page_flip_ready(&mut self, state: &mut ServerState);
 
+    /// Tell the backend that something that could affect on-screen
+    /// pixels has changed since the last composite. KMS uses this to
+    /// gate `composite_and_flip` so an idle server doesn't burn
+    /// vsync-paced composite cycles. Default is a no-op for backends
+    /// (e.g. host-X11) that don't drive their own composite loop.
+    fn mark_dirty(&mut self) {}
+
+    /// If the backend has pending damage and no flip is currently in
+    /// flight, kick the next composite. Called once per core-loop
+    /// iteration so a backend that went dormant after the last
+    /// pageflip-complete (because nothing was dirty) wakes back up
+    /// when fresh damage arrives. Default no-op.
+    ///
+    /// # Errors
+    ///
+    /// Propagates whatever the backend's composite path returns
+    /// (e.g. DRM/Vulkan submit errors on KMS).
+    fn maybe_composite(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Raw fds the core's poller should watch on this backend's behalf.
     /// The core registers each fd against the matching token derived
     /// from `BackendFdKind`.

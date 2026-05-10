@@ -655,6 +655,14 @@ pub struct KmsBackend {
     // whether the kernel ever told us the very first flip latched.
     pub(crate) first_pageflip_logged: Vec<bool>,
 
+    // Set whenever something that could affect on-screen pixels
+    // changes (client request processed, host input dispatched,
+    // host-X11 event fanned out). `composite_and_flip` is a no-op
+    // when this is false — without the gate, the page-flip-complete
+    // loop runs ~60 full composites/sec at idle. Init `true` so the
+    // very first composite paints.
+    pub(crate) screen_dirty: bool,
+
     // Fonts (freetype)
     font_loader: FontLoader,
     fonts: HashMap<u32, FontState>,
@@ -1542,6 +1550,7 @@ impl KmsBackend {
             input_ctx,
             vk,
             first_pageflip_logged: vec![false; layouts_len],
+            screen_dirty: true,
             scanout_pools,
             compositor_pipeline,
             ops_command_pool,
@@ -5391,6 +5400,16 @@ impl KmsBackend {
         // ops fill them directly through Vk. The pre-composite
         // upload pass is gone.
 
+        // Skip the whole pass when nothing has changed since last
+        // composite. Producers (request handlers, host input,
+        // host-X11 fanout) call `mark_dirty` to re-arm; the consumer
+        // path here clears the flag so an idle server costs zero
+        // composite work per vsync.
+        if !self.screen_dirty {
+            return Ok(());
+        }
+        self.screen_dirty = false;
+
         let top_levels: Vec<u32> = self.top_level_order.clone();
 
         // Pre-filter visible top-levels per output (spec §2.5: avoid
@@ -6595,6 +6614,44 @@ impl Backend for KmsBackend {
         if let Err(e) = self.drain_page_flips_and_composite() {
             log::warn!("kms: drain_page_flips_and_composite: {e}");
         }
+    }
+
+    fn mark_dirty(&mut self) {
+        self.screen_dirty = true;
+    }
+
+    fn maybe_composite(&mut self) -> io::Result<()> {
+        if !self.screen_dirty {
+            return Ok(());
+        }
+        // If a flip is already in flight on any output, the upcoming
+        // pageflip-complete will retrigger composite_and_flip. Don't
+        // double-submit — submitting on a CRTC with a flip pending
+        // returns -EBUSY and confuses the swapchain state machine
+        // (see the long comment at composite_and_flip's per-output
+        // skip).
+        let any_pending = self.outputs.iter().enumerate().any(|(idx, layout)| {
+            if layout.swapchain.submitted_idx().is_some() {
+                return true;
+            }
+            self.scanout_pools
+                .get(idx)
+                .and_then(|p| p.as_ref())
+                .map(|p| {
+                    p.bos.iter().any(|b| {
+                        matches!(
+                            b.state.phase,
+                            crate::kms::vk::scanout::BoPhase::Submitted
+                                | crate::kms::vk::scanout::BoPhase::Pending
+                        )
+                    })
+                })
+                .unwrap_or(false)
+        });
+        if any_pending {
+            return Ok(());
+        }
+        self.composite_and_flip()
     }
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, yserver_core::backend::BackendFdKind)> {
@@ -9449,6 +9506,7 @@ mod tests {
             input_ctx: None,
             vk: None,
             first_pageflip_logged: vec![false; 1],
+            screen_dirty: true,
             scanout_pools: Vec::new(),
             compositor_pipeline: None,
             ops_command_pool: None,
@@ -9898,5 +9956,44 @@ mod tests {
         let mut backend = make_test_backend();
         let res = backend.dri3_open(0x1234);
         assert!(res.is_err(), "expected Err when render_node_fd is None");
+    }
+
+    // ---------------------------------------------------------------------------
+    // screen_dirty gate: composite_and_flip is a no-op when nothing has
+    // changed since the last composite. Without this gate, the page-flip-
+    // complete loop runs ~60 full composites/sec at idle.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn screen_dirty_initialises_true_so_first_frame_paints() {
+        let backend = make_test_backend();
+        assert!(
+            backend.screen_dirty,
+            "fresh backend must start dirty so the initial composite paints"
+        );
+    }
+
+    #[test]
+    fn composite_and_flip_clears_screen_dirty() {
+        let mut backend = make_test_backend();
+        assert!(backend.screen_dirty);
+        backend.composite_and_flip().unwrap();
+        assert!(
+            !backend.screen_dirty,
+            "composite_and_flip must clear the dirty flag"
+        );
+    }
+
+    #[test]
+    fn mark_dirty_re_arms_screen_dirty() {
+        use yserver_core::backend::Backend as _;
+        let mut backend = make_test_backend();
+        backend.composite_and_flip().unwrap();
+        assert!(!backend.screen_dirty);
+        backend.mark_dirty();
+        assert!(
+            backend.screen_dirty,
+            "mark_dirty must re-arm the flag for the next composite"
+        );
     }
 }

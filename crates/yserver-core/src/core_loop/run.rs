@@ -195,6 +195,7 @@ pub fn run_core(
                                         RequestOutcome::Handled
                                     }
                                 };
+                                backend.mark_dirty();
                                 if let RequestOutcome::Disconnect(disc_id) = outcome {
                                     crate::core_loop::process_disconnect::process_disconnect(
                                         state, backend, disc_id,
@@ -233,7 +234,10 @@ pub fn run_core(
                                     state, backend, id,
                                 );
                             }
-                            Message::HostInput(ev) => handle_host_input(state, backend, ev),
+                            Message::HostInput(ev) => {
+                                handle_host_input(state, backend, ev);
+                                backend.mark_dirty();
+                            }
                             Message::PageFlipReady => backend.on_page_flip_ready(state),
                         }
                     }
@@ -247,7 +251,12 @@ pub fn run_core(
         // this iteration. Fanout runs at the outermost stack frame
         // — no `wait_for_reply` is on the stack here — so handlers
         // that issue further host requests are safe.
-        dispatch_pending_host_events(state, backend);
+        if dispatch_pending_host_events(state, backend) {
+            // Host events (pointer, expose, configure) can change
+            // visible state; mark dirty so the KMS gate re-arms. No-op
+            // for backends without their own composite loop.
+            backend.mark_dirty();
+        }
 
         // F2: if a `wait_for_reply` (called by `process_request`
         // mid-handler) saw the host close, propagate it as a clean
@@ -268,6 +277,15 @@ pub fn run_core(
         for disc_id in reconcile_client_writable_interest(poll.registry(), state) {
             crate::core_loop::process_disconnect::process_disconnect(state, backend, disc_id);
         }
+
+        // Wake the composite path back up if the backend went dormant
+        // after the previous pageflip-complete (because nothing was
+        // dirty) and fresh damage has since arrived. No-op for
+        // backends that don't drive their own composite loop, and
+        // no-op if a flip is still in flight on the KMS path.
+        if let Err(e) = backend.maybe_composite() {
+            log::warn!("core_loop::run: maybe_composite failed: {e}");
+        }
     }
 }
 
@@ -277,8 +295,10 @@ pub fn run_core(
 /// SetClipRectangles, etc.) cannot recursively re-dispatch — the new
 /// request's reply lands in `pending_replies` and the next
 /// outer-loop iteration drains anything `wait_for_reply` re-enqueued.
-fn dispatch_pending_host_events(state: &mut ServerState, backend: &mut dyn Backend) {
+fn dispatch_pending_host_events(state: &mut ServerState, backend: &mut dyn Backend) -> bool {
+    let mut any = false;
     while let Some(event) = backend.pop_pending_host_event() {
+        any = true;
         // The fanout helpers borrow `xid_map` immutably — clone the
         // map up-front so we can release the immutable borrow on
         // backend before mutating `state`'s per-client outbound
@@ -311,6 +331,7 @@ fn dispatch_pending_host_events(state: &mut ServerState, backend: &mut dyn Backe
             }
         }
     }
+    any
 }
 
 pub(crate) fn handle_host_container_resize(
