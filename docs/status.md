@@ -3403,3 +3403,183 @@ actually fix wezterm. The follow-up that read xkbcommon's
    Vulkan import path.
 2. vng-side server crash on vkcube — separate triage; reproduce
    under `vng` and capture the panic / coredump.
+
+## Late-night session — vkcube renders, xeyes works, gtk3-demo starts (2026-05-10 → 2026-05-11)
+
+Continuation of the GLX/DRI3/XKB hardening day. Same external-source-
+grounding playbook (`/usr/share/xcb/*.xml`, `xkb/XKBMAlloc.c`,
+`libX11/src/xkb/XKBGetMap.c`, GTK's `gdkkeys-x11.c`) carried six more
+fixes through the input + drawing stack. Each one of these would have
+been Xorg parity by inspection; they were never going to surface
+without a client that exercised the specific path.
+
+### Fixes
+
+1. **`PresentPixmapSynced` body length 92 → 84** (`80f5376`). Our
+   parser invented a 4-byte pad after `release_syncobj` that doesn't
+   exist in `/usr/share/xcb/present.xml`. Mesa anv WSI shipped a
+   canonical 84-byte body and we rejected every first frame as
+   `BadLength`. vkcube + vkgears hung in `drmSyncobjTimelineWait`
+   because the swapchain's `xcb_wait_for_special_event` thread never
+   received a `PresentCompleteNotify`.
+
+2. **VK_EXT_image_drm_format_modifier always-on for LINEAR**
+   (`80f5376`). The explicit-modifier path was skipped for
+   `DRM_FORMAT_MOD_LINEAR`, dropping the client's `stride`. Mesa anv
+   allocates 300×BGRA8 swapchain BOs at `stride=1280` (vs the 1200
+   our import auto-computed), so every row drifted +80 bytes —
+   diagonal smear on Intel iGPU. bee/radv happened to compute a
+   matching pitch, which is why the same code looked fine there.
+
+3. **Wire-constant audit punch list** (`839054b`). One systematic
+   sweep against the canonical XML for every extension we publish.
+   Caught:
+   - `XFIXES ChangeCursorByName` was opcode 23 (which is actually
+     `SetCursorName`); canonical is 27. We were dispatching
+     `SetCursorName` traffic through our `ChangeCursorByName` arm.
+   - `GLX_BadRenderRequest` shipped as 0 (= `BadContext`); canonical
+     is 6. Active in the dispatcher, so every unsupported indirect-
+     rendering minor reported the wrong error code.
+   - `GLX_UnsupportedPrivateRequest` shipped as 11
+     (= `BadCurrentDrawable`); canonical is 8.
+   - `GLX CopyContext` shipped as 12 (= `UseXFont`); canonical is 10.
+   - XKB host_x11 `xkb_minor_has_reply` listed void minors 14, 16, 18,
+     20 (`SetIndicatorMap`/`SetNamedIndicator`/`SetNames`/
+     `SetGeometry`) as reply-bearing; would block on synthetic replies
+     that can't come.
+   Canonical pin tests added so re-regression is locked.
+
+4. **xeyes — depth-1 PolyFill R8 channel + QueryPointer window-relative
+   coords** (`dc7b58d`).
+   - `try_vk_solid_fill` hard-coded the X11 0xRRGGBB unpack into
+     `[R, G, B, A]`. Correct for `B8G8R8A8_UNORM` mirrors but writes
+     zero into the R channel of `R8_UNORM` mirrors (depth-1 shape
+     masks, depth-8 alpha masks). xeyes draws its elliptical mask
+     with `ChangeGC fg=1; PolyFillArc` onto a depth-1 pixmap, and
+     every pixel was being stored as 0. The cascade was
+     invisible-xeyes: empty bitmap → `bitmap_to_yx_banded_rects`
+     returns 0 rects → xeyes's bounding shape empty → WM's
+     `SHAPE::Combine` mirrors an empty shape into the WM frame →
+     `walk_subtree_into_draws` early-returns on
+     `shape_bounding empty` *without* descending into children → no
+     quads in the composite scene. Fix: branch on `mirror.format` so
+     R8_UNORM mirrors put the fg byte in `color[0]`.
+   - `QueryPointer` returned the cursor's root-absolute coords as
+     both `root_x/root_y` *and* `win_x/win_y`. Worked at window
+     origin (0, 0); broke as soon as the WM dragged the window.
+     Fix: parse the window xid from the request body and subtract
+     `state.resources.window_absolute_position(window)` from the
+     cursor's absolute position. xeyes iris now tracks correctly
+     through window drags.
+
+5. **Server-side key auto-repeat** (`353c1b0`). yserver was
+   advertising `global_auto_repeat=1` + `RepeatKeys` in
+   `GetKeyboardControl` / XKB Controls but never generated repeat
+   events — libinput emits one press/release per physical event and
+   the consumer has to fire repeats. xterm/wezterm saw a single key
+   per press and didn't fall back to client-side repeat because
+   we'd promised to handle it. Now: a single `KeyRepeatState` on
+   `ServerState` (X11 mandates only the last-pressed key repeats),
+   `handle_host_input` arms / replaces / clears on key events,
+   the mio poll uses a finite timeout = `next_fire - now` while a
+   key is held (idle server still uses `None` — no idle wakeups,
+   §"Cause-1 idle composite gate" still wins), and end-of-iteration
+   `fire_pending_repeats` fans out paired KeyRelease+KeyPress in
+   `REPEAT_PERIOD = 40 ms` steps after a `REPEAT_INITIAL_DELAY =
+   660 ms` hold. Classic mode (no `XkbPerClientFlags`
+   `DetectableAutoRepeat` opt-in); every client handles it. Defaults
+   match `xset -r`; pulling delay/rate from the XKB Controls block
+   for live `xset r rate N M` is a small follow-up.
+
+6. **XKB `nTypes ≥ XkbNumRequiredTypes` (= 4)** (`7065eda`). GTK3
+   uses Xlib's classic `XkbGetMap()`, which internally calls
+   `XkbAllocClientMap(xkb, mask, rep->nTypes)`; that helper's
+   precondition in `libX11/src/xkb/XKBMAlloc.c:46-48` rejects any
+   `nTotalTypes < XkbNumRequiredTypes` (= 4) with `BadValue`.
+   `_XkbReadGetMapReply` propagates `BadAlloc`, `XkbGetMap` returns
+   `NULL`, GDK fires `g_error("Failed to get keymap")` and gtk3-demo
+   aborts. We shipped `nTypes = 2` (ONE_LEVEL + TWO_LEVEL); X11
+   reserves the first four indices (ONE_LEVEL / TWO_LEVEL /
+   ALPHABETIC / KEYPAD) and every server is required to publish at
+   least the four. xkbcommon-x11 doesn't enforce the minimum (just
+   unpacks what's there via xcb's iterators), which is why wezterm
+   and the morning's hardening commits cleared validation while
+   GTK3 didn't. Fix: `reply_get_map` ships 4 types (two real +
+   two minimal placeholders); `reply_get_names` mirrors with
+   `nTypes=4`, `nLevelsPerType=[1, 2, 1, 1]`, matching ATOM-list
+   sizes — required so xkbcommon-x11's
+   `FAIL_UNLESS(reply->nTypes == keymap->num_types)` still holds
+   for the wezterm path. Verified by a tiny direct-Xlib probe
+   (`./test-xkbgetmap`) returning `XkbGetMap OK` against yserver.
+
+7. **RENDER ARGB32 glyphsets accepted** (`1cf8b25`). gtk3-demo
+   reached its main window after the XKB fix but every widget came
+   up empty. Diagnosis chain: instrumented
+   `try_vk_render_composite_glyphs` with per-bail reason logs
+   (`vk text bail: ...`) — all 184 calls passed every early-return
+   gate. A per-call summary then showed two distinct shapes:
+   `seen=N missing=0 pushed=N` for A8 sets (working);
+   `seen=N missing=N pushed=0` for ARGB32 sets (every glyph absent
+   from `active_gs.glyphs`). One `render_create_glyphset` log line
+   pinned it: `client_format=0x4 -> Other`. GTK3/Pango/Cairo
+   defaults to ARGB32 glyphsets for body text under modern themes
+   (so the format can carry colour glyphs / subpixel coverage);
+   `parse_add_glyphs` was silently dropping every `Other`-format
+   upload. Fix: new `GlyphSetFormat::Argb32` variant,
+   `parse_add_glyphs` accepts ARGB32, extracts the alpha channel
+   from each 4-byte BGRA pixel into a densely-packed A8 buffer,
+   stores the glyph as `format=A8` (so the downstream atlas + text
+   pipeline path is identical from there on — no shader change).
+   Subpixel detail and emoji colour are lost; glyph mask shape
+   survives, which is enough for grayscale text on any background.
+   Standard Xorg fallback when the dst can't carry the glyph's
+   full channel data.
+
+### Surface left on master
+
+- Diagnostic breadcrumbs (all only fire on bail / once per init, no
+  per-call noise) for the RENDER glyph + fill paths:
+  `vk text bail: ...` (six reasons),
+  `render_create_glyphset: client_format=0xN -> {fmt:?}`,
+  `parse_add_glyphs bail: format=...`,
+  `render_fill_rectangles bail: ...`,
+  `vk copy diag: ...` (four reasons in `try_vk_copy_area`).
+- `walk diag: skip xid=... (reason)` in `walk_subtree_into_draws`
+  (kept the skip path; stripped the per-walk per-window line).
+- `test-xkbgetmap.c` + `test-xkbgetmap` in the project root — minimal
+  Xlib-only probe that asserts `XkbGetMap` returns non-NULL. Useful
+  regression check for XKB GetMap parsing without needing a full
+  GTK app.
+
+### Memory updates
+
+- New: `feedback_wire_format_external_source.md` — every wire-format
+  / opcode / struct ABI / driver-interop layout must be grounded in
+  the canonical external source (`/usr/share/xcb/*.xml`, proto
+  headers, `objdump` against the linked client, upstream client
+  source). Today produced ≥ 13 distinct bugs of this exact shape;
+  every one was findable in one pass from an external source and
+  invariably wrong when reasoned from scratch.
+
+### Known issues, deferred
+
+- **gtk3-demo TreeView left-pane labels still missing**. Right-pane
+  text (description paragraphs, `Application Class` heading) renders
+  fine after the ARGB32 fix; the `Run` toolbar button label renders
+  inside its button; but the demo-category labels next to the
+  expander arrows in the left pane are absent or displaced.
+  Initial diagnostic showed glyphs reaching the atlas, so it's a
+  *placement* issue, not an upload one. Two small block-shaped
+  artifacts at the bottom-left and bottom-right of the scanout in
+  the diagnostic dumps are suspected displaced labels but
+  unconfirmed. Next session.
+- **ARGB32 colour glyphs / subpixel detail lost**. Today's fix
+  downgrades ARGB32 to A8 via the alpha channel. Emoji and LCD-
+  subpixel-rendered text will show shape but no colour / no
+  per-channel coverage. Proper support needs a second atlas
+  (`B8G8R8A8`) and a colour-glyph text pipeline variant.
+- **`XkbPerClientFlags` reply is a 32-byte zero placeholder**.
+  `DetectableAutoRepeat` opt-in is unsupported (we always fan out
+  paired Release+Press); fine because classic auto-repeat works
+  universally and our key-repeat implementation generates the right
+  pairs already.
