@@ -200,9 +200,19 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
     let total_modmap = u8::try_from(modmap.len()).unwrap_or(u8::MAX);
 
     // -- Section sizes --------------------------------------------
-    // KeyTypes: 2 types. ONE_LEVEL = 8 B (header, no map entries).
+    // KeyTypes: 4 types. X11 reserves the first four indices
+    // (ONE_LEVEL/TWO_LEVEL/ALPHABETIC/KEYPAD) and Xlib's
+    // `XkbAllocClientMap` rejects `nTypes < XkbNumRequiredTypes`
+    // (= 4) with BadValue — XkbGetMap then returns NULL and GTK3
+    // dies with "Failed to get keymap". xkbcommon-x11 doesn't
+    // enforce the minimum, which is why wezterm worked at 2.
+    // Our keys only reference indices 0 and 1; types 2 and 3 are
+    // shipped as minimal ONE_LEVEL stubs so they exist in the
+    // table without expanding the symbol layout.
+    // ONE_LEVEL = 8 B header (no map entries).
     // TWO_LEVEL = 8 B header + 1 KTSetMapEntry (8 B) = 16 B.
-    let key_types_bytes: usize = 8 + 16;
+    // Types 2 + 3 = 8 B header each.
+    let key_types_bytes: usize = 8 + 16 + 8 + 8;
 
     // KeySyms: 8-byte header + nSyms * 4 per key.
     let key_syms_bytes: usize = keys
@@ -240,8 +250,8 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
     //         |KeyActions|VirtualMods|VirtualModMap = 0xDF.
     r[12..14].copy_from_slice(&0x00DF_u16.to_le_bytes());
     // [14] firstType=0
-    r[15] = 2; // nTypes
-    r[16] = 2; // totalTypes
+    r[15] = 4; // nTypes — XkbNumRequiredTypes
+    r[16] = 4; // totalTypes
     r[17] = min_kc; // firstKeySym
     r[18..20].copy_from_slice(&u16::try_from(total_syms).unwrap_or(u16::MAX).to_le_bytes());
     r[20] = n_keys; // nKeySyms — covers full range
@@ -285,6 +295,15 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
     r[map_entry + 3] = SHIFT_MASK; // realMods
     // [map_entry+4..+6] virtualMods=0, [map_entry+6..+8] pad
     off += 16;
+
+    // Types 2 (ALPHABETIC) and 3 (KEYPAD): minimal ONE_LEVEL
+    // headers. Reserved by X11 but unreferenced by our keymap;
+    // shipping them as `numLevels=1, nMapEntries=0` keeps the
+    // wire-format valid without growing the body.
+    r[off + 4] = 1; // numLevels (ALPHABETIC)
+    off += 8;
+    r[off + 4] = 1; // numLevels (KEYPAD)
+    off += 8;
 
     // KeySyms: per-key KeySymMap.
     for k in &keys {
@@ -379,16 +398,19 @@ pub(super) fn reply_get_names(keymap: &Keymap) -> Vec<u8> {
     // * symbolsName    ATOM = 4 bytes  (Symbols)
     // * typesName      ATOM = 4 bytes  (Types)
     // * compatName     ATOM = 4 bytes  (Compat)
-    // * typeNames[2]   ATOM = 8 bytes  (KeyTypeNames)
-    // * nLevelsPerType[2] + pad + ktLevelNames[3] = 16 bytes
-    //                                  (KTLevelNames)
+    // * typeNames[4]   ATOM = 16 bytes (KeyTypeNames) — must match
+    //                                  GetMap's nTypes=4
+    // * nLevelsPerType[4] + pad + ktLevelNames[sumLevels] = 4 + 0 + 5*4
+    //                                  = 24 bytes (KTLevelNames)
     // * virtualModNames: 0 bytes       (VirtualModNames, popcount=0)
     // * keyNames[nKeys] KeyName(4) = nKeys * 4 bytes (KeyNames)
     let unconditional_names_bytes = 4 * 4;
-    let key_type_names_bytes = 2 * 4;
-    let kt_levels_count = 2;
+    let key_type_names_bytes = 4 * 4;
+    let kt_levels_count = 4;
     let kt_levels_count_pad = (4 - kt_levels_count % 4) % 4;
-    let kt_level_names_bytes = kt_levels_count + kt_levels_count_pad + 3 * 4;
+    // nLevelsPerType = [1, 2, 1, 1] (ONE_LEVEL/TWO_LEVEL/ALPHABETIC-stub/KEYPAD-stub)
+    let kt_level_names_count: usize = 1 + 2 + 1 + 1;
+    let kt_level_names_bytes = kt_levels_count + kt_levels_count_pad + kt_level_names_count * 4;
     let nk = usize::from(n_keys);
     let key_names_bytes = nk * 4;
     let extra =
@@ -403,7 +425,7 @@ pub(super) fn reply_get_names(keymap: &Keymap) -> Vec<u8> {
     r[8..12].copy_from_slice(&which.to_le_bytes());
     r[12] = min_kc;
     r[13] = max_kc;
-    r[14] = 2; // nTypes — must match GetMap's nTypes
+    r[14] = 4; // nTypes — must match GetMap's nTypes
     // [15] groupNames = 0
     // [16..18] virtualMods = 0
     r[18] = min_kc; // firstKey
@@ -411,10 +433,8 @@ pub(super) fn reply_get_names(keymap: &Keymap) -> Vec<u8> {
     // [20..24] indicators = 0
     // [24] nRadioGroups = 0
     // [25] nKeyAliases = 0
-    // [26..28] nKTLevels (sum of nLevelsPerType) — Xlib uses nTypes
-    // here per xkb.xml's note; xkbcommon honours nTypes for the
-    // ATOM list length, so the value is informational.
-    r[26..28].copy_from_slice(&3_u16.to_le_bytes());
+    // [26..28] nKTLevels (sum of nLevelsPerType) = 1+2+1+1 = 5.
+    r[26..28].copy_from_slice(&(kt_level_names_count as u16).to_le_bytes());
     // [28..32] pad
 
     // -- Body ----------------------------------------------------
@@ -425,13 +445,15 @@ pub(super) fn reply_get_names(keymap: &Keymap) -> Vec<u8> {
     // keycodesName + symbolsName + typesName + compatName: 4 zero
     // ATOMs (already zero from the vec! init).
     off += unconditional_names_bytes;
-    // typeNames: 2 ATOMs (zeroed).
+    // typeNames: 4 ATOMs (zeroed).
     off += key_type_names_bytes;
-    // KTLevelNames: nLevelsPerType[] = [1, 2], pad to 4-byte
-    // boundary (2 bytes), then 3 ATOMs (zeroed).
+    // KTLevelNames: nLevelsPerType[] = [1, 2, 1, 1], pad to 4-byte
+    // boundary (0 bytes, count already aligned), then 5 ATOMs (zeroed).
     r[off] = 1; // ONE_LEVEL has 1 level
     r[off + 1] = 2; // TWO_LEVEL has 2 levels
-    off += kt_levels_count + kt_levels_count_pad + 3 * 4;
+    r[off + 2] = 1; // ALPHABETIC stub
+    r[off + 3] = 1; // KEYPAD stub
+    off += kt_levels_count + kt_levels_count_pad + kt_level_names_count * 4;
     // VirtualModNames is empty (popcount(virtualMods=0)=0).
     // KeyNames: n_keys × 4 zero bytes (anonymous names).
     off += key_names_bytes;
@@ -498,7 +520,12 @@ pub(super) fn reply_get_device_info() -> Vec<u8> {
 pub(super) fn reply_minimal(minor: u8) -> Vec<u8> {
     log::debug!("xkb: unimplemented minor {minor}, returning minimal reply");
     let mut r = vec![0u8; 32];
-    r[0] = 1;
+    r[0] = 1; // reply type
+    r[1] = 1; // deviceID — must match the value returned by reply_get_map
+    // and reply_get_controls etc.; xkbcommon-x11 cross-validates the
+    // deviceID across replies and tears down the keymap when it
+    // doesn't agree. GTK3's startup path probes minors 4 (GetState)
+    // and 21 (PerClientFlags) through here.
     r
 }
 
@@ -595,9 +622,10 @@ mod tests {
         let present = u16::from_le_bytes([r[12], r[13]]);
         assert_eq!(present & 0xDF, 0xDF);
 
-        // KeyTypes: 2 types (ONE_LEVEL, TWO_LEVEL).
-        assert_eq!(r[15], 2, "nTypes = 2");
-        assert_eq!(r[16], 2, "totalTypes = 2");
+        // KeyTypes: 4 types — Xlib's XkbAllocClientMap rejects
+        // anything less with BadValue (XkbNumRequiredTypes = 4).
+        assert_eq!(r[15], 4, "nTypes = XkbNumRequiredTypes");
+        assert_eq!(r[16], 4, "totalTypes = XkbNumRequiredTypes");
 
         // KeySyms covers full range, firstKeySym >= minKeyCode and
         // firstKeySym + nKeySyms <= maxKeyCode + 1.
@@ -665,7 +693,8 @@ mod tests {
         let total_modmap = r[33] as usize;
 
         // Compute the offset to the ModifierMap section.
-        let mut off = 40 + 24; // past KeyTypes
+        // KeyTypes: ONE_LEVEL (8) + TWO_LEVEL (16) + 2 stubs (8 each) = 40.
+        let mut off = 40 + 40; // past KeyTypes
         // Walk KeySyms to advance.
         for _ in 0..n_keys {
             let nsyms = u16::from_le_bytes([r[off + 6], r[off + 7]]) as usize;
@@ -711,7 +740,8 @@ mod tests {
         let n_keys = map[11] - map[10] + 1;
         assert_eq!(r[18], map[10], "firstKey == min_kc");
         assert_eq!(r[19], n_keys, "nKeys covers full range");
-        assert_eq!(r[14], 2, "nTypes == GetMap's nTypes (2)");
+        assert_eq!(r[14], map[15], "GetNames nTypes == GetMap's nTypes");
+        assert_eq!(r[14], 4, "nTypes == XkbNumRequiredTypes");
     }
 
     #[test]
