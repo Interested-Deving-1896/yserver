@@ -246,6 +246,20 @@ that the host hides for us.
 - [ ] **Opcode 81 (InstallColormap) unsupported.** fvwm3 calls it once.
       Safe to ignore on a TrueColor backend; could just reply "did it"
       to silence the unsupported-opcode log.
+- [ ] **Can't switch VT while yserver is running.** The startup
+      `KDSKBMODE=K_OFF` blocks the kernel from interpreting
+      Ctrl+Alt+Fn as a VT switch — it's the same mechanism that
+      stops keystrokes from leaking to the underlying TTY. yserver
+      currently doesn't implement the standard
+      `VT_PROCESS` / `VT_RELDISP` cooperative-VT-switch protocol
+      (Xorg's `xf86OpenConsole` / `xf86VTSwitch`), so even if the
+      keys reached us we'd have nowhere to dispatch them. Workaround
+      from a remote shell: `sudo chvt N`, or `sudo systemctl restart
+      display-manager` to land back in the original session.
+      Fix: install a SIGUSR1/SIGUSR2 handler bound via
+      `VT_SETMODE` and release/acquire the DRM master in lock-step
+      with the kernel-driven switch. Mostly cosmetic until the
+      multi-server use case (X+yserver in parallel) becomes real.
 - [ ] **Crash before `console::Drop` leaves the host TTY unusable.**
       yserver's startup grabs the VT with `KDSKBMODE=K_OFF +
       KD_GRAPHICS` (kernel keystroke→TTY translation suppressed) and
