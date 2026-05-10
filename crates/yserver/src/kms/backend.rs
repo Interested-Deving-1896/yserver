@@ -6105,7 +6105,9 @@ impl KmsBackend {
         // `COLOR_ATTACHMENT_OPTIMAL` (composite leaves it there) or
         // sometimes `PRESENT_SRC_KHR` after a flip — use GENERAL on
         // the dst side which is permissive enough not to fight either.
-        let ticket = run_one_shot_op(&vk, pool_handle, |vk, cb| {
+        // run_one_shot_op submits + waits idle, so when it returns the
+        // staging buffer is host-coherent and ready to read.
+        run_one_shot_op(&vk, pool_handle, |vk, cb| {
             let pre = [ash::vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
                 .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
@@ -6167,9 +6169,6 @@ impl KmsBackend {
             Ok(())
         })
         .map_err(|e| io::Error::other(format!("scanout copy submit: {e:?}")))?;
-
-        vk.wait_ticket(ticket, std::time::Duration::MAX)
-            .map_err(|e| io::Error::other(format!("scanout copy wait: {e:?}")))?;
 
         // Pick a unique filename so successive dumps don't clobber.
         static DUMP_COUNT: AtomicU32 = AtomicU32::new(0);
