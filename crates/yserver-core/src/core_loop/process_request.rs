@@ -5372,6 +5372,70 @@ fn handle_xi2_request(
             reply.extend_from_slice(&[0u8; 4]);
             buf.extend_from_slice(&reply);
         }
+        // XI2 grab opcodes. We don't yet honour grabs in event routing,
+        // but the calling client (commonly GTK opening a popup) blocks
+        // in _XReply waiting for XIGrabDevice / XIPassiveGrabDevice
+        // replies. Without these stubs, mate-panel's calendar applet
+        // never even maps its popup window. Returning Success +
+        // empty-modifier-list lets the popup state machine advance;
+        // outside-click dismissal works via normal pointer fanout.
+        51 => {
+            // XIGrabDevice: reply is 32 bytes (header + status byte at
+            // offset 8 + 23 pad). Status=0 (Success). The status sits
+            // inside the trailing 24, not the reply's `data` byte.
+            let (grab_window, deviceid) = if body.len() >= 16 {
+                (
+                    u32::from_le_bytes([body[0], body[1], body[2], body[3]]),
+                    u16::from_le_bytes([body[12], body[13]]),
+                )
+            } else {
+                (0, 0)
+            };
+            debug!(
+                "client {} #{} XIGrabDevice window=0x{:x} deviceid={} -> Success (stub)",
+                client_id.0, sequence.0, grab_window, deviceid
+            );
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
+            reply.extend_from_slice(&[0u8; 24]);
+            buf.extend_from_slice(&reply);
+        }
+        52 => {
+            debug!("client {} #{} XIUngrabDevice (stub)", client_id.0, sequence.0);
+            return Ok(RequestOutcome::Handled);
+        }
+        53 => {
+            debug!("client {} #{} XIAllowEvents (stub)", client_id.0, sequence.0);
+            return Ok(RequestOutcome::Handled);
+        }
+        54 => {
+            // XIPassiveGrabDevice: reply is 32 bytes (header +
+            // num_modifiers CARD16 at offset 8 + 22 pad). With
+            // num_modifiers=0 the client treats every requested
+            // modifier combination as successfully grabbed.
+            let (grab_window, detail, deviceid) = if body.len() >= 18 {
+                (
+                    u32::from_le_bytes([body[4], body[5], body[6], body[7]]),
+                    u32::from_le_bytes([body[12], body[13], body[14], body[15]]),
+                    u16::from_le_bytes([body[16], body[17]]),
+                )
+            } else {
+                (0, 0, 0)
+            };
+            debug!(
+                "client {} #{} XIPassiveGrabDevice window=0x{:x} detail=0x{:x} deviceid={} -> empty-modifier-list (stub)",
+                client_id.0, sequence.0, grab_window, detail, deviceid
+            );
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
+            reply.extend_from_slice(&[0u8; 24]);
+            buf.extend_from_slice(&reply);
+        }
+        55 => {
+            debug!(
+                "client {} #{} XIPassiveUngrabDevice (stub)",
+                client_id.0, sequence.0
+            );
+            return Ok(RequestOutcome::Handled);
+        }
         // XI 1.x reply-required minors. xts opens a probe XListInputDevices /
         // XOpenDevice on every test, so without these stubs the entire
         // XI / XIproto suites hang on _XReply. Each reply is exactly
@@ -5407,7 +5471,10 @@ fn handle_xi2_request(
             buf.extend_from_slice(&reply);
         }
         _ => {
-            debug!("unhandled XI2 request minor={}", minor);
+            debug!(
+                "client {} #{} unhandled XI2 request minor={}",
+                client_id.0, sequence.0, minor
+            );
             return Ok(RequestOutcome::Handled);
         }
     }

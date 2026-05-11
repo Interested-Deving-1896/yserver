@@ -4166,3 +4166,78 @@ interactive smoke yet — each handler is a wire-format proxy of an
 already-working rect-list path, so the unit tests cover the new
 surface and a MATE re-run can confirm the `XFIXES::unknown` lines
 go away.
+
+## XI2 grab stubs — MATE panel popups unblocked (2026-05-11)
+
+Followed up on the "MATE clicks investigation — popup grab
+semantics" entry above by actually reading the log. The previous
+session's next-step #1 ("add `debug!` for XI2 51/52/54 to see
+whether GTK is even attempting an active grab") was the right
+next step but never actually landed — the default arm just said
+`unhandled XI2 request minor={}` with no client_id.
+
+Replayed the existing `yserver-hw.log` from the MATE session:
+
+| Pattern | Count |
+|---------|-------|
+| `libinput button` | 12 |
+| `pointer_fanout XI2: kind=ButtonPress` | 12 |
+| `unhandled XI2 request minor=51` (XIGrabDevice) | **1** |
+| `unhandled XI2 request minor=52/53/54/55` | 0 |
+
+So exactly **one** active-grab call across the whole session, and
+we silently dropped it. XIGrabDevice has a reply
+(`<reply><pad 1><status enum=GrabStatus><pad 23></reply>`); a
+client that called `xcb_xinput_xi_grab_device` and then waited on
+the cookie blocked indefinitely, and the popup state machine
+never reached its `MapWindow` step. (Different symptom from the
+note above, where in an earlier session a popup overlay *did*
+map and then refused to unmap — but the same root cause family.)
+
+### Fix
+
+Stubs for XI2 minors 51–55 in `handle_xi2_request`. None of them
+yet honour the grab in event routing — we still fan out events
+to whoever's under the cursor — but a well-formed reply unsticks
+the client.
+
+| Minor | Op | Behaviour |
+|-------|-----|-----------|
+| **51** | `XIGrabDevice` | 32-byte reply with `status=Success` at offset 8 (the existing `[0u8; 24]` trailer). Logs the window + deviceid. |
+| **52** | `XIUngrabDevice` | Void; logged + acknowledged. |
+| **53** | `XIAllowEvents` | Void; logged + acknowledged. |
+| **54** | `XIPassiveGrabDevice` | 32-byte reply with `num_modifiers=0` (every requested modifier-combo is reported "grabbed"). Logs window + detail + deviceid. |
+| **55** | `XIPassiveUngrabDevice` | Void; logged + acknowledged. |
+
+Also: the catch-all `_ =>` log line in `handle_xi2_request` now
+prefixes `client {id} #{seq}` so future "unhandled" lines name
+the originating client without having to time-correlate with
+surrounding traffic.
+
+### Expected outcome
+
+The mate-panel calendar applet (and any other GTK widget that
+calls `XIGrabDevice` to manage popup dismissal) can now:
+
+1. Open the popup window — its grab call no longer blocks.
+2. Have the popup's input shield receive outside-click
+   `ButtonPress` events via normal pointer fanout, which is
+   what the popup-dismiss widget code listens for.
+
+What is *not* fixed:
+
+- Real grab routing semantics: events are still delivered to
+  the spatially-correct top-level, not redirected to the
+  grabbing client when the cursor leaves the grab window. For
+  basic popup dismissal this is usually fine, but for things
+  like Sync-mode key/button grabs and pointer-confinement it
+  isn't.
+- `mode=NotifyGrab` crossing events on grab activation —
+  currently we don't generate the synthetic
+  `EnterNotify`/`LeaveNotify` pairs that some widgets rely on.
+
+Validation: `cargo test --workspace` green (272 + 208 + 88 + 9).
+`cargo clippy --workspace` clean (same pre-existing
+`build_path_selector_inputs` doc warning, untouched). MATE
+re-run pending — would confirm the calendar applet (and other
+GTK popups) dismiss on outside clicks.
