@@ -4086,3 +4086,38 @@ bug is downstream in popup grab/dismissal semantics.
 4. Cross-check against the gtk3-demo flow: same renderer, did
    any of its popup menus (e.g. right-click) work? If yes the
    diff would isolate mate-panel-specific behaviour.
+
+### Easy-win side quest — XFIXES missing minors
+
+Same log surfaced four XFIXES minors that mate-panel / marco /
+common GTK widgets call but we silently `XFIXES::unknown`:
+
+| Minor | Op | Hits in 30 s session |
+|-------|-----|---------------------|
+| **22** | `SetWindowShapeRegion` | client 14 × 7 |
+| **1**  | `ChangeSaveSet` (XFIXES variant) | clients 16/35/43 × 6 |
+| **23** | `SetPictureClipRegion` | client 14 × 1 |
+| **21** | `SetGCClipRegion` | client 14 × 2 |
+
+Cheap to implement: we already have `CreateRegion` / region
+storage and the rect-list variants of every target op
+(`SetClipRectangles` for GCs, `SetPictureClipRectangles` for
+pictures, the SHAPE handler for window shape). Each XFIXES
+minor is parse-region-xid → fetch stored rect list → reuse the
+existing rectangle-list path. ~30–50 LoC each, no new state, no
+new sync.
+
+Expected payoff:
+- Silences the recurring `XFIXES::unknown` noise from
+  mate-panel and marco.
+- Almost certainly relevant to "panel transparent areas catch
+  clicks" because mate-panel uses `SetWindowShapeRegion` (minor
+  22) to mark its empty pixels as click-through. Won't fix the
+  popup-stuck-after-first-click bug (that's the XI2 grab work
+  above) but may smooth other interactions.
+- Plausibly unblocks widgets we haven't tested yet that depend
+  on XFIXES-region-based clipping.
+
+A reasonable pick if you want a short, mechanical session that
+makes visible progress without the depth-of-rabbit-hole risk
+inherent in the XI2 grab investigation.
