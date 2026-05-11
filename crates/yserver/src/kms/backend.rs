@@ -6182,7 +6182,7 @@ impl KmsBackend {
     /// `Recording` (fallbacks) phase — i.e. whatever is closest to
     /// "what's on the monitor right now".
     pub fn do_dump_scanout(&mut self) -> io::Result<()> {
-        use crate::kms::vk::{ops::run_one_shot_op, scanout::BoPhase};
+        use crate::kms::vk::scanout::BoPhase;
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let Some(vk) = self.vk.as_ref().cloned() else {
@@ -6192,30 +6192,63 @@ impl KmsBackend {
             return Err(io::Error::other("no ops command pool"));
         };
 
-        // Pick a bo, preferring "currently on screen" over earlier
-        // states. Falls through to recording / submitted (so we can
-        // dump even mid-pageflip-pending).
+        // Pick the best-available bo *per pool* — each pool corresponds
+        // to one DRM output (CRTC), so a multi-monitor setup wants one
+        // dump per pool. Within a pool prefer "currently on screen"
+        // and fall through to recording / submitted so we can still
+        // dump mid-pageflip-pending.
         let preferred = [
             BoPhase::OnScreen,
             BoPhase::Pending,
             BoPhase::Submitted,
             BoPhase::Recording,
         ];
-        let mut chosen: Option<(usize, usize)> = None;
-        'outer: for phase in preferred {
-            for (pi, pool) in self.scanout_pools.iter().enumerate() {
-                let Some(pool) = pool.as_ref() else {
-                    continue;
-                };
+        let mut chosen: Vec<(usize, usize)> = Vec::new();
+        for (pi, pool) in self.scanout_pools.iter().enumerate() {
+            let Some(pool) = pool.as_ref() else {
+                continue;
+            };
+            for phase in preferred {
                 if let Some(bi) = pool.bos.iter().position(|b| b.state.phase == phase) {
-                    chosen = Some((pi, bi));
-                    break 'outer;
+                    chosen.push((pi, bi));
+                    break;
                 }
             }
         }
-        let Some((pool_idx, bo_idx)) = chosen else {
+        if chosen.is_empty() {
             return Err(io::Error::other("no non-Free scanout bo found"));
-        };
+        }
+
+        // Shared run counter so concurrent SIGUSR1 dumps don't clobber.
+        static DUMP_COUNT: AtomicU32 = AtomicU32::new(0);
+        let n = DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+
+        let mut last_err: Option<io::Error> = None;
+        let mut wrote_any = false;
+        for (pool_idx, bo_idx) in chosen {
+            match self.dump_scanout_one(&vk, pool_handle, pool_idx, bo_idx, n) {
+                Ok(()) => wrote_any = true,
+                Err(e) => {
+                    log::warn!("do_dump_scanout: pool {pool_idx} failed: {e}");
+                    last_err = Some(e);
+                }
+            }
+        }
+        if !wrote_any {
+            return Err(last_err.unwrap_or_else(|| io::Error::other("scanout dump failed")));
+        }
+        Ok(())
+    }
+
+    fn dump_scanout_one(
+        &mut self,
+        vk: &std::sync::Arc<crate::kms::vk::device::VkContext>,
+        pool_handle: ash::vk::CommandPool,
+        pool_idx: usize,
+        bo_idx: usize,
+        run: u32,
+    ) -> io::Result<()> {
+        use crate::kms::vk::ops::run_one_shot_op;
 
         let pool = self.scanout_pools[pool_idx].as_mut().unwrap();
         let bo = &mut pool.bos[bo_idx];
@@ -6233,7 +6266,7 @@ impl KmsBackend {
         // the dst side which is permissive enough not to fight either.
         // run_one_shot_op submits + waits idle, so when it returns the
         // staging buffer is host-coherent and ready to read.
-        run_one_shot_op(&vk, pool_handle, |vk, cb| {
+        run_one_shot_op(vk, pool_handle, |vk, cb| {
             let pre = [ash::vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
                 .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
@@ -6296,10 +6329,7 @@ impl KmsBackend {
         })
         .map_err(|e| io::Error::other(format!("scanout copy submit: {e:?}")))?;
 
-        // Pick a unique filename so successive dumps don't clobber.
-        static DUMP_COUNT: AtomicU32 = AtomicU32::new(0);
-        let n = DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
-        let path = format!("./yserver-scanout-{n}.ppm");
+        let path = format!("./yserver-scanout-{run}-out{pool_idx}.ppm");
 
         let raw =
             unsafe { std::slice::from_raw_parts(staging_mapped.as_ptr(), staging_size as usize) };
