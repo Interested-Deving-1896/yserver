@@ -3719,3 +3719,129 @@ xfwm4 just falls back, but both are easy to silence.
   observable behaviour as a real X server with XRes builtin but
   no clients tracked; just without the warning. Canonical layout
   per `/usr/share/xcb/res.xml`.
+
+## MATE desktop comes up — partial render (2026-05-11)
+
+First serious test of full MATE on yserver-hw. Three protocol-level
+bugs fixed, mate-session bootstraps, mate-panel renders to the
+screen, then the visible rendering exposes deeper issues that didn't
+trip on simpler WMs (fvwm3 / xfwm4 / e16 / wmaker / gtk3-demo).
+
+### Fixed
+
+1. **`fix(req)` — exact-length validator now accepts BIG-REQUESTS**
+   (`17eeb26`). `validate_exact_request_length` compared the client's
+   `length_units` against `exact_required_length()`'s output without
+   accounting for the extra header unit that BIG-REQUESTS inserts.
+   For a BIG request, the wire is `length_units*4 - 8 == body.len()`
+   (8-byte header: 4-byte normal header + 4-byte extended length),
+   not `length_units*4 - 4`. Detected from the body/length-units
+   relationship; bump the required by one when BIG is used.
+
+   Without this: every `_NET_WM_ICON`-sized ChangeProperty (~256 KB)
+   from any GTK client got `BadLength`. mate-panel + caja both
+   `Gdk-WARNING: poly request too large` and died, then respawned
+   in tight loops via session manager. With the fix, zero BadLength
+   errors across a full mate-session run.
+
+2. **`fix(randr)` — pixel→mm formula off by 10×** (`89f1136`). The
+   integer-math formula for per-output / per-screen mm dimensions
+   used divisor 9600 and rounding bias 4800; the correct values for
+   96 DPI are 960 and 480 (mm = px * 25.4 / 96 → (px*254 + 480)/960).
+
+   Net effect: yserver advertised a 2560 px monitor as **68 mm**
+   wide, which clients infer as **≈ 956 DPI**. GTK's auto-scale
+   rounds that to a 10× multiplier, so mate-panel laid out content
+   for a "logical" ~256 px display and only painted the leftmost
+   1136 px of the actual 2560 px panel window. SIGUSR1 scanout
+   verified before/after — panel now paints edge-to-edge.
+
+   Three call sites + two tests updated; the setup_thread.rs
+   `1024 px → 677 mm` reference scaler already used the right ratio.
+
+3. **`just(mate)` — full mate-session bootstrap** (`cad37bb`).
+   `yserver-mate-hw` was launching bare `marco` + `wezterm`. Bare
+   marco from a TTY crashes inside libX11's `XQueryExtension` /
+   `_XInitDisplayLock` due to an `unsetenv()`-after-threads heap
+   corruption that's an environment issue on this Arch + cachyos
+   host (reproduces against vanilla Xephyr too — `tools/marco-xephyr.sh`
+   was written to prove this and stays around).
+
+   Recipe now goes through `dbus-run-session mate-session --display :7`
+   with `WAYLAND_DISPLAY` / `WAYLAND_SOCKET` stripped and
+   `GDK_BACKEND=x11` / `XDG_SESSION_TYPE=x11` forced — otherwise
+   GTK auto-detects Wayland and `gdk_x11_window_get_xid()` assertion-
+   fails inside mate-settings-daemon. Companion `yserver-mate` recipe
+   added for vng (virtio-vga-gl + Venus + zink) iteration.
+
+### Diagnostic surface left
+
+- **`exact-length BadLength` diagnostic at the request-length emit
+  site in `process_request.rs`.** Dumps opcode, header.data,
+  length_units, body.len, computed-required, and a 64-byte body
+  preview. Caught today's BIG-REQUESTS off-by-one in one log line.
+
+- **`ChangeProperty BadLength` per-branch diagnostic** in
+  `handle_change_property` (parse-fail and length-mismatch paths).
+  Redundant with the request-length one for ChangeProperty
+  specifically, but the parse-fail branch is more granular about
+  *which* field parsing fell off.
+
+- **`tools/marco-{gdb,watch,xephyr}.sh` + `tools/marco-gdb-watch.gdb`**
+  (`155efe7`). The whole hardware-watchpoint-on-libX11-state and
+  marco-under-Xephyr setup, ready for re-use.
+
+### Visible after the fixes
+
+mate-session bootstraps cleanly, marco runs without crashing,
+mate-panel sizes correctly (2560 px wide on the primary monitor at
+sensible icon height), caja launches, mate-settings-daemon configures
+cursor theme, system tray populates (network, sync, weather, security
+icons). Second monitor (HDMI-A-1) is on, cursor crosses freely
+between outputs; default MATE config doesn't put a panel on the
+second screen.
+
+### Known issues, deferred
+
+- **GTK widget flicker (irregular, rapid).** Only GTK widgets
+  flicker — gray desktop and static regions are stable. With marco's
+  compositor disabled (`gsettings set org.mate.Marco.general
+  compositing-manager false`) the panel doesn't draw at all (likely
+  needs marco compositor for ARGB transparency) but the notification
+  popup still flickers — so the flicker isn't two-compositors
+  competing, it's in our RENDER / glyph / damage path itself. Same
+  family of bugs as yesterday's gtk3-demo work. No `vk text bail`
+  / `parse_add_glyphs bail` / `render_fill_rectangles bail` lines
+  in the run, so we're not falling into the obvious sw-fallback
+  paths. Next session: add per-frame RENDER::Composite logging on
+  the notification window, or x11trace the notification daemon.
+
+- **Text-rendering residuals** (carry-over from `1cf8b25` ARGB32
+  glyphset accept). User flagged "bad text rendering like residuals
+  of the gtk3 demo fixes we did yesterday — and weren't fully fixed
+  yet". TreeView left-pane labels still missing per yesterday's
+  notes; same bug now visible on mate-panel + notification text.
+
+- **COMPOSITE BadAlloc** (1 error in the run, mate-panel client
+  on resource `0xe00041`). One-off. Likely a redirect-pixmap path
+  we don't fully model. mate-panel proceeds despite it.
+
+- **XFIXES minor=22 unhandled** — mate-panel calls it ≥ 5×. Modern
+  XFIXES request (1.4+ era). Returns a `debug!("XFIXES::unknown")`
+  but no error; possibly causing mate-panel to compute the wrong
+  visible region for its applets. Worth implementing as a stub
+  next session.
+
+- **Compositor 3-deep BO pool / cursor on second monitor.** Earlier
+  in the day the cursor showed up "huge and flickering" on a smaller
+  notification-shaped window; that resolved once DPI math was fixed
+  and marco's compositor took over (mate-panel needs it for ARGB).
+  Still — multi-monitor cursor handoff during composite hasn't been
+  smoke-tested end-to-end.
+
+### Memory updates
+
+- Updated `feedback_wire_format_external_source.md` applies again —
+  the BIG-REQUESTS unit-count behavior is in `bigreq.xml` /
+  `xproto.xml` and the X.org server's `bigreq.c`; we re-derived it
+  from log evidence instead of checking the canonical source first.
