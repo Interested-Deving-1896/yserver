@@ -6420,14 +6420,14 @@ impl KmsBackend {
             // bo isn't available the frame is skipped — no pixman
             // fallback. The next pageflip-complete event will retrigger
             // composite_and_flip.
-            let bo_slot = self.try_vulkan_composite_flip(layout_idx, visible);
-            if bo_slot.is_none() {
+            let Some((bo_idx, pool_slot)) = self.try_vulkan_composite_flip(layout_idx, visible)
+            else {
                 log::debug!(
                     "composite: deferring frame on output {} until a Free bo is available",
                     self.outputs[layout_idx].output.connector_name
                 );
                 continue;
-            }
+            };
             // record_submit was added in task 7; keep it here.
             self.outputs[layout_idx].damage.record_submit();
             log::debug!(
@@ -6460,13 +6460,8 @@ impl KmsBackend {
                         layout_idx,
                         frame_id,
                         submitted_gen,
-                        bo_slot,
-                        // composite_pool_slot: PLACEHOLDER until T5.
-                        // Must not be read by any caller before T5 lands the
-                        // real value from `try_vulkan_composite_flip`.
-                        // T6 starts reading this field (release-on-retirement)
-                        // and must not land before T5.
-                        0,
+                        Some(bo_idx),
+                        pool_slot, // real pool slot now, not placeholder
                         ash::vk::Fence::null(),
                     ),
                     gpu_retired: false,
@@ -6480,22 +6475,65 @@ impl KmsBackend {
         Ok(())
     }
 
+    /// Lazy-init the composite pool ring for this output. Returns
+    /// `None` if Vulkan or the compositor pipeline isn't up
+    /// (test path).
+    fn ensure_composite_pools(
+        &mut self,
+        layout_idx: usize,
+    ) -> Option<&mut crate::kms::scheduler::composite_pool_ring::CompositePoolRing> {
+        if self.outputs[layout_idx].composite_pools.is_none() {
+            let vk = self.vk.as_ref()?.clone();
+            match crate::kms::scheduler::composite_pool_ring::CompositePoolRing::new(
+                vk,
+                crate::kms::vk::pipeline::MAX_DESCRIPTOR_SETS_PER_FRAME,
+            ) {
+                Ok(ring) => {
+                    self.outputs[layout_idx].composite_pools = Some(ring);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "composite: failed to create descriptor pool ring for output {}: {e:?}",
+                        self.outputs[layout_idx].output.connector_name
+                    );
+                    return None;
+                }
+            }
+        }
+        self.outputs[layout_idx].composite_pools.as_mut()
+    }
+
     /// VkComposite path (sub-phase 4.1.3.4): build a
     /// [`CompositeScene`] from the window tree, pick a Free
     /// `ScanoutBo`, record the per-window quad-draw composite pass,
-    /// submit, atomic-flip with explicit fences. Returns `Some(bo_idx)`
-    /// with the index of the scanout BO that was used, or `None` if the
-    /// composite + flip did not happen (no free BO, no Vulkan, or error).
-    fn try_vulkan_composite_flip(&mut self, layout_idx: usize, visible: &[u32]) -> Option<usize> {
+    /// submit, atomic-flip with explicit fences. Returns
+    /// `Some((bo_idx, pool_slot))` with the scanout BO index and the
+    /// descriptor pool slot acquired from the per-output ring, or
+    /// `None` if the composite + flip did not happen (no free BO, no
+    /// Vulkan, ring exhausted, or error).
+    fn try_vulkan_composite_flip(
+        &mut self,
+        layout_idx: usize,
+        visible: &[u32],
+    ) -> Option<(usize, usize)> {
         use crate::kms::vk::{compositor, scanout::BoPhase};
 
-        let vkctx = self.vk.as_ref()?;
-        let pipeline = self.compositor_pipeline.as_ref()?;
-        let pool = self
-            .scanout_pools
-            .get(layout_idx)
-            .and_then(|p| p.as_ref())?;
-        let Some(bo_idx) = pool.bos.iter().position(|b| b.state.phase == BoPhase::Free) else {
+        // Clone the Arc immediately so the immutable self.vk borrow
+        // doesn't extend across the mutable ensure_composite_pools
+        // call below.
+        let vkctx = self.vk.as_ref()?.clone();
+        self.compositor_pipeline.as_ref()?; // existence check; borrow drops here
+
+        // Read-only check for a Free BO. Mutable re-borrow happens
+        // later (for record_and_present_composite).
+        let bo_idx = {
+            let pool = self
+                .scanout_pools
+                .get(layout_idx)
+                .and_then(|p| p.as_ref())?;
+            pool.bos.iter().position(|b| b.state.phase == BoPhase::Free)
+        };
+        let Some(bo_idx) = bo_idx else {
             log::warn!(
                 "vk composite: no Free bo in pool for output {} — deferring frame",
                 self.outputs[layout_idx].output.connector_name
@@ -6503,31 +6541,72 @@ impl KmsBackend {
             return None;
         };
 
+        // Acquire a descriptor pool slot from this output's ring.
+        let pool_slot = {
+            let ring = self.ensure_composite_pools(layout_idx)?;
+            ring.acquire()
+        };
+        let Some(pool_slot) = pool_slot else {
+            log::warn!(
+                "vk composite: descriptor pool ring exhausted for output {} — deferring frame",
+                self.outputs[layout_idx].output.connector_name
+            );
+            return None;
+        };
+
+        let descriptor_pool = self.outputs[layout_idx]
+            .composite_pools
+            .as_ref()
+            .expect("ensure_composite_pools just succeeded")
+            .pool_at(pool_slot);
+
         let scene = self.build_composite_scene(layout_idx, visible);
 
-        // Re-borrow pool mutably to advance bo state.
+        // Take the pipeline reference here; it's independent of
+        // self.scanout_pools and self.outputs[idx].
+        let pipeline = self.compositor_pipeline.as_ref()?;
         let pool_mut = self
             .scanout_pools
             .get_mut(layout_idx)
             .and_then(|p| p.as_mut())?;
         let bo = &mut pool_mut.bos[bo_idx];
-        pipeline.reset_descriptors().ok(); // transitional shared-pool reset; T5 replaces
-        match compositor::record_and_present_composite(
-            vkctx,
+        let result = compositor::record_and_present_composite(
+            &vkctx,
             &self.device,
             &self.outputs[layout_idx].output,
             bo,
             pipeline,
-            pipeline.descriptor_pool, // T5 replaces with ring slot
+            descriptor_pool,
             &scene,
-        ) {
-            Ok(()) => Some(bo_idx),
+        );
+
+        match result {
+            Ok(()) => Some((bo_idx, pool_slot)),
             Err(e) => {
                 log::warn!(
                     "vk composite: record_and_present_composite failed on output {}: {e} \
                      — skipping frame",
                     self.outputs[layout_idx].output.connector_name
                 );
+                // Error-path pool release. `record_and_present_composite`
+                // can fail BEFORE or AFTER `vkQueueSubmit2` (see
+                // `vk/compositor.rs` — pre-submit: layout / fb / record
+                // errors; post-submit: `export_signaled_fd` /
+                // `submit_flip_with_fences`). Post-submit, the GPU may
+                // still be reading descriptor sets allocated from
+                // `pool_slot`. Resetting the pool then would invalidate
+                // sets in active use — phase-4-unsafe.
+                //
+                // Conservative fix: drain the queue before releasing.
+                // Atomic-commit rejection is the typical trigger and is
+                // rare; a `queue_wait_idle` here is acceptable. The hot
+                // path (Ok branch) is unchanged.
+                unsafe {
+                    let _ = vkctx.device.queue_wait_idle(vkctx.graphics_queue);
+                }
+                if let Some(ring) = self.outputs[layout_idx].composite_pools.as_mut() {
+                    ring.release(pool_slot);
+                }
                 None
             }
         }
