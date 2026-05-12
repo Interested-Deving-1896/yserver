@@ -598,6 +598,8 @@ pub(crate) struct OutputLayout {
     pub y: i32,
     pub width: u16,
     pub height: u16,
+    #[allow(dead_code)]
+    pub damage: crate::kms::scheduler::damage::OutputDamageState,
 }
 
 impl OutputLayout {
@@ -751,6 +753,12 @@ pub struct KmsBackend {
     // whether the kernel ever told us the very first flip latched.
     pub(crate) first_pageflip_logged: Vec<bool>,
 
+    /// Per-output damage tracker and generation counter. Drives the
+    /// T7 cutover from the global `screen_dirty` bool to per-output
+    /// dirty tracking. Unused until task 7; present here so T7's diff
+    /// is a pure read/write-path swap with no struct layout churn.
+    #[allow(dead_code)]
+    pub(crate) scheduler: crate::kms::scheduler::RenderScheduler,
     // Set whenever something that could affect on-screen pixels
     // changes (client request processed, host input dispatched,
     // host-X11 event fanned out). `composite_and_flip` is a no-op
@@ -1300,6 +1308,7 @@ impl KmsBackend {
                 y: 0,
                 width: 800,
                 height: 600,
+                damage: crate::kms::scheduler::damage::OutputDamageState::new(),
             }],
             fb_w: 800,
             fb_h: 600,
@@ -1315,6 +1324,7 @@ impl KmsBackend {
             input_ctx: None,
             vk: None,
             first_pageflip_logged: vec![false; 1],
+            scheduler: crate::kms::scheduler::RenderScheduler::new(),
             screen_dirty: true,
             scanout_pools: Vec::new(),
             compositor_pipeline: None,
@@ -1505,6 +1515,7 @@ impl KmsBackend {
                 y: 0,
                 width: w,
                 height: h,
+                damage: crate::kms::scheduler::damage::OutputDamageState::new(),
             });
             next_x = next_x.saturating_add(i32::from(w));
         }
@@ -1879,6 +1890,7 @@ impl KmsBackend {
             input_ctx,
             vk,
             first_pageflip_logged: vec![false; layouts_len],
+            scheduler: crate::kms::scheduler::RenderScheduler::new(),
             screen_dirty: true,
             scanout_pools,
             compositor_pipeline,
