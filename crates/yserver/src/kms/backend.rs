@@ -6185,6 +6185,34 @@ impl KmsBackend {
         }
     }
 
+    /// Bump dirty on every output whose rect intersects `old` ∪ `new`.
+    /// Use this from geometry-change call sites (configure, restack,
+    /// reparent, unmap, destroy, map). `old == new` is fine — bumps
+    /// only the intersecting outputs. An empty rect (w=0 or h=0)
+    /// overlaps nothing and is safely ignored.
+    fn mark_window_dirty_with_old_rect(&mut self, old: Rect, new: Rect) {
+        for layout in &mut self.outputs {
+            let lr = layout.rect();
+            let lr_x2 = lr.x.saturating_add(lr.w);
+            let lr_y2 = lr.y.saturating_add(lr.h);
+            let old_overlaps = old.w > 0
+                && old.h > 0
+                && old.x < lr_x2
+                && lr.x < old.x.saturating_add(old.w)
+                && old.y < lr_y2
+                && lr.y < old.y.saturating_add(old.h);
+            let new_overlaps = new.w > 0
+                && new.h > 0
+                && new.x < lr_x2
+                && lr.x < new.x.saturating_add(new.w)
+                && new.y < lr_y2
+                && lr.y < new.y.saturating_add(new.h);
+            if old_overlaps || new_overlaps {
+                layout.damage.bump_dirty();
+            }
+        }
+    }
+
     /// True iff any output has unpresented damage and no pending flip.
     fn any_output_needs_composite(&self) -> bool {
         self.outputs.iter().any(|l| l.damage.needs_composite())
@@ -10606,7 +10634,7 @@ mod tests {
     use yserver_core::backend::Backend;
     use yserver_protocol::x11::ResourceId;
 
-    use super::{AliasEntry, AliasRegistry, KmsBackend, WindowState};
+    use super::{AliasEntry, AliasRegistry, KmsBackend, OutputLayout, WindowState};
     use yserver_core::backend::PixmapHandle;
 
     #[test]
@@ -11276,5 +11304,166 @@ mod tests {
 
         b.poly_text16(None, 0, 0, &body).unwrap();
         assert_eq!(b.current_font, Some(0xCAFE_F00D));
+    }
+
+    // ---------------------------------------------------------------------------
+    // mark_window_dirty_with_old_rect — helper and multi-output fixture
+    // ---------------------------------------------------------------------------
+
+    /// Push a synthetic second (or third) output into `backend.outputs`.
+    /// Constructs a new `OutputLayout` using the same fake DRM handles as
+    /// `for_tests()`; tests must never pass these through the DRM ioctl path.
+    /// `x` is the left edge in virtual-screen coords; `width` is in pixels.
+    fn push_extra_output(backend: &mut KmsBackend, x: i32, width: u16) {
+        backend.outputs.push(OutputLayout {
+            output: crate::drm::modeset::Output {
+                connector: ::drm::control::from_u32(2).unwrap(),
+                connector_name: format!("test-extra-{x}"),
+                crtc: ::drm::control::from_u32(2).unwrap(),
+                plane: ::drm::control::from_u32(2).unwrap(),
+                // SAFETY: never passed to DRM in tests.
+                mode: unsafe { std::mem::zeroed() },
+                picked: crate::drm::modeset::Mode {
+                    name: format!("{width}x600"),
+                    width,
+                    height: 600,
+                    vrefresh: 60,
+                    preferred: false,
+                },
+                plane_fb_id_prop: ::drm::control::from_u32(2).unwrap(),
+                plane_crtc_id_prop: ::drm::control::from_u32(2).unwrap(),
+            },
+            swapchain: crate::drm::Swapchain::empty_for_tests(),
+            x,
+            y: 0,
+            width,
+            height: 600,
+            damage: crate::kms::scheduler::damage::OutputDamageState::new(),
+        });
+        // Keep first_pageflip_logged in sync with the outputs count.
+        backend.first_pageflip_logged.push(false);
+    }
+
+    #[test]
+    fn mark_window_dirty_with_old_rect_single_output_sanity() {
+        // Single output: any non-empty rect touching it bumps the gen.
+        let mut backend = make_test_backend();
+        let gen_before = backend.outputs[0].damage.dirty_gen();
+        let rect = super::Rect {
+            x: 10,
+            y: 10,
+            w: 50,
+            h: 50,
+        };
+        backend.mark_window_dirty_with_old_rect(rect, rect);
+        assert!(
+            backend.outputs[0].damage.dirty_gen() > gen_before,
+            "single output must be bumped when rect is on it"
+        );
+    }
+
+    #[test]
+    fn mark_window_dirty_with_old_rect_bumps_old_and_new_outputs() {
+        let mut backend = make_test_backend();
+        // Output A: x=0..800 (from for_tests). Output B: x=1920..3840.
+        push_extra_output(&mut backend, 1920, 1920);
+        // Extend the output B width to cover x=1920..3840; the base output
+        // covers 0..800. Use a new_rect on B.
+        let gen_a_before = backend.outputs[0].damage.dirty_gen();
+        let gen_b_before = backend.outputs[1].damage.dirty_gen();
+        let old_rect = super::Rect {
+            x: 50,
+            y: 50,
+            w: 100,
+            h: 100,
+        }; // on A (0..800)
+        let new_rect = super::Rect {
+            x: 2000,
+            y: 50,
+            w: 100,
+            h: 100,
+        }; // on B (1920..3840)
+        backend.mark_window_dirty_with_old_rect(old_rect, new_rect);
+        assert!(
+            backend.outputs[0].damage.dirty_gen() > gen_a_before,
+            "output A must be bumped (old_rect is on A)"
+        );
+        assert!(
+            backend.outputs[1].damage.dirty_gen() > gen_b_before,
+            "output B must be bumped (new_rect is on B)"
+        );
+    }
+
+    #[test]
+    fn mark_window_dirty_with_old_rect_does_not_bump_uninvolved_outputs() {
+        let mut backend = make_test_backend();
+        // Output A: 0..800. Output B: 1920..3840. Output C: 3840..5760.
+        push_extra_output(&mut backend, 1920, 1920);
+        push_extra_output(&mut backend, 3840, 1920);
+        let gens_before: Vec<u64> = backend
+            .outputs
+            .iter()
+            .map(|l| l.damage.dirty_gen())
+            .collect();
+        // Move within A — only A bumps.
+        let old_rect = super::Rect {
+            x: 50,
+            y: 50,
+            w: 100,
+            h: 100,
+        };
+        let new_rect = super::Rect {
+            x: 200,
+            y: 50,
+            w: 100,
+            h: 100,
+        };
+        backend.mark_window_dirty_with_old_rect(old_rect, new_rect);
+        assert!(
+            backend.outputs[0].damage.dirty_gen() > gens_before[0],
+            "output A must be bumped (both rects on A)"
+        );
+        assert_eq!(
+            backend.outputs[1].damage.dirty_gen(),
+            gens_before[1],
+            "output B must NOT be bumped"
+        );
+        assert_eq!(
+            backend.outputs[2].damage.dirty_gen(),
+            gens_before[2],
+            "output C must NOT be bumped"
+        );
+    }
+
+    #[test]
+    fn mark_window_dirty_with_old_rect_handles_empty_rect_as_no_bump() {
+        // Empty rect (e.g. map: old = empty, new = current) overlaps nothing.
+        let mut backend = make_test_backend();
+        let gen_before = backend.outputs[0].damage.dirty_gen();
+        let empty = super::Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
+        let new_rect = super::Rect {
+            x: 50,
+            y: 50,
+            w: 100,
+            h: 100,
+        };
+        // map case: old=empty, new=current — only new bumps output A.
+        backend.mark_window_dirty_with_old_rect(empty, new_rect);
+        assert!(
+            backend.outputs[0].damage.dirty_gen() > gen_before,
+            "output must be bumped by new_rect even when old is empty"
+        );
+        // unmap case: old=current, new=empty — only old bumps output A.
+        let gen_mid = backend.outputs[0].damage.dirty_gen();
+        backend.mark_window_dirty_with_old_rect(new_rect, empty);
+        assert!(
+            backend.outputs[0].damage.dirty_gen() > gen_mid,
+            "output must be bumped by old_rect even when new is empty"
+        );
     }
 }
