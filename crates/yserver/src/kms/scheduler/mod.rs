@@ -6,3 +6,5 @@
 
 pub mod damage;
 pub mod in_flight;
+pub mod output_frame;
+pub mod paint_batch;
