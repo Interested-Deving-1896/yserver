@@ -7810,6 +7810,20 @@ impl Backend for KmsBackend {
         } else {
             Vec::new()
         };
+        // Snapshot the mapped rect before destruction so we can dirty the
+        // right outputs. Unmapped windows are invisible, so no dirty needed.
+        let destroy_rect = self.windows.get(&host_xid).and_then(|w| {
+            if !w.mapped {
+                return None;
+            }
+            let (ox, oy) = self.absolute_origin(host_xid);
+            Some(Rect {
+                x: ox as i32,
+                y: oy as i32,
+                w: i32::from(w.width),
+                h: i32::from(w.height),
+            })
+        });
 
         if self.windows.remove(&host_xid).is_some() {
             // Update parent's children list (or top-level stacking order
@@ -7827,6 +7841,16 @@ impl Backend for KmsBackend {
         }
         self.xid_map.remove(&host_xid);
 
+        // Dirty outputs that displayed this window (empty new = nothing to show).
+        let empty = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
+        if let Some(rect) = destroy_rect {
+            self.mark_window_dirty_with_old_rect(rect, empty);
+        }
         let _ = siblings;
         Ok(())
     }
@@ -7835,6 +7859,24 @@ impl Backend for KmsBackend {
         if let Some(window) = self.windows.get_mut(&host_xid) {
             window.mapped = true;
         }
+        // Dirty outputs intersecting the newly-visible rect.
+        // old = empty (window wasn't visible), new = current rect.
+        let empty = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
+        let map_rect = self.windows.get(&host_xid).map(|w| {
+            let (ox, oy) = self.absolute_origin(host_xid);
+            Rect {
+                x: ox as i32,
+                y: oy as i32,
+                w: i32::from(w.width),
+                h: i32::from(w.height),
+            }
+        });
+        self.mark_window_dirty_with_old_rect(empty, map_rect.unwrap_or(empty));
         Ok(())
     }
 
@@ -7847,12 +7889,33 @@ impl Backend for KmsBackend {
         let Some((parent_xid, _children, _wx, _wy, _ww, _wh)) = info else {
             return Ok(());
         };
+        // Snapshot screen-space rect before unmapping, so we dirty the
+        // right outputs (absolute_origin relies on the parent chain).
+        let pre_rect = {
+            let (ox, oy) = self.absolute_origin(host_xid);
+            self.windows.get(&host_xid).map(|w| Rect {
+                x: ox as i32,
+                y: oy as i32,
+                w: i32::from(w.width),
+                h: i32::from(w.height),
+            })
+        };
 
         // Unmap the window
         if let Some(window) = self.windows.get_mut(&host_xid) {
             window.mapped = false;
         }
-
+        // Dirty outputs that were displaying this window.
+        // new = empty (window is now invisible).
+        let empty = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
+        if let Some(rect) = pre_rect {
+            self.mark_window_dirty_with_old_rect(rect, empty);
+        }
         let _ = parent_xid;
         Ok(())
     }
