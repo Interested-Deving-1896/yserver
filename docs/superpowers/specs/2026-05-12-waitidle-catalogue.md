@@ -57,20 +57,20 @@ fundamental lifetime requirement.
 |---|---|---|---|---|
 | `crates/yserver/src/kms/vk/ops/mod.rs:59` | `OpsCommandPool::drop` | teardown | stays | Pool drop must drain the queue before `vkDestroyCommandPool`; CBs allocated from this pool may be in-flight. |
 | `crates/yserver/src/kms/vk/ops/mod.rs:100` | `run_one_shot_op` | sync | phase 4 | The canonical per-op hot-path drain: submit then immediately wait idle so the caller's next op sees a clean queue. Every drawing op (fill, copy, text, traps…) funnels through here. |
-| `crates/yserver/src/kms/vk/ops/mod.rs:168` | `OpsStaging::ensure` | temporary | phase 4 | Grow path for the shared staging buffer. Wait is conservative ("eager-submit means nothing is in-flight") but unnecessary once the retire queue defers old-buffer frees. |
+| `crates/yserver/src/kms/vk/ops/mod.rs:168` | `OpsStaging::ensure` | temporary | phase 3 | Grow path for the shared staging buffer. Wait is conservative ("eager-submit means nothing is in-flight") but unnecessary once `PaintBatch` owns the staging buffer and the retire queue defers old-buffer frees. Goes with the first recorder family to migrate (HLD §Phasing: "associated scratch drains are gone"). |
 | `crates/yserver/src/kms/vk/ops/mod.rs:184` | `OpsStaging::drop` | teardown | stays | Staging buffer destruction; must drain before unmap + free. |
-| `crates/yserver/src/kms/vk/glyph.rs:444` | `GlyphAtlas::grow_staging` | temporary | phase 4 | Grow path for the atlas staging buffer; same pattern as `OpsStaging::ensure` — conservative wait that a retire queue renders unnecessary. |
+| `crates/yserver/src/kms/vk/glyph.rs:444` | `GlyphAtlas::grow_staging` | temporary | phase 3 | Grow path for the atlas staging buffer; same pattern as `OpsStaging::ensure` — conservative wait that goes away when the text family migrates to `PaintBatch` and the atlas resize is deferred through the retire queue. |
 | `crates/yserver/src/kms/vk/glyph.rs:460` | `GlyphAtlas::drop` | teardown | stays | Atlas drop must drain before freeing the staging buffer, atlas image, and view. |
 | `crates/yserver/src/kms/vk/target.rs:735` | `DrawableImage::initialize_clear` | sync | phase 4 | One-shot CB that clears a freshly-created mirror to (0,0,0,0) and transitions it to `SHADER_READ_ONLY_OPTIMAL`. Could use a signalled fence instead of `wait_idle`; same pattern as `run_one_shot_op`. |
-| `crates/yserver/src/kms/vk/copy_scratch.rs:76` | `CopyScratch::ensure_size` | temporary | phase 4 | Grow path that destroys the old scratch image. Retire queue could defer the old image free so the wait is unnecessary. |
+| `crates/yserver/src/kms/vk/copy_scratch.rs:76` | `CopyScratch::ensure_size` | temporary | phase 3 | Grow path that destroys the old scratch image. Retires with the copy family migration to `PaintBatch`; the old image free defers through the retire queue. |
 | `crates/yserver/src/kms/vk/copy_scratch.rs:137` | `CopyScratch::drop` | teardown | stays | Scratch image drop; must drain before `vkDestroyImage` + free. |
-| `crates/yserver/src/kms/vk/dst_readback.rs:105` | `DstReadback::ensure` | temporary | phase 4 | Grow path that replaces the per-format readback scratch image. Old image destroy could be deferred by a retire queue. |
+| `crates/yserver/src/kms/vk/dst_readback.rs:105` | `DstReadback::ensure` | temporary | phase 3 | Grow path that replaces the per-format readback scratch image. Retires with the render family migration to `PaintBatch`; old image destroy defers through the retire queue. |
 | `crates/yserver/src/kms/vk/dst_readback.rs:264` | `DstReadback::drop` | teardown | stays | Readback scratch images drop; must drain before destroying views, images, and freeing memory. |
 | `crates/yserver/src/kms/vk/gradient.rs:250` | `GradientPicture::drop` | teardown | stays | Gradient image drop; must drain before `vkDestroyImageView` + `vkDestroyImage` + free. |
 | `crates/yserver/src/kms/vk/pipeline.rs:314` | `CompositorPipeline::drop` | teardown | stays | Compositor pipeline teardown; must drain before destroying descriptor pool, pipelines, layout, and sampler. |
 | `crates/yserver/src/kms/vk/text_pipeline.rs:329` | `TextPipeline::drop` | teardown | stays | Text pipeline teardown; must drain before destroying descriptor pool, pipeline, layout, set layout, and sampler. |
-| `crates/yserver/src/kms/vk/mask_scratch.rs:110` | `MaskScratch::ensure_image_size` | temporary | phase 4 | Grow path for the mask scratch image; retire queue could defer the old image free. |
-| `crates/yserver/src/kms/vk/mask_scratch.rs:133` | `MaskScratch::ensure_staging` | temporary | phase 4 | Grow path for the mask scratch staging buffer; same pattern as `OpsStaging::ensure`. |
+| `crates/yserver/src/kms/vk/mask_scratch.rs:110` | `MaskScratch::ensure_image_size` | temporary | phase 3 | Grow path for the mask scratch image; retires with the render family migration to `PaintBatch`. Old image free defers through the retire queue. |
+| `crates/yserver/src/kms/vk/mask_scratch.rs:133` | `MaskScratch::ensure_staging` | temporary | phase 3 | Grow path for the mask scratch staging buffer; same pattern as `OpsStaging::ensure`. Retires with the render family migration to `PaintBatch`. |
 | `crates/yserver/src/kms/vk/mask_scratch.rs:239` | `MaskScratch::drop` | teardown | stays | Mask scratch drop; must drain before freeing staging buffer, view, image, and memory. |
 | `crates/yserver/src/kms/vk/logic_fill_pipeline.rs:137` | `LogicFillPipelineCache::drop` | teardown | stays | Logic-fill pipeline cache teardown; must drain before destroying cached pipelines and layout. |
 | `crates/yserver/src/kms/vk/render_pipeline.rs:510` | `RenderPipelineCache::drop` | teardown | stays | Render (RENDER Composite) pipeline cache teardown; must drain before destroying pipelines, descriptor pool, layout, set layout, and sampler. |
@@ -104,23 +104,40 @@ replaces `run_one_shot_op` with a timeline fence, the `GetImage` path will
 use a targeted fence wait — that future targeted wait is where the
 **readback** classification will live.
 
-### Phase 4 target lists
+### Phase 3 target list
 
-Per the HLD's "Phasing" section, phase 4 ("Sync rework") replaces the
-hot-path `vkQueueWaitIdle` between paint and composite with timeline
-semaphores. The two **sync** sites and the six **temporary** sites are
-all phase-4 targets — sync sites are deleted, temporary sites are replaced
-with retire-queue / `PaintBatch` resource-ownership plumbing that defers
-the free past the submission's fence value.
+Per the HLD's "Phasing" section (lines 279–284), phase 3 migrates recorders
+to `PaintBatch` one family at a time (fill → copy → image → render → text →
+traps). After each family migrates, *its* `run_one_shot_op` calls and **its
+associated scratch drains are gone** — resource ownership transfers to the
+batch, and the scratch grow paths' synchronous waits become deferred frees
+through the retire queue.
+
+**Phase 3 — replace with deferred free (temporary), per recorder family:**
+- `crates/yserver/src/kms/vk/ops/mod.rs:168` (`OpsStaging::ensure`) — shared across all image-transfer families; retires once the first family migrates.
+- `crates/yserver/src/kms/vk/copy_scratch.rs:76` (`CopyScratch::ensure_size`) — retires with the copy family.
+- `crates/yserver/src/kms/vk/dst_readback.rs:105` (`DstReadback::ensure`) — retires with the render family.
+- `crates/yserver/src/kms/vk/mask_scratch.rs:110` (`MaskScratch::ensure_image_size`) — retires with the render family.
+- `crates/yserver/src/kms/vk/mask_scratch.rs:133` (`MaskScratch::ensure_staging`) — retires with the render family.
+- `crates/yserver/src/kms/vk/glyph.rs:444` (`GlyphAtlas::grow_staging`) — retires with the text family.
+
+Each row above is replaced by enqueueing the old resource into the batch's
+retire queue; the queue drops the resource when it drains past the
+submission's fence value.
+
+### Phase 4 target list
+
+Per the HLD's "Phasing" section (lines 285–288), phase 4 ("Sync rework")
+replaces the residual hot-path `vkQueueWaitIdle` between paint and composite
+with a timeline-semaphore wait, and converts the KMS handoff to binary
+SYNC_FD. After this phase the hot-path `waitIdle` is gone.
 
 **Phase 4 — delete (sync, replace with timeline fence):**
-- `crates/yserver/src/kms/vk/ops/mod.rs:100` (`run_one_shot_op`) → submit returns a fence; callers that need CPU-visible results wait on that fence.
+- `crates/yserver/src/kms/vk/ops/mod.rs:100` (`run_one_shot_op`) → any residual one-shot uses (those not absorbed by family migration in phase 3) get a fence-based completion; callers that need CPU-visible results wait on that fence.
 - `crates/yserver/src/kms/vk/target.rs:735` (`initialize_clear`) → one-shot CB already; use a fence instead of `wait_idle`.
 
-**Phase 4 — replace with deferred free (temporary):**
-- `crates/yserver/src/kms/vk/ops/mod.rs:168`, `crates/yserver/src/kms/vk/glyph.rs:444`, `crates/yserver/src/kms/vk/copy_scratch.rs:76`, `crates/yserver/src/kms/vk/dst_readback.rs:105`, `crates/yserver/src/kms/vk/mask_scratch.rs:110`, `crates/yserver/src/kms/vk/mask_scratch.rs:133` → enqueue old resource into retire queue; drop when the queue drains past the submission's fence value.
+### Stays forever (teardown)
 
-**Stays forever (teardown):**
 All 14 teardown sites. The `crates/yserver/src/kms/vk/device.rs:333`
 `vkDeviceWaitIdle` is spec-required. The rest are `Drop` impls (and one
 `pub fn` consumed only from `Drop`) whose waits are correct and permanent.
