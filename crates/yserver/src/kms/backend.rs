@@ -599,6 +599,12 @@ pub(crate) struct OutputLayout {
     pub width: u16,
     pub height: u16,
     pub damage: crate::kms::scheduler::damage::OutputDamageState,
+    /// Per-output ring of composite descriptor pools. Lazy-init on
+    /// first composite for this output (requires `vk` + the
+    /// compositor pipeline's `descriptor_set_layout`). `None` on
+    /// the `for_tests` path (no Vulkan).
+    #[allow(dead_code)]
+    pub composite_pools: Option<crate::kms::scheduler::composite_pool_ring::CompositePoolRing>,
 }
 
 impl OutputLayout {
@@ -1299,6 +1305,7 @@ impl KmsBackend {
                 width: 800,
                 height: 600,
                 damage: crate::kms::scheduler::damage::OutputDamageState::new(),
+                composite_pools: None,
             }],
             fb_w: 800,
             fb_h: 600,
@@ -1505,6 +1512,7 @@ impl KmsBackend {
                 width: w,
                 height: h,
                 damage: crate::kms::scheduler::damage::OutputDamageState::new(),
+                composite_pools: None,
             });
             next_x = next_x.saturating_add(i32::from(w));
         }
@@ -11613,6 +11621,7 @@ mod tests {
             width,
             height: 600,
             damage: crate::kms::scheduler::damage::OutputDamageState::new(),
+            composite_pools: None,
         });
         // Keep first_pageflip_logged in sync with the outputs count.
         backend.first_pageflip_logged.push(false);
