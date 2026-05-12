@@ -15,7 +15,7 @@ use self::{
     paint_batch::{BatchError, BatchState, PaintBatch},
 };
 
-// `batch_descriptor_arena` is added in T3.
+pub mod batch_descriptor_arena;
 pub mod batch_upload_arena;
 pub mod composite_pool_ring;
 pub mod damage;

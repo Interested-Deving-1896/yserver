@@ -21,7 +21,12 @@ use std::sync::Arc;
 
 use ash::vk;
 
-use crate::kms::{scheduler::batch_upload_arena::BatchUploadArena, vk::device::VkContext};
+use crate::kms::{
+    scheduler::{
+        batch_descriptor_arena::BatchDescriptorArena, batch_upload_arena::BatchUploadArena,
+    },
+    vk::device::VkContext,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchState {
@@ -90,6 +95,7 @@ pub struct PaintBatch {
     vk: Arc<VkContext>,
     retire_resources: Vec<Box<dyn BatchResource>>,
     upload_arena: Option<BatchUploadArena>,
+    descriptor_arena: Option<BatchDescriptorArena>,
 }
 
 impl std::fmt::Debug for PaintBatch {
@@ -116,6 +122,7 @@ impl PaintBatch {
             vk,
             retire_resources: Vec::new(),
             upload_arena: None,
+            descriptor_arena: None,
         }
     }
 
@@ -148,6 +155,15 @@ impl PaintBatch {
             self.upload_arena = Some(BatchUploadArena::new(self.vk.clone()));
         }
         self.upload_arena.as_mut().unwrap()
+    }
+
+    /// Mutable reference to the per-batch descriptor arena, lazy-init
+    /// on first call.
+    pub fn descriptor_arena_mut(&mut self) -> &mut BatchDescriptorArena {
+        if self.descriptor_arena.is_none() {
+            self.descriptor_arena = Some(BatchDescriptorArena::new(self.vk.clone()));
+        }
+        self.descriptor_arena.as_mut().unwrap()
     }
 
     /// Run `record` against the batch's CB. Lazy-allocates and
@@ -377,6 +393,9 @@ impl PaintBatch {
         if let Some(arena) = self.upload_arena.take() {
             Box::new(arena).release(&self.vk);
         }
+        if let Some(arena) = self.descriptor_arena.take() {
+            Box::new(arena).release(&self.vk);
+        }
         for r in self.retire_resources.drain(..) {
             r.release(&self.vk);
         }
@@ -392,6 +411,9 @@ impl PaintBatch {
             unsafe { self.vk.device.free_command_buffers(self.pool, &[cb]) };
         }
         if let Some(arena) = self.upload_arena.take() {
+            Box::new(arena).release(&self.vk);
+        }
+        if let Some(arena) = self.descriptor_arena.take() {
             Box::new(arena).release(&self.vk);
         }
         for r in self.retire_resources.drain(..) {
