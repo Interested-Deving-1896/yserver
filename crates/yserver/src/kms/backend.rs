@@ -6250,6 +6250,10 @@ impl KmsBackend {
                 // Already retired or null-sentinel: no real fence to check.
                 true
             } else if let Some(vk) = self.vk.as_ref() {
+                // SAFETY: composite_fence was created by `vk.device`
+                // and remains valid as long as VK is initialised; the
+                // `if let Some(vk)` guard establishes that VK is not
+                // torn down. Non-blocking status query.
                 let status = unsafe { vk.device.get_fence_status(composite_fence) };
                 matches!(status, Ok(true))
             } else {
@@ -11426,7 +11430,7 @@ mod tests {
     #[test]
     fn composite_and_flip_does_not_set_flip_pending_on_no_vk_path() {
         // The for_tests backend has no VK context, so
-        // try_vulkan_composite_flip returns false and record_submit
+        // try_vulkan_composite_flip returns None and record_submit
         // is never called. This test guards against the regression
         // where record_submit is accidentally called outside the
         // successful-submit branch.
