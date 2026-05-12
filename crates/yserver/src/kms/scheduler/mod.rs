@@ -5,3 +5,4 @@
 //! hot-path `vkQueueWaitIdle` calls are unchanged.
 
 pub mod damage;
+pub mod in_flight;
