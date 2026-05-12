@@ -1,14 +1,23 @@
-//! Per-output ring of two descriptor pools for composite recording.
+//! Per-output ring of descriptor pools for composite recording.
 //!
 //! Phase 2: replaces the single shared `CompositorPipeline.descriptor_pool`
 //! that was reset at the start of every composite pass. With per-frame
 //! ownership of a pool, multiple per-output composites can be in flight
 //! simultaneously without one's reset invalidating another's sets.
 //!
-//! Sizing rationale: at most one flip in flight per output (existing
-//! flip-pending skip), plus one frame being recorded. Ring of 2 is
-//! sufficient; backpressure (acquire returning None) only fires if the
-//! ring is exhausted, which the existing skip logic prevents.
+//! Sizing rationale: a pool slot is held in_use from `acquire` (at
+//! composite record time) until the matching `InFlightFrame` reaches
+//! `fully_retired()`. Full retirement requires the frame's scanout BO
+//! to advance to `BoPhase::Free`, which takes three pageflip-complete
+//! events from submit (`Pending → OnScreen → Retiring → Free`). The
+//! existing flip-pending skip paces records at one per pageflip cycle,
+//! so the steady-state pipeline has up to three concurrent
+//! `InFlightFrame`s per output (one in each of OnScreen/Retiring
+//! plus the just-submitted Pending). Each holds its acquired slot.
+//! The composite about to record acquires the next available slot.
+//! `RING_LEN = 3` is the minimum that keeps a slot available at
+//! record time; smaller values exhaust the ring under steady-state
+//! vsync rendering with a 3-BO scanout pool.
 
 use std::sync::Arc;
 
@@ -16,7 +25,10 @@ use ash::vk;
 
 use crate::kms::vk::device::VkContext;
 
-pub const RING_LEN: usize = 2;
+/// Number of descriptor pools per output. Sized to match the depth of
+/// the scanout `BoPhase` retirement pipeline; see the module-level
+/// "Sizing rationale" doc.
+pub const RING_LEN: usize = 3;
 
 /// Slot-tracking state. Extracted from `CompositePoolRing` so the
 /// state machine can be unit-tested without a real `VkContext`.
@@ -169,13 +181,15 @@ mod tests {
         let a = t.acquire();
         let b = t.acquire();
         let c = t.acquire();
+        let d = t.acquire();
         assert_eq!(a, Some(0));
         assert_eq!(b, Some(1));
+        assert_eq!(c, Some(2));
         assert_eq!(
-            c, None,
-            "third acquire on a RING_LEN=2 ring must return None"
+            d, None,
+            "fourth acquire on a RING_LEN=3 ring must return None"
         );
-        assert_eq!(t.slots_in_use(), 2);
+        assert_eq!(t.slots_in_use(), 3);
     }
 
     #[test]
