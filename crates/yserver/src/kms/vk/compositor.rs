@@ -111,7 +111,9 @@ pub struct CompositeScene {
 /// real render pass instead of a buffer→image copy):
 ///
 /// 1. Bo state must be `Free`. Transition to `Recording`.
-/// 2. Reset descriptor pool; allocate one descriptor set per draw.
+/// 2. Allocate one descriptor set per draw from the passed
+///    `descriptor_pool`. The pool was reset by the ring's
+///    `release()` when this slot was last returned; it's empty.
 /// 3. Record:
 ///    - layout transition `UNDEFINED → COLOR_ATTACHMENT_OPTIMAL`,
 ///    - `vkCmdBeginRendering` with `loadOp = CLEAR` (bg color),
@@ -132,6 +134,7 @@ pub fn record_and_present_composite(
     output: &Output,
     bo: &mut ScanoutBo,
     pipeline: &CompositorPipeline,
+    descriptor_pool: vk::DescriptorPool,
     scene: &CompositeScene,
 ) -> Result<(), PresentError> {
     if bo.state.phase != BoPhase::Free {
@@ -141,13 +144,17 @@ pub fn record_and_present_composite(
 
     bo.state.transition_to_recording();
 
-    // Reset descriptor pool from previous frame; allocate fresh
-    // descriptor sets for this frame's draws.
-    pipeline.reset_descriptors().map_err(PresentError::Vk)?;
+    // Reset is unnecessary — CompositePoolRing::release does the
+    // reset when a slot is returned. Caller hands us an empty pool.
+
     let mut descriptors: Vec<vk::DescriptorSet> = Vec::with_capacity(scene.draws.len());
     for draw in &scene.draws {
-        match pipeline.allocate_descriptor_for_view(draw.image_view) {
-            Ok(set) => descriptors.push(set),
+        let layouts = [pipeline.descriptor_set_layout];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&layouts);
+        let set = match unsafe { vk.device.allocate_descriptor_sets(&alloc_info) } {
+            Ok(sets) => sets[0],
             Err(e) => {
                 log::warn!(
                     "composite: descriptor allocation failed ({e:?}) at draw {} of {} — \
@@ -157,7 +164,18 @@ pub fn record_and_present_composite(
                 );
                 break;
             }
-        }
+        };
+        let image_info = [vk::DescriptorImageInfo::default()
+            .image_view(draw.image_view)
+            .sampler(pipeline.sampler)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let writes = [vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&image_info)];
+        unsafe { vk.device.update_descriptor_sets(&writes, &[]) };
+        descriptors.push(set);
     }
 
     record_composite_command_buffer(vk, bo, pipeline, scene, &descriptors)?;

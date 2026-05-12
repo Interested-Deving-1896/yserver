@@ -6511,12 +6511,14 @@ impl KmsBackend {
             .get_mut(layout_idx)
             .and_then(|p| p.as_mut())?;
         let bo = &mut pool_mut.bos[bo_idx];
+        pipeline.reset_descriptors().ok(); // transitional shared-pool reset; T5 replaces
         match compositor::record_and_present_composite(
             vkctx,
             &self.device,
             &self.outputs[layout_idx].output,
             bo,
             pipeline,
+            pipeline.descriptor_pool, // T5 replaces with ring slot
             &scene,
         ) {
             Ok(()) => Some(bo_idx),

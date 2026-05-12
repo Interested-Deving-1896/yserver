@@ -111,7 +111,7 @@ pub struct CompositorPipeline {
     /// holding a single combined image sampler. Overflow falls back
     /// to a soft warn (some windows would skip drawing this frame
     /// rather than crash).
-    descriptor_pool: vk::DescriptorPool,
+    pub descriptor_pool: vk::DescriptorPool, // T7 removes
     /// Color attachment format the pipeline was built for. The
     /// scanout bos use `B8G8R8A8_UNORM`; if anything else shows up
     /// the caller has to build a fresh pipeline.
