@@ -1,6 +1,6 @@
 //! Per-output dirty-generation tracking.
 //!
-//! Replaces the global `screen_dirty: bool`. Each `OutputLayout`
+//! Replaces the previous global dirty boolean. Each `OutputLayout`
 //! owns one of these. Producers (paint, geometry change, hotplug,
 //! input fanout) call `bump_dirty`; the composite scheduler reads
 //! `needs_composite`.

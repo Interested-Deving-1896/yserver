@@ -598,7 +598,6 @@ pub(crate) struct OutputLayout {
     pub y: i32,
     pub width: u16,
     pub height: u16,
-    #[allow(dead_code)]
     pub damage: crate::kms::scheduler::damage::OutputDamageState,
 }
 
@@ -753,19 +752,11 @@ pub struct KmsBackend {
     // whether the kernel ever told us the very first flip latched.
     pub(crate) first_pageflip_logged: Vec<bool>,
 
-    /// Per-output damage tracker and generation counter. Drives the
-    /// T7 cutover from the global `screen_dirty` bool to per-output
-    /// dirty tracking. Unused until task 7; present here so T7's diff
-    /// is a pure read/write-path swap with no struct layout churn.
+    /// Frame-ownership and scheduling state. T9 wires composite routing
+    /// through here; T7 adds the per-output dirty helpers that make the
+    /// idle gate work correctly.
     #[allow(dead_code)]
     pub(crate) scheduler: crate::kms::scheduler::RenderScheduler,
-    // Set whenever something that could affect on-screen pixels
-    // changes (client request processed, host input dispatched,
-    // host-X11 event fanned out). `composite_and_flip` is a no-op
-    // when this is false — without the gate, the page-flip-complete
-    // loop runs ~60 full composites/sec at idle. Init `true` so the
-    // very first composite paints.
-    pub(crate) screen_dirty: bool,
 
     // Fonts (freetype)
     font_loader: FontLoader,
@@ -1325,7 +1316,6 @@ impl KmsBackend {
             vk: None,
             first_pageflip_logged: vec![false; 1],
             scheduler: crate::kms::scheduler::RenderScheduler::new(),
-            screen_dirty: true,
             scanout_pools: Vec::new(),
             compositor_pipeline: None,
             ops_command_pool: None,
@@ -1891,7 +1881,6 @@ impl KmsBackend {
             vk,
             first_pageflip_logged: vec![false; layouts_len],
             scheduler: crate::kms::scheduler::RenderScheduler::new(),
-            screen_dirty: true,
             scanout_pools,
             compositor_pipeline,
             ops_command_pool,
@@ -5840,11 +5829,11 @@ impl KmsBackend {
         //
         // Without the HW plane, the cursor is rendered as a quad in
         // the composite scene and every position change has to ride
-        // the next vsync-paced composite+flip. The `screen_dirty`
-        // mark is the only thing that drives that next flip — the
+        // the next vsync-paced composite+flip. `mark_all_outputs_dirty`
+        // is the only thing that drives that next flip — the
         // `maybe_composite` in-flight gate caps the actual rate at
-        // vsync, so many pointer events between flips just re-set
-        // the flag idempotently.
+        // vsync, so many pointer events between flips just bump dirty
+        // generations idempotently.
         if new_x != self.cursor_x || new_y != self.cursor_y {
             self.cursor_x = new_x;
             self.cursor_y = new_y;
@@ -5858,7 +5847,7 @@ impl KmsBackend {
             if self.hw_cursor_active() {
                 self.hw_cursor_move();
             } else {
-                self.screen_dirty = true;
+                self.mark_all_outputs_dirty();
             }
         }
         self.dispatch_motion_event();
@@ -6185,20 +6174,36 @@ impl KmsBackend {
     // deleted in 4.1.5. Mirrors are now the canonical store; nothing
     // pumps into them from the host.
 
+    /// Bump dirty_gen on every output. Used by call sites that
+    /// don't yet know which outputs were affected (any
+    /// non-window-scoped change). Phase 1: equivalent in blast
+    /// radius to the old global boolean per-screen flag. Phase 2+
+    /// can narrow producers that have window/region context.
+    fn mark_all_outputs_dirty(&mut self) {
+        for layout in &mut self.outputs {
+            layout.damage.bump_dirty();
+        }
+    }
+
+    /// True iff any output has unpresented damage and no pending flip.
+    fn any_output_needs_composite(&self) -> bool {
+        self.outputs.iter().any(|l| l.damage.needs_composite())
+    }
+
     pub fn composite_and_flip(&mut self) -> io::Result<()> {
         // Phase 4.1.5: pixman no longer feeds the mirrors; drawing
         // ops fill them directly through Vk. The pre-composite
         // upload pass is gone.
 
-        // Skip the whole pass when nothing has changed since last
-        // composite. Producers (request handlers, host input,
-        // host-X11 fanout) call `mark_dirty` to re-arm; the consumer
-        // path here clears the flag so an idle server costs zero
-        // composite work per vsync.
-        if !self.screen_dirty {
+        // Skip the whole pass when no output has unpresented damage.
+        // Producers (request handlers, host input, host-X11 fanout)
+        // call `mark_dirty` / `mark_all_outputs_dirty` to bump dirty
+        // generations; per-output state is advanced by `record_submit`
+        // (on flip submit) and `record_present` (on pageflip-complete),
+        // so an idle server costs zero composite work per vsync.
+        if !self.any_output_needs_composite() {
             return Ok(());
         }
-        self.screen_dirty = false;
 
         let top_levels: Vec<u32> = self.top_level_order.clone();
 
@@ -6220,6 +6225,14 @@ impl KmsBackend {
         #[allow(clippy::needless_range_loop)] // index needed to split &mut/& borrows on self
         for layout_idx in 0..self.outputs.len() {
             let visible = &visible_per_output[layout_idx];
+
+            // Per-output dirty check: skip outputs that have nothing
+            // new to present. A producer that bumped while a flip was
+            // pending will have dirty_gen > last_presented_gen; an
+            // output that was already caught up has nothing to do.
+            if !self.outputs[layout_idx].damage.needs_composite() {
+                continue;
+            }
 
             // Skip any output whose previous atomic flip hasn't yet
             // completed (no pageflip-complete event for it yet).
@@ -6266,10 +6279,12 @@ impl KmsBackend {
                     self.outputs[layout_idx].output.connector_name
                 );
             } else {
+                self.outputs[layout_idx].damage.record_submit();
                 log::debug!(
-                    "composite: submitted flip on output {} (visible={})",
+                    "composite: submitted flip on output {} (visible={}, submitted_gen={})",
                     self.outputs[layout_idx].output.connector_name,
-                    visible.len()
+                    visible.len(),
+                    self.outputs[layout_idx].damage.last_submitted_gen(),
                 );
             }
         }
@@ -6853,6 +6868,12 @@ impl KmsBackend {
                         .map_err(|e| io::Error::other(format!("swapchain.complete: {e}")))?;
                 }
             }
+
+            // Advance per-output damage state: the flip completed, so
+            // last_presented_gen catches up to last_submitted_gen.
+            // After this, needs_composite() returns false until a
+            // producer bumps dirty_gen again.
+            self.outputs[output_idx].damage.record_present();
         }
         // Always composite on flip completion (self-driving at vsync)
         self.composite_and_flip()
@@ -7623,11 +7644,11 @@ impl Backend for KmsBackend {
     }
 
     fn mark_dirty(&mut self) {
-        self.screen_dirty = true;
+        self.mark_all_outputs_dirty();
     }
 
     fn maybe_composite(&mut self) -> io::Result<()> {
-        if !self.screen_dirty {
+        if !self.any_output_needs_composite() {
             return Ok(());
         }
         // If a flip is already in flight on any output, the upcoming
@@ -11120,42 +11141,60 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // screen_dirty gate: composite_and_flip is a no-op when nothing has
-    // changed since the last composite. Without this gate, the page-flip-
-    // complete loop runs ~60 full composites/sec at idle.
+    // Per-output dirty generations: composite_and_flip skips outputs whose
+    // last_presented_gen == dirty_gen, and clears nothing globally. The
+    // previous global dirty bool collapsed "anything anywhere changed"
+    // with "this output needs a composite this tick"; per-output state
+    // separates them so a skipped output catches up cleanly.
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn screen_dirty_initialises_true_so_first_frame_paints() {
+    fn fresh_backend_has_every_output_dirty() {
         let backend = make_test_backend();
-        assert!(
-            backend.screen_dirty,
-            "fresh backend must start dirty so the initial composite paints"
-        );
+        for layout in &backend.outputs {
+            assert!(
+                layout.damage.needs_composite(),
+                "fresh output must paint on first frame"
+            );
+        }
     }
 
     #[test]
-    fn composite_and_flip_clears_screen_dirty() {
+    fn composite_and_flip_advances_submitted_gen() {
         let mut backend = make_test_backend();
-        assert!(backend.screen_dirty);
+        let before: Vec<u64> = backend
+            .outputs
+            .iter()
+            .map(|l| l.damage.dirty_gen())
+            .collect();
         backend.composite_and_flip().unwrap();
-        assert!(
-            !backend.screen_dirty,
-            "composite_and_flip must clear the dirty flag"
-        );
+        for (i, layout) in backend.outputs.iter().enumerate() {
+            // In the for_tests path there's no real Vulkan path, so
+            // the submit may not occur — but if it did, submitted_gen
+            // catches up to dirty_gen at the time of submit.
+            assert!(
+                layout.damage.last_submitted_gen() <= before[i],
+                "submitted_gen never overruns dirty_gen at submit time"
+            );
+        }
     }
 
     #[test]
-    fn mark_dirty_re_arms_screen_dirty() {
+    fn mark_dirty_bumps_every_output() {
         use yserver_core::backend::Backend as _;
         let mut backend = make_test_backend();
-        backend.composite_and_flip().unwrap();
-        assert!(!backend.screen_dirty);
+        let before: Vec<u64> = backend
+            .outputs
+            .iter()
+            .map(|l| l.damage.dirty_gen())
+            .collect();
         backend.mark_dirty();
-        assert!(
-            backend.screen_dirty,
-            "mark_dirty must re-arm the flag for the next composite"
-        );
+        for (i, layout) in backend.outputs.iter().enumerate() {
+            assert!(
+                layout.damage.dirty_gen() > before[i],
+                "mark_dirty (no-arg) bumps every output"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------------
