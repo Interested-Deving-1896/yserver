@@ -6,9 +6,9 @@
 //! sampling that window's `vk_mirror`, plus a final cursor quad.
 //!
 //! This module owns the *pipeline* — built once per backend
-//! lifetime, reused every frame. Per-frame state (descriptor pool,
-//! command-buffer recording) lives in the call site (4.1.3.4 wires
-//! that next).
+//! lifetime, reused every frame. Per-frame descriptor pools live in
+//! the per-output `CompositePoolRing` (one ring per output); command-
+//! buffer recording lives in the call site (4.1.3.4 wires that next).
 //!
 //! Pipeline shape:
 //!
@@ -16,7 +16,7 @@
 //!   build time via the frag shader's `SRC_ALPHA_MODE` spec-constant
 //!   — see L1 plan task A.2). Both share one descriptor set layout
 //!   (single combined image sampler at binding 0), one nearest-filter
-//!   sampler, one pipeline layout, and one descriptor pool.
+//!   sampler, and one pipeline layout.
 //! - Vertex stage: 4-vertex `vkCmdDraw(4, 1, ...)` driven by
 //!   `gl_VertexIndex` — no vertex buffer is bound.
 //! - Fragment stage: samples the bound texture; the spec-constant
@@ -90,8 +90,9 @@ const _: () = assert!(std::mem::size_of::<CompositePushConsts>() == 40);
 /// of the fragment shader's `SRC_ALPHA_MODE` specialization
 /// constant — and the caller picks per draw via
 /// [`Self::pipeline_for`]. Both pipelines share the same
-/// descriptor-set layout, pipeline layout, sampler, and descriptor
-/// pool.
+/// descriptor-set layout, pipeline layout, and sampler.
+/// Per-frame descriptor pools are managed by the per-output
+/// `CompositePoolRing`.
 pub struct CompositorPipeline {
     vk: Arc<VkContext>,
     /// Force-opaque variant (`SRC_ALPHA_MODE = 0`). Window-mirror
@@ -105,22 +106,16 @@ pub struct CompositorPipeline {
     pub pipeline_layout: vk::PipelineLayout,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
     pub sampler: vk::Sampler,
-    /// Backend-shared descriptor pool. Reset at the start of every
-    /// composite pass; per-draw descriptor sets allocated from it
-    /// then. Sized for [`MAX_DESCRIPTOR_SETS_PER_FRAME`] sets — each
-    /// holding a single combined image sampler. Overflow falls back
-    /// to a soft warn (some windows would skip drawing this frame
-    /// rather than crash).
-    pub descriptor_pool: vk::DescriptorPool, // T7 removes
     /// Color attachment format the pipeline was built for. The
     /// scanout bos use `B8G8R8A8_UNORM`; if anything else shows up
     /// the caller has to build a fresh pipeline.
     pub color_format: vk::Format,
 }
 
-/// Soft cap on per-frame draws. Resized only if real sessions show
-/// it's not enough — e.g. a complex WM with hundreds of subwindows
-/// + decorations. Most fvwm/wmaker sessions stay well under 256.
+/// Soft cap on per-frame draws per output. Used by `CompositePoolRing`
+/// to size each per-output descriptor pool. Resized only if real
+/// sessions show it's not enough — e.g. a complex WM with hundreds of
+/// subwindows + decorations. Most fvwm/wmaker sessions stay well under 256.
 pub const MAX_DESCRIPTOR_SETS_PER_FRAME: u32 = 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -223,29 +218,6 @@ impl CompositorPipeline {
                 }
             };
 
-        // Descriptor pool — one combined image sampler per set,
-        // capped at MAX_DESCRIPTOR_SETS_PER_FRAME. Reset at the
-        // start of every composite pass.
-        let pool_sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(MAX_DESCRIPTOR_SETS_PER_FRAME)];
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(MAX_DESCRIPTOR_SETS_PER_FRAME)
-            .pool_sizes(&pool_sizes);
-        let descriptor_pool = match unsafe { device.create_descriptor_pool(&pool_info, None) } {
-            Ok(p) => p,
-            Err(e) => {
-                unsafe {
-                    device.destroy_pipeline(pipeline_passthrough, None);
-                    device.destroy_pipeline(pipeline_opaque, None);
-                    device.destroy_pipeline_layout(pipeline_layout, None);
-                    device.destroy_descriptor_set_layout(descriptor_set_layout, None);
-                    device.destroy_sampler(sampler, None);
-                }
-                return Err(e.into());
-            }
-        };
-
         Ok(Self {
             vk,
             pipeline_opaque,
@@ -253,7 +225,6 @@ impl CompositorPipeline {
             pipeline_layout,
             descriptor_set_layout,
             sampler,
-            descriptor_pool,
             color_format,
         })
     }
@@ -268,55 +239,12 @@ impl CompositorPipeline {
             self.pipeline_opaque
         }
     }
-
-    /// Reset the descriptor pool. Invalidates every descriptor set
-    /// allocated since the last reset; call at the start of each
-    /// composite pass.
-    pub fn reset_descriptors(&self) -> Result<(), vk::Result> {
-        unsafe {
-            self.vk
-                .device
-                .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())
-        }
-    }
-
-    /// Allocate a fresh descriptor set bound to `image_view` +
-    /// the shared nearest sampler. Returns the set ready for
-    /// `vkCmdBindDescriptorSets`. The set is invalid once
-    /// [`Self::reset_descriptors`] is called (next frame boundary).
-    pub fn allocate_descriptor_for_view(
-        &self,
-        image_view: vk::ImageView,
-    ) -> Result<vk::DescriptorSet, vk::Result> {
-        let layouts = [self.descriptor_set_layout];
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&layouts);
-        let sets = unsafe { self.vk.device.allocate_descriptor_sets(&alloc_info)? };
-        let set = sets[0];
-        let image_info = [vk::DescriptorImageInfo::default()
-            .image_view(image_view)
-            .sampler(self.sampler)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let writes = [vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&image_info)];
-        unsafe { self.vk.device.update_descriptor_sets(&writes, &[]) };
-        Ok(set)
-    }
 }
 
 impl Drop for CompositorPipeline {
     fn drop(&mut self) {
         unsafe {
             let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
-            // Pool tears down all per-frame descriptor sets; safe
-            // before destroying the pipelines.
-            self.vk
-                .device
-                .destroy_descriptor_pool(self.descriptor_pool, None);
             self.vk
                 .device
                 .destroy_pipeline(self.pipeline_passthrough, None);
