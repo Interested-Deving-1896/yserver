@@ -7867,6 +7867,18 @@ impl Backend for KmsBackend {
             .windows
             .get(&host_xid)
             .is_some_and(|_w| config.width.is_some() || config.height.is_some());
+        // Snapshot the pre-change screen-space rect for old∪new dirty
+        // propagation. `absolute_origin` needs &self so we capture it
+        // before the &mut borrow below.
+        let pre_rect = self.windows.get(&host_xid).map(|w| {
+            let (ox, oy) = self.absolute_origin(host_xid);
+            Rect {
+                x: ox as i32,
+                y: oy as i32,
+                w: i32::from(w.width),
+                h: i32::from(w.height),
+            }
+        });
         // Apply scalar updates first; capture the resize dims so the
         // mirror reallocation below can run without holding a &mut
         // borrow on `windows` (allocate_window_mirror takes &self).
@@ -7910,6 +7922,26 @@ impl Backend for KmsBackend {
                 window.vk_mirror = new_mirror;
             }
         }
+        // Dirty outputs intersecting old ∪ new screen-space rect.
+        // Must happen after the position/size fields are updated so
+        // `absolute_origin` returns the post-change coords.
+        let empty = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
+        let pre = pre_rect.unwrap_or(empty);
+        let post = self.windows.get(&host_xid).map_or(empty, |w| {
+            let (ox, oy) = self.absolute_origin(host_xid);
+            Rect {
+                x: ox as i32,
+                y: oy as i32,
+                w: i32::from(w.width),
+                h: i32::from(w.height),
+            }
+        });
+        self.mark_window_dirty_with_old_rect(pre, post);
         // Apply X11 stack_mode + sibling: restack the window in its
         // parent's stacking list. Without this, fvwm's "raise menu" path
         // (ConfigureWindow stack=Above on a freshly-mapped popup) leaves
@@ -7917,6 +7949,9 @@ impl Backend for KmsBackend {
         // popup behind unrelated top-levels.
         if let Some(stack_mode) = config.stack_mode {
             self.restack_window(host_xid, stack_mode, config.sibling);
+            // Restack doesn't move the window but changes which pixels are
+            // visible — dirty outputs intersecting the current position.
+            self.mark_window_dirty_with_old_rect(post, post);
         }
         let _ = resized;
         Ok(())

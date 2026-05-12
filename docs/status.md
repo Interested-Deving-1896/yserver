@@ -4718,3 +4718,105 @@ Suggested order:
 The composite plan/spec themselves are sound and don't need
 revision — Phase C just changes status from "withdrawn for
 marco" to "deferred until 1–3 land."
+
+## Composite work — follow-ups corrected after empirical work (2026-05-12)
+
+After the L1+L2 work and the XInput 2 fixes landed on master
+(`9237cdc`), the three follow-ups identified above need
+correction based on what was actually observed:
+
+### Issue 1 (Polaris dual-output flicker) — root cause was c468e7e, not the scanout allocator
+
+When the c468e7e cascade (`Automatic redirect with seeded
+backing + scanout-from-backing` plus the three follow-up
+patches) was dropped from the merge, dual-output flicker on
+discrete Polaris **went away** with it. The PCIe-bandwidth-
+from-GTT theory was wrong on two counts:
+- PCIe link is Gen 3 × 16 (~15.75 GB/s); the worst-case
+  2 × 2560×1440 × 60 Hz × 4 bytes ≈ 3.4 GB/s is far from
+  saturating it.
+- `amdgpu_top` capture (via `tools/amdgpu-bo-placement.sh`)
+  shows GTT usage ~300 MB baseline — same with yserver dead.
+  yserver's scanout BOs aren't materially in GTT.
+
+What was Issue 1 in the previous entry remains a **real
+follow-up**, but reframed: yserver should adopt the
+**GBM-with-modifier scanout allocator** as the principal path
+on drivers that advertise `VK_EXT_image_drm_format_modifier`,
+with the existing **Vulkan-linear-export** as the fallback for
+cap-restricted drivers (RADV gfx8/Polaris, lavapipe, Mesa
+Venus). This is what wlroots / Mutter / KWin /
+xorg-modesetting all do. The motivation is **architectural
+correctness across all GPUs**, not a fix for any current
+observed symptom. Codex sign-off: "after sync rework, add
+GBM/modifier allocation as a gated fast path; do not replace
+Vulkan-linear on Polaris." Tracked as a separate spec /
+follow-up; orthogonal to the sync rework below.
+
+### Issue 2 (per-op `vkQueueWaitIdle`) — real and on the docket
+
+Confirmed by direct observation: paint bursts (wezterm open,
+uxterm resize, mate-control-center hover) saturate GPU to
+100% on every tested machine; the per-op queue drain is the
+mechanism. Spec drafted at
+[`2026-05-12-paint-composite-sync-design.md`](superpowers/specs/2026-05-12-paint-composite-sync-design.md)
+(v2 after codex review round 1). Phasing P0..P7. Active work
+branch: `graphics-followups`.
+
+### Issue 3 (c468e7e redirect cascade) — resolved by dropping the commits
+
+The squash-merge to master dropped the c468e7e cascade. MATE
+panel renders correctly on master. Re-introducing Automatic
+redirect is a follow-up for "if/when a compositor needs it";
+not blocking anything today.
+
+### Other follow-ups surfaced this session
+
+- **HW cursor plane on amdgpu DCE** (`2d357cc`). Legacy
+  `set_cursor2`/`move_cursor` ioctls + atomic primary plane
+  produce cursor artefacts on Polaris (DCE 11.2) but not on
+  Renoir (DCN) or Skylake (i915). Plan: revert the HW plane
+  after the sync rework lands and pointer motion no longer
+  needs the kernel bypass. If the composite-quad cursor still
+  feels laggy on Polaris after the sync rework, refactor the
+  HW plane to atomic-plane commits instead of reverting.
+- **Applet-drag cascade crash**. Dragging a panel applet
+  (e.g. workspace switcher) in MATE crashes mate-panel on
+  release: cascade of `BadWindow` errors from clients
+  referencing windows the panel destroyed during the applet
+  reparent. Long-standing pre-existing issue (also visible on
+  bee/fuji as "couldn't drag the workspace applet
+  correctly"), surfaced now that input is precise enough to
+  actually trigger the reparent flow. Likely cause: missing
+  `DestroyNotify` / `ReparentNotify` / `UnmapNotify` during
+  reparent. Separate branch when picked up.
+
+### Open question on dual-output flicker
+
+Codex flagged: the per-output `vk_flip_pending` skip in
+`composite_and_flip` (`backend.rs:6212..6243`) can drift the
+two outputs into different frame ages under burst paint —
+that's an independent flicker mechanism the sync rework
+won't necessarily fix. P6 of the sync spec re-tests dual-
+screen Polaris after sync rework lands; if flicker
+re-surfaces, it's a separate scheduling fix to the per-output
+skip logic.
+
+### Sequencing
+
+In order:
+
+1. **Sync rework** (graphics-followups branch, spec landed) —
+   biggest user-visible win (GTK hover responsiveness),
+   makes the per-frame draw fanout Compiz-class compositors
+   need sustainable.
+2. **HW cursor plane revert** — side effect of (1).
+3. **GBM scanout allocator** as a feature-detected primary
+   path — architectural correctness across all GPUs; codex
+   sign-off says do this *after* sync rework, not before
+   (it doesn't help the sync work and adds import/layout
+   failure cases mid-rework).
+4. **Applet-drag cascade** — separate branch when picked up.
+5. **Phase C — TFP** — once (1)-(3) land, GLX_EXT_texture_
+   from_pixmap on a sound foundation, ready for Compiz-class
+   compositors.
