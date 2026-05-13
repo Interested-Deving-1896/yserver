@@ -706,6 +706,17 @@ pub struct KmsBackend {
     // when Vulkan didn't come up.
     pub(crate) ops_command_pool: Option<crate::kms::vk::ops::OpsCommandPool>,
 
+    /// Set by `flush_if_needed` when `PaintBatch::submit_and_wait`
+    /// returns a Vk error. Once true, every paint entry point
+    /// (`record_paint_op{,_batch_op}`, `flush_if_needed`,
+    /// `composite_and_flip`, `try_vulkan_composite_flip`) is a
+    /// no-op or early-Err. The renderer is unrecoverable in-process;
+    /// an external supervisor restarts yserver to recover.
+    ///
+    /// See `docs/superpowers/plans/2026-05-12-rendering-rearchitecture-phase3.md`
+    /// "Renderer-disabled design" section.
+    pub(crate) renderer_failed: bool,
+
     // Per-backend host-mapped staging buffer used by image-transfer
     // ops (PutImage / GetImage / MIT-SHM PutImage / MIT-SHM GetImage /
     // MitShmCreatePixmap). Reused across ops, grows on demand. `None`
@@ -1324,6 +1335,7 @@ impl KmsBackend {
             scanout_pools: Vec::new(),
             compositor_pipeline: None,
             ops_command_pool: None,
+            renderer_failed: false,
             ops_staging: None,
             glyph_atlas: None,
             text_pipeline: None,
@@ -1460,6 +1472,17 @@ impl KmsBackend {
         reason: crate::kms::scheduler::paint_batch::BatchFlushReason,
     ) -> Result<(), ash::vk::Result> {
         use crate::kms::scheduler::paint_batch::{BatchError, BatchFlushReason};
+        if self.renderer_failed {
+            // Already failed: best-effort reasons swallow; strict
+            // reasons surface ERROR_DEVICE_LOST so the caller's
+            // synchronous-reply contract isn't silently broken.
+            return match reason {
+                BatchFlushReason::Readback
+                | BatchFlushReason::ExternalSync
+                | BatchFlushReason::ProtocolBarrier => Err(ash::vk::Result::ERROR_DEVICE_LOST),
+                _ => Ok(()),
+            };
+        }
         log::trace!("flush_if_needed: reason={reason:?}");
         let dirty_outputs: Vec<usize> = (0..self.outputs.len())
             .filter(|&i| self.outputs[i].damage.needs_composite())
@@ -1473,7 +1496,14 @@ impl KmsBackend {
         );
         match result {
             Ok(()) => Ok(()),
-            Err(BatchError::Vk(r)) => Err(r),
+            Err(BatchError::Vk(r)) => {
+                log::error!(
+                    "flush_if_needed({reason:?}): submit_and_wait returned fatal {r:?}; \
+                     latching renderer_failed — KMS renderer disabled until restart"
+                );
+                self.renderer_failed = true;
+                Err(r)
+            }
             Err(BatchError::Poisoned) if strict => {
                 log::warn!(
                     "flush_if_needed({reason:?}): batch was Poisoned; \
@@ -1493,17 +1523,41 @@ impl KmsBackend {
         }
     }
 
-    /// Append a paint-recorder op into the current `PaintBatch`'s
-    /// command buffer. Closure receives `(&VkContext, &mut PaintBatch, vk::CommandBuffer)`.
+    /// Returns the resources needed to call
+    /// `self.scheduler.record_paint_op` / `record_paint_batch_op`,
+    /// or `None` if the renderer is failed / Vk is unavailable /
+    /// the ops pool is not yet built.
     ///
-    /// **This is the load-bearing API**, with `&mut PaintBatch`
-    /// exposed so 3C recorders can call `batch.upload_arena_mut()` /
-    /// `batch.descriptor_arena_mut()` / `batch.adopt(resource)` from
-    /// inside the closure. 3B fill/copy recorders ignore the batch
-    /// parameter (use the thin `record_paint_op` shim below).
+    /// **Use this at every paint call site that needs to take a
+    /// `&mut self.windows[id]` / `&mut self.pixmaps[id]` borrow
+    /// for the recorder's `&mut DrawableImage` argument.** Going
+    /// through `self.record_paint_op(...)` (the shim below) is
+    /// convenient when no such borrow conflict exists, but the shim
+    /// is `&mut self` and conflicts with field borrows.
     ///
-    /// Landing the wide signature now means 3C does not need to
-    /// refactor the API introduced in 3A.
+    /// Both shim and helper gate on `renderer_failed` — every
+    /// paint entry point checks the flag.
+    fn paint_resources(
+        &self,
+    ) -> Option<(
+        std::sync::Arc<crate::kms::vk::device::VkContext>,
+        ash::vk::CommandPool,
+    )> {
+        if self.renderer_failed {
+            return None;
+        }
+        let vk_arc = self.vk.as_ref().cloned()?;
+        let pool_handle = self.ops_command_pool.as_ref()?.handle();
+        Some((vk_arc, pool_handle))
+    }
+
+    /// Shim: pull vk + ops pool via `paint_resources()`, delegate
+    /// to the scheduler-level `record_paint_batch_op`. Useful when
+    /// the caller doesn't hold a conflicting `&mut self.windows`
+    /// / `.pixmaps` borrow. Recorders that DO hold such a borrow
+    /// must use `paint_resources()` + `self.scheduler.record_paint_batch_op(...)`
+    /// directly (field projection works because `&mut self.scheduler`
+    /// is disjoint from `&mut self.windows`).
     pub fn record_paint_batch_op<F>(&mut self, record: F) -> Result<(), ash::vk::Result>
     where
         F: FnOnce(
@@ -1512,66 +1566,17 @@ impl KmsBackend {
             ash::vk::CommandBuffer,
         ) -> Result<(), ash::vk::Result>,
     {
-        let Some(vk_arc) = self.vk.as_ref().cloned() else {
-            return Err(ash::vk::Result::ERROR_INITIALIZATION_FAILED);
+        let Some((vk_arc, pool_handle)) = self.paint_resources() else {
+            // Either renderer_failed or vk/ops_pool unavailable. The
+            // caller's existing fallback (typically log + return
+            // false to fall back to pixman) handles either case.
+            return Err(ash::vk::Result::ERROR_DEVICE_LOST);
         };
-        let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
-            return Err(ash::vk::Result::ERROR_INITIALIZATION_FAILED);
-        };
-        // open_batch consumes the Arc — clone for the closure
-        // invocation below.
-        let _ = self.scheduler.open_batch(vk_arc.clone(), pool_handle);
-        let batch = self
-            .scheduler
-            .current_paint_batch
-            .as_mut()
-            .expect("open_batch just ran");
-        // We need `&mut PaintBatch` AND the closure has to receive
-        // both `&mut PaintBatch` and the CB. `append`'s F sees only
-        // `(&VkContext, CommandBuffer)`. Inline the equivalent of
-        // `batch.append(record)` so the user closure can take
-        // `batch` too. The CB must come from `batch`'s state
-        // machine — replicate the lazy-open path here.
-        use crate::kms::scheduler::paint_batch::{BatchError, BatchState};
-        match batch.state() {
-            BatchState::Poisoned => return Err(ash::vk::Result::ERROR_DEVICE_LOST),
-            BatchState::Closed | BatchState::Submitted | BatchState::Retired => {
-                log::error!(
-                    "record_paint_batch_op: batch in non-recording state {:?}",
-                    batch.state()
-                );
-                return Err(ash::vk::Result::ERROR_UNKNOWN);
-            }
-            BatchState::Idle => {
-                // The lazy-open path lives on PaintBatch itself —
-                // expose a method that begins recording and returns
-                // the CB, then call into the user closure. See
-                // `PaintBatch::begin_recording_explicit` added in
-                // T1 step 1.
-                if let Err(e) = batch.begin_recording_explicit() {
-                    return Err(match e {
-                        BatchError::Vk(r) => r,
-                        _ => ash::vk::Result::ERROR_UNKNOWN,
-                    });
-                }
-            }
-            BatchState::Recording => {}
-        }
-        let cb = batch.command_buffer().expect("Recording implies cb");
-        // Borrow split: vk_arc was cloned above; pass it by reference.
-        match record(&vk_arc, batch, cb) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                batch.poison_external();
-                Err(e)
-            }
-        }
+        self.scheduler
+            .record_paint_batch_op(vk_arc, pool_handle, record)
     }
 
-    /// Thin shim for recorders that don't need the batch handle
-    /// (fill, copy-distinct, copy-same). Matches the existing
-    /// `run_one_shot_op` closure signature for textual-rewrite
-    /// migration in 3B.
+    /// Shim for recorders that don't need the batch handle.
     pub fn record_paint_op<F>(&mut self, record: F) -> Result<(), ash::vk::Result>
     where
         F: FnOnce(
@@ -2113,6 +2118,7 @@ impl KmsBackend {
             scanout_pools,
             compositor_pipeline,
             ops_command_pool,
+            renderer_failed: false,
             ops_staging,
             glyph_atlas,
             text_pipeline,
@@ -6741,6 +6747,14 @@ impl KmsBackend {
     }
 
     pub fn composite_and_flip(&mut self) -> io::Result<()> {
+        if self.renderer_failed {
+            // Renderer is in fatal state; skip paint+composite. The
+            // backend is alive enough to drain pageflip-completes
+            // and process input — clients still see the X server,
+            // they just see the last good frame on screen.
+            return Ok(());
+        }
+
         // Phase 4.1.5: pixman no longer feeds the mirrors; drawing
         // ops fill them directly through Vk. The pre-composite
         // upload pass is gone.
@@ -6805,13 +6819,10 @@ impl KmsBackend {
         if let Err(e) = self
             .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::VisibleComposite)
         {
-            // Per submit_and_wait's path-2 semantics, this is fatal:
-            // a CB and its resources have been abandoned. Stop
-            // normal rendering.
-            log::error!(
-                "composite cycle: paint batch flush returned fatal {e:?}; \
-                 KMS renderer is in an unrecoverable state"
-            );
+            // flush_if_needed already latched renderer_failed and
+            // logged the underlying Vk error. Propagate to the
+            // event loop; future composite ticks early-return at
+            // the top of this function via the renderer_failed gate.
             return Err(std::io::Error::other(format!(
                 "PaintBatch::submit_and_wait failed: {e:?}"
             )));
@@ -6984,6 +6995,9 @@ impl KmsBackend {
         layout_idx: usize,
         visible: &[u32],
     ) -> Option<(usize, usize)> {
+        if self.renderer_failed {
+            return None;
+        }
         use crate::kms::vk::{compositor, scanout::BoPhase};
 
         // Clone the Arc immediately so the immutable self.vk borrow
@@ -12297,5 +12311,50 @@ mod tests {
             backend.outputs[0].damage.dirty_gen() > gen_mid,
             "output must be bumped by old_rect even when new is empty"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // renderer_failed gate tests (Task 1, step 5)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn renderer_failed_makes_record_paint_op_return_device_lost() {
+        let mut backend = make_test_backend();
+        backend.renderer_failed = true;
+        let result = backend.record_paint_op(|_, _| Ok(()));
+        assert_eq!(result, Err(ash::vk::Result::ERROR_DEVICE_LOST));
+    }
+
+    #[test]
+    fn renderer_failed_makes_visible_composite_flush_a_noop() {
+        use crate::kms::scheduler::paint_batch::BatchFlushReason;
+        let mut backend = make_test_backend();
+        backend.renderer_failed = true;
+        // VisibleComposite is best-effort; gate returns Ok.
+        assert!(
+            backend
+                .flush_if_needed(BatchFlushReason::VisibleComposite)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn renderer_failed_makes_readback_flush_surface_device_lost() {
+        use crate::kms::scheduler::paint_batch::BatchFlushReason;
+        let mut backend = make_test_backend();
+        backend.renderer_failed = true;
+        // Readback is strict; gate returns Err.
+        assert_eq!(
+            backend.flush_if_needed(BatchFlushReason::Readback),
+            Err(ash::vk::Result::ERROR_DEVICE_LOST)
+        );
+    }
+
+    #[test]
+    fn renderer_failed_makes_composite_and_flip_a_noop() {
+        let mut backend = make_test_backend();
+        backend.renderer_failed = true;
+        // Even with dirty outputs, composite returns Ok early.
+        assert!(backend.composite_and_flip().is_ok());
     }
 }

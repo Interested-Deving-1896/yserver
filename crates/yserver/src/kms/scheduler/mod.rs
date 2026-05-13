@@ -86,6 +86,80 @@ impl RenderScheduler {
     pub fn current_batch_state(&self) -> Option<BatchState> {
         self.current_paint_batch.as_ref().map(PaintBatch::state)
     }
+
+    /// Append a paint-recorder op into the current `PaintBatch`'s
+    /// command buffer. Closure receives `(&VkContext, &mut PaintBatch, vk::CommandBuffer)`.
+    ///
+    /// **This is the load-bearing API** with `&mut PaintBatch`
+    /// exposed so 3C+ recorders can call `batch.upload_arena_mut()`,
+    /// `batch.descriptor_arena_mut()`, `batch.adopt(resource)` from
+    /// inside the closure. 3B fill/copy recorders ignore the batch
+    /// parameter (use `record_paint_op` shim).
+    ///
+    /// `vk` and `pool` are passed in (not pulled from `self`) so the
+    /// `&mut self` here is `&mut RenderScheduler` only — disjoint
+    /// from `&mut KmsBackend.windows` / `.pixmaps` borrows the call
+    /// site holds for the recorder's `&mut DrawableImage` argument.
+    pub fn record_paint_batch_op<F>(
+        &mut self,
+        vk_arc: Arc<VkContext>,
+        pool: vk::CommandPool,
+        record: F,
+    ) -> Result<(), vk::Result>
+    where
+        F: FnOnce(&VkContext, &mut PaintBatch, vk::CommandBuffer) -> Result<(), vk::Result>,
+    {
+        // open_batch consumes the Arc — clone for the closure invocation.
+        // Note: parameter is `vk_arc` not `vk` so it doesn't shadow the
+        // `ash::vk` module used for `vk::Result::*` below.
+        let _ = self.open_batch(vk_arc.clone(), pool);
+        let batch = self
+            .current_paint_batch
+            .as_mut()
+            .expect("open_batch just ran");
+        match batch.state() {
+            BatchState::Poisoned => return Err(vk::Result::ERROR_DEVICE_LOST),
+            BatchState::Closed | BatchState::Submitted | BatchState::Retired => {
+                log::error!(
+                    "record_paint_batch_op: batch in non-recording state {:?}",
+                    batch.state()
+                );
+                return Err(vk::Result::ERROR_UNKNOWN);
+            }
+            BatchState::Idle => {
+                if let Err(e) = batch.begin_recording_explicit() {
+                    return Err(match e {
+                        BatchError::Vk(r) => r,
+                        _ => vk::Result::ERROR_UNKNOWN,
+                    });
+                }
+            }
+            BatchState::Recording => {}
+        }
+        let cb = batch.command_buffer().expect("Recording implies cb");
+        match record(&vk_arc, batch, cb) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                batch.poison_external();
+                Err(e)
+            }
+        }
+    }
+
+    /// Thin shim for recorders that don't need the batch handle
+    /// (3B fill/copy). Same closure signature as `run_one_shot_op`
+    /// for textual-rewrite migration.
+    pub fn record_paint_op<F>(
+        &mut self,
+        vk_arc: Arc<VkContext>,
+        pool: vk::CommandPool,
+        record: F,
+    ) -> Result<(), vk::Result>
+    where
+        F: FnOnce(&VkContext, vk::CommandBuffer) -> Result<(), vk::Result>,
+    {
+        self.record_paint_batch_op(vk_arc, pool, |vk, _batch, cb| record(vk, cb))
+    }
 }
 
 #[cfg(test)]
