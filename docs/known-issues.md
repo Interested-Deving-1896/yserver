@@ -406,6 +406,35 @@ that the host hides for us.
       compositor never falls behind vblank in the log, so the most
       suspicious link is input-event delivery rate.
 
+- [ ] **mate-control-center under adapta-nokto: catastrophic mouse
+      lag.** Observed 2026-05-13 on `bee`. The moment mate-cc is
+      open under the adapta-nokto GTK theme, the whole desktop becomes
+      unusable — Alt-F2 takes minutes to surface, cursor lags by
+      minutes behind the actual input. `amdgpu_top` shows continuous
+      GPU work, so this is real submission saturation, not yserver
+      spinning on CPU. Closing mate-cc (or switching to the default
+      Menta theme) restores responsiveness — under default theme
+      mate-cc is mostly OK, only briefly laggy. Reproduces on `master`
+      (predates Phase 3F-1), so this is not a 3F-1 regression. The
+      hardware angle is unconfirmed — adapta-nokto was not tested on
+      `silence`, so we don't yet know whether the cliff is
+      hardware-class-dependent or just absolute theme-workload-driven.
+      Likely root cause regardless: adapta-nokto's rounded-everything
+      + drop shadows + heavy gradients trigger many per-call
+      `queue_wait_idle`s in the still-legacy `run_one_shot_op` paths:
+      `try_vk_render_traps_or_tris` (Trapezoids drives rounded
+      corners; flushes the batch + waits idle per call until 3F-2)
+      and `GlyphAtlas::intern` (per-glyph wait-idle for newly seen
+      glyphs; Phase-5 scope). Each round-trip serializes the
+      single-threaded core loop with the GPU, so each compounded
+      wait-idle steals from the input event budget. Both fixes (3F-2
+      traps migration + Phase-5 atlas rewrite) are on the rework
+      critical path; this entry is here to capture the reproducer
+      (theme + workload) for verification after each phase lands. A
+      reproducer on `silence` with adapta-nokto would let us
+      distinguish "hardware drains too slowly" from "absolute op
+      count exceeds frame budget on any hardware."
+
 ## WM-specific behaviour
 
 - [ ] **e16 popup rounded corners.** Cosmetic — popup outer shape is
