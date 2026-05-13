@@ -23,6 +23,16 @@ pub mod in_flight;
 pub mod output_frame;
 pub mod paint_batch;
 
+/// Maximum number of paint batches that can be Submitted but
+/// not yet Retired. Phase 4 T4 backpressure: when
+/// `close_and_submit_async` would push past this, the oldest
+/// batch is blocking-waited first.
+///
+/// 4 ≈ one composite period at 60 Hz worth of paint cycles; high
+/// enough to absorb bursty paint without blocking, low enough to
+/// bound GPU-side queue depth and CPU-side resource lifetime.
+const MAX_IN_FLIGHT_PAINT_BATCHES: usize = 4;
+
 #[derive(Debug, Default)]
 pub struct RenderScheduler {
     pub in_flight: InFlight,
@@ -107,6 +117,20 @@ impl RenderScheduler {
         &mut self,
         dirty_outputs: Vec<usize>,
     ) -> Result<vk::Fence, BatchError> {
+        // 4-T4: backpressure. If the in-flight queue is at cap,
+        // synchronously wait on the oldest batch before pushing
+        // a new one. Prevents unbounded growth under chatty
+        // clients (e.g. mate-cc + adapta-nokto's pixmap-churn
+        // pattern that fires hundreds of ProtocolBarrier flushes
+        // per second).
+        while self.submitted_paint_batches.len() >= MAX_IN_FLIGHT_PAINT_BATCHES {
+            let Some(mut oldest) = self.submitted_paint_batches.pop_front() else {
+                break;
+            };
+            oldest.wait_for_completion()?;
+            drop(oldest);
+        }
+
         let Some(mut batch) = self.current_paint_batch.take() else {
             return Ok(vk::Fence::null());
         };
