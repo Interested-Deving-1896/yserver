@@ -405,6 +405,26 @@ that the host hides for us.
       classifier in `BackendEventSink::handle_backend_event` that
       maps specific `(major, minor, code)` tuples to DEBUG level
       so the WARN log is actually scannable.
+- [ ] **X11 error encoder hard-codes `minor_code = 0` for extension
+      errors.** `emit_x11_error(state, client_id, sequence, code,
+      bad_value, major_opcode)` has no `minor` parameter and bakes
+      `minor_code: 0` into the encoded error reply (see callers in
+      `crates/yserver-core/src/core_loop/process_request.rs`; the
+      Composite handler around line 2583 is one of many). Real X.Org
+      threads the per-extension minor opcode through. The wire bug:
+      a client receives `error_code 2 (BadValue), request_code 144
+      (Composite), minor_code 0` regardless of whether the failing
+      request was `RedirectSubwindows` (minor 2),
+      `NameWindowPixmap` (minor 6), etc. — confusing debugging.
+      Surfaced 2026-05-13 when chasing the xfwm4 Composite startup
+      failure (the error said minor 0 = QueryVersion, but the
+      actual failing request was `RedirectSubwindows` = minor 2 —
+      the inverted Automatic/Manual mode constants bug). Fix:
+      thread the minor opcode through `emit_x11_error` (add a
+      parameter; default to 0 for core requests; pass the request
+      minor for extension requests). Touches every `emit_x11_error`
+      call site (~60-80 across the file). Cosmetic but high impact
+      on future debugging sessions.
 - [ ] **`just yserver-bare-metal` recipe.** Automate the kmscon
       dance (stop kmscon for current VT → run yserver → restart
       kmscon on exit). Already documented as a manual recipe in
