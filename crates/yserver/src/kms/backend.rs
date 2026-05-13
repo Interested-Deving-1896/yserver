@@ -1697,7 +1697,7 @@ impl KmsBackend {
     /// Phase-3B T0 catalogue of paint-side run_one_shot_op sites
     /// (every site as of 2026-05-13):
     ///
-    ///   upload_bgra_to_mirror:            mirror.record_upload_rect          — wrapped
+    ///   upload_bgra_to_mirror:            mirror.record_upload_rect          — migrated 3C T2 (record_paint_batch_op + arena)
     ///   fill_mirror_solid:                fill::record_fill_rectangles        — migrated T2 (record_paint_op)
     ///   copy_drawable_to_new_cursor_mirror: vk_copy::record_copy_area_distinct — migrated T3 (record_paint_op)
     ///   copy_pixmap_mirror_to_cursor:     vk_copy::record_copy_area_distinct  — migrated T3 (record_paint_op)
@@ -11062,6 +11062,19 @@ impl Backend for KmsBackend {
         let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
             return Ok(None);
         };
+        // Conservative protocol boundary: GradientPicture::new_* runs its
+        // own one-shot upload CB outside the PaintBatch. The new gradient
+        // has a fresh XID, so no in-flight batch can race it — this flush
+        // is hygiene cleanup between the batched paint pipeline and the
+        // gradient one-shot, not a UAF fix. Cheap because gradient creates
+        // are low-frequency. On flush Err return Ok(None), matching the
+        // handler's existing "vk init failed" fallback shape.
+        if let Err(e) = self
+            .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier)
+        {
+            log::warn!("render_create_linear_gradient: pre-build flush failed ({e:?})");
+            return Ok(None);
+        }
         let gradient =
             match GradientPicture::new_linear(vkctx, pool_handle, (p1x, p1y), (p2x, p2y), &stops) {
                 Ok(g) => g,
@@ -11124,6 +11137,19 @@ impl Backend for KmsBackend {
         let Some(pool_handle) = self.ops_command_pool.as_ref().map(|p| p.handle()) else {
             return Ok(None);
         };
+        // Conservative protocol boundary: GradientPicture::new_* runs its
+        // own one-shot upload CB outside the PaintBatch. The new gradient
+        // has a fresh XID, so no in-flight batch can race it — this flush
+        // is hygiene cleanup between the batched paint pipeline and the
+        // gradient one-shot, not a UAF fix. Cheap because gradient creates
+        // are low-frequency. On flush Err return Ok(None), matching the
+        // handler's existing "vk init failed" fallback shape.
+        if let Err(e) = self
+            .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier)
+        {
+            log::warn!("render_create_radial_gradient: pre-build flush failed ({e:?})");
+            return Ok(None);
+        }
         let gradient = match GradientPicture::new_radial(
             vkctx,
             pool_handle,
