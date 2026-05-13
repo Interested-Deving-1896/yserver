@@ -103,6 +103,7 @@ The grow path is rare:
 3. **`renderer_failed` gate**: every paint entry goes through `paint_resources()`.
 4. **`record_paint_batch_op` is the load-bearing API**: 3F-1 needs `&mut PaintBatch` inside the closure to call `batch.descriptor_arena_mut()`. Use the wide API.
 5. **`PaintBatch::descriptor_arena_mut()` lazily creates the arena** — first call per batch allocates the first pool chunk. No setup needed in the migration.
+6. **Shared `SolidColorImage` is safe across batched composites.** `solid_src_image` and `solid_mask_image` are single backend-wide 1×1 images. Each batched render-composite call records its own `record_solid_color_clear` (barrier → `cmd_clear_color_image` → barrier) immediately before the draw, and `solid.set_current_layout` is called AFTER the barriers are emitted into the CB. So two render-composites in the same batch with different clear colours record as `barrier A → clearA → barrier A' → sampleA → barrier B → clearB → barrier B' → sampleB`. The pre-clear `SHADER_READ_ONLY → TRANSFER_DST` barrier on op B forms the WAR against op A's sample. CPU-side `current_layout` only reflects the last-recorded barrier, which is correct (the CB executes the barriers in order). Don't break this property — keep `record_solid_color_clear` inside the closure, NOT lifted before it.
 
 ### Out of scope (deferred to 3F-2 and later)
 
@@ -431,7 +432,7 @@ EOF
 
 - [ ] **Step 1: Read backend.rs lines 5580–6163**
 
-Note the structure that survives the migration vs gets replaced:
+Note the structure that survives the migration vs gets replaced. **The line numbers below are approximate — they drift as `backend.rs` evolves. Treat them as orientation hints; use the anchor strings in `Find:` blocks (and the cutover greps in T4) as the source of truth.**
 
 | Lines (approx) | What | Disposition |
 |---|---|---|
@@ -911,7 +912,9 @@ just yserver-mate-hw-release
 
 Exercise composite-heavy workloads:
 
-1. **rendercheck on yserver** — `just rendercheck-yserver` (or the project-equivalent recipe). All categories: composite (every op), trapezoids, triangles. **Critical:** prior to 3F-1 every rendercheck composite case fired the pre-record `ProtocolBarrier` flush; if 3F-1 introduced a descriptor lifetime bug, rendercheck composite cases will fail visually (corrupted pixels) or with `paint batch submit failed` in the log.
+1. **rendercheck on yserver — primary descriptor-arena stress test.** `just rendercheck-yserver` (or the project-equivalent recipe). The two RENDER-composite-specific cases are `composite` and `cacomposite`; these are where a descriptor-arena lifetime bug, a missing pre-resize flush, or a broken `record_solid_color_clear` cross-batch invariant will surface first (failures present as visual corruption or `paint batch submit failed` in `yserver-hw.log`). All other categories (fill, dcoords, scoords, mcoords, tscoords, tmcoords, blend, gradients, repeat, triangles, bug7366) are regression-only — they don't exercise the new code paths but a regression there is still a stop-the-line.
+
+   **Budget note**: per `docs/test-status.md` (2026-05-10 yserver baseline), `composite` and `cacomposite` are currently **INCOMPLETE at the 600 s budget on yserver/KMS** (rc=124), vs OK on ynest. If they remain INCOMPLETE at the same partial-pass count, the gate is "no new failures in cases that DID complete + the partial-pass count is at least as high as the pre-3F-1 baseline". If they suddenly complete (because batching makes the host faster), that's the better signal — but the gate isn't "they must complete". Don't increase the per-test budget just to force them to finish; the underlying perf gap is a Phase-4-sync-rework concern.
 2. **mate-control-center hover** — RenderComposite-heavy when hover gradients are active.
 3. **GTK theme transitions** — open `gtk3-demo` or similar; click through the theme browser.
 4. **gedit / pluma text + selection drag** — picks up render-composite via the cairo selection-highlight overlay (composite of solid colour over text).
