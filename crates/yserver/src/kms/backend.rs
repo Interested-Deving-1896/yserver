@@ -617,6 +617,74 @@ impl OutputLayout {
     }
 }
 
+/// Per-tick aggregation of "composite deferred" events. The composite
+/// path can defer a frame for two backpressure reasons: the descriptor
+/// pool ring is exhausted, or no scanout BO is Free. Both happen
+/// frequently in steady-state vsync (especially during startup bursts
+/// like MATE session bring-up) and used to log a `warn!` per
+/// occurrence — ~hundreds per second under load, drowning out real
+/// signal. This struct counts them and emits one `info!` line every
+/// `FLUSH_INTERVAL`. Individual events still log at `debug!`.
+#[derive(Debug, Default)]
+struct CompositeDeferStats {
+    pool_ring_exhausted: u64,
+    no_free_bo: u64,
+    /// Connector name of the most recent defer; used only for the
+    /// info-level summary line. Stable across the interval since
+    /// MATE usually only saturates the primary output, but if multiple
+    /// outputs defer the last-seen wins.
+    last_output: Option<String>,
+    last_flush: Option<std::time::Instant>,
+}
+
+impl CompositeDeferStats {
+    const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn note(&mut self, kind: CompositeDeferKind, output_name: &str) {
+        match kind {
+            CompositeDeferKind::PoolRingExhausted => self.pool_ring_exhausted += 1,
+            CompositeDeferKind::NoFreeBo => self.no_free_bo += 1,
+        }
+        if self.last_output.as_deref() != Some(output_name) {
+            self.last_output = Some(output_name.to_owned());
+        }
+    }
+
+    /// Returns Some(summary) if at least one event has been counted
+    /// and `FLUSH_INTERVAL` has elapsed since the last flush. Resets
+    /// counters on emit.
+    fn maybe_flush(&mut self) -> Option<String> {
+        let now = std::time::Instant::now();
+        let due = match self.last_flush {
+            None => self.pool_ring_exhausted + self.no_free_bo > 0,
+            Some(t) => {
+                now.duration_since(t) >= Self::FLUSH_INTERVAL
+                    && self.pool_ring_exhausted + self.no_free_bo > 0
+            }
+        };
+        if !due {
+            return None;
+        }
+        let summary = format!(
+            "vk composite: deferred frames in last {:?}: pool_ring_exhausted={} no_free_bo={} (last_output={})",
+            now.duration_since(self.last_flush.unwrap_or(now)),
+            self.pool_ring_exhausted,
+            self.no_free_bo,
+            self.last_output.as_deref().unwrap_or("?"),
+        );
+        self.pool_ring_exhausted = 0;
+        self.no_free_bo = 0;
+        self.last_flush = Some(now);
+        Some(summary)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum CompositeDeferKind {
+    PoolRingExhausted,
+    NoFreeBo,
+}
+
 pub struct KmsBackend {
     // DRM (Phase 6.1 reuse)
     device: Arc<drm::Device>,
@@ -729,6 +797,14 @@ pub struct KmsBackend {
     /// See `docs/superpowers/plans/2026-05-12-rendering-rearchitecture-phase3.md`
     /// "Renderer-disabled design" section.
     pub(crate) renderer_failed: bool,
+
+    /// Aggregated counts of composite-defer events (descriptor pool
+    /// ring exhausted, no Free scanout BO). Flushed as a single
+    /// `info!` line every `CompositeDeferStats::FLUSH_INTERVAL` from
+    /// `composite_and_flip` so steady-state backpressure doesn't
+    /// drown the log in per-frame warns. Per-occurrence is still
+    /// logged at `debug!`.
+    composite_defer_stats: CompositeDeferStats,
 
     // Per-backend host-mapped staging buffer used by image-transfer
     // ops (PutImage / GetImage / MIT-SHM PutImage / MIT-SHM GetImage /
@@ -1344,6 +1420,7 @@ impl KmsBackend {
             compositor_pipeline: None,
             ops_command_pool: None,
             renderer_failed: false,
+            composite_defer_stats: CompositeDeferStats::default(),
             ops_staging: None,
             glyph_atlas: None,
             text_pipeline: None,
@@ -2127,6 +2204,7 @@ impl KmsBackend {
             compositor_pipeline,
             ops_command_pool,
             renderer_failed: false,
+            composite_defer_stats: CompositeDeferStats::default(),
             ops_staging,
             glyph_atlas,
             text_pipeline,
@@ -6789,6 +6867,10 @@ impl KmsBackend {
         // before we decide whether any output needs compositing.
         self.poll_in_flight();
 
+        if let Some(summary) = self.composite_defer_stats.maybe_flush() {
+            log::info!("{summary}");
+        }
+
         // Skip the whole pass when no output has unpresented damage.
         // Producers (request handlers, host input, host-X11 fanout)
         // call `mark_dirty` / `mark_all_outputs_dirty` to bump dirty
@@ -7041,10 +7123,10 @@ impl KmsBackend {
             pool.bos.iter().position(|b| b.state.phase == BoPhase::Free)
         };
         let Some(bo_idx) = bo_idx else {
-            log::warn!(
-                "vk composite: no Free bo in pool for output {} — deferring frame",
-                self.outputs[layout_idx].output.connector_name
-            );
+            let name = &self.outputs[layout_idx].output.connector_name;
+            log::debug!("vk composite: no Free bo in pool for output {name} — deferring frame");
+            self.composite_defer_stats
+                .note(CompositeDeferKind::NoFreeBo, name);
             return None;
         };
 
@@ -7054,10 +7136,12 @@ impl KmsBackend {
             ring.acquire()
         };
         let Some(pool_slot) = pool_slot else {
-            log::warn!(
-                "vk composite: descriptor pool ring exhausted for output {} — deferring frame",
-                self.outputs[layout_idx].output.connector_name
+            let name = &self.outputs[layout_idx].output.connector_name;
+            log::debug!(
+                "vk composite: descriptor pool ring exhausted for output {name} — deferring frame"
             );
+            self.composite_defer_stats
+                .note(CompositeDeferKind::PoolRingExhausted, name);
             return None;
         };
 
