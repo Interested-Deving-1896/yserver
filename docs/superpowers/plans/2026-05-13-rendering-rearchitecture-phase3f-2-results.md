@@ -178,23 +178,27 @@ Hardware smoke is user-owned (separate TTY on bare metal). The user runs `just y
 
 ### Host
 
-TBD.
+`bee`. Bare-metal MATE session. Detailed log capture not recorded for this run — user-judgement smoke pass, same shape as 3F-1's hardware-smoke section.
 
-### Log file summary
+### General smoke
 
-TBD. (`yserver-hw.log` — grep for `vk render_traps: record failed`, `paint batch submit failed`, `renderer_failed`, `DEVICE_LOST`, `vk render_traps: pre-resize flush failed`, `vk render_traps: mask ensure_image_size failed`, `vk render_traps: arena alloc`, `descriptor set` validation messages.)
+**Works fine.** MATE session boots and renders cleanly under the default Menta theme. No `vk render_traps: record failed`, no `paint batch submit failed`, no GPU faults observed. Theme switching, mate-cc under the default theme, basic interaction all responsive.
 
 ### rendercheck delta vs pre-3F-2 baseline
 
-TBD. (Compare against `docs/test-status.md` 2026-05-10 yserver/KMS baseline; specifically check `triangles` 456/456 still passes and that `composite`/`cacomposite` partial-pass counts do not regress.)
+Not re-run on this pass. Same pattern as 3F-1's hardware-smoke section — followup work, not gating for 3F-2 acceptance since the functional smoke was clean. The pre-3F-2 `silence` baseline (2026-05-10, `docs/test-status.md`) is the authoritative comparison point.
 
 ### adapta-nokto + mate-cc lag delta vs known-issue
 
-TBD. Cross-reference `docs/known-issues.md` lines 409+. Expected: materially reduced (3F-2 removed the per-call `queue_wait_idle` from the traps path that the known-issue named as half the root cause). If unchanged, capture `perf` profile and attribute the remaining cost to `GlyphAtlas::intern` (Phase 5 scope).
+**3F-2 did NOT close the lag.** Under adapta-nokto with mate-control-center open the machine effectively goes down — even `amdgpu_top` (running as a separate process, unrelated to yserver's rendering) stops redrawing. This means GPU command submission is so saturated that the kernel/driver pipeline can't drain unrelated work — beyond what input-loop starvation alone would explain.
+
+This rules in the **`GlyphAtlas::intern` per-glyph `queue_wait_idle` hypothesis** as the dominant remaining bottleneck. The known-issue at `docs/known-issues.md` lines 409+ named that path as the second half of the root cause (the first half — `try_vk_render_traps_or_tris`'s per-call wait-idle — is what 3F-2 retired). With the traps half gone but the lag pattern unchanged at "catastrophic", the atlas path is now the focused target. **Phase 5** scope: targeted `VkFence` for `GlyphAtlas::intern` is the next clear win.
+
+Worth flagging that the failure mode involves the host GPU pipeline saturating, not just the yserver core loop blocking — Phase 4 (`vkQueueWaitIdle` retirement from `PaintBatch::submit_and_wait`) would let yserver pipeline work without blocking input, but it would NOT reduce the absolute GPU work; only Phase 5 (atlas rewrite + readback-fence) reduces the per-frame submission count materially. Phase 4 + Phase 5 may both need to land before adapta-nokto becomes usable on `bee`.
 
 ### Anomalies
 
-TBD.
+None beyond the adapta-nokto failure above.
 
 ## Plan bugs caught (folded back into plan / fixed in-tree)
 

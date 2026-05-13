@@ -419,21 +419,25 @@ that the host hides for us.
       hardware angle is unconfirmed — adapta-nokto was not tested on
       `silence`, so we don't yet know whether the cliff is
       hardware-class-dependent or just absolute theme-workload-driven.
-      Likely root cause regardless: adapta-nokto's rounded-everything
-      + drop shadows + heavy gradients trigger many per-call
-      `queue_wait_idle`s in the still-legacy `run_one_shot_op` paths:
-      `try_vk_render_traps_or_tris` (Trapezoids drives rounded
-      corners; flushes the batch + waits idle per call until 3F-2)
-      and `GlyphAtlas::intern` (per-glyph wait-idle for newly seen
-      glyphs; Phase-5 scope). Each round-trip serializes the
-      single-threaded core loop with the GPU, so each compounded
-      wait-idle steals from the input event budget. Both fixes (3F-2
-      traps migration + Phase-5 atlas rewrite) are on the rework
-      critical path; this entry is here to capture the reproducer
-      (theme + workload) for verification after each phase lands. A
-      reproducer on `silence` with adapta-nokto would let us
-      distinguish "hardware drains too slowly" from "absolute op
-      count exceeds frame budget on any hardware."
+
+      **Post-3F-2 update (2026-05-13)**: 3F-2 retired
+      `try_vk_render_traps_or_tris`'s per-call `vkQueueWaitIdle`
+      (the traps half of the original two-part hypothesis), but the
+      lag is **unchanged** — adapta-nokto + mate-cc still brings the
+      machine down to the point where `amdgpu_top` (a separate process,
+      unrelated to yserver) stops redrawing. That confirms the
+      bottleneck is GPU-submission saturation, not input-loop
+      starvation, which in turn rules in the remaining hypothesis:
+      `GlyphAtlas::intern`'s per-glyph `queue_wait_idle` is the
+      dominant remaining cost (each new glyph drains the queue
+      completely before the next can be uploaded). Phase 5 scope.
+      Phase 4 (`vkQueueWaitIdle` retirement from
+      `PaintBatch::submit_and_wait`) helps input fluidity but does
+      not reduce the absolute submission count; both Phase 4 and
+      Phase 5 likely need to land before adapta-nokto becomes usable
+      on `bee`. A reproducer on `silence` with adapta-nokto would
+      still help separate "hardware drains too slowly" from "absolute
+      op count exceeds frame budget on any hardware."
 
 ## WM-specific behaviour
 
