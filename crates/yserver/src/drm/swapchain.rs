@@ -114,6 +114,16 @@ pub struct Swapchain {
 }
 
 impl Swapchain {
+    /// Disarm every buffer in this swapchain so its `Drop` becomes
+    /// a no-op. **Only valid at final process exit.** Called from
+    /// the shutdown path when atomic `disable_output` failed for
+    /// this output — see `Buffer::disarm` doc.
+    pub fn disarm(&mut self) {
+        for buf in &mut self.buffers {
+            buf.disarm();
+        }
+    }
+
     /// Construct an empty `Swapchain` for tests — no buffers, no
     /// pending scanout. Hidden from rustdoc; for fixture use only.
     #[doc(hidden)]

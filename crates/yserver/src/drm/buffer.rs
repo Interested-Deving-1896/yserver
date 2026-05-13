@@ -16,6 +16,20 @@ pub struct Buffer {
     width: u16,
     height: u16,
     stride: u32,
+    /// When `true`, `Drop` early-returns: no destroy_framebuffer,
+    /// no munmap, no destroy_dumb_buffer. Resources leak until
+    /// process-exit DRM-fd close reaps the kernel-side state.
+    /// Set by `disarm()` from the shutdown path when atomic
+    /// `disable_output` failed for this Buffer's CRTC — KMS may
+    /// still hold the FB, so user-side teardown would corrupt
+    /// kernel state.
+    ///
+    /// **ONLY safe to use at final process exit.** This Drop
+    /// short-circuit bypasses fb/dumb cleanup but does NOT prevent
+    /// Rust from dropping other fields (like the `Arc<Device>`).
+    /// Using disarm at runtime (hotplug, modeset recovery) could
+    /// produce a zombie handle when the Device's refcount expires.
+    disarmed: bool,
 }
 
 unsafe impl Send for Buffer {}
@@ -59,6 +73,7 @@ impl Buffer {
             width,
             height,
             stride,
+            disarmed: false,
         })
     }
 
@@ -88,10 +103,25 @@ impl Buffer {
             *word = pixel;
         }
     }
+
+    /// Mark this buffer as "let process-exit clean up." Subsequent
+    /// `Drop` is a no-op (no destroy_framebuffer / munmap /
+    /// destroy_dumb_buffer). Idempotent. **Only valid at final
+    /// process exit** — see field doc.
+    pub fn disarm(&mut self) {
+        self.disarmed = true;
+    }
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
+        if self.disarmed {
+            log::warn!(
+                "drm Buffer disarmed (atomic disable_output failed); \
+                 leaking FB/dumb to be reaped by DRM-fd close"
+            );
+            return;
+        }
         if let Err(err) = self.device.destroy_framebuffer(self.fb_id) {
             log::warn!(
                 "destroy_framebuffer 0x{:x} failed: {err}",

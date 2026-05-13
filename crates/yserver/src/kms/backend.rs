@@ -8217,7 +8217,20 @@ impl KmsBackend {
                     p.drain_all_pending(vk);
                 }
             } else {
+                // Disarm BOTH the Vulkan scanout pool AND the dumb
+                // swapchain buffers for this output. Either or both
+                // may have submitted FBs that KMS still holds after
+                // the failed atomic disable. Letting either Drop run
+                // its normal teardown (destroy_framebuffer + GEM
+                // close for ScanoutBo; destroy_framebuffer + munmap
+                // + destroy_dumb_buffer for Buffer) reintroduces the
+                // `atomic remove_fb failed with -22` UAF that the
+                // 6-step sequence is meant to prevent. Codex review
+                // of T2 caught the swapchain gap.
                 self.disarm_scanout_pool(idx);
+                if let Some(layout) = self.outputs.get_mut(idx) {
+                    layout.swapchain.disarm();
+                }
             }
         }
 

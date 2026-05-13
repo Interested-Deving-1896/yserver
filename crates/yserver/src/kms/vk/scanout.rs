@@ -239,6 +239,13 @@ pub struct ScanoutBo {
     /// Set by `disarm()` from the shutdown path when atomic
     /// `disable_output` failed for this BO's CRTC — KMS may still
     /// hold the FB, so user-side teardown would corrupt kernel state.
+    ///
+    /// **ONLY safe to use at final process exit.** This Drop
+    /// short-circuit bypasses Vk image / memory / GEM / FB cleanup
+    /// but does NOT prevent Rust from dropping other fields (like
+    /// the `Arc<VkContext>`). Using disarm at runtime (hotplug,
+    /// modeset recovery) could produce a zombie VkImage when the
+    /// VkContext's refcount expires.
     disarmed: bool,
 }
 
@@ -427,6 +434,7 @@ impl ScanoutBo {
 
     /// Mark this BO as "let process-exit clean up." Subsequent
     /// `Drop` is a no-op. Idempotent.
+    /// **Only valid at final process exit** — see field doc.
     pub fn disarm(&mut self) {
         self.disarmed = true;
     }
