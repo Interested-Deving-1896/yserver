@@ -798,6 +798,16 @@ pub struct KmsBackend {
     /// "Renderer-disabled design" section.
     pub(crate) renderer_failed: bool,
 
+    /// Set by `disable_output` so the rest of teardown can run
+    /// without `composite_and_flip` racing in and resubmitting a
+    /// new frame. Latched once; never cleared.
+    ///
+    /// Distinct from `renderer_failed` (which models in-process
+    /// Vk failure that an external supervisor could in principle
+    /// restart around): `shutting_down` is terminal-by-design,
+    /// triggered when `lib.rs` is unwinding the backend.
+    pub(crate) shutting_down: bool,
+
     /// Aggregated counts of composite-defer events (descriptor pool
     /// ring exhausted, no Free scanout BO). Flushed as a single
     /// `info!` line every `CompositeDeferStats::FLUSH_INTERVAL` from
@@ -1420,6 +1430,7 @@ impl KmsBackend {
             compositor_pipeline: None,
             ops_command_pool: None,
             renderer_failed: false,
+            shutting_down: false,
             composite_defer_stats: CompositeDeferStats::default(),
             ops_staging: None,
             glyph_atlas: None,
@@ -2204,6 +2215,7 @@ impl KmsBackend {
             compositor_pipeline,
             ops_command_pool,
             renderer_failed: false,
+            shutting_down: false,
             composite_defer_stats: CompositeDeferStats::default(),
             ops_staging,
             glyph_atlas,
@@ -6914,11 +6926,12 @@ impl KmsBackend {
     }
 
     pub fn composite_and_flip(&mut self) -> io::Result<()> {
-        if self.renderer_failed {
-            // Renderer is in fatal state; skip paint+composite. The
-            // backend is alive enough to drain pageflip-completes
-            // and process input — clients still see the X server,
-            // they just see the last good frame on screen.
+        if self.renderer_failed || self.shutting_down {
+            // Renderer is in fatal state or backend is shutting down;
+            // skip paint+composite. The backend is alive enough to
+            // drain pageflip-completes and process input — clients
+            // still see the X server, they just see the last good
+            // frame on screen.
             return Ok(());
         }
 
@@ -7166,7 +7179,7 @@ impl KmsBackend {
         layout_idx: usize,
         visible: &[u32],
     ) -> Option<(usize, usize)> {
-        if self.renderer_failed {
+        if self.renderer_failed || self.shutting_down {
             return None;
         }
         use crate::kms::vk::{compositor, scanout::BoPhase};
@@ -7988,6 +8001,128 @@ impl KmsBackend {
                 .phase
         );
         Ok(())
+    }
+
+    /// Shutdown step 4 (per docs/known-issues.md "P0: KMS teardown..."):
+    /// drain DRM pageflip-complete events until no scanout BO is in
+    /// `BoPhase::Pending` (i.e., the kernel has finished honouring
+    /// every flip we submitted before shutdown began). The atomic
+    /// `disable_output` commit in step 5 only succeeds when KMS has
+    /// no in-flight flips on the connector.
+    ///
+    /// Polls the DRM fd with `nix::poll::poll` (POLLIN, 50 ms timeout
+    /// per iteration), drains via the existing
+    /// `drm::page_flip::drain_events`, and re-checks. Bails after
+    /// `MAX_WAIT_MS` total elapsed with a warn log — at that point
+    /// something is genuinely stuck and proceeding to the atomic
+    /// disable is the least-bad option (it may still fail, but we
+    /// avoid hanging the shutdown path indefinitely).
+    ///
+    /// Caller MUST NOT have called `ScanoutBoPool::drain_all_pending`
+    /// before this — that force-resets BO state to Free and would
+    /// make `has_pending_pageflip` lie.
+    #[allow(dead_code)] // wired in by T2 of the KMS teardown fix plan.
+    fn drain_pending_pageflips_for_shutdown(&mut self) -> io::Result<()> {
+        use ::drm::control::crtc;
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        use std::{os::fd::AsFd, time::Instant};
+
+        const POLL_INTERVAL_MS: u8 = 50;
+        const MAX_WAIT_MS: u128 = 500;
+
+        let started = Instant::now();
+        loop {
+            let any_pending = self
+                .scanout_pools
+                .iter()
+                .filter_map(|p| p.as_ref())
+                .any(|p| p.has_pending_pageflip());
+            if !any_pending {
+                return Ok(());
+            }
+            if started.elapsed().as_millis() >= MAX_WAIT_MS {
+                log::warn!(
+                    "shutdown: drain_pending_pageflips_for_shutdown timed out after {MAX_WAIT_MS} ms; \
+                     proceeding to atomic disable_output anyway (it may fail)"
+                );
+                return Ok(());
+            }
+
+            // Wait for the DRM fd to have an event ready. Crucial:
+            // `drm::Device::receive_events()` is a blocking `read()`,
+            // so we MUST only call drain_events when poll reports
+            // POLLIN. A bare `Ok(_)` would include Ok(0) (timeout, no
+            // readiness) and a subsequent blocking read could hang
+            // past the 500 ms ceiling.
+            let fd_borrow = self.device.as_fd();
+            let mut fds = [PollFd::new(fd_borrow, PollFlags::POLLIN)];
+            let timeout = PollTimeout::from(POLL_INTERVAL_MS);
+            let ready = match poll(&mut fds, timeout) {
+                Ok(0) => false,
+                Ok(_) => fds[0]
+                    .revents()
+                    .map(|r| r.contains(PollFlags::POLLIN))
+                    .unwrap_or(false),
+                Err(nix::errno::Errno::EINTR) => false,
+                Err(e) => {
+                    log::warn!("shutdown: drain_pending_pageflips_for_shutdown poll failed: {e}");
+                    return Ok(());
+                }
+            };
+            if !ready {
+                continue;
+            }
+
+            // Drain whatever events are available; transition Pending → OnScreen
+            // for each completing CRTC. Re-uses the existing per-event handler
+            // from drain_page_flips_and_composite, but without the composite-and-flip
+            // tail-call (shutting_down gates that out anyway).
+            let mut flipped: Vec<crtc::Handle> = Vec::new();
+            if let Err(e) = drm::page_flip::drain_events(&self.device, |c| flipped.push(c)) {
+                log::warn!("shutdown: drain_events failed: {e}");
+                return Ok(());
+            }
+            for c in flipped {
+                let Some(output_idx) = self.outputs.iter().position(|o| o.output.crtc == c) else {
+                    continue;
+                };
+                if let Some(pool) = self
+                    .scanout_pools
+                    .get_mut(output_idx)
+                    .and_then(|p| p.as_mut())
+                {
+                    advance_pool_on_pageflip_complete(pool);
+                }
+                // Keep damage state internally consistent during the
+                // bounded shutdown loop (codex review nit). Not load-
+                // bearing for process exit; cheap.
+                self.outputs[output_idx].damage.record_present();
+            }
+        }
+    }
+
+    /// Disarm every scanout BO in the given pool index so its `Drop`
+    /// becomes a no-op. Called for outputs whose atomic
+    /// `disable_output` failed — KMS may still hold the FB, so
+    /// user-side `destroy_framebuffer` from `ScanoutBo::Drop` would
+    /// produce the `atomic remove_fb failed with -22` kernel WARN
+    /// that strands Wayland host sessions. Process-exit DRM-fd close
+    /// reaps the GEM/FB; VkDevice teardown releases the userspace
+    /// handles. This Drop deliberately skips per-object cleanup
+    /// (vkDestroyImage, destroy_framebuffer, close_buffer, etc.) —
+    /// it's a deliberate last-resort leak, not a normal teardown.
+    #[allow(dead_code)] // wired in by T2 of the KMS teardown fix plan.
+    fn disarm_scanout_pool(&mut self, output_idx: usize) {
+        let Some(pool) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(|p| p.as_mut())
+        else {
+            return;
+        };
+        for bo in &mut pool.bos {
+            bo.disarm();
+        }
     }
 
     /// Disable each DRM output (CRTC + plane) for clean shutdown.

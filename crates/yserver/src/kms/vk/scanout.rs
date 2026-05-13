@@ -230,6 +230,16 @@ pub struct ScanoutBo {
     /// device. Cloned per bo from the pool's Arc so individual bos
     /// can be moved/dropped independently.
     vk: Arc<VkContext>,
+    /// When `true`, `Drop` early-returns: no explicit
+    /// `destroy_framebuffer`, no GEM close, no Vk teardown.
+    /// Resources are then leaked until process-exit DRM-fd close +
+    /// VkDevice teardown — the kernel reaps GEM/FB on device-fd close
+    /// and the userspace heap goes away with the process. This is a
+    /// deliberate last-resort leak path, not a normal cleanup route.
+    /// Set by `disarm()` from the shutdown path when atomic
+    /// `disable_output` failed for this BO's CRTC — KMS may still
+    /// hold the FB, so user-side teardown would corrupt kernel state.
+    disarmed: bool,
 }
 
 /// Per-bo transfer-side resources (command pool/buffer + staging
@@ -393,6 +403,7 @@ impl ScanoutBo {
             vk_transfer,
             drm,
             vk,
+            disarmed: false,
         })
     }
 
@@ -401,6 +412,12 @@ impl ScanoutBo {
     /// — it returns the freshly-payloaded fd to hand KMS as
     /// `IN_FENCE_FD`. KMS consumes the fd on atomic accept (kernel
     /// closes it).
+    /// Mark this BO as "let process-exit clean up." Subsequent
+    /// `Drop` is a no-op. Idempotent.
+    pub fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+
     #[allow(dead_code)] // wired in by Task 2.5 (atomic-commit fence path).
     pub fn export_signaled_fd(&self) -> Result<OwnedFd, vk::Result> {
         let ext = self.vk.external_semaphore_fd.clone();
@@ -417,6 +434,21 @@ impl ScanoutBo {
 
 impl Drop for ScanoutBo {
     fn drop(&mut self) {
+        if self.disarmed {
+            // Disarmed by shutdown-failed-disable path; let DRM-fd
+            // close (process exit) reap GEM/FB and VkDevice teardown
+            // releases the userspace handles. We are DELIBERATELY
+            // leaking: this Drop deliberately skips vkDestroyImage,
+            // vkFreeMemory, destroy_framebuffer, close_buffer(gem),
+            // etc. — because touching them while KMS may still hold
+            // the FB produces the `atomic remove_fb failed with -22`
+            // warning that strands Wayland host sessions.
+            log::warn!(
+                "ScanoutBo disarmed (atomic disable_output failed); \
+                 leaking FB/GEM/Vk to be reaped by DRM-fd close"
+            );
+            return;
+        }
         // Defensive fence-fd cleanup. If the bo was Submitted /
         // Pending / OnScreen / Retiring at drop time (mid-flight
         // shutdown, or modeset that didn't go through the explicit
@@ -544,6 +576,18 @@ impl ScanoutBoPool {
     /// keep the bos." Re-allocating bos with new dimensions is the
     /// caller's responsibility (drop the pool, allocate a fresh one
     /// with `ScanoutBoPool::allocate`).
+    /// True if any bo in this pool is in `BoPhase::Pending` —
+    /// i.e. an atomic flip was accepted by KMS and the kernel
+    /// hasn't yet emitted its pageflip-complete event for that
+    /// flip. Used by the shutdown sequence to wait until KMS
+    /// quiesces before issuing `disable_output`. Calling
+    /// `disable_output` while a Pending bo exists is what
+    /// produces the `atomic remove_fb failed with -22` kernel
+    /// warning that leaves Wayland host compositors stranded.
+    pub fn has_pending_pageflip(&self) -> bool {
+        self.bos.iter().any(|b| b.state.phase == BoPhase::Pending)
+    }
+
     #[allow(dead_code)] // wired in by 4.1.2.6 modeset path; today's only consumer is Drop.
     pub fn drain_all_pending(&mut self, vk: &VkContext) {
         if let Err(e) = unsafe { vk.device.device_wait_idle() } {
