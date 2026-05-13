@@ -61,6 +61,16 @@ impl CopyScratch {
         self.extent
     }
 
+    /// True if a later `ensure_size(width, height)` call would reallocate
+    /// the scratch image. Callers in batched paint paths use this BEFORE
+    /// entering `record_paint_batch_op` so they can flush any in-flight
+    /// batch — `ensure_size` destroys the old image after `queue_wait_idle`,
+    /// which does NOT wait for un-submitted commands. Without a pre-flush,
+    /// an open batch CB embedding the old image would dangle.
+    pub fn needs_grow(&self, width: u32, height: u32) -> bool {
+        width > self.extent.width || height > self.extent.height
+    }
+
     /// Ensure the scratch is at least `(width, height)` pixels.
     /// Reallocates and resets the layout if a grow happens.
     pub fn ensure_size(&mut self, width: u32, height: u32) -> Result<(), CopyScratchError> {

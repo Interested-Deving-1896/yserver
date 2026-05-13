@@ -1701,7 +1701,7 @@ impl KmsBackend {
     ///   fill_mirror_solid:                fill::record_fill_rectangles        — migrated T2 (record_paint_op)
     ///   copy_drawable_to_new_cursor_mirror: vk_copy::record_copy_area_distinct — migrated T3 (record_paint_op)
     ///   copy_pixmap_mirror_to_cursor:     vk_copy::record_copy_area_distinct  — migrated T3 (record_paint_op)
-    ///   try_vk_copy_area (same-overlap):  copy::record_copy_area_same_overlap — deferred 3D (borrow-conflict fallback, flush moved into arm)
+    ///   try_vk_copy_area (same-overlap):  copy::record_copy_area_same_overlap — migrated 3D (record_paint_batch_op, shared CopyScratch)
     ///   try_vk_copy_area (same):          copy::record_copy_area_same         — migrated T3 (record_paint_op)
     ///   try_vk_copy_area (distinct):      copy::record_copy_area_distinct     — migrated T3 (record_paint_op)
     ///   try_vk_fill_with_function:        fill::record_logic_fill             — migrated T2 (record_paint_op)
@@ -3230,7 +3230,7 @@ impl KmsBackend {
         width: u16,
         height: u16,
     ) -> bool {
-        use crate::kms::vk::ops::{copy, run_one_shot_op};
+        use crate::kms::vk::ops::copy;
 
         // paint_resources() checks renderer_failed + extracts vk/pool.
         // Taken here before any self.windows/pixmaps borrow so the
@@ -3269,24 +3269,42 @@ impl KmsBackend {
             );
 
             if overlapping {
-                // Overlap: round-trip through `copy_scratch`. Deferred to
-                // 3D (uses CopyScratch shared scratch image).
+                // Overlap: round-trip through `copy_scratch` (single
+                // shared GPU-resident scratch image, no host staging).
                 //
-                // Borrow-conflict fallback for run_legacy_paint_op
-                // (same_overlap defers to 3D): flush before the raw
-                // run_one_shot_op so any batched paint ops are
-                // GPU-complete before this reads current_layout.
-                // Flush must happen before the mirror borrow below
-                // (flush_if_needed takes &mut self).
-                {
+                // 3D migration: append to the open PaintBatch via
+                // record_paint_batch_op instead of run_one_shot_op.
+                // The closure holds three disjoint &mut field borrows
+                // simultaneously: scheduler (via the call), mirror
+                // (re-borrowed from windows/pixmaps), and scratch
+                // (re-borrowed from self.copy_scratch). Disjoint field
+                // paths make this OK with the borrow checker.
+                //
+                // vk_arc / pool_handle come from the outer-scope
+                // paint_resources() call at the top of this function.
+
+                // Step 1: If a scratch resize is needed, pre-flush the
+                // batch BEFORE acquiring any mut borrows AND BEFORE
+                // scratch.ensure_size (which is the operation that
+                // would otherwise free an image still referenced by
+                // an unsubmitted batch CB). ensure_size destroys the
+                // old image after queue_wait_idle, which does NOT
+                // wait for un-submitted commands. This check uses a
+                // shared borrow of self.copy_scratch that ends before
+                // the flush_if_needed call (&mut self).
+                let needs_scratch_grow = self
+                    .copy_scratch
+                    .as_ref()
+                    .is_some_and(|s| s.needs_grow(u32::from(width), u32::from(height)));
+                if needs_scratch_grow {
                     use crate::kms::scheduler::paint_batch::BatchFlushReason;
                     if let Err(e) = self.flush_if_needed(BatchFlushReason::ProtocolBarrier) {
-                        log::warn!("vk copy same-overlap: pre-flush failed: {e:?}");
+                        log::warn!("vk copy same-overlap: pre-resize flush failed: {e:?}");
                         return false;
                     }
                 }
 
-                // Resolve the mirror; we need a single &mut to it.
+                // Step 2: Resolve the mirror; we need a single &mut to it.
                 let Some(mirror) = self
                     .windows
                     .get_mut(&src_xid)
@@ -3312,8 +3330,11 @@ impl KmsBackend {
                     return true;
                 }
 
-                // Sized to the source-rect bbox so the scratch is just big
-                // enough to hold the in-flight copy.
+                // Step 3: Re-borrow scratch + ensure_size. If the
+                // pre-flush above ran, ensure_size's destroy-old path
+                // is safe because the batch was fully retired. If
+                // no flush was needed (no grow), ensure_size is a no-op
+                // on the dimension check.
                 let Some(scratch) = self.copy_scratch.as_mut() else {
                     return false;
                 };
@@ -3322,16 +3343,20 @@ impl KmsBackend {
                     return false;
                 }
                 let bbox_origin = (i32::from(src_x), i32::from(src_y));
-                return match run_one_shot_op(&vk_arc, pool_handle, |vk, cb| {
-                    copy::record_copy_area_same_overlap(
-                        vk,
-                        cb,
-                        mirror,
-                        scratch,
-                        &regions,
-                        bbox_origin,
-                    )
-                }) {
+
+                let result =
+                    self.scheduler
+                        .record_paint_batch_op(vk_arc, pool_handle, |vk, _batch, cb| {
+                            copy::record_copy_area_same_overlap(
+                                vk,
+                                cb,
+                                mirror,
+                                scratch,
+                                &regions,
+                                bbox_origin,
+                            )
+                        });
+                return match result {
                     Ok(()) => true,
                     Err(e) => {
                         log::warn!(
