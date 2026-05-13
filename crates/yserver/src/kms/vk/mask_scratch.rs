@@ -110,7 +110,14 @@ impl MaskScratch {
     /// Ensure the scratch image is at least `(width, height)` pixels,
     /// reallocating if smaller. After this returns the image is in
     /// `UNDEFINED` layout (treated as new) when reallocation happens.
-    fn ensure_image_size(&mut self, width: u32, height: u32) -> Result<(), MaskScratchError> {
+    ///
+    /// 3F-2: callers in batched paint paths MUST pre-flush the open
+    /// PaintBatch with `BatchFlushReason::ProtocolBarrier` before
+    /// calling this if `needs_image_grow(width, height)` returns
+    /// `true`. The grow path destroys the old image after
+    /// `queue_wait_idle`, which does NOT wait for un-submitted
+    /// commands.
+    pub fn ensure_image_size(&mut self, width: u32, height: u32) -> Result<(), MaskScratchError> {
         if width <= self.extent.width && height <= self.extent.height {
             return Ok(());
         }
@@ -243,6 +250,95 @@ impl MaskScratch {
         })?;
         self.current_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         Ok(())
+    }
+
+    /// Record the barrier-copy-barrier sequence that uploads
+    /// `width × height` R8 pixels from `src_buffer + src_offset`
+    /// to the scratch image's top-left `(0, 0)` rect, into the
+    /// supplied CB. After this returns the image's `current_layout`
+    /// reflects `SHADER_READ_ONLY_OPTIMAL` (the CB's terminal
+    /// transition); on CB execute the image lands in that layout.
+    ///
+    /// Caller is responsible for:
+    ///   1. Calling `ensure_image_size(width, height)?` BEFORE this
+    ///      method (after any required pre-resize batch flush, per
+    ///      `needs_image_grow`).
+    ///   2. Allocating staging via `BatchUploadArena::alloc(width *
+    ///      height, 4)` and copying the row-major coverage bytes
+    ///      into the returned `mapped_ptr`.
+    ///   3. Passing the resulting `buffer` + `offset` here.
+    ///
+    /// `width` / `height` must be ≤ `self.extent` (no grow inside
+    /// this method); zero-sized rects no-op.
+    pub fn record_upload_r8(
+        &mut self,
+        vk: &VkContext,
+        cb: vk::CommandBuffer,
+        src_buffer: vk::Buffer,
+        src_offset: u64,
+        width: u32,
+        height: u32,
+    ) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        debug_assert!(
+            width <= self.extent.width && height <= self.extent.height,
+            "MaskScratch::record_upload_r8: caller must ensure_image_size first",
+        );
+        let device = &vk.device;
+        let old_layout = self.current_layout;
+        let to_dst = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+            .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .old_layout(old_layout)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(self.image)
+            .subresource_range(color_subresource_range())];
+        let dep = vk::DependencyInfo::default().image_memory_barriers(&to_dst);
+        unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
+
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(src_offset)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_offset(vk::Offset3D::default())
+            .image_extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            });
+        let regions = [region];
+        unsafe {
+            device.cmd_copy_buffer_to_image(
+                cb,
+                src_buffer,
+                self.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &regions,
+            );
+        }
+
+        let to_read = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(self.image)
+            .subresource_range(color_subresource_range())];
+        let dep = vk::DependencyInfo::default().image_memory_barriers(&to_read);
+        unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
+
+        self.current_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
     }
 }
 
