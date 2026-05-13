@@ -38,6 +38,37 @@ once the underlying patterns are understood.
 
 ## Input, grabs, event routing
 
+- [ ] **Caja mouse wheel doesn't work until a view-switch (yserver
+      event-delivery bug).** Observed 2026-05-13 on dual-screen MATE
+      smoke. When caja launches in its default view (list or icon),
+      the mouse wheel does nothing. After toggling the view mode once
+      (View → Icon View / View → List View), the wheel works in
+      whichever view caja is in, and keeps working across subsequent
+      view switches. Pre-regression (before 3E text-run migration),
+      list view's wheel worked from launch — so this is a real
+      regression, not just GTK initialization quirk.
+      yserver does emit core button-4/5 press+release pairs from the
+      libinput scroll path (verified in `yserver-hw.log` —
+      `libinput button code=0x181 pressed=true → X11 detail=5`,
+      138 events in the smoke run). So the wheel reaches X11. The
+      stateful "fix after view-switch" pattern points at:
+      (a) initial event-mask subscription on caja's view widget not
+          including ButtonPressMask in the right window, OR
+      (b) pointer-grab state from caja's initial focus chain
+          consuming wheel events before they reach the view widget,
+          OR
+      (c) some Enter/Leave / crossing-event sequence on view-switch
+          that re-establishes the focus chain.
+      Bisect candidates among recent input/render changes: the 3E
+      text-run migration (no input code, but changes render timing
+      → could affect when/which Configure/Map/Expose events caja
+      sees relative to its event-mask setup); the scroll-wheel
+      commit `b7d17a1`; the `has_axis` fix `56f93d9`.
+      Investigation path: log every PointerButton(4/5) event's
+      target window + propagation chain in the first 5 seconds
+      after caja launches, vs after a view-switch. The difference
+      tells which window the wheel events are landing on (vs which
+      window caja's view widget expects). Filed 2026-05-13.
 - [ ] **Caja right-click context menu pops up offset (too far right
       and down).** Observed 2026-05-13 on dual-screen MATE smoke
       (5120x1440 = 2× 2560x1440). Right-clicking an item in caja
