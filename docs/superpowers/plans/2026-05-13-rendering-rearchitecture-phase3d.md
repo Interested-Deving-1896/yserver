@@ -10,6 +10,18 @@
 
 ---
 
+## Prerequisite — confirm 3C has landed
+
+Before starting T1, verify the tree state. This plan assumes 3C T1 and T2 are committed (`d4e7d3d` / `e53b8c9` / `9c3b6e2` / `e1686b5` / `f24eb72`):
+
+```bash
+cd /home/jos/Projects/yserver
+git log --oneline graphics-followups | grep -E "3C|put_image|upload_bgra_to_mirror" | head -10
+rg -n 'record_paint_batch_op' crates/yserver/src/kms/backend.rs | head
+```
+
+Expected: `try_vk_put_image` (~backend.rs:3812) and `upload_bgra_to_mirror` (~backend.rs:2603) both use `self.scheduler.record_paint_batch_op(...)`. If they still use `OpsStaging::ensure + run_one_shot_op`, **STOP** — this plan's cutover-grep expectations and the "end-of-3C" baseline assume those migrations are already in place. Run 3C first.
+
 ## Phase context
 
 Read `docs/superpowers/plans/2026-05-13-rendering-rearchitecture-phase3c-results.md` first. Phase 3D's scope is **deliberately narrow** — one recorder, one call site, parallels 3B's distinct/same migrations. Reasoning:
@@ -361,18 +373,32 @@ Expected:
 - clippy: 5 pre-existing warnings; no new ones.
 - tests: yserver lib 138 passed + workspace green.
 
-### Step 2: Hardware smoke
+### Step 2: Hardware smoke (REQUIRED for 3D)
 
-- [ ] **Step 3: Document smoke as user-deferred**
+- [ ] **Step 3: Run focused hardware smoke**
 
-Like 3C, this migration is correctness-preserving by construction (same recorder body, same scratch-image semantics, just inside the open batch CB instead of a one-shot). xts / rendercheck / MATE smoke remain user discretion. Workloads to verify if running smoke:
+Unlike 3C, this phase **requires** a hardware smoke pass before merging. Reason: the migration deliberately changes the shared CopyScratch lifetime under batching — the exact bug class that produced the 3B AMD VM_CONTEXT fault. Codex review specifically flagged this. The pre-resize flush mitigates the most likely failure mode, but a hardware run is the only way to validate it under real workloads.
 
-- `xterm` scrollback (long output / `seq 1 10000`).
-- Text selection drag in any terminal or text widget.
-- MATE file-manager refresh.
-- Window drag with text content visible.
+Run on the user's hardware host (e.g. `silence`):
 
-No GPU faults expected; phase-3B drawable-destruction barriers cover windows/pixmaps which are the copy targets.
+```bash
+just yserver-mate-hw-release    # or local equivalent
+```
+
+Then exercise these workloads (each one drives same-overlap heavily):
+
+1. `xterm` scrollback — run `seq 1 100000` then mouse-wheel scroll through it for ~30s.
+2. Text-selection drag — open `gedit` (or `pluma`), paste a multi-page doc, then click-drag-select repeatedly across page boundaries for ~30s.
+3. MATE file-manager — open a folder with many icons, scroll up/down for ~30s.
+4. Window drag with text content visible — drag the `xterm` and `gedit` windows around the screen for ~30s each.
+
+**Pass criteria (all must hold):**
+- No `paint batch submit failed` / `renderer_failed` / `DEVICE_LOST` in `yserver-hw.log`.
+- No `VM_CONTEXT` / `amdgpu` GPU fault / kernel oops in `journalctl -k --since "yserver-start-time"`.
+- No `vk copy same-overlap: pre-resize flush failed` warnings (rare path; if it fires, the cause is more interesting than the path itself).
+- Subjectively: scroll/drag stays smooth, no corruption.
+
+If any of these fail, **STOP** and report the failure mode — do not merge. The most likely culprit if a VM fault appears is the CopyScratch lifetime hole (which the pre-resize flush is supposed to close); investigate before continuing.
 
 ### Step 3: Write results doc
 
@@ -385,7 +411,7 @@ Follow the 3A/3B/3C template. Sections:
 3. **Preflight checks**: fmt, clippy, test counts from your actual run.
 4. **Cutover greps**: real `rg` output, semantic site listing.
 5. **Done conditions**: enumerated below.
-6. **Hardware smoke**: user-deferred (write "Deferred to user. Migration is correctness-preserving by construction; same recorder body, same shared-CopyScratch semantics, now inside the open batch CB. The steady-state / unconditional pre-record ProtocolBarrier flush that fired on every same-overlap op (xterm scrollback / text-selection drag) is gone; a resize-only pre-flush remains, firing only when CopyScratch::needs_grow returns true (typically once at startup / when a new max rect is seen).").
+6. **Hardware smoke**: report the actual run. Hostname, log file summary (lines matching the pass criteria), and any anomalies. The smoke is REQUIRED for 3D (see T2 step 3) — do not write "deferred to user" here. If the workload couldn't be run for environmental reasons, mark the phase as DONE_WITH_CONCERNS and surface the gap.
 7. **Plan bugs caught (folded back into plan)**: any recipe-level issues hit during T1 execution. If none, write "None — recipe applied cleanly."
 8. **Commit summary** table: Plan, T1, T2.
 9. **Known deferred items** — point to 3E for: text-run, render-composite, traps, MaskScratch upload, glyph atlas incremental upload. Note `record_get_image` is phase 5 scope.
@@ -427,9 +453,10 @@ EOF
 4. `try_vk_copy_area` same-overlap arm uses `record_paint_batch_op` with three disjoint field borrows (`scheduler` + mirror + scratch).
 5. The OLD inline `flush_if_needed(ProtocolBarrier)` borrow-conflict fallback at the top of the same-overlap arm is gone.
 6. `CopyScratch::needs_grow` exists; same-overlap arm calls it BEFORE the mirror/scratch borrows and conditionally pre-flushes the batch when a resize is pending. The flush only fires on actual resize events (rare in steady state).
-7. `CopyScratch::ensure_size` is called BEFORE `record_paint_batch_op` so CPU-side failure doesn't disturb batch state.
-8. The `run_legacy_paint_op` audit catalogue entry for `try_vk_copy_area (same-overlap)` reads `migrated 3D (record_paint_batch_op, shared CopyScratch)`.
-9. Hardware smoke green on the user's host (deferred to user, but no `paint batch submit failed` / `renderer_failed` expected under workloads listed in T2 step 3).
+7. **Ordering invariant**: the resize pre-flush MUST happen BEFORE `scratch.ensure_size(...)`, not merely before `record_paint_batch_op`. If `ensure_size` runs first, it could free the old image while an unsubmitted batch CB still references it. The recipe orders it correctly; the done condition is here so a future reader can spot a regression.
+8. `CopyScratch::ensure_size` is called BEFORE `record_paint_batch_op` so CPU-side failure doesn't disturb batch state.
+9. The `run_legacy_paint_op` audit catalogue entry for `try_vk_copy_area (same-overlap)` reads `migrated 3D (record_paint_batch_op, shared CopyScratch)`.
+10. Hardware smoke green on the user's host per T2 step 3 (the workloads listed there must all run clean — no GPU fault, no `paint batch submit failed`, no `renderer_failed`).
 
 ## Cutover greps (post-3D — semantic, not numeric)
 
