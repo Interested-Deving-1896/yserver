@@ -174,6 +174,11 @@ pub struct PaintBatch {
     retire_resources: Vec<Box<dyn BatchResource>>,
     upload_arena: Option<BatchUploadArena>,
     descriptor_arena: Option<BatchDescriptorArena>,
+    /// Allocated on first submit. Signaled when the submitted CB
+    /// completes on the GPU. Destroyed in `retire_now()` after the
+    /// fence has been waited on / observed signaled. On the
+    /// path-2 device-lost path, leaked alongside the CB.
+    fence: Option<vk::Fence>,
 }
 
 impl std::fmt::Debug for PaintBatch {
@@ -201,6 +206,7 @@ impl PaintBatch {
             retire_resources: Vec::new(),
             upload_arena: None,
             descriptor_arena: None,
+            fence: None,
         }
     }
 
@@ -345,28 +351,40 @@ impl PaintBatch {
         }
     }
 
-    /// Submit + idle-wait + retire. Phase 3 collapses
+    /// Submit + fence-wait + retire. Phase 3 collapses
     /// Closed→Submitted→Retired into this one call. Phase 4
-    /// splits them: submit returns immediately, retirement is
-    /// driven by `release_holder`.
+    /// narrows the wait from `queue_wait_idle` (all queue) to
+    /// `wait_for_fences` on this batch's own fence — composite-
+    /// side submissions on the same queue no longer serialize
+    /// the paint-side wait. Phase 4 T2+ further splits this into
+    /// `submit_async` + `try_retire_if_signaled` for best-effort
+    /// flushes; the strict-flush path keeps using this blocking
+    /// entry.
     ///
     /// On Idle (no CB allocated): no submit; transitions directly
     /// to Retired. On Poisoned: returns `BatchError::Poisoned`
     /// without touching the queue.
     ///
-    /// **Three distinct failure paths**, with different retirement
+    /// **Four distinct failure paths**, with different retirement
     /// semantics — DO NOT collapse them:
     ///
-    /// 1. **Submit fails** (`queue_submit2` returns Err): the CB
-    ///    never entered the queue. Free the CB, retire resources,
-    ///    return the error.
-    /// 2. **Wait fails** (`queue_submit2` Ok, `queue_wait_idle`
-    ///    Err): the CB IS in flight or the device is lost. The GPU
-    ///    may still be reading our resources. We must NOT free
-    ///    the CB and must NOT call `BatchResource::release` —
-    ///    those Vulkan handles are abandoned until device
-    ///    destruction. The batch stays in `Submitted` forever
-    ///    (its `Drop` honours the same leak; see `Drop` impl).
+    /// 1a. **Fence creation fails** (`create_fence` before
+    ///     submit): the CB never entered the queue and no fence
+    ///     was created. Free the CB, retire resources, return
+    ///     the error. Mechanically identical to 1b but listed
+    ///     separately so reviewers don't have to infer it.
+    /// 1b. **Submit fails** (`queue_submit2` returns Err): the
+    ///     CB never entered the queue. Destroy the fence
+    ///     (created in 1a's step but not yet given to the queue),
+    ///     free the CB, retire resources, return the error.
+    /// 2.  **Wait fails** (`queue_submit2` Ok, `wait_for_fences`
+    ///     Err): the CB IS in flight or the device is lost. The
+    ///     GPU may still be reading our resources. We must NOT
+    ///     free the CB, must NOT destroy the fence, and must NOT
+    ///     call `BatchResource::release` — those Vulkan handles
+    ///     are abandoned until device destruction. The batch
+    ///     stays in `Submitted` forever (its `Drop` honours the
+    ///     same leak; see `Drop` impl).
     ///
     ///    **This is not a recoverable state.** Callers that get
     ///    `BatchError::Vk` from `submit_and_wait` MUST treat the
@@ -379,7 +397,8 @@ impl PaintBatch {
     ///    not a supported steady state — it produces more
     ///    abandoned CBs each cycle.
     ///
-    /// 3. **Both succeed**: free CB, retire resources, return Ok.
+    /// 3.  **Both succeed**: free CB, retire resources
+    ///     (including fence destroy), return Ok.
     pub fn submit_and_wait(&mut self) -> Result<(), BatchError> {
         match self.state {
             BatchState::Poisoned => return Err(BatchError::Poisoned),
@@ -394,17 +413,42 @@ impl PaintBatch {
             BatchState::Closed => {}
         }
         let cb = self.cb.expect("Closed implies cb was allocated");
+
+        // 4-T1: create a fence and use it as the submit's signal.
+        // Then wait_for_fences on it instead of the broad
+        // queue_wait_idle. This narrows the wait to OUR submission
+        // — composite-side submissions on the same queue no
+        // longer serialize the paint-side wait.
+        let fence_info = vk::FenceCreateInfo::default();
+        let fence = match unsafe { self.vk.device.create_fence(&fence_info, None) } {
+            Ok(f) => f,
+            Err(e) => {
+                // Path 1a: fence creation failed before submit.
+                // CB never queued; safe to free + retire.
+                unsafe { self.vk.device.free_command_buffers(self.pool, &[cb]) };
+                self.cb = None;
+                self.state = BatchState::Closed;
+                self.poison();
+                return Err(BatchError::Vk(e));
+            }
+        };
+        self.fence = Some(fence);
+
         let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
         let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
 
-        // Path 1: submit fails. CB never queued; safe to free + retire.
+        // Path 1b: submit fails. CB never queued; safe to free + retire.
         if let Err(e) = unsafe {
             self.vk
                 .device
-                .queue_submit2(self.vk.graphics_queue, &submit, vk::Fence::null())
+                .queue_submit2(self.vk.graphics_queue, &submit, fence)
         } {
-            unsafe { self.vk.device.free_command_buffers(self.pool, &[cb]) };
+            unsafe {
+                self.vk.device.destroy_fence(fence, None);
+                self.vk.device.free_command_buffers(self.pool, &[cb]);
+            }
             self.cb = None;
+            self.fence = None;
             self.state = BatchState::Closed; // back to a poisonable state
             self.poison();
             return Err(BatchError::Vk(e));
@@ -415,9 +459,11 @@ impl PaintBatch {
 
         // Path 2 / 3: wait. On wait failure the CB and our resources
         // may still be referenced by the GPU. Leak rather than UB.
-        match unsafe { self.vk.device.queue_wait_idle(self.vk.graphics_queue) } {
+        let fences = [fence];
+        match unsafe { self.vk.device.wait_for_fences(&fences, true, u64::MAX) } {
             Ok(()) => {
-                // Path 3: clean retirement.
+                // Path 3: clean retirement. retire_now destroys the
+                // fence alongside the CB and arenas.
                 unsafe { self.vk.device.free_command_buffers(self.pool, &[cb]) };
                 self.cb = None;
                 self.retire_now();
@@ -425,15 +471,16 @@ impl PaintBatch {
             }
             Err(e) => {
                 // Path 2: device-lost or similar. Intentionally do
-                // NOT free the CB, do NOT release retire_resources
-                // — those handles are abandoned. The batch stays
-                // in `Submitted` forever; its `Drop` does nothing.
+                // NOT free the CB, do NOT destroy the fence, do NOT
+                // release retire_resources — those handles are
+                // abandoned. The batch stays in `Submitted` forever;
+                // its `Drop` does nothing.
                 //
                 // Upper layers MUST treat this as a fatal
                 // KMS-renderer condition (see method doc above).
                 log::error!(
-                    "PaintBatch::submit_and_wait: queue_wait_idle failed ({e:?}); \
-                     CB and resources abandoned. KMS renderer is in an \
+                    "PaintBatch::submit_and_wait: wait_for_fences failed ({e:?}); \
+                     CB / fence / resources abandoned. KMS renderer is in an \
                      unrecoverable state — caller MUST tear down or disable."
                 );
                 Err(BatchError::Vk(e))
@@ -468,6 +515,9 @@ impl PaintBatch {
             "retire_now from {:?}",
             self.state
         );
+        if let Some(fence) = self.fence.take() {
+            unsafe { self.vk.device.destroy_fence(fence, None) };
+        }
         if let Some(arena) = self.upload_arena.take() {
             Box::new(arena).release(&self.vk);
         }
@@ -514,8 +564,8 @@ impl Drop for PaintBatch {
             BatchState::Submitted => {
                 log::error!(
                     "PaintBatch::drop while Submitted — abandoned resources \
-                     (CB + arenas + descriptor pools). KMS renderer is in an \
-                     unrecoverable state."
+                     (CB + fence + arenas + descriptor pools). KMS renderer \
+                     is in an unrecoverable state."
                 );
             }
             // Idle / Recording / Closed: nothing on the GPU yet.
