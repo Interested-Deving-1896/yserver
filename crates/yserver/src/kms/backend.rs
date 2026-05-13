@@ -8566,6 +8566,15 @@ impl Backend for KmsBackend {
             })
         });
 
+        // Phase-3B drawable-destruction barrier: a batched paint op
+        // recorded earlier (3B T2/T3 migrated fill + copy) may still
+        // reference this window's vk_mirror VkImage, and an in-flight
+        // composite may still sample it. flush_if_needed submits the
+        // batch and queue_wait_idles, draining BOTH before we drop
+        // the WindowState.
+        let _ = self
+            .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier);
+
         if self.windows.remove(&host_xid).is_some() {
             // Update parent's children list (or top-level stacking order
             // if this was a top-level window).
@@ -8722,6 +8731,15 @@ impl Backend for KmsBackend {
             {
                 log::warn!("configure_window: bg_pixel fill on resize failed: {e:?}");
             }
+            // Phase-3B drawable-destruction barrier: flush any
+            // batched paint that referenced the old vk_mirror (and
+            // drain any in-flight composite that samples it) before
+            // dropping it via the reassignment below. This also
+            // flushes the fresh fill on `new_mirror` recorded just
+            // above, which is fine — the next composite picks it up.
+            let _ = self.flush_if_needed(
+                crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier,
+            );
             if let Some(window) = self.windows.get_mut(&host_xid) {
                 window.vk_mirror = new_mirror;
             }
@@ -8996,6 +9014,12 @@ impl Backend for KmsBackend {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        // Phase-3B drawable-destruction barrier: a batched paint or
+        // in-flight composite may still reference this pixmap's
+        // VkImage. flush_if_needed submits the batch + queue_wait_idle
+        // before we drop / rescue the mirror.
+        let _ = self
+            .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier);
         if let Some(ps) = self.pixmaps.remove(&host_xid) {
             // Rescue the vk_mirror for any picture still referencing
             // this pixmap (e.g. fvwm frees the cursor source pixmap
@@ -10454,6 +10478,11 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         host_pic: u32,
     ) -> io::Result<()> {
+        // Phase-3B drawable-destruction barrier: a batched paint or
+        // in-flight composite may still reference this picture's
+        // rescued vk_mirror (if any). Flush before dropping.
+        let _ = self
+            .flush_if_needed(crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier);
         self.pictures.remove(&host_pic);
         self.picture_rescued_images.remove(&host_pic);
         Ok(())
@@ -10998,6 +11027,15 @@ impl Backend for KmsBackend {
             let cw = src.extent.width;
             let ch = src.extent.height;
             let vk_mirror = self.copy_drawable_to_new_cursor_mirror(&mut src);
+            // Phase-3B drawable-destruction barrier:
+            // `copy_drawable_to_new_cursor_mirror` (T3-migrated)
+            // records into the batch and returns; `src` is about to
+            // drop, destroying the rescued mirror's VkImage. Flush
+            // the batch before the drop so the GPU has consumed the
+            // copy.
+            let _ = self.flush_if_needed(
+                crate::kms::scheduler::paint_batch::BatchFlushReason::ProtocolBarrier,
+            );
             // `src` drops here, releasing the rescued mirror's VkImage.
             self.cursors.insert(
                 id,
