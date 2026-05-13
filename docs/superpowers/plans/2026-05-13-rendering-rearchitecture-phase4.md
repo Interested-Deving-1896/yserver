@@ -86,8 +86,9 @@ After Phase 4, strict reasons go through `submit_and_wait` (or its renamed equiv
 |---|---|---|
 | `crates/yserver/src/kms/scheduler/paint_batch.rs` | Add `fence: Option<vk::Fence>` field. `submit_and_wait` swaps `vkQueueWaitIdle` for fence-creation + `wait_for_fences`. Add `submit_async` (returns the fence handle). Add `try_retire_if_signaled` (non-blocking status check; retires if signaled). Update `Drop` for `Submitted` to leak fence too. Update path-2 doc. | T1 + T2 |
 | `crates/yserver/src/kms/scheduler/mod.rs` | Add `submitted_paint_batches: VecDeque<PaintBatch>`. Add `RenderScheduler::submit_async`, `RenderScheduler::poll_retired_paint_batches`, `RenderScheduler::pending_paint_batches`. | T2 + T3 |
-| `crates/yserver/src/kms/backend.rs` | `flush_if_needed` branches strict vs best-effort. Call `poll_retired_paint_batches` from `poll_in_flight` (or alongside). Add bounded-queue backpressure check. | T3 + T4 |
-| `docs/superpowers/plans/2026-05-13-rendering-rearchitecture-phase4-results.md` | Results doc. | T5 |
+| `crates/yserver/src/kms/backend.rs` | `flush_if_needed` branches strict vs best-effort. Call `poll_retired_paint_batches` from `poll_in_flight` (or alongside). Add bounded-queue backpressure check. Drain `submitted_paint_batches` after `vkDeviceWaitIdle()` in the shutdown path. | T3 + T4 + T5 |
+| `crates/yserver/src/kms/scheduler/mod.rs` (drain helper) | Add `drain_submitted_paint_batches`. | T5 |
+| `docs/superpowers/plans/2026-05-13-rendering-rearchitecture-phase4-results.md` | Results doc. | T6 |
 
 ## Pre-task notes (read before starting)
 
@@ -99,20 +100,21 @@ After Phase 4, strict reasons go through `submit_and_wait` (or its renamed equiv
 
 4. **Backpressure**: if `submitted_paint_batches.len()` exceeds a small bound (proposal: `MAX_IN_FLIGHT_PAINT_BATCHES = 4` — about one composite period at 60 Hz), block on the oldest fence before pushing the new one. This prevents unbounded growth under chatty clients (the listener-starvation pattern from `docs/known-issues.md` is the worst-case driver).
 
-5. **`VisibleComposite` was the only best-effort caller blocking on `queue_wait_idle` historically**. After Phase 4 it goes async and the composite-side fence-dependency model (`OutputFrame::holders` + `PaintBatch::holders`) becomes load-bearing. Phase 3A landed `acquire_holder` / `release_holder` for shape; Phase 4 wires them.
+5. **`VisibleComposite` was the only best-effort caller blocking on `queue_wait_idle` historically.** After Phase 4 it goes async — `flush_if_needed(VisibleComposite)` returns immediately and the paint batch retires on the composite-tick poll.
 
-   **Sequencing in `composite_and_flip` (per the HLD):**
-   - Close current `PaintBatch` → `submit_async` → batch enters `Submitted` with a fence.
-   - For each output that this batch's `dirty_outputs` includes, the new `OutputFrame` captures `acquire_holder()` on the batch.
-   - Composite's CB records a `vk::wait_semaphores` (or, with binary fences, queues a `wait_for_fences` host-side check at submit time, but that defeats the point).
-   - **Binary-fence variant** (simpler, Phase 4 scope): the composite recorder doesn't wait on the GPU; instead, the host-side `acquire_holder` keeps the `PaintBatch` alive until `OutputFrame::composite_done[output]` (a separate fence) signals. The composite CB just samples — the implicit GPU ordering is "this submission queued after the paint submission, on the same queue, so the GPU serializes them." This is the convention single-queue uses today and works without timeline semaphores.
-   - **No change to `composite_and_flip`'s GPU command recording.** Composite already submits on the same `graphics_queue`. Single-queue serialization guarantees paint's writes are visible to composite's reads. The fence we add per `PaintBatch` is purely for CPU-side retirement, not for GPU-side synchronization.
+   **Why no semaphore handoff to composite is needed in this phase**: per the Vulkan spec (see [Fundamentals](https://docs.vulkan.org/spec/latest/chapters/fundamentals.html) and [Synchronization](https://docs.vulkan.org/spec/latest/chapters/synchronization.html)), same-queue submission order is the **ordering basis** for cross-submission dependencies, but it does NOT by itself guarantee execution ordering or memory visibility. Cross-submission memory visibility requires `vkCmdPipelineBarrier2` (image/memory barriers) or explicit semaphore signal/wait.
 
-   This is the critical simplification: **`PaintBatch::fence` is for CPU-side retirement only.** No semaphore handoff to composite. Composite's GPU work serializes after paint's GPU work because they're submitted in order on the same queue. The `holders` mechanism is just for CPU-side "don't recycle these resources yet" tracking.
+   What makes Phase 4 safe **without** adding a semaphore: each paint recorder already ends its CB with an explicit image-layout-and-access barrier transitioning the mirror to `SHADER_READ_ONLY_OPTIMAL` (see `vk/ops/fill.rs:130`, `vk/ops/render.rs:71`, `vk/ops/image.rs:15`, plus the trap/text/composite paths). Composite's CB is then submitted **later** on the **same** graphics queue (paint at `backend.rs:~1586`, composite at `backend.rs:~7088` / `vk/compositor.rs:~195`). The combination — same-queue submission order PLUS explicit per-CB ending barriers on the mirror image — is the proper Vulkan memory dependency for "paint writes happen-before composite reads."
+
+   This is the precise framing. Drop the older "single-queue serialization guarantees visibility" shorthand; it's true in practice on all current implementations but is not the actual spec rule and would mask a real bug if a future paint recorder forgot its ending barrier.
+
+   **`PaintBatch::fence` is for CPU-side retirement only.** No GPU-side semaphore handoff. The host-side fence keeps the paint batch's resources alive on the CPU until the GPU has signaled completion; composite's GPU-side reads are ordered by the per-CB barriers, not by the fence.
+
+   **`OutputFrame::holders` / `PaintBatch::holders` stay at 0 in Phase 4.** Phase 3A landed `acquire_holder` / `release_holder` for shape but Phase 4 does NOT wire them — the same-queue + per-CB-barrier story above is sufficient on its own. Wiring `holders` for cross-batch reference-counted retirement is Phase 6 (batch-owned refcounted handles) territory; it'd be needed if/when we share a paint batch's images across multiple subsequent composite cycles in flight, which Phase 4 does not introduce.
 
 6. **The path-2 (device-lost) wait-failure path stays.** Today: `queue_wait_idle` failure leaks CB + resources + (with Phase 4) fence. Same behavior, narrower trigger (now `wait_for_fences` on the specific fence rather than the broader idle wait).
 
-7. **Test coverage**: state-machine tests in `paint_batch.rs` extend (fence-allocated-and-destroyed transitions). Recorder tests unaffected. Coverage for the new async behavior is hardware smoke (T5) — yserver in a normal MATE session, plus rendercheck to confirm no regressions.
+7. **Test coverage**: state-machine tests in `paint_batch.rs` extend (fence-allocated-and-destroyed transitions). Recorder tests unaffected. Coverage for the new async behavior is hardware smoke (T6) — yserver in a normal MATE session, plus rendercheck to confirm no regressions.
 
 8. **clippy / fmt**: plain `cargo clippy -p yserver`, `cargo +nightly fmt`. 5 pre-existing `doc_lazy_continuation` warnings; no new ones.
 
@@ -387,21 +389,26 @@ Replace lines starting with `/// Submit + idle-wait + retire.` through `/// 3. *
     /// to Retired. On Poisoned: returns `BatchError::Poisoned`
     /// without touching the queue.
     ///
-    /// **Three distinct failure paths**, with different retirement
+    /// **Four distinct failure paths**, with different retirement
     /// semantics — DO NOT collapse them:
     ///
-    /// 1. **Submit fails** (`queue_submit2` returns Err, OR fence
-    ///    creation failed before submit): the CB never entered
-    ///    the queue. Destroy the fence (if created), free the CB,
-    ///    retire resources, return the error.
-    /// 2. **Wait fails** (`queue_submit2` Ok, `wait_for_fences`
-    ///    Err): the CB IS in flight or the device is lost. The
-    ///    GPU may still be reading our resources. We must NOT
-    ///    free the CB, must NOT destroy the fence, and must NOT
-    ///    call `BatchResource::release` — those Vulkan handles
-    ///    are abandoned until device destruction. The batch
-    ///    stays in `Submitted` forever (its `Drop` honours the
-    ///    same leak; see `Drop` impl).
+    /// 1a. **Fence creation fails** (`create_fence` before
+    ///     submit): the CB never entered the queue and no fence
+    ///     was created. Free the CB, retire resources, return
+    ///     the error. Mechanically identical to 1b but listed
+    ///     separately so reviewers don't have to infer it.
+    /// 1b. **Submit fails** (`queue_submit2` returns Err): the
+    ///     CB never entered the queue. Destroy the fence
+    ///     (created in 1a's step but not yet given to the queue),
+    ///     free the CB, retire resources, return the error.
+    /// 2.  **Wait fails** (`queue_submit2` Ok, `wait_for_fences`
+    ///     Err): the CB IS in flight or the device is lost. The
+    ///     GPU may still be reading our resources. We must NOT
+    ///     free the CB, must NOT destroy the fence, and must NOT
+    ///     call `BatchResource::release` — those Vulkan handles
+    ///     are abandoned until device destruction. The batch
+    ///     stays in `Submitted` forever (its `Drop` honours the
+    ///     same leak; see `Drop` impl).
     ///
     ///    **This is not a recoverable state.** Callers that get
     ///    `BatchError::Vk` from `submit_and_wait` MUST treat the
@@ -414,8 +421,8 @@ Replace lines starting with `/// Submit + idle-wait + retire.` through `/// 3. *
     ///    not a supported steady state — it produces more
     ///    abandoned CBs each cycle.
     ///
-    /// 3. **Both succeed**: free CB, retire resources (including
-    ///    fence destroy), return Ok.
+    /// 3.  **Both succeed**: free CB, retire resources
+    ///     (including fence destroy), return Ok.
 ```
 
 ### Step 5: Update `Drop` for `Submitted` state
@@ -1119,7 +1126,125 @@ EOF
 
 ---
 
-## Task 5: Validation + phase-4 results doc
+## Task 5: Shutdown drain — block on remaining `submitted_paint_batches` before backend teardown
+
+**Goal:** Phase 4 makes `flush_if_needed(Shutdown)` best-effort, so paint batches can still be in `submitted_paint_batches` when the backend tears down. Without an explicit drain, `PaintBatch::drop` for `Submitted` fires the leak warning (and actually leaks the CB / fence / arenas / descriptor pools per the path-2 contract). Add a final drain so the shutdown path retires every queued batch before the scheduler drops.
+
+**Files:**
+- Modify: `crates/yserver/src/kms/scheduler/mod.rs` (add `drain_submitted_paint_batches`).
+- Modify: `crates/yserver/src/kms/backend.rs` (call it from the shutdown path, after `vkDeviceWaitIdle`).
+
+### Step 1: Add `drain_submitted_paint_batches` to the scheduler
+
+- [ ] **Step 1: Add the method to `impl RenderScheduler`** in `scheduler/mod.rs`, immediately after `poll_retired_paint_batches`:
+
+```rust
+    /// Synchronously retire every batch currently in the
+    /// submitted-paint-batches queue. For shutdown only — best-
+    /// effort `flush_if_needed(Shutdown)` would leave batches in
+    /// the queue and `PaintBatch::drop` would leak them.
+    ///
+    /// Order: FIFO. Calls `wait_for_completion` on each batch.
+    /// On any failure, the remaining batches are left in the
+    /// queue (their `Drop` will fire the leak warning); the
+    /// error propagates. Caller MUST already have latched a
+    /// renderer-failed condition before calling, OR be prepared
+    /// to handle the leak (acceptable at shutdown).
+    ///
+    /// Should be called AFTER `vkDeviceWaitIdle()` in the
+    /// teardown sequence — at that point every fence is
+    /// guaranteed signaled, so each `wait_for_completion`
+    /// returns immediately. Calling before `vkDeviceWaitIdle`
+    /// would block on each fence in turn (still correct, just
+    /// pessimal).
+    #[allow(clippy::missing_errors_doc)]
+    pub fn drain_submitted_paint_batches(&mut self) -> Result<(), BatchError> {
+        while let Some(mut batch) = self.submitted_paint_batches.pop_front() {
+            batch.wait_for_completion()?;
+            drop(batch);
+        }
+        Ok(())
+    }
+```
+
+### Step 2: Find the shutdown path in `backend.rs`
+
+- [ ] **Step 2: Find where the backend tears down**
+
+```bash
+rg -n 'fn disable_output\|fn shutdown\|device_wait_idle' crates/yserver/src/kms/backend.rs | head
+```
+
+Look for the function called at process-shutdown / `disable_output` time. The KMS teardown fix (`a693255`) added the 6-step `disable_output` that ends in `vkDeviceWaitIdle()` (search for `device_wait_idle` in `backend.rs`). The drain belongs **after** the `vkDeviceWaitIdle()` (every fence will already be signaled then) and **before** anything else that could drop the scheduler.
+
+### Step 3: Insert the drain call
+
+- [ ] **Step 3: Add the drain call immediately after `vkDeviceWaitIdle()`** in the shutdown sequence.
+
+Find the `vkDeviceWaitIdle()` call site (approximate location: `backend.rs:~8246` from the codex-review citation; verify with grep before editing). Add:
+
+```rust
+            // 4-T5: drain any paint batches that didn't finish
+            // retiring through the composite-tick poll. After
+            // vkDeviceWaitIdle their fences are signaled, so
+            // each wait_for_completion returns immediately —
+            // we're just running the CB-free + resource-release
+            // + fence-destroy sequence on the host side.
+            if let Err(e) = self.scheduler.drain_submitted_paint_batches() {
+                log::warn!(
+                    "shutdown: drain_submitted_paint_batches failed ({e:?}); \
+                     remaining batches will fire the leak warning on Drop"
+                );
+            }
+```
+
+(The exact location depends on the shutdown function's structure — slot it in immediately after the `device_wait_idle` call in whatever function does the teardown.)
+
+### Step 4: Build
+
+- [ ] **Step 4: `cargo check -p yserver`** — clean.
+
+### Step 5: Tests + fmt + clippy
+
+- [ ] **Step 5-7: standard verification**:
+```bash
+cargo test -p yserver --lib 2>&1 | tail -5    # 138 passed
+cargo +nightly fmt --check                     # no diff
+cargo clippy -p yserver 2>&1 | tail -10        # 5 pre-existing
+```
+
+### Step 6: Commit T5
+
+- [ ] **Step 8: Commit**:
+
+```bash
+git add crates/yserver/src/kms/scheduler/mod.rs crates/yserver/src/kms/backend.rs
+git commit -m "$(cat <<'EOF'
+refactor(kms): drain submitted_paint_batches on shutdown
+
+Phase 4 T5: Phase 4 makes flush_if_needed(Shutdown) best-effort,
+so paint batches stay in submitted_paint_batches across the
+shutdown handoff. Without an explicit drain, PaintBatch::drop
+for Submitted fires its leak warning and abandons the CB /
+fence / arenas / descriptor pools per the path-2 contract.
+
+Add RenderScheduler::drain_submitted_paint_batches —
+synchronously retires every queued batch via
+wait_for_completion. Called immediately after vkDeviceWaitIdle
+in the shutdown sequence so each fence is already signaled and
+each wait returns instantly; we're just running the host-side
+free + release + destroy sequence per batch.
+
+Caught by codex review of the Phase 4 plan (P2).
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+## Task 6: Validation + phase-4 results doc
 
 **Goal:** End-to-end verification + results doc following the 3F-1/3F-2 template.
 
@@ -1218,7 +1343,7 @@ Follow the 3F-2 template. Sections:
 
 10. **What's next**: per `docs/status.md`, the next phase decision after Phase 4 depends on the Friday silence + Nvidia test results (per `project_amd_lag_investigation.md` memory). Provisional: Phase 5 narrow to readback + glyph atlas, OR AMD-investigation phase if the silence test reveals broad recent-amdgpu regression.
 
-### Step 4: Commit T5
+### Step 4: Commit T6
 
 - [ ] **Step 5: Commit**
 
@@ -1264,7 +1389,8 @@ EOF
 9. `flush_if_needed` branches by strict vs best-effort and calls `close_and_submit` (strict) or `close_and_submit_async` (best-effort).
 10. `poll_in_flight` calls `poll_retired_paint_batches` at its top, before the existing output-frame polling.
 11. Backpressure: `close_and_submit_async` blocks on the oldest fence if the queue is at `MAX_IN_FLIGHT_PAINT_BATCHES = 4`.
-12. Hardware smoke green per T5 step 3.
+12. `drain_submitted_paint_batches` exists on `RenderScheduler` and is called from the shutdown path **after** `vkDeviceWaitIdle()`. After shutdown returns, `submitted_paint_batches.is_empty()` (no leaked-Submitted warnings).
+13. Hardware smoke green per T6 step 3.
 
 ## Cutover greps (post-4 — semantic, not numeric)
 
@@ -1296,6 +1422,10 @@ $ rg -n 'close_and_submit_async\|close_and_submit\(' crates/yserver/src/kms/back
 $ rg -n 'poll_retired_paint_batches' crates/yserver/src/kms/
 # Method definition in scheduler/mod.rs + 1 call site in
 # backend.rs (top of poll_in_flight).
+
+$ rg -n 'drain_submitted_paint_batches' crates/yserver/src/kms/
+# Method definition in scheduler/mod.rs + 1 call site in
+# backend.rs (in the shutdown path, after vkDeviceWaitIdle()).
 ```
 
 ## Notes for the implementer
@@ -1305,4 +1435,4 @@ $ rg -n 'poll_retired_paint_batches' crates/yserver/src/kms/
 - **No new tests to write.** The state-machine tests in `paint_batch.rs` don't exercise Vulkan; the new methods are covered by the hardware smoke. If you want a unit-testable invariant, a `BatchState`-only test for "Submitted requires fence" via a no-op mock could land — but the existing test pattern (commented `#[ignore]` tests waiting for a VkContext harness) suggests the project hasn't built that mock yet; don't start here.
 - **Backpressure constant**: `MAX_IN_FLIGHT_PAINT_BATCHES = 4` is a starting point. If hardware smoke shows it's too low (frequent backpressure waits) or too high (excessive GPU queue depth), tune. The constant is private to `scheduler/mod.rs` so changes are local.
 - **The composite-side semaphore handoff is NOT done in this phase.** `OutputFrame::holders` and `PaintBatch::holders` stay at 0; the composite path still depends on single-queue-submission-order GPU serialization. Phase 6 (batch-owned refcounted handles) is the right place to wire holders if/when needed.
-- **Watch for**: if rendercheck regresses on Readback cases (GetImage, MIT-SHM GetImage), the strict-flush wait_for_fences path may have a bug — check that `close_and_submit` (NOT `_async`) is called for Readback. The grep at T5 Step 1 catches this if both paths exist.
+- **Watch for**: if rendercheck regresses on Readback cases (GetImage, MIT-SHM GetImage), the strict-flush wait_for_fences path may have a bug — check that `close_and_submit` (NOT `_async`) is called for Readback. The grep at T6 Step 1 catches this if both paths exist.
