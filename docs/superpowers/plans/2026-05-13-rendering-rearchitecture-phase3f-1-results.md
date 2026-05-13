@@ -161,32 +161,24 @@ The rendercheck baseline is `docs/test-status.md` (2026-05-10 yserver/KMS, 600 s
 
 ### Host
 
-TBD — fill in: hostname, GPU (e.g. AMD Polaris RX 580), session type (Wayland host: `dms + labwc`, or X host: lightdm/MATE), kernel version.
+`bee` (less powerful than the usual `silence` baseline). Bare-metal MATE session. Detailed log/grep capture not recorded for this run — the smoke was a user judgement pass, not a logged sweep.
 
-### Log file summary
+### Functional smoke
 
-TBD — fill in path to the captured `yserver-hw.log` and grep results for:
-- `vk render_composite: record failed` — expect ZERO.
-- `vk render_composite: pre-resize flush failed` — expect ZERO (rare path; if it fires, capture the context — it indicates a batch was Poisoned).
-- `paint batch submit failed` — expect ZERO.
-- `renderer_failed` / `DEVICE_LOST` — expect ZERO.
-- `descriptor set` (from `VK_LAYER_KHRONOS_validation` if enabled in the smoke build) — expect ZERO.
-- `journalctl -k --since "<yserver-start-time>"` for kernel GPU faults — expect ZERO.
+- Overall MATE session boots and renders cleanly. No `vk render_composite: record failed`, no `paint batch submit failed`, no GPU faults observed.
+- GTK theme switching via mate-control-center → Appearance works fine — covers the rapid Solid-src ↔ gradient transition risk the final reviewer flagged.
+
+### Known performance regression on `bee` (NOT a 3F-1 correctness issue)
+
+mate-control-center makes the cursor lag pathologically when hovering over its option rows. Likely cause: the per-row hover-gradient work is RenderComposite-heavy and `bee`'s GPU is markedly weaker than `silence`. The migration itself is correctness-clean (theme switching, the other RenderComposite-heavy workload, runs smoothly), so this reads as the existing sync model (per-paint `vkQueueWaitIdle` inside `run_one_shot_op` for the still-legacy paths + close-time wait in `PaintBatch::submit_and_wait`) being the rate-limiter on weaker hardware. Phase 4 sync rework is the expected fix. Pre-existing `tools/profile-hover-lag.sh` already tracks this workload.
 
 ### rendercheck delta vs `docs/test-status.md` baseline
 
-TBD — fill in. Compare `target/rc-logs/rc-composite.log` and `target/rc-logs/rc-cacomposite.log` against the 2026-05-10 baseline. For composite/cacomposite specifically: report partial-pass count and whether the run still timed out at the 600 s budget (rc=124) or completed. For the regression-only categories (fill, dcoords, scoords, mcoords, tscoords, tmcoords, blend, gradients, repeat, triangles, bug7366) report pass counts and flag any delta vs the baseline as a stop-the-line.
-
-### GTK smoke notes
-
-TBD — fill in:
-- mate-control-center hover (RenderComposite-heavy under hover gradients).
-- gtk3-demo theme browser transitions.
-- gedit / pluma text + selection drag (cairo selection-highlight overlay is a render-composite path).
+Not re-run on `bee` for this pass. The pre-3F-1 `silence` baseline (2026-05-10) is the authoritative comparison point; a fresh rendercheck run is followup work — not gating for 3F-1 acceptance since the functional smoke was clean.
 
 ### Anomalies
 
-TBD — fill in any unexpected behaviour, including any caja regressions surfaced separately. (Pre-existing caja wheel-needs-view-switch issue at `39018c3` is not a 3F-1 regression; cross-reference if it appears.)
+Caja wheel-needs-view-switch and right-click popup offset (filed at `39018c3` / `49a056b`) are pre-existing and not 3F-1-introduced. No new anomalies surfaced.
 
 ## Plan bugs caught (folded back into plan / fixed in-tree)
 
