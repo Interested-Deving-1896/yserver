@@ -698,12 +698,25 @@ pub struct KmsBackend {
     #[allow(dead_code)]
     pub(crate) compositor_pipeline: Option<crate::kms::vk::pipeline::CompositorPipeline>,
 
+    /// Frame-ownership and scheduling state. `PaintBatch` holds a
+    /// `VkCommandBuffer` allocated from `ops_command_pool` below, so
+    /// this field MUST be declared (and therefore dropped) BEFORE
+    /// `ops_command_pool` — otherwise `OpsCommandPool::Drop` runs
+    /// `destroy_command_pool` first, and the subsequent
+    /// `PaintBatch::Drop`'s `free_command_buffers` call hits a
+    /// dangling pool handle (driver-dependent: AMD radv panics).
+    pub(crate) scheduler: crate::kms::scheduler::RenderScheduler,
+
     // Drawing-op command pool (sub-phase 4.1.4). Separate from
     // `MirrorUploader`'s transfer pool — drawing ops emit graphics
     // workload (begin_rendering / clear_attachments / draws), the
     // uploader emits transfer workload. Sharing pools risks
     // lifetime tangles when both run in the same frame. `None`
     // when Vulkan didn't come up.
+    //
+    // Drop order: comes AFTER `scheduler` above so `PaintBatch::Drop`
+    // can free its CB against a still-valid pool. See `scheduler`
+    // doc for details.
     pub(crate) ops_command_pool: Option<crate::kms::vk::ops::OpsCommandPool>,
 
     /// Set by `flush_if_needed` when `PaintBatch::submit_and_wait`
@@ -767,11 +780,6 @@ pub struct KmsBackend {
     // pageflip-complete event arrives. Lets us see in the log
     // whether the kernel ever told us the very first flip latched.
     pub(crate) first_pageflip_logged: Vec<bool>,
-
-    /// Frame-ownership and scheduling state. T9 wires composite routing
-    /// through here; T7 adds the per-output dirty helpers that make the
-    /// idle gate work correctly.
-    pub(crate) scheduler: crate::kms::scheduler::RenderScheduler,
 
     // Fonts (freetype)
     font_loader: FontLoader,
