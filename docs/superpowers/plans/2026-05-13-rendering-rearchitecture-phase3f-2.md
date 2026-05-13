@@ -239,24 +239,31 @@ EOF
 
 ---
 
-## Task 2: Migrate `MaskScratch::upload_r8` to per-batch arena staging
+## Task 2: Add arena-aware MaskScratch primitives (additive)
 
-**Goal:** Drop `MaskScratch`'s private host-mapped staging buffer and the embedded `run_one_shot_op` inside `upload_r8`. The caller orchestrates: it pre-flushes if needed, calls `ensure_image_size` directly (now `pub`), allocates from `BatchUploadArena` inside the closure, copies bytes, and calls a new `record_upload_r8(vk, cb, src_buffer, src_offset, w, h)` recorder that records the barrier-copy-barrier into the supplied CB.
+**Goal:** Add the two new APIs `try_vk_render_traps_or_tris` will need to drive its own upload from per-batch `BatchUploadArena` staging. **Additive only** — keep the legacy `upload_r8`, the staging fields, `ensure_staging`, `allocate_staging`, the staging branch of `Drop`, and the manual `Send`/`Sync` impls in place. T3 deletes all of those alongside the caller migration, because traps is the sole `upload_r8` caller and deletion is only safe once the caller switches.
+
+The two additive APIs:
+
+1. `pub fn ensure_image_size(...)` — flip the existing private method to `pub` and document the pre-flush contract callers in batched paint paths must follow.
+2. `pub fn record_upload_r8(&mut self, vk, cb, src_buffer, src_offset, w, h)` — record the barrier-copy-barrier sequence into a caller-supplied CB. Byte-for-byte the same Vulkan sequence the existing `upload_r8` records, but written into the supplied CB instead of an embedded `run_one_shot_op`.
+
+**Mirrors 3F-1's T2 shape**: that task added `allocate_descriptor_for_views_into` next to the legacy `allocate_descriptor_for_views` and kept the legacy in place until 3F-2 T4 removed it. 3F-2 T2 + T3 follow the same additive-then-delete pattern, just compressed (because traps is the only `upload_r8` caller, the legacy can disappear in T3 instead of waiting for a separate cleanup task).
 
 **Files:**
 - Modify: `crates/yserver/src/kms/vk/mask_scratch.rs`
 
-### Step 1: Read the current `upload_r8` body
+### Step 1: Read the current `upload_r8` body (for the barrier sequence to mirror)
 
 - [ ] **Step 1: Re-read `mask_scratch.rs:149-233`**
 
-Identify the three sub-phases of the current `upload_r8`:
-1. `ensure_image_size(w, h)?` — image grow.
-2. `ensure_staging(needed)?` + `copy_nonoverlapping` into `self.staging_mapped` — staging fill.
-3. `run_one_shot_op(...) { barrier old_layout → TRANSFER_DST + cmd_copy_buffer_to_image(buffer = self.staging_buffer) + barrier TRANSFER_DST → SHADER_READ_ONLY }` — record + submit + waitidle.
-4. `self.current_layout = SHADER_READ_ONLY_OPTIMAL`.
+The three sub-phases of `upload_r8` you'll be **mirroring** (not modifying) in `record_upload_r8`:
+1. `ensure_image_size(w, h)?` — image grow. The new `record_upload_r8` does NOT call this; the caller calls `ensure_image_size` directly before recording.
+2. `ensure_staging(needed)?` + `copy_nonoverlapping` into `self.staging_mapped` — staging fill. The new `record_upload_r8` does NOT do this; the caller copies into a `BatchUploadArena` allocation.
+3. `run_one_shot_op(...) { barrier old_layout → TRANSFER_DST + cmd_copy_buffer_to_image(buffer = self.staging_buffer) + barrier TRANSFER_DST → SHADER_READ_ONLY }` — record + submit + waitidle. The new `record_upload_r8` records **byte-for-byte the same barrier-copy-barrier sequence** into a caller-supplied CB, with `src_buffer + src_offset` replacing `self.staging_buffer + 0`. No `run_one_shot_op`, no `queue_wait_idle` — the batch's eventual `submit_and_wait` covers it.
+4. `self.current_layout = SHADER_READ_ONLY_OPTIMAL` — CPU-side state update. The new `record_upload_r8` does this too, after recording the final barrier.
 
-After T2: (1) is the caller's responsibility (call `ensure_image_size` directly, now public, on `&mut self.mask_scratch`); (2) is the caller's responsibility (arena alloc + copy); (3) becomes the new `record_upload_r8(vk, cb, src_buffer, src_offset, w, h, &mut self)` — same barrier-copy-barrier sequence, but written into the supplied CB instead of a one-shot.
+T2 is additive: `upload_r8` stays callable (still used by `try_vk_render_traps_or_tris` until T3 migrates it). The staging fields, `ensure_staging`, `allocate_staging`, the staging branch of `Drop`, and the manual `Send`/`Sync` impls all stay. T3 deletes them as part of the caller migration.
 
 ### Step 2: Make `ensure_image_size` public + extract the grow side from the upload path
 
@@ -286,9 +293,9 @@ pub fn ensure_image_size(&mut self, width: u32, height: u32) -> Result<(), MaskS
 
 ### Step 3: Add the new `record_upload_r8` recorder
 
-- [ ] **Step 3: Append to `impl MaskScratch`, replacing the entire old `upload_r8` method**
+- [ ] **Step 3: Append `record_upload_r8` to `impl MaskScratch`, immediately AFTER the existing `upload_r8`**
 
-Delete the old `pub fn upload_r8(&mut self, pool, w, h, bytes) -> Result<(), MaskScratchError>` (lines 145-233). Replace with:
+Locate the closing `}` of the existing `pub fn upload_r8(&mut self, pool, w, h, bytes) -> Result<(), MaskScratchError>` method (around line 233). Leave it in place. Immediately after its closing `}`, append:
 
 ```rust
     /// Record the barrier-copy-barrier sequence that uploads
@@ -383,163 +390,56 @@ Delete the old `pub fn upload_r8(&mut self, pool, w, h, bytes) -> Result<(), Mas
 
 (The body is byte-for-byte the same `cmd_pipeline_barrier2 + cmd_copy_buffer_to_image + cmd_pipeline_barrier2` sequence the old `upload_r8` recorded — only the staging buffer/offset come from the caller now, and there's no enclosing `run_one_shot_op`. CPU-side `set_current_layout` happens AFTER the barriers are recorded, matching the `record_solid_color_clear` invariant from 3F-1 #6: multiple `record_upload_r8` calls in the same batch are safe because each records its own barrier-clear-barrier sequentially.)
 
-### Step 4: Strip the staging-side fields + helpers
+### Step 4: Build
 
-- [ ] **Step 4: Remove the four staging fields from the struct (line 43-46)**
+- [ ] **Step 4: `cargo check -p yserver`**
 
-Change:
-```rust
-pub struct MaskScratch {
-    vk: Arc<VkContext>,
-    image: vk::Image,
-    view: vk::ImageView,
-    image_memory: vk::DeviceMemory,
-    extent: vk::Extent2D,
-    current_layout: vk::ImageLayout,
-    staging_buffer: vk::Buffer,
-    staging_memory: vk::DeviceMemory,
-    staging_mapped: NonNull<u8>,
-    staging_size: u64,
-}
-```
+Expected: clean. The legacy `upload_r8` is still in place — `try_vk_render_traps_or_tris` continues to call it until T3. The new `record_upload_r8` is unused inside this crate (`#[allow(dead_code)]` is NOT needed; the function is `pub` so the warning won't trigger).
 
-To:
-```rust
-pub struct MaskScratch {
-    vk: Arc<VkContext>,
-    image: vk::Image,
-    view: vk::ImageView,
-    image_memory: vk::DeviceMemory,
-    extent: vk::Extent2D,
-    current_layout: vk::ImageLayout,
-}
-```
+### Step 5: Tests + fmt + clippy
 
-- [ ] **Step 5: Strip the initialiser in `new`**
-
-In `MaskScratch::new` (line 53), drop the `allocate_staging` call and its error-cleanup branch (`let initial_staging = ...; let (staging_buffer, ...) = allocate_staging(...)`) plus the corresponding `Ok(Self { ... staging_buffer, ... })` lines. After the edit, `new` reads roughly:
-
-```rust
-pub fn new(vk: Arc<VkContext>) -> Result<Self, MaskScratchError> {
-    let extent = vk::Extent2D {
-        width: 256,
-        height: 256,
-    };
-    let (image, view, image_memory) = allocate_image(&vk, extent)?;
-    Ok(Self {
-        vk,
-        image,
-        view,
-        image_memory,
-        extent,
-        current_layout: vk::ImageLayout::UNDEFINED,
-    })
-}
-```
-
-(Note: the `match allocate_staging` cleanup branch that destroyed the just-allocated image on staging-alloc failure is no longer needed — staging doesn't exist here. The `allocate_image?` call's `?` is the only failure point.)
-
-- [ ] **Step 6: Strip `ensure_staging` (lines 123-143) and `allocate_staging` (lines 334-394)**
-
-Delete both functions entirely. Their callers are gone after the `upload_r8` removal in Step 3.
-
-- [ ] **Step 7: Strip the staging cleanup in `Drop` (lines 237-247)**
-
-Change:
-```rust
-impl Drop for MaskScratch {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
-            self.vk.device.unmap_memory(self.staging_memory);
-            self.vk.device.destroy_buffer(self.staging_buffer, None);
-            self.vk.device.free_memory(self.staging_memory, None);
-            self.vk.device.destroy_image_view(self.view, None);
-            self.vk.device.destroy_image(self.image, None);
-            self.vk.device.free_memory(self.image_memory, None);
-        }
-    }
-}
-```
-
-To:
-```rust
-impl Drop for MaskScratch {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
-            self.vk.device.destroy_image_view(self.view, None);
-            self.vk.device.destroy_image(self.image, None);
-            self.vk.device.free_memory(self.image_memory, None);
-        }
-    }
-}
-```
-
-(The `queue_wait_idle` on Drop is still right — `Drop` only runs at backend teardown when no in-flight CBs reference the image. It's not part of any paint hot path.)
-
-- [ ] **Step 8: Strip the now-unused imports**
-
-Remove from the top of the file:
-- `use std::ptr::NonNull;` (was used by `staging_mapped`)
-- `use super::{device::VkContext, ops::run_one_shot_op};` becomes `use super::device::VkContext;` (the new `record_upload_r8` does NOT need `run_one_shot_op`).
-
-Also remove the now-unused `unsafe impl Send` / `unsafe impl Sync` for MaskScratch (the only fields needing the SAFETY argument were the staging mapping pointer — `NonNull<u8>` isn't Send/Sync by default. Once that's gone, the remaining fields are all `Send + Sync` through normal blanket impls, so the manual `unsafe impl` becomes dead code AND a `safe_code_in_unsafe_impl` lint trigger). The struct will still be Send+Sync automatically.
-
-  - Delete lines:
-    ```rust
-    unsafe impl Send for MaskScratch {}
-    unsafe impl Sync for MaskScratch {}
-    ```
-
-### Step 5: Build
-
-- [ ] **Step 9: `cargo check -p yserver`**
-
-Expected: clean. If `unused_import` warnings appear for `NonNull` or `run_one_shot_op` — go back to Step 8.
-
-### Step 6: Tests + fmt + clippy
-
-- [ ] **Step 10: `cargo test -p yserver --lib 2>&1 | tail -5`**
+- [ ] **Step 5: `cargo test -p yserver --lib 2>&1 | tail -5`**
 
 Expected: 138 passed.
 
-- [ ] **Step 11: `cargo +nightly fmt --check`**
+- [ ] **Step 6: `cargo +nightly fmt --check`**
 
 Expected: no diff.
 
-- [ ] **Step 12: `cargo clippy -p yserver 2>&1 | tail -10`**
+- [ ] **Step 7: `cargo clippy -p yserver 2>&1 | tail -10`**
 
-Expected: 5 pre-existing warnings, no new ones. If clippy flags the freed manual `Send + Sync` impl, that's expected — already removed in Step 8.
+Expected: 5 pre-existing warnings, no new ones.
 
-### Step 7: Commit T2
+### Step 6: Commit T2
 
-- [ ] **Step 13: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add crates/yserver/src/kms/vk/mask_scratch.rs
 git commit -m "$(cat <<'EOF'
-refactor(kms): decompose MaskScratch::upload_r8 for batched recording
+refactor(kms): add arena-aware MaskScratch primitives (additive)
 
-3F-2 prep. MaskScratch ceases to own its private host-mapped
-staging buffer; staging moves to per-batch BatchUploadArena. The
-upload primitive splits into three: needs_image_grow (T1 +
-public), ensure_image_size (now public; pre-flush contract
-documented), and record_upload_r8 (records barrier-copy-barrier
-into a caller-supplied CB from a caller-supplied source buffer +
-offset). The old upload_r8(pool, w, h, bytes) was incompatible
-with batched recording on two counts: image grow's
-queue_wait_idle doesn't wait for un-submitted CBs, and the
-embedded run_one_shot_op forced a synchronous drain per call.
+3F-2 prep. Adds the two new APIs try_vk_render_traps_or_tris will
+need in T3 when it migrates from upload_r8 + run_one_shot_op to
+BatchUploadArena + record_paint_batch_op:
 
-The staging fields (staging_buffer / staging_memory /
-staging_mapped / staging_size) and the ensure_staging /
-allocate_staging helpers are deleted; the manual Send/Sync impls
-follow (no NonNull pointer field remaining).
+  - ensure_image_size is now pub, with a documented pre-flush
+    contract: callers in batched paint paths must pre-flush the
+    open PaintBatch (BatchFlushReason::ProtocolBarrier) BEFORE
+    calling this if needs_image_grow returns true. The grow path
+    destroys the old image after queue_wait_idle, which does not
+    wait for un-submitted commands.
 
-No caller changes here — try_vk_render_traps_or_tris is the sole
-caller and migrates in T3, which is where the orchestration
-moves.
+  - record_upload_r8 records the same barrier-copy-barrier
+    sequence the legacy upload_r8 records, but writes into a
+    caller-supplied CB from a caller-supplied source buffer +
+    offset (rather than embedding a one-shot op and using its own
+    private staging buffer).
+
+Additive only — the legacy upload_r8 + staging fields +
+ensure_staging + allocate_staging + manual Send/Sync impls +
+related Drop branches all stay. They go away in T3 alongside the
+caller migration, when traps stops calling upload_r8.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -1005,26 +905,126 @@ Troubleshooting (similar to 3F-1's table — see plan):
 | `mismatched types: expected vk::Result, found ArenaError` | Closure's `?` propagates `vk::Result`, but `arena.alloc` returns `ArenaError` | The outer-flag pattern AVOIDS `?` on arena alloc — use the `match { Ok / Err }` shown in Step 8. Only `?` on `vk::Result`-returning calls (`allocate_descriptor_for_views_into`, `record_render_composite`) |
 | `mask_bytes does not live long enough` | Closure capture lifetime conflict — `coverage_mask` is `&[u8]` with the function's lifetime; the closure borrows it by reference | The pattern in Step 8 binds `mask_bytes = coverage_mask` (a `&[u8]` copy) before the closure; the closure captures the local binding. Both live for the function call |
 
-### Step 11: Tests + fmt + clippy
+### Step 11: Verify the legacy `upload_r8` has no remaining callers, then delete it
 
-- [ ] **Step 14: `cargo test -p yserver --lib 2>&1 | tail -5`**
+- [ ] **Step 14: Confirm zero callers of the legacy `upload_r8`**
+
+```bash
+rg -n '\.upload_r8\(' crates/yserver/src crates/yserver-core/src crates/yserver-protocol/src
+```
+
+Expected: ZERO hits. After the migration at Step 9 the closure calls `record_upload_r8`, not `upload_r8`. If a hit remains, you haven't fully migrated the caller — go back to the relevant step.
+
+- [ ] **Step 15: Delete `upload_r8` and all the now-orphaned staging machinery in `mask_scratch.rs`**
+
+This is the second half of the work that 3F-1's analogous "T4 cleanup of legacy" did for `RenderPipelineCache`, just compressed into the migration commit because traps was the sole caller. Apply all of these in `crates/yserver/src/kms/vk/mask_scratch.rs`:
+
+  - **Delete the entire `pub fn upload_r8(&mut self, pool, w, h, bytes) -> Result<(), MaskScratchError>` method body** (from its doc comment "Copy `bytes` (row-major, no padding..." through to its closing `}`).
+
+  - **Remove the four staging fields from `pub struct MaskScratch`**:
+    ```rust
+    staging_buffer: vk::Buffer,
+    staging_memory: vk::DeviceMemory,
+    staging_mapped: NonNull<u8>,
+    staging_size: u64,
+    ```
+
+  - **Strip the staging branch from `MaskScratch::new`**. Drop the `let initial_staging = ...; let (staging_buffer, staging_memory, staging_mapped) = match allocate_staging(...) { ... };` block. Drop the corresponding `staging_buffer / staging_memory / staging_mapped / staging_size` lines from the `Ok(Self { ... })`. After the edit `new` reads:
+    ```rust
+    pub fn new(vk: Arc<VkContext>) -> Result<Self, MaskScratchError> {
+        let extent = vk::Extent2D { width: 256, height: 256 };
+        let (image, view, image_memory) = allocate_image(&vk, extent)?;
+        Ok(Self {
+            vk,
+            image,
+            view,
+            image_memory,
+            extent,
+            current_layout: vk::ImageLayout::UNDEFINED,
+        })
+    }
+    ```
+
+  - **Delete `fn ensure_staging` and the free function `allocate_staging`**. Both have no remaining callers.
+
+  - **Strip the staging cleanup from `Drop`**. Change:
+    ```rust
+    impl Drop for MaskScratch {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
+                self.vk.device.unmap_memory(self.staging_memory);
+                self.vk.device.destroy_buffer(self.staging_buffer, None);
+                self.vk.device.free_memory(self.staging_memory, None);
+                self.vk.device.destroy_image_view(self.view, None);
+                self.vk.device.destroy_image(self.image, None);
+                self.vk.device.free_memory(self.image_memory, None);
+            }
+        }
+    }
+    ```
+    To:
+    ```rust
+    impl Drop for MaskScratch {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
+                self.vk.device.destroy_image_view(self.view, None);
+                self.vk.device.destroy_image(self.image, None);
+                self.vk.device.free_memory(self.image_memory, None);
+            }
+        }
+    }
+    ```
+    (The `queue_wait_idle` on Drop is still right — it only runs at backend teardown.)
+
+  - **Strip the now-unused imports**. Change:
+    ```rust
+    use std::{ptr::NonNull, sync::Arc};
+
+    use ash::vk;
+
+    use super::{device::VkContext, ops::run_one_shot_op};
+    ```
+    To:
+    ```rust
+    use std::sync::Arc;
+
+    use ash::vk;
+
+    use super::device::VkContext;
+    ```
+    (Drop `ptr::NonNull` and `ops::run_one_shot_op` — both are unused after the staging fields and `upload_r8` are gone.)
+
+  - **Delete the manual `unsafe impl Send for MaskScratch {}` and `unsafe impl Sync for MaskScratch {}`**. These were required by the `staging_mapped: NonNull<u8>` field. Without it the struct's remaining fields are all auto-Send + auto-Sync, so the manual impls become dead code AND a `safe_code_in_unsafe_impl` lint trigger.
+
+### Step 12: Tests + fmt + clippy
+
+- [ ] **Step 16: `cargo check -p yserver`**
+
+Expected: clean. Likely failure modes:
+- `unused_import` for `NonNull` or `run_one_shot_op` — imports weren't fully stripped.
+- `field 'staging_*' missing from struct literal` — `new`'s `Ok(Self { ... })` still references removed fields.
+- `cannot find type NonNull in this scope` — staging fields weren't removed from the struct decl.
+
+- [ ] **Step 17: `cargo test -p yserver --lib 2>&1 | tail -5`**
 
 Expected: 138 passed.
 
-- [ ] **Step 15: `cargo +nightly fmt --check`**
+- [ ] **Step 18: `cargo +nightly fmt --check`**
 
 Expected: no diff.
 
-- [ ] **Step 16: `cargo clippy -p yserver 2>&1 | tail -10`**
+- [ ] **Step 19: `cargo clippy -p yserver 2>&1 | tail -10`**
 
 Expected: 5 pre-existing warnings, no new ones.
 
-### Step 12: Commit T3
+### Step 13: Commit T3
 
-- [ ] **Step 17: Commit**
+- [ ] **Step 20: Commit**
 
 ```bash
-git add crates/yserver/src/kms/backend.rs
+git add crates/yserver/src/kms/backend.rs crates/yserver/src/kms/vk/mask_scratch.rs
 git commit -m "$(cat <<'EOF'
 refactor(kms): migrate try_vk_render_traps_or_tris to record_paint_batch_op
 
@@ -1051,6 +1051,13 @@ DstReadback resize.
 Audit catalogue updated: try_vk_render_traps_or_tris is now
 marked migrated 3F-2, and the row label is corrected from
 "try_vk_render_traps (composite)" to the real function name.
+
+With traps no longer calling upload_r8, the legacy upload_r8 +
+its staging fields + ensure_staging + allocate_staging + manual
+Send/Sync impls + the staging branch of Drop + the now-unused
+NonNull / run_one_shot_op imports are all deleted. Same commit
+to keep the tree compiling — there's no point at which the
+legacy and the migrated path coexist with non-zero callers.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
