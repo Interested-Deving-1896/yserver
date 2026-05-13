@@ -95,7 +95,7 @@ impl MaskScratch {
     }
 
     /// True if a later `ensure_image_size(width, height)` call would
-    /// reallocate the per-format scratch image. Callers in batched
+    /// reallocate the scratch image. Callers in batched
     /// paint paths use this BEFORE entering `record_paint_batch_op`
     /// so they can flush any in-flight batch — `ensure_image_size`
     /// destroys the old image after `queue_wait_idle`, which does
