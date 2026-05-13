@@ -248,10 +248,10 @@ The plan's "Cutover greps (post-3F-2 — semantic, not numeric)" entry for the `
 
 **Phase 4 planning** is the natural next move. 3F-2 has retired the last paint-side `run_one_shot_op` (every `try_vk_render_*` and `try_vk_copy_*` and `try_vk_fill_*` and `try_vk_put_*` and `try_vk_text_*` recorder packs into the open `PaintBatch`). Phase 4's `vkQueueWaitIdle` retirement from `PaintBatch::submit_and_wait` is the next clear win and what would close the remaining gap on workloads still bottlenecked by GPU-drain serialization — most visibly the `docs/known-issues.md` adapta-nokto + mate-cc reproducer, *if* the 3F-2 smoke shows the traps half of the lag is gone and the glyph-atlas + close-time wait are the new dominant costs.
 
-Three reasonable shapes Phase 4 could take, in priority order:
+**Phase 4 — sync rework** (next phase per `docs/status.md`). One primary target: retire `vkQueueWaitIdle` from `PaintBatch::submit_and_wait`. Real `VkFence` polled via `vkGetFenceStatus`, or timeline semaphore. With 3F-2 landed, this is the remaining serialization point on the paint hot path — every other per-paint wait-idle is now gone.
 
-1. **`PaintBatch::submit_and_wait` → submit + per-batch-fence handoff.** Most disruptive but biggest single win — every protocol-barrier flush stops blocking. Requires the batch retire queue to drain fenced work asynchronously.
-2. **`record_get_image` (the three readback handlers) → targeted VkFence per HLD.** Phase 5 scope as written but small enough to pull forward if Phase 4 turns out to be longer. Removes the readback half of `run_one_shot_op`'s remaining cost.
-3. **`GlyphAtlas::intern` per-glyph wait-idle → batch-owned atlas growth.** Phase 5 scope; the second half of the adapta-nokto + mate-cc story. If 3F-2's smoke shows the lag is materially better with traps gone but text-rendering frames still pay a tax, this is the next clear lever.
+**Phase 5 — targeted `VkFence` for the remaining one-shot paths.** `record_get_image` (4 readback handlers), `GlyphAtlas::intern` per-glyph one-shot upload + wait-idle (the per-glyph atlas grow that's the suspected co-cause of the adapta-nokto + mate-cc lag), the `MaskScratch` / `CopyScratch` / `dst_readback` `ensure_size` grow paths (after 3F-2 the grow itself is rare since traps/composite both pre-flush). Could be pulled forward into Phase 4 if Phase 4's scope stays narrow AND the 3F-2 hardware smoke shows the atlas dominates the remaining lag.
 
-The 3F-2 hardware smoke result will determine which of these three is the highest-yield Phase 4 target.
+**Phase 6 — batch-owned refcounted resource handles.** Codex's recommendation from 3B salvage and the structural fix for the record-time CPU layout tracking caveat (Pre-task note #8 of 3F-2's plan). Subsumes the destruction-barrier pattern at 5 drawable-free sites and the `needs_grow` pre-flush gates at 3D/3F-1/3F-2.
+
+Order: Phase 4 is the unambiguous next step. Phases 5 and 6 are roughly independent; Phase 5 is the natural next-after-4 because it closes the remaining per-op wait-idle gap and (per hypothesis) the second half of the adapta-nokto + mate-cc lag.

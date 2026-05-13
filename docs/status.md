@@ -70,6 +70,13 @@ Cross-cutting bugs and followups that don't fit a phase live in
   - Hardware smoke: TBD (user-owned).
   - Results: `docs/superpowers/plans/2026-05-13-rendering-rearchitecture-phase3f-1-results.md`
 
+- [x] **Phase 3F-2 — Render-traps/triangles migration + MaskScratch arena** (`f242945` + cleanup `df5dbba`)
+  - Migrated `try_vk_render_traps_or_tris` (the last paint-side recorder on legacy `run_one_shot_op + ProtocolBarrier flush`) to `record_paint_batch_op`. Mask coverage staging moved from `MaskScratch`'s private buffer to per-batch `BatchUploadArena` via the new `MaskScratch::record_upload_r8` + `needs_image_grow` + pub `ensure_image_size` trio.
+  - Removed the legacy `RenderPipelineCache::reset_descriptors` / `allocate_descriptor_for_views` / `descriptor_pool` field (T4). All RENDER paths now allocate descriptors per-batch via `BatchDescriptorArena`.
+  - Audit catalogue: traps row label corrected from "try_vk_render_traps (composite)" to "try_vk_render_traps_or_tris".
+  - Hardware smoke: TBD (user-owned).
+  - Results: `docs/superpowers/plans/2026-05-13-rendering-rearchitecture-phase3f-2-results.md`
+
 ### Inter-phase chores landed alongside
 
 - [x] **Composite defer log summary** (`4c4741b`) — turn per-frame `pool_ring_exhausted` warn-spam into a periodic 5s `info!` summary.
@@ -78,12 +85,6 @@ Cross-cutting bugs and followups that don't fit a phase live in
 
 ### Remaining — in priority order
 
-- [ ] **Phase 3F-2 — Render-traps/triangles migration + MaskScratch arena**
-  - Recorder: `try_vk_render_traps_or_tris` (RENDER Trapezoids/Triangles/TriStrip/TriFan).
-  - `MaskScratch::upload_r8` → `BatchUploadArena` migration (currently shared host buffer, aliases between in-batch ops).
-  - `MaskScratch::needs_grow` for the image-side grow path (analogous to 3F-1's `DstReadback::needs_grow`).
-  - Removal of the legacy `RenderPipelineCache::reset_descriptors` / `allocate_descriptor_for_views` + the `RenderPipelineCache.descriptor_pool` field when their last caller goes away.
-  - Audit-catalogue label fix: `try_vk_render_traps (composite)` → real name `try_vk_render_traps_or_tris`.
 - [ ] **Phase 4 — Sync rework**
   - Retire `vkQueueWaitIdle` from `run_one_shot_op` (the hot-path drain).
   - Retire the close-time wait in `PaintBatch::submit_and_wait`.
