@@ -1309,10 +1309,10 @@ rg -n 'reset_descriptors\(' crates/yserver/src/kms/
 Expected: ZERO hits (the function is gone after T4).
 
 ```bash
-rg -n 'needs_grow|needs_image_grow' crates/yserver/src/kms/
+rg -n 'fn needs_grow\b|fn needs_image_grow\b|\.needs_grow\(|\.needs_image_grow\(' crates/yserver/src/kms/
 ```
 
-Expected: 3 defs (`copy_scratch.rs` 3D, `dst_readback.rs` 3F-1, `mask_scratch.rs` 3F-2) + 3 call sites in `backend.rs` (`try_vk_copy_area` 3D, `try_vk_render_composite` 3F-1, `try_vk_render_traps_or_tris` 3F-2).
+Expected: 3 defs (`copy_scratch.rs` 3D, `dst_readback.rs` 3F-1, `mask_scratch.rs` 3F-2) + 3 call sites in `backend.rs` (`try_vk_copy_area` 3D, `try_vk_render_composite` 3F-1, `try_vk_render_traps_or_tris` 3F-2). The `fn …\b` / `\.…\(` discriminators distinguish defs/calls from doc-comment references (e.g. the 3F-1 pre-flush comment at `backend.rs:6005` mentions `needs_grow` in prose).
 
 ```bash
 rg -n '3D-deferred: render-traps' crates/yserver/src/kms/backend.rs
@@ -1491,8 +1491,9 @@ $ rg -n 'allocate_descriptor_for_views_into' crates/yserver/src/kms/
 $ rg -n 'reset_descriptors\(' crates/yserver/src/kms/
 # ZERO (the function is gone).
 
-$ rg -n 'needs_grow|needs_image_grow' crates/yserver/src/kms/
+$ rg -n 'fn needs_grow\b|fn needs_image_grow\b|\.needs_grow\(|\.needs_image_grow\(' crates/yserver/src/kms/
 # 3 defs (copy_scratch, dst_readback, mask_scratch) + 3 call sites in backend.rs.
+# Discriminators exclude doc-comment prose references.
 
 $ rg -n '3D-deferred: render-traps' crates/yserver/src/kms/backend.rs
 # ZERO.
