@@ -412,12 +412,6 @@ impl ScanoutBo {
     /// — it returns the freshly-payloaded fd to hand KMS as
     /// `IN_FENCE_FD`. KMS consumes the fd on atomic accept (kernel
     /// closes it).
-    /// Mark this BO as "let process-exit clean up." Subsequent
-    /// `Drop` is a no-op. Idempotent.
-    pub fn disarm(&mut self) {
-        self.disarmed = true;
-    }
-
     #[allow(dead_code)] // wired in by Task 2.5 (atomic-commit fence path).
     pub fn export_signaled_fd(&self) -> Result<OwnedFd, vk::Result> {
         let ext = self.vk.external_semaphore_fd.clone();
@@ -429,6 +423,12 @@ impl ScanoutBo {
         // caller owns. Wrap in OwnedFd so close() runs on Drop unless
         // the fd is consumed (e.g. handed to KMS via IN_FENCE_FD).
         Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+    }
+
+    /// Mark this BO as "let process-exit clean up." Subsequent
+    /// `Drop` is a no-op. Idempotent.
+    pub fn disarm(&mut self) {
+        self.disarmed = true;
     }
 }
 
@@ -576,18 +576,6 @@ impl ScanoutBoPool {
     /// keep the bos." Re-allocating bos with new dimensions is the
     /// caller's responsibility (drop the pool, allocate a fresh one
     /// with `ScanoutBoPool::allocate`).
-    /// True if any bo in this pool is in `BoPhase::Pending` —
-    /// i.e. an atomic flip was accepted by KMS and the kernel
-    /// hasn't yet emitted its pageflip-complete event for that
-    /// flip. Used by the shutdown sequence to wait until KMS
-    /// quiesces before issuing `disable_output`. Calling
-    /// `disable_output` while a Pending bo exists is what
-    /// produces the `atomic remove_fb failed with -22` kernel
-    /// warning that leaves Wayland host compositors stranded.
-    pub fn has_pending_pageflip(&self) -> bool {
-        self.bos.iter().any(|b| b.state.phase == BoPhase::Pending)
-    }
-
     #[allow(dead_code)] // wired in by 4.1.2.6 modeset path; today's only consumer is Drop.
     pub fn drain_all_pending(&mut self, vk: &VkContext) {
         if let Err(e) = unsafe { vk.device.device_wait_idle() } {
@@ -603,6 +591,18 @@ impl ScanoutBoPool {
                 drop(unsafe { OwnedFd::from_raw_fd(fd) });
             }
         }
+    }
+
+    /// True if any bo in this pool is in `BoPhase::Pending` —
+    /// i.e. an atomic flip was accepted by KMS and the kernel
+    /// hasn't yet emitted its pageflip-complete event for that
+    /// flip. Used by the shutdown sequence to wait until KMS
+    /// quiesces before issuing `disable_output`. Calling
+    /// `disable_output` while a Pending bo exists is what
+    /// produces the `atomic remove_fb failed with -22` kernel
+    /// warning that leaves Wayland host compositors stranded.
+    pub fn has_pending_pageflip(&self) -> bool {
+        self.bos.iter().any(|b| b.state.phase == BoPhase::Pending)
     }
 
     /// Allocate `count` Vulkan-first bos for one output. Phase 4.1.2
