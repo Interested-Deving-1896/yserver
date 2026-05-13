@@ -26,4 +26,12 @@ pub enum InputEvent {
         code: u32,
         pressed: bool,
     },
+    /// Pointer scroll wheel / two-finger / continuous scroll, in v120
+    /// high-resolution units. 120 v120 ≈ one "click" of a discrete wheel.
+    /// `dx_v120 > 0` is scroll-right, `dy_v120 > 0` is scroll-down (matches
+    /// libinput's convention).
+    PointerScroll {
+        dx_v120: i32,
+        dy_v120: i32,
+    },
 }

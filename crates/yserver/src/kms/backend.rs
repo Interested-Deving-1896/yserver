@@ -6519,6 +6519,14 @@ impl KmsBackend {
             0x112 => 2, // BTN_MIDDLE
             0x113 => 8, // BTN_SIDE
             0x114 => 9, // BTN_EXTRA
+            // yserver-synthetic scroll codes — see SYNTH_SCROLL_* in
+            // yserver_core::core_loop::message. libinput emits scroll as
+            // axis events; the libinput thread fans them out into press+
+            // release pairs of these codes, mapped here to X11 buttons.
+            0x180 => 4, // SYNTH_SCROLL_UP
+            0x181 => 5, // SYNTH_SCROLL_DOWN
+            0x182 => 6, // SYNTH_SCROLL_LEFT
+            0x183 => 7, // SYNTH_SCROLL_RIGHT
             _ => {
                 log::debug!("unmapped libinput button code 0x{code:x}, dropping");
                 return;

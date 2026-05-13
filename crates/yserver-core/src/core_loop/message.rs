@@ -75,12 +75,28 @@ pub enum HostInputEvent {
         /// always < 0x200 and u8 would silently truncate `BTN_LEFT` to
         /// `0x10` — the KMS backend's `0x110 => 1` mapping then never
         /// matched and clicks were dropped.
+        ///
+        /// Scroll wheel "clicks" arrive here too, using yserver-synthetic
+        /// codes (`SYNTH_SCROLL_*` below). libinput models scroll as axis
+        /// events, but X11 only models scroll as button-4/5/6/7 click
+        /// events — the libinput thread accumulates axis deltas into
+        /// press+release pairs of these synthetic codes, and backends
+        /// translate them to X11 buttons.
         button: u16,
         pressed: bool,
         time: u32,
     },
     Key(HostKeyEvent),
 }
+
+/// Synthetic Linux-style input codes for scroll-wheel "buttons" carried
+/// in `HostInputEvent::PointerButton`. Picked outside the standard Linux
+/// BTN_* range (BTN_TASK = 0x117 is the highest real code) so a real
+/// device button can never collide.
+pub const SYNTH_SCROLL_UP: u16 = 0x180;
+pub const SYNTH_SCROLL_DOWN: u16 = 0x181;
+pub const SYNTH_SCROLL_LEFT: u16 = 0x182;
+pub const SYNTH_SCROLL_RIGHT: u16 = 0x183;
 
 /// Reply from the core to a setup thread's `SetupAllocate` request.
 ///

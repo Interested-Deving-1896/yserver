@@ -114,6 +114,10 @@ impl Backend for HostX11Backend {
                     0x112 => 2, // BTN_MIDDLE
                     0x113 => 8, // BTN_SIDE
                     0x114 => 9, // BTN_EXTRA
+                    0x180 => 4, // SYNTH_SCROLL_UP
+                    0x181 => 5, // SYNTH_SCROLL_DOWN
+                    0x182 => 6, // SYNTH_SCROLL_LEFT
+                    0x183 => 7, // SYNTH_SCROLL_RIGHT
                     _ => {
                         log::debug!(
                             "ynest: dropping HostInputEvent::PointerButton for unknown linux code 0x{button:x}"

@@ -3641,6 +3641,10 @@ fn dispatch_fake_input(
                 1 => 0x110, // BTN_LEFT
                 2 => 0x112, // BTN_MIDDLE
                 3 => 0x111, // BTN_RIGHT
+                4 => 0x180, // SYNTH_SCROLL_UP
+                5 => 0x181, // SYNTH_SCROLL_DOWN
+                6 => 0x182, // SYNTH_SCROLL_LEFT
+                7 => 0x183, // SYNTH_SCROLL_RIGHT
                 8 => 0x113, // BTN_SIDE
                 9 => 0x114, // BTN_EXTRA
                 _ => {

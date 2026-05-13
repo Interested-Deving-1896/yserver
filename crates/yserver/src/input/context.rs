@@ -22,7 +22,7 @@ use input::{
     event::{
         EventTrait,
         keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait},
-        pointer::{ButtonState, PointerEvent},
+        pointer::{Axis, ButtonState, PointerEvent, PointerScrollEvent},
     },
 };
 use libc::{O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY};
@@ -166,6 +166,23 @@ fn log_input_devnodes() {
     }
 }
 
+/// Finger/continuous scroll → `PointerScroll` v120 quantization.
+/// Both event types expose only `scroll_value` (in cursor-pixel-
+/// equivalent units, no v120 quantization). Convert at ~15 px per
+/// logical wheel click (xwayland/Sway convention) → factor 8.
+fn finger_or_continuous_to_event<E>(ev: &E) -> Option<InputEvent>
+where
+    E: PointerScrollEvent,
+{
+    const PX_TO_V120: f64 = 8.0;
+    let dx_v120 = (ev.scroll_value(Axis::Horizontal) * PX_TO_V120) as i32;
+    let dy_v120 = (ev.scroll_value(Axis::Vertical) * PX_TO_V120) as i32;
+    if dx_v120 == 0 && dy_v120 == 0 {
+        return None;
+    }
+    Some(InputEvent::PointerScroll { dx_v120, dy_v120 })
+}
+
 fn translate(event: &Event) -> Option<InputEvent> {
     match event {
         Event::Keyboard(KeyboardEvent::Key(key)) => {
@@ -193,6 +210,17 @@ fn translate(event: &Event) -> Option<InputEvent> {
             code: btn.button(),
             pressed: btn.button_state() == ButtonState::Pressed,
         }),
+        Event::Pointer(PointerEvent::ScrollWheel(ev)) => {
+            // Wheel events come pre-quantized in v120 (120 = one click).
+            let dx_v120 = ev.scroll_value_v120(Axis::Horizontal) as i32;
+            let dy_v120 = ev.scroll_value_v120(Axis::Vertical) as i32;
+            if dx_v120 == 0 && dy_v120 == 0 {
+                return None;
+            }
+            Some(InputEvent::PointerScroll { dx_v120, dy_v120 })
+        }
+        Event::Pointer(PointerEvent::ScrollFinger(ev)) => finger_or_continuous_to_event(ev),
+        Event::Pointer(PointerEvent::ScrollContinuous(ev)) => finger_or_continuous_to_event(ev),
         _ => None,
     }
 }
