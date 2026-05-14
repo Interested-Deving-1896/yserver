@@ -62,6 +62,23 @@ pub struct Trapezoid {
     pub right_p2: (i32, i32),
 }
 
+impl Trapezoid {
+    /// Convert this trapezoid (16.16 fixed-point) into the f32-based
+    /// instance struct the GPU pipeline (`trap_pipeline::TrapPipeline`)
+    /// expects as per-instance vertex attributes (gpu-trap T1).
+    #[must_use]
+    pub fn to_instance_data(&self) -> crate::kms::vk::trap_pipeline::TrapInstanceData {
+        crate::kms::vk::trap_pipeline::TrapInstanceData {
+            top: fixed_to_f32(self.top),
+            bottom: fixed_to_f32(self.bottom),
+            left_p1: [fixed_to_f32(self.left_p1.0), fixed_to_f32(self.left_p1.1)],
+            left_p2: [fixed_to_f32(self.left_p2.0), fixed_to_f32(self.left_p2.1)],
+            right_p1: [fixed_to_f32(self.right_p1.0), fixed_to_f32(self.right_p1.1)],
+            right_p2: [fixed_to_f32(self.right_p2.0), fixed_to_f32(self.right_p2.1)],
+        }
+    }
+}
+
 /// One RENDER triangle (matches `pixman_triangle_t`).
 #[derive(Debug, Clone, Copy)]
 pub struct Triangle {

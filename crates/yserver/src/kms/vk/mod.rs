@@ -25,5 +25,6 @@ pub mod scanout;
 pub mod sync;
 pub mod target;
 pub mod text_pipeline;
+pub mod trap_pipeline;
 // `pub mod upload;` retired in 4.1.5 — pixman → mirror upload pump
 // gone with the rest of the pixman canonical-store machinery.

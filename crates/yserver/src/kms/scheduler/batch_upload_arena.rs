@@ -142,7 +142,7 @@ impl BatchUploadArena {
     fn allocate_chunk(vk: &VkContext, size: u64) -> Result<Chunk, ArenaError> {
         let buf_info = vk::BufferCreateInfo::default()
             .size(size)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::VERTEX_BUFFER)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = unsafe { vk.device.create_buffer(&buf_info, None)? };
 
