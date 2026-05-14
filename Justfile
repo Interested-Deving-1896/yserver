@@ -457,6 +457,34 @@ yserver-mate-hw-release log="warn":
         echo "yserver log: yserver-hw.log";\
         echo "mate log:    mate.log"'
 
+# Release-mode mate with the core-loop telemetry enabled (see
+# `LoopTelemetry` in `crates/yserver-core/src/core_loop/run.rs`).
+# Emits one info!-level line per second to yserver-hw.log with
+# iter/s, req/s, drain_max, top opcodes, host_input gap, etc.
+#
+# Use to diagnose input-loop starvation on bee/adapta — reproduce
+# the lag, then `grep "loop telemetry" yserver-hw.log` for the
+# rollups. RUST_LOG defaults to `info` so the telemetry lines come
+# through; pass `log=warn` if you need quieter output, but you'll
+# lose the rollup lines (they're info!-level).
+yserver-mate-hw-telemetry log="info":
+    cargo build --release --bin yserver
+    bash -c '\
+        YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-hw.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session mate-session --display :7 > mate.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "yserver log:    yserver-hw.log";\
+        echo "mate log:       mate.log";\
+        echo "";\
+        echo "telemetry lines:";\
+        grep "loop telemetry" yserver-hw.log | tail -10'
+
 # Bare-metal GLX/DRI3 smoke: yserver + glxgears with verbose Mesa logs.
 # Mesa's loader_dri3 prints every probe step + driver load failure so
 # we can pinpoint why "failed to load driver: radeonsi" fires. Pair
