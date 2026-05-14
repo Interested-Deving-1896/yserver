@@ -100,17 +100,24 @@ Cross-cutting bugs and followups that don't fit a phase live in
   - Hardware smoke: TBD (user-owned).
   - Results: `docs/superpowers/plans/2026-05-14-rendering-rearchitecture-phase5-results.md`
 
+- [x] **Pixmap-allocation pool — burst-absorbing `VkImage` recycling** (`850bb9c` + `9443a2e` + `8b3f243` + `2966407` + `a7c2384` + this T6 commit)
+  - Burst-absorbing recycling of server-owned pixmap `VkImage` + `VkImageView` + `VkDeviceMemory` triples, keyed by `(width, height, format)`. Closes the kernel-allocator burst hot path under adapta-nokto + mate-cc cross-vendor reproducer (catastrophic pre-pool on bee/RDNA2 + Arch and fuji/Intel + Arch).
+  - T1 (`850bb9c`): `PixmapPool` infrastructure — new `crates/yserver/src/kms/vk/pixmap_pool.rs` with `PixmapPool` + key/entry/`PooledPixmapReturn` BatchResource + `try_take` / `try_return` / `stats` / `drain`. `Arc<Mutex<HashMap<…>>>` shape per the codex Round-1 P0 fold (`Arc<RefCell<…>>` doesn't satisfy `BatchResource: Send`). `DrawableImage::new_from_pool` constructor.
+  - T2 (`9443a2e`): `free_pixmap` synchronous-flush gone from the common path; mirrors adopt as `PooledPixmapReturn` BatchResources into the currently-open paint batch via Phase 5 T2's `defer_resource_release`. Eligibility + bucket-cap decided at retire time (codex Round-3 P0 — uniform defer-release for all Vulkan-up server-owned mirrors). DRI3-imported variant routes to flush+drop fallback (T2 reviewer agent caught `into_pool_entry` panics for `ImageBacking::Imported`).
+  - T3 (`8b3f243`): `allocate_pixmap_mirror` consults `self.pixmap_pool.as_ref().and_then(|p| p.try_take(key))` before falling through to `new_server_owned_pixmap`. Pool hit skips `vkCreateImage` + `vkAllocateMemory` entirely.
+  - T4 (`2966407`): shutdown drain — `pixmap_pool.drain()` called after `scheduler.drain_submitted_paint_batches()`; defensive `Arc::strong_count > 1` warning catches Phase-4-T5 ordering bugs.
+  - T5 (`a7c2384`): synthetic burst test (100 pixmaps × 2 bursts → `total_hits == 32 == PIXMAP_POOL_BUCKET_CAP`); `pixmap_pool_stats` + `force_retire_in_flight_for_test` accessors as Pattern A pub fns (cfg(test)-on-impl doesn't reach integration test crates per codex Round-1 P1).
+  - Hardware smoke: TBD (user-owned). The load-bearing test: bee + fuji under adapta-nokto + mate-cc. If `bee` improves, AMD-specific investigation is no longer next-priority.
+  - Results: `docs/superpowers/plans/2026-05-14-pixmap-allocation-pool-results.md`
+
 ### Remaining — in priority order
 
-- [ ] **Pixmap-allocation pool — burst-absorbing `VkImage` recycling** (was: "AMD investigation phase")
-  - Confirmed cross-vendor reproducer: apply adapta-nokto theme with mate-cc visible → catastrophic on bee (RDNA2 + Arch) and fuji (Intel + Arch); usable-but-slow on imac (Polaris11 + older Ubuntu).
-  - Not amdgpu-specific — Intel chokes too. Recent kernels (Arch) catastrophic; older (Ubuntu 25.04) merely slow.
-  - Root cause per perf data + interactive testing: yserver's per-pixmap `VkImage`/memory/VA alloc-free path can't absorb workload bursts. mate-cc launcher first-paint and system-wide theme transitions both fire dense `CreatePixmap`/`FreePixmap` cycles for small (16x16, 32x32) widget pixmaps; the kernel allocator serializes under burst rate.
-  - Fix shape: `VkImagePool` on `KmsBackend` keyed by `(extent, format, usage)`. `FreePixmap` of small pixmaps returns image to pool; `CreatePixmap` checks pool first. Bounded pool size per bucket. Drain at backend teardown.
-  - Validation: adapta + mate-cc apply test on bee + fuji.
 - [ ] **Phase 6 — Resource lifetime: batch-owned refcounted handles**
   - Codex's long-term recommendation from 3B salvage: instead of relying on protocol destruction barriers + `queue_wait_idle`, adopt destroyed VkImages into the open `PaintBatch` via `BatchResource` so destruction defers automatically.
-  - Subsumes the 3D needs_grow + pre-resize-flush pattern for `CopyScratch`, the analogous patterns 3F will introduce for `MaskScratch` + `dst_readback`, and the 3B destruction-barrier collection.
+  - Subsumes the 3D needs_grow + pre-resize-flush pattern for `CopyScratch`, the analogous patterns 3F introduced for `MaskScratch` + `dst_readback`, the 3B destruction-barrier collection, the Phase-5 `Retired*Image` flavours, and the pixmap-pool `PooledPixmapReturn` — all into a uniform refcounted-handle model.
+- [ ] **AMD-specific investigation — DEPRIORITIZED pending pixmap-pool hardware smoke**
+  - If T6 hardware smoke confirms the pool closes the bee adapta-nokto + mate-cc lag: AMD-specific investigation drops off the critical path (root cause was the vendor-agnostic kernel allocator burst, not amdgpu-specific behaviour).
+  - If `bee` is still slow post-pool: amdgpu ftrace + ioctl-rate measurement per `project_amd_lag_investigation.md` memory is the next move.
 
 ---
 
