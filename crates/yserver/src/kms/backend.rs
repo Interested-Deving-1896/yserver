@@ -6874,6 +6874,11 @@ impl KmsBackend {
 
     /// Allocate a per-pixmap VkImage mirror. Same Option semantics
     /// as [`Self::allocate_window_mirror`].
+    ///
+    /// pixmap-pool T3: try the `PixmapPool` first; on hit we
+    /// reconstruct a `DrawableImage` from the recycled triple and
+    /// skip `initialize_clear` (the first paint overwrites the whole
+    /// image). On miss, fall through to the fresh-allocation path.
     fn allocate_pixmap_mirror(
         &self,
         width: u32,
@@ -6884,6 +6889,34 @@ impl KmsBackend {
         if width == 0 || height == 0 {
             return None;
         }
+
+        // Pool keys on (width, height, format); derive format from
+        // depth via the shared helper so this never drifts from
+        // `new_server_owned_pixmap`'s mapping.
+        let format = crate::kms::vk::target::DrawableImage::format_for_pixmap_depth(depth);
+        let key = crate::kms::vk::pixmap_pool::PixmapPoolKey {
+            width,
+            height,
+            format,
+        };
+        if let Some(pool) = self.pixmap_pool.as_ref()
+            && let Some(entry) = pool.try_take(key)
+        {
+            // Pool hit: construct DrawableImage from the entry.
+            // `new_from_pool` preserves the previous tenant's
+            // `current_layout`, leaves lazy mask / no-alpha views
+            // unbuilt, and we skip `initialize_clear` — the first
+            // paint will overwrite the whole image.
+            let img = crate::kms::vk::target::DrawableImage::new_from_pool(
+                std::sync::Arc::clone(vkctx),
+                entry,
+                format,
+                ash::vk::Extent2D { width, height },
+            );
+            return Some(img);
+        }
+
+        // Pool miss — fall through to fresh allocation.
         match crate::kms::vk::target::DrawableImage::new_server_owned_pixmap(
             std::sync::Arc::clone(vkctx),
             width,

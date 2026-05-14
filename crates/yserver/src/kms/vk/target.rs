@@ -225,6 +225,25 @@ impl DrawableImage {
         Self::new_server_owned(vk, width, height, vk::Format::B8G8R8A8_UNORM)
     }
 
+    /// Map an X11 pixmap depth to its server-owned mirror format.
+    /// Used by both [`Self::new_server_owned_pixmap`] (for fresh
+    /// allocation) and `KmsBackend::allocate_pixmap_mirror`'s pool-key
+    /// derivation, so the two sites cannot drift.
+    #[must_use]
+    pub fn format_for_pixmap_depth(depth: u8) -> vk::Format {
+        match depth {
+            1 | 8 => vk::Format::R8_UNORM,
+            24 | 32 => vk::Format::B8G8R8A8_UNORM,
+            other => {
+                log::warn!(
+                    "DrawableImage::format_for_pixmap_depth: unhandled depth {other} → \
+                     defaulting to B8G8R8A8_UNORM (4.1.4 should fix the format-mapping table)"
+                );
+                vk::Format::B8G8R8A8_UNORM
+            }
+        }
+    }
+
     /// Allocate a server-owned mirror for an X pixmap. Format is
     /// derived from the pixmap's depth (only depths 1, 8, 24, 32 are
     /// in scope today, matching pixman's `FormatCode` set).
@@ -235,18 +254,7 @@ impl DrawableImage {
         height: u32,
         depth: u8,
     ) -> Result<Self, DrawableImageError> {
-        let format = match depth {
-            1 => vk::Format::R8_UNORM,
-            8 => vk::Format::R8_UNORM,
-            24 | 32 => vk::Format::B8G8R8A8_UNORM,
-            other => {
-                log::warn!(
-                    "DrawableImage::new_server_owned_pixmap: unhandled depth {other} → \
-                     defaulting to B8G8R8A8_UNORM (4.1.4 should fix the format-mapping table)"
-                );
-                vk::Format::B8G8R8A8_UNORM
-            }
-        };
+        let format = Self::format_for_pixmap_depth(depth);
         Self::new_server_owned(vk, width, height, format)
     }
 
@@ -857,7 +865,6 @@ impl DrawableImage {
     ///
     /// Lazy `mask_view` / `no_alpha_src_view` are set to `None`;
     /// they'll be rebuilt on demand if needed.
-    #[allow(dead_code)] // wired by pixmap-pool T3 (allocate_pixmap_mirror).
     pub fn new_from_pool(
         vk: Arc<VkContext>,
         entry: crate::kms::vk::pixmap_pool::PooledPixmapImage,
