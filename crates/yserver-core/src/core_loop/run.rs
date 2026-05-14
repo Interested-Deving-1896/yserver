@@ -8,10 +8,10 @@
 //! listener.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     os::{
-        fd::AsRawFd,
+        fd::{AsRawFd, OwnedFd},
         unix::net::{UnixListener, UnixStream},
     },
     time::{Duration, Instant},
@@ -203,6 +203,83 @@ impl LoopTelemetry {
     }
 }
 
+/// Core-loop fairness cap. Each main-loop iteration processes at
+/// most this many X protocol requests before yielding back to the
+/// outer poll / maintenance pass. Excess requests are buffered in
+/// `deferred_requests` and picked up at the start of the next
+/// iteration.
+///
+/// **Why this matters** (per the telemetry rollups from the bee /
+/// adapta-nokto investigation): without a cap, `Message::Request`
+/// can monopolise the thread for SECONDS at a time on a single
+/// iteration when GTK fires bursts of RENDER traffic during a
+/// window drag — observed iter_wall_max=6884ms with
+/// drain_max=32857 in one iteration. During that window,
+/// `HostInput` and `PageFlipReady` messages sit in the same
+/// channel undelivered, so the cursor visibly freezes (gap_max
+/// up to 8.5 seconds between consecutive cursor events).
+///
+/// 32 chosen as the initial cap because: typical request cost is
+/// ~0.25 ms, so 32 × 0.25 ≈ 8 ms per iteration worst case — about
+/// one frame at 120 Hz, well below the perceptual cursor-lag
+/// threshold. The cap is intentionally NOT time-based at this
+/// stage; count-based is simpler and the telemetry shows
+/// per-request costs are tightly clustered. If we ever encounter
+/// per-request outliers above ~5 ms, revisit with a time budget.
+const MAX_REQUESTS_PER_ITER: usize = 32;
+
+/// One pending X protocol request held over from a prior iteration
+/// because the per-iteration `MAX_REQUESTS_PER_ITER` cap was hit
+/// before it could be processed. Buffered locally rather than
+/// pushed back into the channel: re-sending would re-trigger the
+/// channel's waker (one atomic CAS per push-back) and the local
+/// VecDeque avoids that overhead.
+struct DeferredRequest {
+    id: yserver_protocol::x11::ClientId,
+    sequence: yserver_protocol::x11::SequenceNumber,
+    header: yserver_protocol::x11::RequestHeader,
+    body: Vec<u8>,
+    attached_fd: Option<OwnedFd>,
+}
+
+/// Process one X protocol request and run its post-handler bookkeeping
+/// (mark_dirty + disconnect-on-error). Factored so the two drain paths
+/// in `run_core` (the deferred queue at the top of each iteration and
+/// the channel drain inside `NOTIFY_TOKEN`) share identical semantics.
+///
+/// Returns `Some(disconnect_id)` if the handler signalled a
+/// disconnect; the caller runs `process_disconnect` immediately after.
+fn process_request_inline(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    id: yserver_protocol::x11::ClientId,
+    sequence: yserver_protocol::x11::SequenceNumber,
+    header: yserver_protocol::x11::RequestHeader,
+    body: &[u8],
+    attached_fd: Option<OwnedFd>,
+) -> Option<yserver_protocol::x11::ClientId> {
+    let outcome = match process_request(state, backend, id, sequence, header, body, attached_fd) {
+        Ok(out) => out,
+        Err(err) => {
+            // A request handler errored — usually a backend-side
+            // limit (e.g., "too many points"). Log + continue rather
+            // than killing the server. Pre-existing bug: bogus client
+            // requests shouldn't be fatal.
+            log::warn!(
+                "request handler error (client {} opcode {}): {err}",
+                id.0,
+                header.opcode,
+            );
+            RequestOutcome::Handled
+        }
+    };
+    backend.mark_dirty();
+    match outcome {
+        RequestOutcome::Disconnect(disc_id) => Some(disc_id),
+        _ => None,
+    }
+}
+
 /// X11 default auto-repeat initial delay before the first synthetic
 /// KeyPress fires. Matches xset's `-r` defaults; not yet pulled from
 /// the XKB Controls block.
@@ -266,15 +343,25 @@ pub fn run_core(
              1s rollups via info!"
         );
     }
+    let mut deferred_requests: VecDeque<DeferredRequest> = VecDeque::new();
     loop {
-        // If a key is currently held, wake the loop in time to fire
-        // the next synthetic repeat. `Duration::ZERO` keeps mio
-        // returning immediately when we're already past `next_fire`.
-        let poll_timeout = state.repeat_state.as_ref().map(|r| {
-            r.next_fire
-                .checked_duration_since(Instant::now())
-                .unwrap_or(Duration::ZERO)
-        });
+        // Fairness: if we already have unprocessed work queued from a
+        // prior iteration, don't block on the poller — we have things
+        // to do right now. Without this, an idle moment where the
+        // channel is briefly empty would let `poll.poll` block until
+        // a fresh fd event, leaving the backlog stranded.
+        let poll_timeout = if !deferred_requests.is_empty() {
+            Some(Duration::ZERO)
+        } else {
+            // If a key is currently held, wake the loop in time to fire
+            // the next synthetic repeat. `Duration::ZERO` keeps mio
+            // returning immediately when we're already past `next_fire`.
+            state.repeat_state.as_ref().map(|r| {
+                r.next_fire
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or(Duration::ZERO)
+            })
+        };
         poll.poll(&mut events, poll_timeout)?;
         let iter_start = if telemetry.enabled {
             Some(Instant::now())
@@ -282,6 +369,43 @@ pub fn run_core(
             None
         };
         let mut requests_this_iter: u32 = 0;
+        let mut request_budget: usize = MAX_REQUESTS_PER_ITER;
+
+        // Fairness: drain the backlog from prior iterations FIRST,
+        // counted against this iteration's request budget. If the
+        // backlog itself exceeds the budget, we'll bail out before
+        // touching the channel — guarantees that `HostInput` /
+        // `PageFlipReady` arriving via fd events (DRM_TOKEN,
+        // LIBINPUT_TOKEN, etc.) still get serviced in the outer
+        // for-ev loop below.
+        while request_budget > 0 {
+            let Some(req) = deferred_requests.pop_front() else {
+                break;
+            };
+            let req_opcode = req.header.opcode;
+            let req_start = if telemetry.enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            let disc = process_request_inline(
+                state,
+                backend,
+                req.id,
+                req.sequence,
+                req.header,
+                &req.body,
+                req.attached_fd,
+            );
+            if let Some(start) = req_start {
+                telemetry.record_request(req_opcode, start.elapsed());
+            }
+            requests_this_iter += 1;
+            request_budget -= 1;
+            if let Some(disc_id) = disc {
+                crate::core_loop::process_disconnect::process_disconnect(state, backend, disc_id);
+            }
+        }
         for ev in events.iter() {
             match ev.token() {
                 LISTENER_TOKEN => {
@@ -371,46 +495,50 @@ pub fn run_core(
                                 body,
                                 attached_fd,
                             } => {
-                                let req_opcode = header.opcode;
-                                let req_start = if telemetry.enabled {
-                                    Some(Instant::now())
+                                if request_budget == 0 {
+                                    // Hit the fairness cap. Buffer the
+                                    // request locally and stop pulling
+                                    // more Request messages this
+                                    // iteration. Priorities (HostInput,
+                                    // PageFlipReady, Shutdown, etc.)
+                                    // arriving LATER in the channel
+                                    // still get processed because we
+                                    // continue the `try_recv_all`
+                                    // iteration — only the Request arm
+                                    // defers.
+                                    deferred_requests.push_back(DeferredRequest {
+                                        id,
+                                        sequence,
+                                        header,
+                                        body,
+                                        attached_fd,
+                                    });
                                 } else {
-                                    None
-                                };
-                                let outcome = match process_request(
-                                    state,
-                                    backend,
-                                    id,
-                                    sequence,
-                                    header,
-                                    &body,
-                                    attached_fd,
-                                ) {
-                                    Ok(out) => out,
-                                    Err(err) => {
-                                        // A request handler errored — usually a
-                                        // backend-side limit (e.g., "too many
-                                        // points"). Log + continue rather than
-                                        // killing the server. Pre-existing bug:
-                                        // bogus client requests shouldn't be
-                                        // fatal.
-                                        log::warn!(
-                                            "request handler error (client {} opcode {}): {err}",
-                                            id.0,
-                                            req_opcode,
-                                        );
-                                        RequestOutcome::Handled
-                                    }
-                                };
-                                backend.mark_dirty();
-                                if let Some(start) = req_start {
-                                    telemetry.record_request(req_opcode, start.elapsed());
-                                }
-                                requests_this_iter += 1;
-                                if let RequestOutcome::Disconnect(disc_id) = outcome {
-                                    crate::core_loop::process_disconnect::process_disconnect(
-                                        state, backend, disc_id,
+                                    let req_opcode = header.opcode;
+                                    let req_start = if telemetry.enabled {
+                                        Some(Instant::now())
+                                    } else {
+                                        None
+                                    };
+                                    let disc = process_request_inline(
+                                        state,
+                                        backend,
+                                        id,
+                                        sequence,
+                                        header,
+                                        &body,
+                                        attached_fd,
                                     );
+                                    if let Some(start) = req_start {
+                                        telemetry.record_request(req_opcode, start.elapsed());
+                                    }
+                                    requests_this_iter += 1;
+                                    request_budget -= 1;
+                                    if let Some(disc_id) = disc {
+                                        crate::core_loop::process_disconnect::process_disconnect(
+                                            state, backend, disc_id,
+                                        );
+                                    }
                                 }
                             }
                             Message::SetupAllocate { id, response_tx } => {
