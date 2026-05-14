@@ -88,7 +88,7 @@ Both effects compound: fewer synchronous flushes lets the input loop service inp
    - 32 BGRA8 32×32 images is `32 × (32 × 32 × 4 + alignment) ≈ 128 KB per bucket`. Across ~10 active buckets, worst-case pool memory is ~1.5 MB. Acceptable.
    - When a bucket is full, the BatchResource's `release` destroys the image (no growth past cap).
 
-3. **Max pooled dimension (`MAX_POOLED_DIM = 128`)**: pixmaps with `width > MAX_POOLED_DIM || height > MAX_POOLED_DIM` skip the pool (both on free and on alloc). Above 128×128 the per-image memory grows quadratically and the reuse rate drops sharply (clients tend to use unique sizes at that scale). Rationale: keeps the pool's worst-case memory bounded and skips a regime where it doesn't help.
+3. **Max pooled dimension (`MAX_POOLED_DIM = 128`)**: pixmaps with `width > MAX_POOLED_DIM || height > MAX_POOLED_DIM` are not kept in the pool. On the **create side** this means `try_take` returns `None` for oversize keys (callers fresh-allocate). On the **free side** the mirror still goes through defer-release uniformly: `PooledPixmapReturn::release` calls `try_return` which rejects oversize entries with `Err(entry)`, and the BatchResource destroys the entry at batch-retire time (after the open batch's fence signals — GPU is done with the image). Above 128×128 the per-image memory grows quadratically and the reuse rate drops sharply (clients tend to use unique sizes at that scale). Rationale: keeps the pool's worst-case memory bounded; **no direct-drop of a live `VkImage` on the hot path** — destruction is always deferred through the open paint batch's retire (codex round-3 P0 fold).
 
 4. **`PooledPixmapReturn` BatchResource — `Arc<Mutex<…>>` required, NOT `RefCell`** (codex P0 from round 1): `BatchResource: Send + std::fmt::Debug` is the existing trait bound (paint_batch.rs:146). `Arc<RefCell<…>>` is NOT `Send` (RefCell isn't Sync). Use `Arc<PixmapPool>` where `PixmapPool` internally uses `std::sync::Mutex<HashMap<…>>` for its buckets + `Mutex<PixmapPoolStats>` for stats. The single-threaded core loop invariant means the Mutex is never contended; the lock cost is one atomic CAS per pool op, well below the per-op savings the pool unlocks.
 
@@ -733,9 +733,10 @@ fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::
 **Key invariants preserved**:
 - Picture rescue path: same shape as before.
 - Renderer-failed: the defer-release path still runs (it's idempotent on a Poisoned batch — pool's BatchResource leaks with the batch, no UAF).
-- Oversize pixmaps: skip the pool, direct Drop. The direct-Drop path retains its synchronous `queue_wait_idle` (Phase 5 deferral) — accepted.
+- **Oversize pixmaps**: go through defer-release like everything else. `PooledPixmapReturn::release` calls `try_return`, which returns `Err(entry)` for ineligible (oversize) keys; `release` then calls `pool.destroy_entry(entry)`. The destroy runs at batch-retire time, after the open batch's fence has signaled — GPU is done with the image. No direct-drop of a live `VkImage` anywhere on the hot path (codex round-3 P0 fold).
+- **Bucket-cap rejection**: same shape as oversize — `try_return` returns Err, `release` destroys at retire time.
 
-**What's removed**: the synchronous `flush_if_needed(ProtocolBarrier)` at the top of `free_pixmap`. This is the win.
+**What's removed**: the synchronous `flush_if_needed(ProtocolBarrier)` at the top of `free_pixmap`. This is the win. The only synchronous `queue_wait_idle` that survives in the pool's surface is in `PixmapPool::Drop` — a **shutdown-only** defensive drain that should never fire if T4's explicit `pool.drain()` after the scheduler drain runs correctly. It is NOT in the hot path.
 
 ### Step 3: Gates + commit
 
@@ -763,8 +764,9 @@ hundreds of blocking submits per second into one per composite cycle.
 
 Picture-rescue path unchanged: a live picture referencing the freed
 pixmap still takes the mirror via picture_rescued_images. Oversize
-pixmaps (>MAX_POOLED_DIM) skip the pool and direct-Drop (synchronous
-wait retained for now; Phase 5 follow-up territory).
+pixmaps (>MAX_POOLED_DIM) and bucket-cap rejections still go through
+defer-release; PooledPixmapReturn::release destroys them at batch-
+retire time. No direct-drop of a live VkImage on the hot path.
 ```
 
 ### Done conditions for T2
