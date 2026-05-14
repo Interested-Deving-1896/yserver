@@ -5446,21 +5446,30 @@ fn handle_xi2_request(
             //   | set:BOOL(1) | pad1(3) | deviceid(2) | pad2(18)
             // Total = 32 bytes.
             //
-            // set=0 (no per-client master pointer override), deviceid=2
-            // (system default master pointer — matches the deviceid we
-            // advertise in XIQueryDevice's "Virtual core pointer" entry).
-            // The earlier handler returned deviceid=0, which GTK treats
-            // as an invalid device and uses verbatim in subsequent
-            // XInput requests — mate-panel's workspace-applet drag
-            // path crashed processing the bad reply, taking the panel
-            // down with it.
+            // Must reply `set=True`: libXi's `XIGetClientPointer`
+            // only writes the caller's `*deviceid` out-parameter
+            // when `reply.set == True`. With `set=False` it returns
+            // False and leaves the caller's variable uninitialized,
+            // which GDK then passes verbatim to `g_hash_table_lookup`
+            // on its device id_table — looking up garbage returns
+            // NULL, so GDK assigns `device=NULL` to any synthetic
+            // core ButtonPress/ButtonRelease/MotionNotify from
+            // XSendEvent (gdkdevicemanager-xi2.c::translate_event
+            // calls `get_client_pointer` to attribute the device),
+            // and the next `proxy_button_event` SEGVs at
+            // `pointer_info->toplevel_under_pointer`. mate-panel
+            // dies on every workspace-switch click because wnck-applet
+            // SendEvents a synthetic ButtonRelease into the panel
+            // when activating a workspace.
             debug!(
-                "client {} #{} XIGetClientPointer -> set=0 deviceid=2",
+                "client {} #{} XIGetClientPointer -> set=1 deviceid=2",
                 client_id.0, sequence.0
             );
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
-            // set(1) + pad(3) packed as a single u32 = 0 (set=False).
-            x11::write_u32(byte_order, &mut reply, 0);
+            // set=True (1) + 3 bytes pad — write as a single u32 with
+            // the low byte = 1 so byte order doesn't matter.
+            reply.push(1);
+            reply.extend_from_slice(&[0u8; 3]);
             // deviceid (u16) = 2, then pad to reach 32 bytes total.
             x11::write_u16(byte_order, &mut reply, 2);
             reply.extend_from_slice(&[0u8; 18]);
@@ -5519,29 +5528,147 @@ fn handle_xi2_request(
             buf.extend_from_slice(&reply);
         }
         48 => {
+            // XIQueryDevice. Class type ids per XI2:
+            //   0=Key, 1=Button, 2=Valuator, 3=Scroll.
+            // ATOM=0 (None) is spec-legal for unlabeled buttons/axes —
+            // GDK falls back to a default string. Length fields are in
+            // 4-byte units and include the 8-byte class header (type +
+            // length + sourceid + a class-specific u16).
             debug!("client {} #{} XIQueryDevice", client_id.0, sequence.0);
+            let le = ClientByteOrder::LittleEndian;
+            let (screen_w, screen_h) = (state.randr.screen_width, state.randr.screen_height);
+
+            fn write_button_class(buf: &mut Vec<u8>, sourceid: u16, num_buttons: u16) {
+                let le = ClientByteOrder::LittleEndian;
+                let state_words = num_buttons.div_ceil(32) as usize;
+                let byte_len = 8 + 4 * state_words + 4 * num_buttons as usize;
+                let units = byte_len / 4;
+                x11::write_u16(le, buf, 1); // type = Button
+                x11::write_u16(le, buf, units as u16);
+                x11::write_u16(le, buf, sourceid);
+                x11::write_u16(le, buf, num_buttons);
+                buf.extend(std::iter::repeat_n(0u8, 4 * state_words));
+                buf.extend(std::iter::repeat_n(0u8, 4 * num_buttons as usize)); // labels: ATOM=None
+            }
+
+            fn write_valuator_class(
+                buf: &mut Vec<u8>,
+                sourceid: u16,
+                number: u16,
+                max_int: i32,
+            ) {
+                let le = ClientByteOrder::LittleEndian;
+                // Header(8) + label(4) + min(8) + max(8) + value(8) +
+                // resolution(4) + mode+pad(4) = 44 bytes = 11 units.
+                x11::write_u16(le, buf, 2); // type = Valuator
+                x11::write_u16(le, buf, 11);
+                x11::write_u16(le, buf, sourceid);
+                x11::write_u16(le, buf, number);
+                x11::write_u32(le, buf, 0); // label ATOM = None
+                // FP3232 min = 0.0
+                x11::write_u32(le, buf, 0);
+                x11::write_u32(le, buf, 0);
+                // FP3232 max = (max_int, 0)
+                x11::write_u32(le, buf, max_int as u32);
+                x11::write_u32(le, buf, 0);
+                // FP3232 value = 0.0
+                x11::write_u32(le, buf, 0);
+                x11::write_u32(le, buf, 0);
+                x11::write_u32(le, buf, 0); // resolution
+                buf.push(1); // mode = Absolute
+                buf.extend_from_slice(&[0u8; 3]); // pad
+            }
+
+            fn write_scroll_class(
+                buf: &mut Vec<u8>,
+                sourceid: u16,
+                number: u16,
+                scroll_type: u16,
+            ) {
+                let le = ClientByteOrder::LittleEndian;
+                // Header(8) + scroll_type+pad(4) + flags(4) +
+                // increment(8) = 24 bytes = 6 units.
+                x11::write_u16(le, buf, 3); // type = Scroll
+                x11::write_u16(le, buf, 6);
+                x11::write_u16(le, buf, sourceid);
+                x11::write_u16(le, buf, number);
+                x11::write_u16(le, buf, scroll_type);
+                x11::write_u16(le, buf, 0); // pad
+                x11::write_u32(le, buf, 0); // flags = 0
+                // FP3232 increment = 1.0
+                x11::write_u32(le, buf, 1);
+                x11::write_u32(le, buf, 0);
+            }
+
+            fn write_key_class(buf: &mut Vec<u8>, sourceid: u16) {
+                let le = ClientByteOrder::LittleEndian;
+                // Header(8) + num_keycodes(implicit via pad u16 slot...) —
+                // actually: header = type+length+sourceid+num_keycodes (8B).
+                // Body = num_keycodes * CARD32 keycodes.
+                // X11 keycodes 8..=255 (248 of them) — matches the
+                // min_keycode/max_keycode advertised in the setup reply.
+                const NUM_KEYCODES: u16 = 248;
+                let body_bytes = 4 * NUM_KEYCODES as usize;
+                let units = (8 + body_bytes) / 4;
+                x11::write_u16(le, buf, 0); // type = Key
+                x11::write_u16(le, buf, units as u16);
+                x11::write_u16(le, buf, sourceid);
+                x11::write_u16(le, buf, NUM_KEYCODES);
+                for kc in 8u32..=255 {
+                    x11::write_u32(le, buf, kc);
+                }
+            }
+
             let mut infos = Vec::new();
-            for (deviceid, use_, attachment, name) in [
-                (2u16, 1u16, 3u16, "Virtual core pointer"),
-                (3u16, 2u16, 2u16, "Virtual core keyboard"),
-            ] {
-                x11::write_u16(ClientByteOrder::LittleEndian, &mut infos, deviceid);
-                x11::write_u16(ClientByteOrder::LittleEndian, &mut infos, use_);
-                x11::write_u16(ClientByteOrder::LittleEndian, &mut infos, attachment);
-                x11::write_u16(ClientByteOrder::LittleEndian, &mut infos, 0);
-                x11::write_u16(ClientByteOrder::LittleEndian, &mut infos, name.len() as u16);
-                infos.push(1);
-                infos.push(0);
+
+            // Master Pointer (deviceid=2): Button(7) + Valuator(X) +
+            // Valuator(Y) + Scroll(Vertical) + Scroll(Horizontal).
+            {
+                let deviceid: u16 = 2;
+                let name = "Virtual core pointer";
+                let mut classes = Vec::new();
+                write_button_class(&mut classes, deviceid, 7);
+                write_valuator_class(&mut classes, deviceid, 0, i32::from(screen_w).max(1) - 1);
+                write_valuator_class(&mut classes, deviceid, 1, i32::from(screen_h).max(1) - 1);
+                write_scroll_class(&mut classes, deviceid, 2, 1); // vertical
+                write_scroll_class(&mut classes, deviceid, 3, 2); // horizontal
+                x11::write_u16(le, &mut infos, deviceid);
+                x11::write_u16(le, &mut infos, 1); // use = MasterPointer
+                x11::write_u16(le, &mut infos, 3); // attachment = paired keyboard
+                x11::write_u16(le, &mut infos, 5); // num_classes
+                x11::write_u16(le, &mut infos, name.len() as u16);
+                infos.push(1); // enabled
+                infos.push(0); // pad
                 infos.extend_from_slice(name.as_bytes());
                 x11::pad_vec4(&mut infos);
+                infos.extend_from_slice(&classes);
             }
+
+            // Master Keyboard (deviceid=3): Key with keycodes 8..=255.
+            {
+                let deviceid: u16 = 3;
+                let name = "Virtual core keyboard";
+                let mut classes = Vec::new();
+                write_key_class(&mut classes, deviceid);
+                x11::write_u16(le, &mut infos, deviceid);
+                x11::write_u16(le, &mut infos, 2); // use = MasterKeyboard
+                x11::write_u16(le, &mut infos, 2); // attachment = paired pointer
+                x11::write_u16(le, &mut infos, 1); // num_classes
+                x11::write_u16(le, &mut infos, name.len() as u16);
+                infos.push(1); // enabled
+                infos.push(0); // pad
+                infos.extend_from_slice(name.as_bytes());
+                x11::pad_vec4(&mut infos);
+                infos.extend_from_slice(&classes);
+            }
+
             let mut reply = x11::fixed_reply(
                 byte_order,
                 sequence,
                 0,
                 x11::checked_units(infos.len())? as u32,
             );
-            x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 2);
+            x11::write_u16(le, &mut reply, 2); // num_devices
             reply.extend_from_slice(&[0; 22]);
             reply.extend_from_slice(&infos);
             buf.extend_from_slice(&reply);
@@ -9510,7 +9637,7 @@ fn handle_send_event(
     let mut event_copy = *req.event;
     event_copy[0] |= 0x80;
 
-    let targets: Vec<ClientId> = if req.destination.0 == 0xffff_ffff {
+    let mut targets: Vec<ClientId> = if req.destination.0 == 0xffff_ffff {
         subscribers_by_id(state, ROOT_WINDOW, req.event_mask)
     } else if req.event_mask == 0 {
         state
@@ -9535,6 +9662,61 @@ fn handle_send_event(
             current = parent;
         }
     };
+    // GDK3 has a NULL-device crash in `proxy_button_event` when its
+    // XI2 wrapper's `get_client_pointer()` returns NULL for a
+    // synthetic core ButtonPress/Release/Motion/Enter/Leave: the
+    // ensuing `_gdk_display_get_pointer_info(display, NULL)` returns
+    // NULL and the next line dereferences it. The crash fires on the
+    // master-pointer alias even when XIQueryDevice and
+    // XIGetClientPointer both report device 2 — somewhere the
+    // id_table lookup miscarries. Mate-panel hits it on every
+    // workspace-switch click because wnck-applet SendEvents a
+    // synthetic ButtonRelease into the panel.
+    //
+    // For event types that have XI2 counterparts (4–8 = Button*,
+    // Motion, Enter, Leave), drop any target client that has an XI2
+    // selection covering the destination (or any ancestor) for the
+    // matching XI2 type bit. The XI2 bit index equals the core type
+    // for these five events. Core-only clients (fvwm, wmaker, e16,
+    // legacy X apps) still receive the event unchanged.
+    let core_type = req.event[0] & 0x7f;
+    if matches!(core_type, 4..=8) {
+        let xi2_bit = 1u32 << core_type;
+        let before = targets.len();
+        targets.retain(|target| {
+            let Some(target_client) = state.clients.get(&target.0) else {
+                return true;
+            };
+            let mut current = req.destination;
+            loop {
+                for deviceid in [0u16, 1, 2, 3] {
+                    if let Some(m) = target_client.xi2_masks.get(&(current, deviceid))
+                        && (m & xi2_bit) != 0
+                    {
+                        return false;
+                    }
+                }
+                let Some(parent) = state.resources.parent_of(current) else {
+                    return true;
+                };
+                if parent == current {
+                    return true;
+                }
+                current = parent;
+            }
+        });
+        if targets.len() != before {
+            debug!(
+                "client {} #{} SendEvent core type={} dest=0x{:x} dropped \
+                 {} target(s) with overlapping XI2 selection (GDK3 NULL-device guard)",
+                client_id.0,
+                sequence.0,
+                core_type,
+                req.destination.0,
+                before - targets.len(),
+            );
+        }
+    }
     let _dropped = fanout_raw_event_to_clients(state, &targets, &event_copy, sender_byte_order);
     debug!(
         "client {} #{} SendEvent type={} dest=0x{:x} event_mask=0x{:x} propagate={} targets={:?}",

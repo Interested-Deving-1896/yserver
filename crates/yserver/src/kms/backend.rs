@@ -7071,10 +7071,7 @@ impl KmsBackend {
     }
 
     fn current_time_ms() -> u32 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u32
+        crate::clock::server_time_ms()
     }
 
     /// Synthesize an EnterNotify/LeaveNotify on `host_xid` with the given
@@ -7207,10 +7204,7 @@ impl KmsBackend {
         } else {
             self.button_mask &= !button_bit;
         }
-        let time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u32;
+        let time = crate::clock::server_time_ms();
         let kind = if pressed {
             PointerEventKind::ButtonPress
         } else {

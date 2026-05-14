@@ -1,3 +1,4 @@
+pub mod clock;
 pub mod drm;
 pub mod input;
 pub mod input_thread;

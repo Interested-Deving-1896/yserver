@@ -16,11 +16,7 @@
 //! Spec: `docs/superpowers/specs/2026-05-05-single-threaded-core-design.md`
 //! Plan: `docs/superpowers/plans/2026-05-06-single-threaded-core.md` §E2.
 
-use std::{
-    io,
-    os::fd::BorrowedFd,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{io, os::fd::BorrowedFd};
 
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
 use yserver_core::{
@@ -375,10 +371,7 @@ pub fn run(input_ctx: SendContext, sender: CoreSender, fb_w: u32, fb_h: u32) -> 
 }
 
 fn current_time_ms() -> u32 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u32
+    crate::clock::server_time_ms()
 }
 
 #[cfg(test)]
