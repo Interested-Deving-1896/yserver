@@ -101,6 +101,31 @@ impl MaskScratch {
         self.view
     }
 
+    /// Raw `vk::Image` handle. Needed by the GPU trap-rasterize path
+    /// (gpu-trap T2) to build image-memory barriers that transition
+    /// the mask between `SHADER_READ_ONLY_OPTIMAL` and
+    /// `COLOR_ATTACHMENT_OPTIMAL` for the new draw.
+    pub fn image(&self) -> vk::Image {
+        self.image
+    }
+
+    /// CPU-tracked layout (3F-2 #8 invariant). Returns the layout
+    /// the image will be in once all previously recorded CBs execute
+    /// in order. The trap-rasterize path (gpu-trap T2) reads this to
+    /// pick the source stage/access of the first barrier.
+    pub fn current_layout(&self) -> vk::ImageLayout {
+        self.current_layout
+    }
+
+    /// Update the CPU-tracked layout. Called by the trap-rasterize
+    /// path (gpu-trap T2) after its terminal COLOR_ATTACHMENT →
+    /// SHADER_READ_ONLY_OPTIMAL barrier records so the next consumer
+    /// of the scratch sees the same layout that future CB execution
+    /// will leave the image in.
+    pub fn set_current_layout(&mut self, layout: vk::ImageLayout) {
+        self.current_layout = layout;
+    }
+
     /// 5-T5: ensure the scratch image is at least `(width, height)`
     /// pixels, reallocating if smaller. Returns `Ok(None)` if no grow
     /// was needed (scratch unchanged). On grow, allocates the new
@@ -256,7 +281,11 @@ fn allocate_image(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+        .usage(
+            vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        )
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED);
     let image = unsafe { vk.device.create_image(&image_info, None)? };

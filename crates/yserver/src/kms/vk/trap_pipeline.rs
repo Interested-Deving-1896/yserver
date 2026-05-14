@@ -134,13 +134,15 @@ impl std::fmt::Debug for TrapPipeline {
 impl TrapPipeline {
     pub fn new(vk: Arc<VkContext>, mask_format: vk::Format) -> Result<Self, TrapPipelineError> {
         let device = &vk.device;
-        // Push consts are read by the vertex shader (for quad
-        // positioning + viewport scaling). The fragment shader does
-        // not currently sample them, so VERTEX-only is sufficient
-        // and avoids a spurious dst stage in the push-constant
-        // visibility mask.
+        // gpu-trap T2: push consts are read by both stages — the
+        // vertex shader for quad positioning + viewport scaling, the
+        // fragment shader for adding `bbox_origin_pixel` to
+        // `gl_FragCoord` (the quad emits in MaskScratch-local coords
+        // so the GPU writes to (0, 0)..(bbox_w, bbox_h), but the
+        // trap edge attributes are in absolute pixel coords from the
+        // protocol). Widening the visibility mask costs nothing.
         let push_const_ranges = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
             .size(std::mem::size_of::<TrapDrawPushConsts>() as u32)];
         let pl_info =

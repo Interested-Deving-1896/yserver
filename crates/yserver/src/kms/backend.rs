@@ -791,6 +791,20 @@ pub struct KmsBackend {
     /// in `Drop` sees a live device queue.
     pub(crate) pixmap_pool: Option<Arc<crate::kms::vk::pixmap_pool::PixmapPool>>,
 
+    /// GPU rasterization pipeline for RENDER `Trapezoids` (gpu-trap
+    /// T1/T2; triangles wired in T3). Replaces the CPU 4×4
+    /// supersampled rasterizer in
+    /// [`KmsBackend::try_vk_render_trapezoids_path`]; `None` when
+    /// Vulkan didn't come up or the pipeline build failed at
+    /// backend init (graceful: traps fall back to pixman).
+    ///
+    /// Drop order: declared AFTER `scheduler` and `pixmap_pool` so
+    /// in-flight `PaintBatch`es that bound this pipeline see live
+    /// handles until they retire; declared BEFORE `ops_command_pool`
+    /// (and therefore the `VkContext` below) so the pipeline's `Drop`
+    /// `destroy_pipeline` runs against a live device.
+    pub(crate) trap_pipeline: Option<crate::kms::vk::trap_pipeline::TrapPipeline>,
+
     // Drawing-op command pool (sub-phase 4.1.4). Separate from
     // `MirrorUploader`'s transfer pool — drawing ops emit graphics
     // workload (begin_rendering / clear_attachments / draws), the
@@ -1443,6 +1457,7 @@ impl KmsBackend {
             first_pageflip_logged: vec![false; 1],
             scheduler: crate::kms::scheduler::RenderScheduler::new(),
             pixmap_pool: None,
+            trap_pipeline: None,
             scanout_pools: Vec::new(),
             compositor_pipeline: None,
             ops_command_pool: None,
@@ -1536,8 +1551,26 @@ impl KmsBackend {
         let pixmap_pool = Arc::new(crate::kms::vk::pixmap_pool::PixmapPool::new(Arc::clone(
             &vk,
         )));
+        // gpu-trap T2: mirror the production init so for_tests_with_vk-
+        // driven tests exercise the same `trap_pipeline.is_some()` path.
+        // Failure here leaves the field `None`; tests that don't rely on
+        // GPU trap rasterize keep working.
+        let trap_pipeline = match crate::kms::vk::trap_pipeline::TrapPipeline::new(
+            Arc::clone(&vk),
+            ash::vk::Format::R8_UNORM,
+        ) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                log::warn!(
+                    "vk trap pipeline init failed (for_tests_with_vk): {e:?} — \
+                     traps will fall back to pixman"
+                );
+                None
+            }
+        };
         backend.vk = Some(vk);
         backend.pixmap_pool = Some(pixmap_pool);
+        backend.trap_pipeline = trap_pipeline;
         backend.ops_command_pool = Some(ops_pool);
         backend.ops_staging = Some(ops_staging);
         backend.logic_fill_pipelines = Some(logic_fill);
@@ -2285,6 +2318,25 @@ impl KmsBackend {
             )))
         });
 
+        // GPU trap-rasterize pipeline (gpu-trap T1/T2). When this
+        // fails to build, traps fall back to pixman — the renderer
+        // still functions, just on the CPU rasterize path. Logged
+        // so the bring-up state is auditable.
+        let trap_pipeline = vk.as_ref().and_then(|vkctx| {
+            match crate::kms::vk::trap_pipeline::TrapPipeline::new(
+                Arc::clone(vkctx),
+                ash::vk::Format::R8_UNORM,
+            ) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    log::warn!(
+                        "vk trap pipeline init failed: {e:?} — traps will fall back to pixman"
+                    );
+                    None
+                }
+            }
+        });
+
         let logic_fill_pipelines = vk.as_ref().and_then(|vkctx| {
             match crate::kms::vk::logic_fill_pipeline::LogicFillPipelineCache::new(
                 Arc::clone(vkctx),
@@ -2324,6 +2376,7 @@ impl KmsBackend {
             first_pageflip_logged: vec![false; layouts_len],
             scheduler: crate::kms::scheduler::RenderScheduler::new(),
             pixmap_pool,
+            trap_pipeline,
             scanout_pools,
             compositor_pipeline,
             ops_command_pool,
@@ -2665,6 +2718,23 @@ fn advance_pool_on_pageflip_complete(pool: &mut crate::kms::vk::scanout::Scanout
             _ => {}
         }
     }
+}
+
+/// RENDER primitive list passed through to
+/// [`KmsBackend::try_vk_render_traps_or_tris`] (gpu-trap T2).
+///
+/// `Traps` is the post-T2 GPU-rasterize path: the function records a
+/// `TrapPipeline` draw that writes coverage into MaskScratch inside
+/// the open paint batch. `Tris` is the legacy CPU-rasterize bridge —
+/// the body falls back to the pre-T2 `rasterize_triangles` +
+/// `MaskScratch::record_upload_r8` shape until T3 wires a sibling GPU
+/// pipeline for triangles.
+pub(crate) enum TrapsOrTris<'a> {
+    /// Decoded trapezoids. T2 GPU-rasterizes via `TrapPipeline`.
+    Traps(&'a [crate::kms::vk::ops::traps::Trapezoid]),
+    /// Decoded triangles. T2 still routes through the CPU rasterizer;
+    /// T3 swaps this for a GPU draw.
+    Tris(&'a [crate::kms::vk::ops::traps::Triangle]),
 }
 
 impl KmsBackend {
@@ -4729,8 +4799,21 @@ impl KmsBackend {
         }
         let bw = (bx1 - bx) as u32;
         let bh = (by1 - by) as u32;
-        let mask = vk_traps::rasterize_trapezoids(&decoded, bx, by, bw, bh);
-        self.try_vk_render_traps_or_tris(op, host_src, host_dst, &mask, bx, by, bw, bh)
+        // gpu-trap T2: rasterize_trapezoids is gone from this arm.
+        // `try_vk_render_traps_or_tris` builds the coverage mask on the
+        // GPU inside the open paint batch (no synchronous CPU work in
+        // the X protocol request handler). The triangle arm still
+        // CPU-rasterizes until T3.
+        self.try_vk_render_traps_or_tris(
+            op,
+            host_src,
+            host_dst,
+            TrapsOrTris::Traps(&decoded),
+            bx,
+            by,
+            bw,
+            bh,
+        )
     }
 
     /// Phase 4.1.4.7 triangle wire-decoder + Vk dispatch. Mirrors
@@ -4834,13 +4917,30 @@ impl KmsBackend {
         }
         let bw = (bx1 - bx) as u32;
         let bh = (by1 - by) as u32;
-        let mask = vk_traps::rasterize_triangles(&tris, bx, by, bw, bh);
-        self.try_vk_render_traps_or_tris(op, host_src, host_dst, &mask, bx, by, bw, bh)
+        // gpu-trap T2: triangles still go through the CPU rasterizer
+        // for now — T3 wires this arm to a sibling GPU pipeline.
+        self.try_vk_render_traps_or_tris(
+            op,
+            host_src,
+            host_dst,
+            TrapsOrTris::Tris(&tris),
+            bx,
+            by,
+            bw,
+            bh,
+        )
     }
 
     /// Sub-phase 4.1.4.7 helper. Vulkan-direct RENDER `Trapezoids`
-    /// / `Triangles` via CPU rasterisation. The R8 mask is uploaded
-    /// to [`MaskScratch`](crate::kms::vk::mask_scratch::MaskScratch);
+    /// / `Triangles`. The trapezoid arm (gpu-trap T2) builds the
+    /// coverage mask on the GPU inside the open paint batch via
+    /// [`TrapPipeline`]; the triangle arm continues to CPU-rasterize
+    /// until T3 wires it through a sibling pipeline.
+    ///
+    /// [`TrapPipeline`]: crate::kms::vk::trap_pipeline::TrapPipeline
+    ///
+    /// Either way the resulting R8 coverage mask lives in
+    /// [`MaskScratch`](crate::kms::vk::mask_scratch::MaskScratch);
     /// the composite path then reads `src.color * mask.alpha` exactly
     /// like a normal Composite call with an A8 mask.
     ///
@@ -4860,7 +4960,7 @@ impl KmsBackend {
         op: u8,
         host_src: u32,
         host_dst: u32,
-        coverage_mask: &[u8], // already CPU-rasterised
+        prims: TrapsOrTris<'_>,
         bbox_x: i32,
         bbox_y: i32,
         bbox_w: u32,
@@ -4869,14 +4969,41 @@ impl KmsBackend {
         use crate::kms::vk::{
             ops::render as vk_render,
             render_pipeline::{StdPictOp, record_solid_color_clear},
+            trap_pipeline::TrapDrawPushConsts,
         };
 
-        if bbox_w == 0 || bbox_h == 0 || coverage_mask.is_empty() {
+        if bbox_w == 0 || bbox_h == 0 {
             return true;
+        }
+        // Primitive list emptiness == no draw.
+        match &prims {
+            TrapsOrTris::Traps([]) | TrapsOrTris::Tris([]) => return true,
+            _ => {}
         }
 
         let Some(std_op) = StdPictOp::from_u8(op) else {
             return false;
+        };
+
+        // gpu-trap T2: GPU trap arm requires the pipeline to be live.
+        // Build a snapshot of pipeline handles outside the closure so
+        // the (`&mut self`) → record_paint_batch_op handoff doesn't
+        // alias `self.trap_pipeline`. If the pipeline is None (init
+        // failed at backend bring-up), the trap arm declines (caller
+        // falls back to pixman). The triangle arm doesn't need the
+        // pipeline for now.
+        let trap_pipeline_snapshot = match &prims {
+            TrapsOrTris::Traps(_) => {
+                let Some(tp) = self.trap_pipeline.as_ref() else {
+                    log::debug!(
+                        "vk render_traps bail: trap_pipeline missing (init failed?) — \
+                         falling back to pixman"
+                    );
+                    return false;
+                };
+                Some((tp.trapezoid_pipeline(), tp.pipeline_layout()))
+            }
+            TrapsOrTris::Tris(_) => None,
         };
 
         // `resolve_render_pic` returns None for gradients (the variant
@@ -5119,15 +5246,24 @@ impl KmsBackend {
                 .defer_resource_release(vk_arc.clone(), pool_handle, old);
         }
 
-        // P1: `mask_view` / `mask_extent` MUST be read AFTER the grow
-        // above — the grow path replaces the old `vk::ImageView`, so a
-        // pre-grow capture would refer to the just-retired view.
+        // P1: `mask_view` / `mask_extent` / `mask_image` MUST be read
+        // AFTER the grow above — the grow path replaces the underlying
+        // `vk::Image` / `vk::ImageView`, so a pre-grow capture would
+        // refer to the just-retired handle.
+        //
+        // gpu-trap T2 borrow-checker note: also snapshot `mask_image`
+        // here as an immutable copy. The GPU-rasterize barrier
+        // sequence needs the raw image handle; reading it inside the
+        // closure would require a second `&` borrow on
+        // `mask_scratch`, which conflicts with the `&mut` borrow used
+        // for `set_current_layout` at the closure tail.
         let mask_view = self
             .mask_scratch
             .as_ref()
             .expect("checked above")
             .image_view();
         let mask_extent = self.mask_scratch.as_ref().expect("checked above").extent();
+        let mask_image = self.mask_scratch.as_ref().expect("checked above").image();
 
         // Disjoint/Conjoint ops reach this path too (e.g. rendercheck's
         // `Conjoint*` triangles cases). For those the shader reads dst
@@ -5267,46 +5403,259 @@ impl KmsBackend {
         // recorded in this batch. Set `arena_oom = true`, return Ok,
         // and report failure to the caller after `record_paint_batch_op`
         // returns.
+        //
+        // gpu-trap T2: the trapezoid arm builds the coverage mask via
+        // a `TrapPipeline` draw into MaskScratch (one
+        // vkCmdDraw(4, n_traps), additive blend, R8_UNORM clamps to
+        // [0,1] for saturating-add semantics). The triangle arm keeps
+        // the legacy CPU rasterize + record_upload_r8 path until T3.
         let render_cache = self.render_pipelines.as_ref().expect("checked above");
         let mut arena_oom = false;
-        let mask_bytes = coverage_mask;
-        let mask_w = bbox_w;
-        let mask_h = bbox_h;
-        let mask_len = mask_bytes.len();
+        // Pre-rasterize the triangle arm OUTSIDE the closure so
+        // borrows on `prims` don't leak in. The trapezoid arm needs
+        // only the slice (passed by reference into the closure for the
+        // GPU upload).
+        let cpu_tri_mask: Option<Vec<u8>> = match &prims {
+            TrapsOrTris::Tris(tris) => Some(crate::kms::vk::ops::traps::rasterize_triangles(
+                tris, bbox_x, bbox_y, bbox_w, bbox_h,
+            )),
+            TrapsOrTris::Traps(_) => None,
+        };
+        let traps_slice: Option<&[crate::kms::vk::ops::traps::Trapezoid]> = match &prims {
+            TrapsOrTris::Traps(t) => Some(t),
+            TrapsOrTris::Tris(_) => None,
+        };
         let result = self
             .scheduler
             .record_paint_batch_op(vk_arc, pool_handle, |vk, batch, cb| {
-                let needed = u64::from(mask_w) * u64::from(mask_h);
-                let alloc = match batch.upload_arena_mut().alloc(needed, 4) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        log::warn!(
-                            "vk render_traps: arena alloc {needed} bytes failed: {e:?} — \
-                             mask upload will fail without poisoning batch"
-                        );
-                        arena_oom = true;
-                        return Ok(());
+                // ---- Build coverage mask in MaskScratch ----
+                if let Some(traps) = traps_slice {
+                    // gpu-trap T2: GPU rasterize. Upload per-instance
+                    // data (40 bytes × n_traps) into the open batch's
+                    // arena, bind it as a vertex buffer, draw one unit
+                    // quad per instance into MaskScratch with additive
+                    // blend.
+                    use crate::kms::vk::trap_pipeline::TrapInstanceData;
+                    let (trap_pipe, trap_layout) =
+                        trap_pipeline_snapshot.expect("Traps arm snapshots pipeline");
+                    let needed =
+                        (traps.len() as u64) * (std::mem::size_of::<TrapInstanceData>() as u64);
+                    let alloc = match batch.upload_arena_mut().alloc(needed, 4) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            log::warn!(
+                                "vk render_traps: arena alloc {needed} bytes (trap \
+                                 instances) failed: {e:?} — trap GPU upload will fail \
+                                 without poisoning batch"
+                            );
+                            arena_oom = true;
+                            return Ok(());
+                        }
+                    };
+                    // SAFETY: alloc.mapped_ptr is HOST_VISIBLE |
+                    // HOST_COHERENT, mapped at alloc.buffer +
+                    // alloc.offset, valid for `needed` bytes. We write
+                    // each TrapInstanceData (size 40, no padding —
+                    // asserted by the const _ in trap_pipeline.rs)
+                    // sequentially via copy_nonoverlapping. The 4-byte
+                    // arena alignment matches `f32` alignment.
+                    let stride = std::mem::size_of::<TrapInstanceData>();
+                    let base = alloc.mapped_ptr.as_ptr();
+                    for (i, t) in traps.iter().enumerate() {
+                        let inst = t.to_instance_data();
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                inst.as_bytes().as_ptr(),
+                                base.add(i * stride),
+                                stride,
+                            );
+                        }
                     }
-                };
-                // SAFETY: alloc.mapped_ptr is HOST_VISIBLE |
-                // HOST_COHERENT mapped at alloc.buffer + alloc.offset
-                // covering `needed` bytes; mask_bytes is valid for
-                // mask_len bytes. mask_len == needed holds by
-                // construction: rasterize_trapezoids and
-                // rasterize_triangles both return `vec![0u8;
-                // (w * h) as usize]`, and `mask_w * mask_h ==
-                // bbox_w * bbox_h ==` coverage_mask length. The
-                // debug_assert below catches any future drift.
-                debug_assert_eq!(mask_len, needed as usize);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        mask_bytes.as_ptr(),
-                        alloc.mapped_ptr.as_ptr(),
-                        mask_len,
+
+                    // 1. Barrier MaskScratch <current_layout> →
+                    //    COLOR_ATTACHMENT_OPTIMAL. Source stage/access
+                    //    are conditional on the source layout (pre-task
+                    //    note 6): UNDEFINED → (TOP_OF_PIPE, NONE) — no
+                    //    prior op to wait on, LOAD_OP_CLEAR discards
+                    //    contents; SHADER_READ_ONLY_OPTIMAL →
+                    //    (FRAGMENT_SHADER, SHADER_SAMPLED_READ); else
+                    //    (ALL_COMMANDS, SHADER_SAMPLED_READ) defensive.
+                    let src_layout = mask_scratch.current_layout();
+                    let (src_stage, src_access) = match src_layout {
+                        ash::vk::ImageLayout::UNDEFINED => (
+                            ash::vk::PipelineStageFlags2::TOP_OF_PIPE,
+                            ash::vk::AccessFlags2::NONE,
+                        ),
+                        ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+                            ash::vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                            ash::vk::AccessFlags2::SHADER_SAMPLED_READ,
+                        ),
+                        _ => (
+                            ash::vk::PipelineStageFlags2::ALL_COMMANDS,
+                            ash::vk::AccessFlags2::SHADER_SAMPLED_READ,
+                        ),
+                    };
+                    let color_range = ash::vk::ImageSubresourceRange::default()
+                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1);
+                    let to_attach = [ash::vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(src_stage)
+                        .src_access_mask(src_access)
+                        .dst_stage_mask(ash::vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                        .dst_access_mask(ash::vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                        .old_layout(src_layout)
+                        .new_layout(ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .image(mask_image)
+                        .subresource_range(color_range)];
+                    let dep = ash::vk::DependencyInfo::default().image_memory_barriers(&to_attach);
+                    unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
+
+                    // 2. cmdBeginRendering with LOAD_OP_CLEAR. The
+                    //    render area is in MaskScratch-LOCAL coords
+                    //    starting at (0, 0) — gpu-trap T2 writes the
+                    //    coverage mask to the top-left of MaskScratch,
+                    //    matching the CPU `record_upload_r8` convention
+                    //    so the surrounding composite's mask sampling
+                    //    (mask_origin = -bbox_x, -bbox_y for full_dst
+                    //    or 0, 0 otherwise) lands at the right pixels.
+                    //    The fragment shader translates back to
+                    //    absolute coords by adding bbox_origin_pixel
+                    //    for the edge math.
+                    let bbox_render_area = ash::vk::Rect2D {
+                        offset: ash::vk::Offset2D { x: 0, y: 0 },
+                        extent: ash::vk::Extent2D {
+                            width: bbox_w,
+                            height: bbox_h,
+                        },
+                    };
+                    let clear = ash::vk::ClearValue {
+                        color: ash::vk::ClearColorValue {
+                            float32: [0.0, 0.0, 0.0, 0.0],
+                        },
+                    };
+                    let color_attachment = ash::vk::RenderingAttachmentInfo::default()
+                        .image_view(mask_view)
+                        .image_layout(ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .load_op(ash::vk::AttachmentLoadOp::CLEAR)
+                        .store_op(ash::vk::AttachmentStoreOp::STORE)
+                        .clear_value(clear);
+                    let color_attachments = [color_attachment];
+                    let rendering_info = ash::vk::RenderingInfo::default()
+                        .render_area(bbox_render_area)
+                        .layer_count(1)
+                        .color_attachments(&color_attachments);
+                    unsafe { vk.device.cmd_begin_rendering(cb, &rendering_info) };
+
+                    // 3. Bind pipeline + per-instance vertex buffer.
+                    unsafe {
+                        vk.device.cmd_bind_pipeline(
+                            cb,
+                            ash::vk::PipelineBindPoint::GRAPHICS,
+                            trap_pipe,
+                        );
+                        vk.device
+                            .cmd_bind_vertex_buffers(cb, 0, &[alloc.buffer], &[alloc.offset]);
+                    }
+
+                    // 4. Push constants.
+                    let pc = TrapDrawPushConsts {
+                        mask_extent: [mask_extent.width as f32, mask_extent.height as f32],
+                        bbox_origin_pixel: [bbox_x as f32, bbox_y as f32],
+                        bbox_size_pixel: [bbox_w as f32, bbox_h as f32],
+                        _pad: [0.0; 2],
+                    };
+                    unsafe {
+                        vk.device.cmd_push_constants(
+                            cb,
+                            trap_layout,
+                            ash::vk::ShaderStageFlags::VERTEX | ash::vk::ShaderStageFlags::FRAGMENT,
+                            0,
+                            pc.as_bytes(),
+                        );
+                    }
+
+                    // 5. Viewport + scissor (dynamic state).
+                    let viewport = ash::vk::Viewport {
+                        x: 0.0,
+                        y: 0.0,
+                        width: mask_extent.width as f32,
+                        height: mask_extent.height as f32,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    };
+                    unsafe {
+                        vk.device.cmd_set_viewport(cb, 0, &[viewport]);
+                        vk.device.cmd_set_scissor(cb, 0, &[bbox_render_area]);
+                    }
+
+                    // 6. Draw: 4 verts (unit quad via TRIANGLE_STRIP)
+                    //    × n_traps instances.
+                    unsafe { vk.device.cmd_draw(cb, 4, traps.len() as u32, 0, 0) };
+
+                    // 7. End rendering.
+                    unsafe { vk.device.cmd_end_rendering(cb) };
+
+                    // 8. Barrier COLOR_ATTACHMENT → SHADER_READ_ONLY
+                    //    for the upcoming composite that samples the
+                    //    mask at binding 1.
+                    let to_read = [ash::vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(ash::vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                        .src_access_mask(ash::vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                        .dst_stage_mask(ash::vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                        .dst_access_mask(ash::vk::AccessFlags2::SHADER_SAMPLED_READ)
+                        .old_layout(ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .new_layout(ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .image(mask_image)
+                        .subresource_range(color_range)];
+                    let dep = ash::vk::DependencyInfo::default().image_memory_barriers(&to_read);
+                    unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
+                    mask_scratch.set_current_layout(ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                } else {
+                    // Triangle (legacy CPU rasterize bridge) — T3
+                    // replaces this with a GPU draw.
+                    let mask_bytes = cpu_tri_mask
+                        .as_deref()
+                        .expect("Tris arm pre-rasterizes mask");
+                    let mask_w = bbox_w;
+                    let mask_h = bbox_h;
+                    let needed = u64::from(mask_w) * u64::from(mask_h);
+                    let alloc = match batch.upload_arena_mut().alloc(needed, 4) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            log::warn!(
+                                "vk render_traps: arena alloc {needed} bytes failed: {e:?} \
+                                 — mask upload will fail without poisoning batch"
+                            );
+                            arena_oom = true;
+                            return Ok(());
+                        }
+                    };
+                    // SAFETY: alloc.mapped_ptr is HOST_VISIBLE |
+                    // HOST_COHERENT mapped at alloc.buffer +
+                    // alloc.offset covering `needed` bytes; mask_bytes
+                    // length == needed because rasterize_triangles
+                    // returns `vec![0u8; (w * h) as usize]`. The
+                    // debug_assert below catches any future drift.
+                    debug_assert_eq!(mask_bytes.len(), needed as usize);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            mask_bytes.as_ptr(),
+                            alloc.mapped_ptr.as_ptr(),
+                            mask_bytes.len(),
+                        );
+                    }
+                    mask_scratch.record_upload_r8(
+                        vk,
+                        cb,
+                        alloc.buffer,
+                        alloc.offset,
+                        mask_w,
+                        mask_h,
                     );
                 }
-                mask_scratch.record_upload_r8(vk, cb, alloc.buffer, alloc.offset, mask_w, mask_h);
 
+                // ---- Composite: src ⊗ MaskScratch → dst (shared) ----
                 let descriptor_set = render_cache.allocate_descriptor_for_views_into(
                     batch.descriptor_arena_mut(),
                     src_view,

@@ -8,7 +8,7 @@
 
 layout(push_constant) uniform PushConsts {
     vec2 mask_extent;        // mask scratch image extent (pixels)
-    vec2 bbox_origin_pixel;  // top-left of bbox in mask pixel coords
+    vec2 bbox_origin_pixel;  // top-left of bbox in ABSOLUTE pixel coords
     vec2 bbox_size_pixel;    // bbox size in pixels
     vec2 _pad;
 } pc;
@@ -33,9 +33,20 @@ void main() {
     // TRIANGLE_STRIP. The vertex shader is invoked 4 times per
     // instance (gl_VertexIndex in [0..4)) and emits the four
     // corners of the bbox in NDC.
+    //
+    // gpu-trap T2: the quad emits at MaskScratch-LOCAL coords
+    // (0..bbox_w, 0..bbox_h), not absolute mask coords. This puts
+    // the GPU-rasterized mask data at MaskScratch[0..bbox_w,
+    // 0..bbox_h], matching the existing CPU-rasterize convention
+    // that `record_upload_r8` uses; the surrounding composite path
+    // then samples mask[(dst.x + mask_origin.x)] without changes.
+    // The fragment shader still computes coverage in ABSOLUTE coords
+    // (trap edges arrive in absolute pixel coords from the X
+    // protocol) — it adds `bbox_origin_pixel` to `gl_FragCoord` to
+    // recover that.
     vec2 quad = vec2(float(gl_VertexIndex & 1),
                      float((gl_VertexIndex >> 1) & 1));
-    vec2 pixel = pc.bbox_origin_pixel + quad * pc.bbox_size_pixel;
+    vec2 pixel = quad * pc.bbox_size_pixel;
     vec2 ndc = pixel / pc.mask_extent * 2.0 - 1.0;
     gl_Position = vec4(ndc, 0.0, 1.0);
 

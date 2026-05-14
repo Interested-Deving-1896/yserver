@@ -19,6 +19,19 @@ layout(location = 3) flat in vec2 left_p2;
 layout(location = 4) flat in vec2 right_p1;
 layout(location = 5) flat in vec2 right_p2;
 
+// gpu-trap T2: trap edges arrive in ABSOLUTE pixel coords from the
+// X protocol, but the quad emits at MaskScratch-LOCAL coords (so the
+// GPU writes mask data at (0..bbox_w, 0..bbox_h) matching the CPU
+// rasterize convention). `bbox_origin_pixel` is the absolute origin
+// of the bbox; the fragment adds it to `gl_FragCoord` to recover
+// absolute pixel position for the edge math.
+layout(push_constant) uniform PushConsts {
+    vec2 mask_extent;
+    vec2 bbox_origin_pixel;
+    vec2 bbox_size_pixel;
+    vec2 _pad;
+} pc;
+
 layout(location = 0) out float coverage;
 
 // Coverage contribution of one slanted edge (left or right). The
@@ -47,7 +60,10 @@ float edge_coverage_linear(vec2 p, vec2 a, vec2 b, float inside_side) {
 }
 
 void main() {
-    vec2 p = gl_FragCoord.xy; // pixel center (Vulkan default)
+    // gpu-trap T2: translate fragment-local coords to absolute pixel
+    // coords for the edge math (the quad emits in mask-local space
+    // to land mask data at MaskScratch[(0,0)..(bbox_w, bbox_h)]).
+    vec2 p = gl_FragCoord.xy + pc.bbox_origin_pixel;
 
     // Top edge: y >= top is inside (top is the upper Y, trap
     // extends downward). c_top = 1 when the pixel is fully below
