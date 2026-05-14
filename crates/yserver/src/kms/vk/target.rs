@@ -848,6 +848,95 @@ impl DrawableImage {
         self.current_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
     }
 
+    /// Construct a `DrawableImage` from a pooled entry. Skips
+    /// `initialize_clear` — the previous tenant's pixels are
+    /// invisible (caller marks `mark_full_damage`; the first paint
+    /// overwrites the whole image). The pool entry's
+    /// `current_layout` is preserved so the first upload's
+    /// pre-barrier transitions correctly.
+    ///
+    /// Lazy `mask_view` / `no_alpha_src_view` are set to `None`;
+    /// they'll be rebuilt on demand if needed.
+    #[allow(dead_code)] // wired by pixmap-pool T3 (allocate_pixmap_mirror).
+    pub fn new_from_pool(
+        vk: Arc<VkContext>,
+        entry: crate::kms::vk::pixmap_pool::PooledPixmapImage,
+        format: vk::Format,
+        extent: vk::Extent2D,
+    ) -> Self {
+        Self {
+            vk_image: entry.image,
+            vk_image_view: entry.view,
+            mask_view: None,
+            no_alpha_src_view: None,
+            extent,
+            format,
+            backing: ImageBacking::ServerOwned {
+                vk_memory: entry.memory,
+            },
+            damage: MirrorDamage::default(),
+            current_layout: entry.current_layout,
+            vk,
+        }
+    }
+
+    /// Decompose a `DrawableImage` into a pooled-pixmap-shape
+    /// (image, view, memory, current_layout) for return-to-pool.
+    /// Destroys the lazy views first (they're format-specific and
+    /// not pooled). Pool-bound Vulkan handles transfer to the
+    /// returned `PooledPixmapImage`; the rest of `self` (notably
+    /// the `Arc<VkContext>`) drops normally.
+    ///
+    /// **Important — does NOT use `mem::forget`.** Codex P1 from
+    /// plan review round 1: forgetting `self` would leak the
+    /// `Arc<VkContext>` strong-count, eventually preventing
+    /// VkContext::Drop's device wait. Instead, the pool-bound
+    /// handles are swapped with `vk::*::null()` so the normal
+    /// `Drop for DrawableImage` runs but sees null handles —
+    /// Vulkan's spec permits destroying null handles as a no-op
+    /// (every `destroy_*` and `free_memory` call), so Drop becomes
+    /// a no-op on the Vulkan side. The `Arc<VkContext>` and other
+    /// non-handle fields drop normally.
+    ///
+    /// Panics if `backing` is `Imported` (DRI3 dma-buf imports
+    /// don't go through the pool; caller must check).
+    #[allow(dead_code)] // wired by pixmap-pool T2 (free_pixmap).
+    pub fn into_pool_entry(mut self) -> crate::kms::vk::pixmap_pool::PooledPixmapImage {
+        let ImageBacking::ServerOwned { vk_memory } = self.backing else {
+            panic!("DrawableImage::into_pool_entry: Imported backing cannot be pooled");
+        };
+        // Destroy lazy format-specific views (not pooled).
+        let mask_view = self.mask_view.take();
+        let no_alpha = self.no_alpha_src_view.take();
+        unsafe {
+            if let Some(v) = mask_view {
+                self.vk.device.destroy_image_view(v, None);
+            }
+            if let Some(v) = no_alpha {
+                self.vk.device.destroy_image_view(v, None);
+            }
+        }
+        // Swap pool-bound handles out, leaving nulls in their
+        // place so self's Drop is a no-op for these handles.
+        let image = std::mem::replace(&mut self.vk_image, vk::Image::null());
+        let view = std::mem::replace(&mut self.vk_image_view, vk::ImageView::null());
+        // Replace backing memory with null so Drop's free_memory
+        // is also a no-op.
+        self.backing = ImageBacking::ServerOwned {
+            vk_memory: vk::DeviceMemory::null(),
+        };
+
+        // self drops here: Vk handle destruction calls are no-ops
+        // on null; vk Arc drops normally; damage / layout fields
+        // drop naturally.
+        crate::kms::vk::pixmap_pool::PooledPixmapImage {
+            image,
+            view,
+            memory: vk_memory,
+            current_layout: self.current_layout,
+        }
+    }
+
     /// Bytes-per-pixel for the image's format. Only the formats this
     /// module actually allocates are recognised.
     pub fn bytes_per_pixel(&self) -> u32 {

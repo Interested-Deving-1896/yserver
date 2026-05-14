@@ -19,6 +19,7 @@ pub mod mask_scratch;
 pub mod memory;
 pub mod ops;
 pub mod pipeline;
+pub mod pixmap_pool;
 pub mod render_pipeline;
 pub mod scanout;
 pub mod sync;
