@@ -745,6 +745,7 @@ impl DrawableImage {
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
             unsafe {
                 crate::vk_count!(queue_submit2);
+                crate::vk_count!(submit_other);
                 device.queue_submit2(self.vk.graphics_queue, &submit, vk::Fence::null())?;
                 device.queue_wait_idle(self.vk.graphics_queue)?;
             }

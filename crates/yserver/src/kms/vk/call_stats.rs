@@ -49,6 +49,36 @@ pub struct VkCallStats {
     pub queue_submit2: AtomicU64,
     pub begin_command_buffer: AtomicU64,
     pub end_command_buffer: AtomicU64,
+
+    // Per-source submit attribution (the per-second emit subdivides
+    // the otherwise-opaque queue_submit2=N count). Sum of all submit_*
+    // counters should approximately equal queue_submit2 (within ~1 of
+    // noise from samples crossing the second boundary).
+    /// flush_if_needed(VisibleComposite) — top of composite_and_flip.
+    /// Expected ~ refresh rate (60 Hz typical).
+    pub submit_visible_composite: AtomicU64,
+    /// flush_if_needed(Readback). Synchronous; CPU needs pixels back.
+    pub submit_readback: AtomicU64,
+    /// flush_if_needed(ExternalSync). DRI3 Present fence, SYNC ext.
+    pub submit_external_sync: AtomicU64,
+    /// flush_if_needed(ProtocolBarrier). Drawable destruction +
+    /// pre-resize-flush gates + Phase-3B run_legacy_paint_op wrapper.
+    pub submit_protocol_barrier: AtomicU64,
+    pub submit_size_limit: AtomicU64,
+    pub submit_latency_limit: AtomicU64,
+    pub submit_shutdown: AtomicU64,
+    /// run_one_shot_op-driven submits. Each gradient creation,
+    /// glyph atlas intern, readback recorder, scanout dump, and
+    /// legacy paint-op funnels here. Expected hot if GTK creates
+    /// many gradients / glyphs per frame.
+    pub submit_one_shot: AtomicU64,
+    /// compositor's record_and_present_composite submit. Drives
+    /// the actual scanout draw + pageflip. Expected ~ refresh rate.
+    pub submit_compositor: AtomicU64,
+    /// Fallback bucket for any submit that doesn't get categorised
+    /// above. Should be near-zero; any non-zero is a missed
+    /// instrumentation site.
+    pub submit_other: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -69,6 +99,16 @@ pub struct VkCallStatsSnapshot {
     pub queue_submit2: u64,
     pub begin_command_buffer: u64,
     pub end_command_buffer: u64,
+    pub submit_visible_composite: u64,
+    pub submit_readback: u64,
+    pub submit_external_sync: u64,
+    pub submit_protocol_barrier: u64,
+    pub submit_size_limit: u64,
+    pub submit_latency_limit: u64,
+    pub submit_shutdown: u64,
+    pub submit_one_shot: u64,
+    pub submit_compositor: u64,
+    pub submit_other: u64,
 }
 
 pub static VK_CALLS: VkCallStats = VkCallStats {
@@ -88,6 +128,16 @@ pub static VK_CALLS: VkCallStats = VkCallStats {
     queue_submit2: AtomicU64::new(0),
     begin_command_buffer: AtomicU64::new(0),
     end_command_buffer: AtomicU64::new(0),
+    submit_visible_composite: AtomicU64::new(0),
+    submit_readback: AtomicU64::new(0),
+    submit_external_sync: AtomicU64::new(0),
+    submit_protocol_barrier: AtomicU64::new(0),
+    submit_size_limit: AtomicU64::new(0),
+    submit_latency_limit: AtomicU64::new(0),
+    submit_shutdown: AtomicU64::new(0),
+    submit_one_shot: AtomicU64::new(0),
+    submit_compositor: AtomicU64::new(0),
+    submit_other: AtomicU64::new(0),
 };
 
 impl VkCallStats {
@@ -112,6 +162,16 @@ impl VkCallStats {
             queue_submit2: self.queue_submit2.swap(0, Ordering::Relaxed),
             begin_command_buffer: self.begin_command_buffer.swap(0, Ordering::Relaxed),
             end_command_buffer: self.end_command_buffer.swap(0, Ordering::Relaxed),
+            submit_visible_composite: self.submit_visible_composite.swap(0, Ordering::Relaxed),
+            submit_readback: self.submit_readback.swap(0, Ordering::Relaxed),
+            submit_external_sync: self.submit_external_sync.swap(0, Ordering::Relaxed),
+            submit_protocol_barrier: self.submit_protocol_barrier.swap(0, Ordering::Relaxed),
+            submit_size_limit: self.submit_size_limit.swap(0, Ordering::Relaxed),
+            submit_latency_limit: self.submit_latency_limit.swap(0, Ordering::Relaxed),
+            submit_shutdown: self.submit_shutdown.swap(0, Ordering::Relaxed),
+            submit_one_shot: self.submit_one_shot.swap(0, Ordering::Relaxed),
+            submit_compositor: self.submit_compositor.swap(0, Ordering::Relaxed),
+            submit_other: self.submit_other.swap(0, Ordering::Relaxed),
         }
     }
 }

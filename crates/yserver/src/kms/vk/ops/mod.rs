@@ -158,6 +158,7 @@ where
         let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
         let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
         crate::vk_count!(queue_submit2);
+        crate::vk_count!(submit_one_shot);
         if let Err(e) = unsafe { vk.device.queue_submit2(vk.graphics_queue, &submit, fence) } {
             unsafe { vk.device.destroy_fence(fence, None) };
             return Err(e);

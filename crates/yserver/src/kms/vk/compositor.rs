@@ -191,6 +191,8 @@ pub fn record_and_present_composite(
         .command_buffer_infos(&cb_info)
         .signal_semaphore_infos(&sig_info)];
     unsafe {
+        crate::vk_count!(queue_submit2);
+        crate::vk_count!(submit_compositor);
         vk.device
             .queue_submit2(vk.graphics_queue, &submit, vk::Fence::null())?;
     }

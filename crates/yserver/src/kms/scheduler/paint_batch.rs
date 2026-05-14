@@ -440,6 +440,7 @@ impl PaintBatch {
         let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
 
         // Path 1b: submit fails. CB never queued; safe to free + retire.
+        crate::vk_count!(queue_submit2);
         if let Err(e) = unsafe {
             self.vk
                 .device
@@ -544,6 +545,7 @@ impl PaintBatch {
         let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
         let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
 
+        crate::vk_count!(queue_submit2);
         if let Err(e) = unsafe {
             self.vk
                 .device

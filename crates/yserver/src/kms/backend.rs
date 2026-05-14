@@ -1694,6 +1694,49 @@ impl KmsBackend {
             };
         }
         log::trace!("flush_if_needed: reason={reason:?}");
+        // Per-source submit attribution: tag this flush by reason.
+        // The submit counter under that name increments iff
+        // close_and_submit{,_async} actually issues a queue_submit2
+        // (the Idle / Poisoned short-circuits do not submit, so this
+        // pre-attribution slightly over-counts; if that becomes a
+        // problem move the increment inside the submit path).
+        match reason {
+            BatchFlushReason::VisibleComposite => {
+                crate::kms::vk::call_stats::VK_CALLS
+                    .submit_visible_composite
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            BatchFlushReason::Readback => {
+                crate::kms::vk::call_stats::VK_CALLS
+                    .submit_readback
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            BatchFlushReason::ExternalSync => {
+                crate::kms::vk::call_stats::VK_CALLS
+                    .submit_external_sync
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            BatchFlushReason::ProtocolBarrier => {
+                crate::kms::vk::call_stats::VK_CALLS
+                    .submit_protocol_barrier
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            BatchFlushReason::SizeLimit => {
+                crate::kms::vk::call_stats::VK_CALLS
+                    .submit_size_limit
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            BatchFlushReason::LatencyLimit => {
+                crate::kms::vk::call_stats::VK_CALLS
+                    .submit_latency_limit
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            BatchFlushReason::Shutdown => {
+                crate::kms::vk::call_stats::VK_CALLS
+                    .submit_shutdown
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let dirty_outputs: Vec<usize> = (0..self.outputs.len())
             .filter(|&i| self.outputs[i].damage.needs_composite())
             .collect();

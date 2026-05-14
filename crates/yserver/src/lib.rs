@@ -67,6 +67,25 @@ pub fn run() -> io::Result<()> {
                     s.begin_command_buffer,
                     s.end_command_buffer,
                 );
+                // Submit attribution: which call sites drive
+                // queue_submit2. Sum should approximately equal
+                // queue_submit2 above (off by ≤ Idle-flush count from
+                // the flush_if_needed pre-attribution).
+                log::info!(
+                    "vk submit src [1s]: vis_composite={} readback={} ext_sync={} \
+                     protocol_barrier={} size_limit={} latency_limit={} shutdown={} \
+                     one_shot={} compositor={} other={}",
+                    s.submit_visible_composite,
+                    s.submit_readback,
+                    s.submit_external_sync,
+                    s.submit_protocol_barrier,
+                    s.submit_size_limit,
+                    s.submit_latency_limit,
+                    s.submit_shutdown,
+                    s.submit_one_shot,
+                    s.submit_compositor,
+                    s.submit_other,
+                );
             }
         });
     }
