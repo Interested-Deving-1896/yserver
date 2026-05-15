@@ -1,9 +1,4 @@
-use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
-    io,
-    sync::Arc,
-};
+use std::{cell::RefCell, collections::HashMap, io, sync::Arc};
 
 use crate::kms::cpu_types::{PictTransform, Rectangle16, Repeat};
 use yserver_core::{
@@ -17,37 +12,16 @@ use yserver_core::{
     },
 };
 use yserver_protocol::x11::{
-    CharInfo as ProtocolCharInfo, ClipRectangles, FontMetrics, RENDER_FMT_A1, RENDER_FMT_A8,
-    RENDER_FMT_ARGB32, ResourceId, xfixes,
+    ClipRectangles, FontMetrics, RENDER_FMT_A1, RENDER_FMT_A8, RENDER_FMT_ARGB32, ResourceId,
+    xfixes,
 };
 
-use crate::drm;
-
-/// Newtype wrapper around `freetype::Face`.
-/// `repr(transparent)` is required so `RefCell::as_ptr` can be safely cast
-/// from `*mut FreetypeFace` to `*mut freetype::Face` in `render_text_string`.
-/// SAFETY: All access is on the single-threaded core thread.
-/// Single-threaded context makes this sound. `Face` contains raw pointers
-/// and `Rc<Vec<u8>>` by default, both `!Send`.
-#[repr(transparent)]
-pub struct FreetypeFace(#[allow(dead_code)] pub freetype::Face);
-unsafe impl Send for FreetypeFace {}
-
-/// Newtype wrapper around `xkb::Context`.
-/// SAFETY: All access is on the single-threaded core thread.
-/// The raw pointer in xkbcommon is not `Send`, but the C library is thread-safe.
-pub struct XkbContext(pub xkbcommon::xkb::Context);
-unsafe impl Send for XkbContext {}
-
-/// Newtype wrapper around `xkb::Keymap`.
-/// SAFETY: All access is on the single-threaded core thread.
-pub struct XkbKeymap(pub xkbcommon::xkb::Keymap);
-unsafe impl Send for XkbKeymap {}
-
-/// Newtype wrapper around `xkb::State`.
-/// SAFETY: All access is on the single-threaded core thread.
-pub struct XkbState(pub xkbcommon::xkb::State);
-unsafe impl Send for XkbState {}
+use crate::{
+    drm,
+    kms::core::{
+        AliasEntry, FontState, FreetypeFace, GlyphSetFormat, GlyphSetState, KmsCore, StoredGlyph,
+    },
+};
 
 /// Owning snapshot of a drawable's mirror pixels, produced by
 /// [`KmsBackend::read_mirror_pixels`]. Tightly packed (no row pad),
@@ -58,95 +32,6 @@ struct MirrorReadback {
     height: u32,
     bytes_per_pixel: u32,
     bytes: Vec<u8>,
-}
-
-/// One entry in the [`AliasRegistry`]: tracks the refcount on a
-/// `Composite::NameWindowPixmap` backing pixmap, plus the
-/// width/height/depth snapshot the alias was created against.
-///
-/// Refcount sources, per the L2 spec:
-///   1. Active redirect on the matching window
-///      (`Window.redirected_backing`).
-///   2. Each live `NameWindowPixmap` alias on this backing.
-/// The backing drops when refcount reaches zero — Unredirect
-/// without aliases (1 → 0), DestroyWindow with surviving aliases
-/// (1 → 0 from owner; aliases keep it alive), final FreePixmap of
-/// the last alias (after Unredirect or Destroy).
-#[allow(dead_code, reason = "width/height/depth consumed by B.6d on resize")]
-#[derive(Clone, Copy, Debug)]
-pub struct AliasEntry {
-    pub refcount: u32,
-    pub width: u16,
-    pub height: u16,
-    pub depth: u8,
-}
-
-/// Refcounted backing-pixmap registry on the KMS backend. Keyed by
-/// the backing's `host_xid` (the `PixmapHandle` the protocol layer
-/// sees through `Window.redirected_backing.host_pixmap`).
-/// L2 plan B.3.
-#[derive(Default, Debug)]
-pub struct AliasRegistry {
-    entries: std::collections::HashMap<u32, AliasEntry>,
-}
-
-#[allow(
-    dead_code,
-    reason = "get/decref/len/is_empty consumed by B.6c (Unredirect teardown) + B.10c (overlay-demote quiescence); B.6d uses the width/height fields for resize check"
-)]
-impl AliasRegistry {
-    /// Add the initial entry for a backing pixmap. Caller seeds the
-    /// `refcount` (typically 1 for the redirect-activation hold).
-    pub fn insert(&mut self, host_pixmap: PixmapHandle, entry: AliasEntry) {
-        self.entries.insert(host_pixmap.as_raw(), entry);
-    }
-
-    /// Refcount-only lookup; returns `None` if the backing isn't
-    /// tracked (e.g. the redirect was torn down).
-    #[must_use]
-    pub fn get(&self, host_pixmap: PixmapHandle) -> Option<&AliasEntry> {
-        self.entries.get(&host_pixmap.as_raw())
-    }
-
-    /// Bump the refcount. Silently no-ops on an unknown handle — the
-    /// caller is expected to have inserted the entry first
-    /// (`Composite::NameWindowPixmap`'s ordering guarantees that).
-    pub fn incref(&mut self, host_pixmap: PixmapHandle) {
-        if let Some(e) = self.entries.get_mut(&host_pixmap.as_raw()) {
-            e.refcount = e.refcount.saturating_add(1);
-        }
-    }
-
-    /// Drop one reference. Returns `true` if the entry was removed
-    /// (refcount reached zero). Returns `false` on an unknown handle
-    /// or when refs remain — caller uses the return value to decide
-    /// whether to release the underlying Vulkan image.
-    pub fn decref(&mut self, host_pixmap: PixmapHandle) -> bool {
-        let key = host_pixmap.as_raw();
-        let Some(entry) = self.entries.get_mut(&key) else {
-            return false;
-        };
-        entry.refcount = entry.refcount.saturating_sub(1);
-        if entry.refcount == 0 {
-            self.entries.remove(&key);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Number of tracked backings. Mostly for test introspection.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// True iff no backings are tracked. Used by overlay-demotion
-    /// quiescence checks (B.10c).
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 /// Axis-aligned overlap test for two rects of the same size in
@@ -720,27 +605,20 @@ pub struct KmsBackend {
     fb_w: u16,
     fb_h: u16,
 
-    // Window tracking: nested window resource ID -> local window state
+    // Shared protocol-bookkeeping state. Embeds the v1+v2 cross-cutting
+    // fields (XID maps, window metadata, fonts, SHAPE regions, COMPOSITE
+    // alias registry, XKB state, etc.). See `crate::kms::core` for the
+    // full inventory. Per Stage 1a, this is a behavior-preserving move
+    // from KmsBackend's previous flat layout; the v2 sibling
+    // KmsBackendV2 (Stage 1b) embeds the same struct so protocol state
+    // doesn't get duplicated across backends.
+    pub(crate) core: KmsCore,
+
+    // Window tracking: nested window resource ID -> local window state.
+    // Stays on KmsBackend (not in KmsCore) because `WindowState`
+    // currently embeds `vk_mirror: Option<DrawableImage>`. Splits in
+    // Stage 2 when `DrawableStore` exists to host the storage half.
     windows: HashMap<u32, WindowState>,
-    next_host_xid: u32, // Monotonic counter, starts at 0x00400000
-
-    // Stacking order for top-level windows (direct children of the root
-    // container). Bottom-to-top: the last entry is on top. Updated by
-    // create / destroy / reparent / configure_subwindow with stack_mode.
-    // The compositor iterates this list in order; HashMap iteration is
-    // unordered and doesn't preserve X11 stacking semantics.
-    top_level_order: Vec<u32>,
-
-    // Backend trait state
-    window_id: u32,
-    root_visual_xid: u32,
-    xid_map: HostXidMap,
-
-    // xkbcommon
-    #[allow(dead_code)]
-    xkb_context: XkbContext,
-    xkb_keymap: XkbKeymap,
-    xkb_state: XkbState,
 
     // libinput
     input_ctx: Option<crate::input::SendContext>,
@@ -897,22 +775,15 @@ pub struct KmsBackend {
     // whether the kernel ever told us the very first flip latched.
     pub(crate) first_pageflip_logged: Vec<bool>,
 
-    // Fonts (freetype)
-    font_loader: FontLoader,
-    fonts: HashMap<u32, FontState>,
-
-    // Pixman pixmaps (non-window drawables)
+    // Pixman pixmaps (non-window drawables). Stays on KmsBackend
+    // because `PixmapState.vk_mirror: Option<DrawableImage>` couples
+    // it to GPU storage. Splits in Stage 2.
     pixmaps: HashMap<u32, PixmapState>,
 
-    // Background state (root)
-    bg_pixel: Option<u32>,
-    bg_pixmap: Option<PixmapHandle>,
-
-    // Software cursor
-    cursor_x: f32,
-    cursor_y: f32,
+    // Software cursor mirror map. Stays on KmsBackend because
+    // `CursorState.vk_mirror: Option<DrawableImage>` couples it to
+    // GPU storage. Splits in Stage 2.
     cursors: HashMap<u32, CursorState>,
-    active_cursor: Option<u32>,
 
     // DRM hardware cursor plane (Phase 4.2 perf). When `Some` the
     // composite pass skips the Vulkan cursor quad and the kernel
@@ -930,74 +801,16 @@ pub struct KmsBackend {
     /// `move_cursor` offsets.
     pub(crate) hw_cursor_hotspot: (u16, u16),
 
-    // X11 KeyButMask bits for currently-held mouse buttons (Button1Mask
-    // = 0x100 .. Button5Mask = 0x1000). OR'd into the `state` field of
-    // MotionNotify (and ButtonRelease) events so WMs can detect drag
-    // gestures. Without this, motion-during-press looks like idle
-    // motion to fvwm and Move-or-Raise never starts a Move.
-    button_mask: u16,
-
-    // Top-level host_xid the cursor was last over. Drives synthetic
-    // EnterNotify / LeaveNotify generation: when this changes between
-    // motion events we emit Leave on the old window and Enter on the new.
-    // ButtonPress / ButtonRelease additionally fire Enter(NotifyGrab) /
-    // Leave(NotifyUngrab) for implicit-pointer-grab semantics — toolkits
-    // (e16's button widgets in particular) won't fire click actions
-    // without these crossing transitions around the press.
-    prev_pointer_window: Option<u32>,
-
-    // Pointer events generated by `process_one_input_event` are buffered
-    // here instead of being dispatched directly through `event_sink`.
-    // The input thread drains this buffer AFTER releasing the backend
-    // mutex (see `drain_pending_pointer_events`) and only then forwards
-    // events to the sink. This is mandatory: the sink calls
-    // `pointer_event_fanout` which acquires `server.lock()`, while
-    // request handlers regularly hold `server.lock()` and reach for the
-    // backend mutex — a server→backend ordering on one side and a
-    // backend→server ordering on the other deadlocks under load. Phase
-    // 6.7's Enter(NotifyGrab) / Leave(NotifyUngrab) crossings tripled
-    // the per-motion fanout count, exposing the latent race as a
-    // routinely-reproducible freeze under e16.
-    pending_pointer_events: Vec<HostPointerEvent>,
-
-    // Current font for text rendering
-    current_font: Option<u32>,
-
-    // Current GC draw state (default GC values).
-    current_function: GcFunction,
-    current_foreground: u32,
-    current_background: u32,
-    current_fill: FillState,
-    current_clip: ClipState,
-
-    // RENDER picture tracking
+    // RENDER picture tracking. Stays on KmsBackend because
+    // `PictureState::Gradient` embeds GPU state. Splits when Stage 2
+    // separates picture records from sampler/pipeline state.
     pictures: HashMap<u32, PictureState>,
 
     // Vk mirrors rescued from freed pixmaps still referenced by live
     // pictures. Keyed by picture host_xid. Cleaned up by
     // render_free_picture (drops the DrawableImage, which releases its
-    // VkImage and allocation).
+    // VkImage and allocation). Stays on KmsBackend (Vk-typed values).
     picture_rescued_images: HashMap<u32, crate::kms::vk::target::DrawableImage>,
-
-    // RENDER glyphset tracking
-    glyphsets: HashMap<u32, GlyphSetState>,
-
-    // SHAPE extension: per-window shape regions keyed by host XID.
-    // None entry = no shape (full rectangle). Some(vec![]) = empty region.
-    shape_bounding: HashMap<u32, Vec<xfixes::RegionRect>>, // kind=0
-    shape_clip: HashMap<u32, Vec<xfixes::RegionRect>>,     // kind=1
-    shape_input: HashMap<u32, Vec<xfixes::RegionRect>>,    // kind=2
-
-    /// Refcounted lifecycle for `Composite::NameWindowPixmap`
-    /// backings (L2 plan B.3). Entries get added by `RedirectWindow`
-    /// activation (B.6a, refcount=1) and bumped/decremented by
-    /// each alias / Unredirect / DestroyWindow / FreePixmap.
-    pub(crate) alias_registry: AliasRegistry,
-    /// `host_window → backing_pixmap_handle` map populated by
-    /// `allocate_redirected_backing`; `name_window_pixmap` looks
-    /// up the matching backing here. Cleared by B.6c when a
-    /// redirect is torn down.
-    pub(crate) host_window_to_backing: HashMap<u32, PixmapHandle>,
 }
 
 /// State for a RENDER picture on the KMS backend.
@@ -1057,44 +870,6 @@ fn default_drawable_picture(host_xid: u32) -> PictureState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GlyphSetFormat {
-    A8,
-    A1,
-    /// ARGB32 source glyphs (Cairo's default for modern GTK3 themes
-    /// using subpixel / colour-emoji rendering). On `AddGlyphs` we
-    /// extract the alpha channel into a densely-packed A8 buffer and
-    /// store the glyph as if it had been uploaded in A8 format — the
-    /// downstream atlas + text pipeline path is identical from there
-    /// on. Subpixel coverage detail and emoji colour are lost; glyph
-    /// shape is preserved, which is enough for grayscale text.
-    Argb32,
-    Other,
-}
-
-struct StoredGlyph {
-    width: u16,
-    height: u16,
-    /// RENDER wire field: top-left of bitmap relative to glyph origin.
-    /// This is the *negative* of FreeType's bitmap_left.
-    /// Draw at pen_x - x, pen_y - y.
-    x: i16,
-    y: i16,
-    x_off: i16,
-    /// Vertical pen advance. Parsed from wire for fidelity but unused —
-    /// horizontal-text rendering only advances the x pen between glyphs.
-    #[allow(dead_code)]
-    y_off: i16,
-    /// Row-major A8 bytes, densely packed (no per-row padding).
-    pixels: Vec<u8>,
-    format: GlyphSetFormat,
-}
-
-pub(super) struct GlyphSetState {
-    format: GlyphSetFormat,
-    glyphs: HashMap<u32, StoredGlyph>,
-}
-
 struct CursorState {
     /// Cursor extent in pixels. Mirrors `vk_mirror`'s extent when the
     /// mirror is present; stored separately so the composite scene
@@ -1141,14 +916,6 @@ struct WindowState {
     vk_mirror: Option<crate::kms::vk::target::DrawableImage>,
 }
 
-struct FontState {
-    #[allow(dead_code)]
-    handle: u32,
-    face: RefCell<FreetypeFace>,
-    metrics: FontMetrics,
-    char_info_cache: HashMap<char, ProtocolCharInfo>,
-}
-
 struct PixmapState {
     #[allow(dead_code)]
     handle: u32,
@@ -1163,204 +930,14 @@ struct PixmapState {
     vk_mirror: Option<crate::kms::vk::target::DrawableImage>,
 }
 
-/// Resolves X11 font names (aliases like `fixed`, XLFDs like
-/// `-adobe-helvetica-bold-r-*-*-12-*-...`, or family names) to a filesystem
-/// path via fontconfig, then opens the file with FreeType.
-///
-/// `catalog` is the list of XLFDs we advertise via ListFonts /
-/// ListFontsWithInfo. It is built once at init time by enumerating
-/// fontconfig's installed-font set and synthesising one XLFD per
-/// (face × pixel-size × charset) combination. Every entry resolves
-/// back through `open_font`, so the LFWI metrics path can return real
-/// FreeType metrics for any name we hand out.
-struct FontLoader {
-    library: freetype::Library,
-    fc: fontconfig::Fontconfig,
-    catalog: Vec<String>,
-}
-
-impl FontLoader {
-    fn new() -> io::Result<Self> {
-        let fc = fontconfig::Fontconfig::new()
-            .ok_or_else(|| io::Error::other("fontconfig init failed"))?;
-        let catalog = build_font_catalog(&fc);
-        log::info!("font catalog: {} XLFDs from fontconfig", catalog.len());
-        Ok(Self {
-            library: freetype::Library::init()
-                .map_err(|e| io::Error::other(format!("freetype init failed: {e:?}")))?,
-            fc,
-            catalog,
-        })
-    }
-
-    fn is_xlfd_pattern(name: &str) -> bool {
-        name.starts_with('-')
-    }
-
-    /// Pull (family, style, pixel_size) hints out of an XLFD pattern.
-    /// XLFD field indices after splitting on '-' (leading '-' produces an
-    /// empty 0th element):
-    ///   1=foundry 2=family 3=weight 4=slant 5=setwidth 6=addstyle
-    ///   7=pixelsize 8=pointsize 9=resx 10=resy 11=spacing 12=avgwidth
-    /// "*" or empty fields are treated as wildcards.
-    fn parse_xlfd(name: &str) -> (Option<String>, Option<String>, Option<u32>) {
-        let parts: Vec<&str> = name.split('-').collect();
-        let take = |i: usize| -> Option<String> {
-            parts
-                .get(i)
-                .filter(|s| !s.is_empty() && **s != "*")
-                .map(|s| (*s).to_string())
-        };
-        let family = take(2);
-        let weight = take(3);
-        let slant = take(4);
-        let style = match (weight.as_deref(), slant.as_deref()) {
-            (None, Some("i" | "o")) => Some("Italic".to_string()),
-            (Some(w), Some("i" | "o")) => Some(format!("{w} Italic")),
-            (Some(w), _) => Some(w.to_string()),
-            (None, _) => None,
-        };
-        let px = parts
-            .get(7)
-            .and_then(|s| s.parse::<u32>().ok())
-            .filter(|&s| s > 0);
-        (family, style, px)
-    }
-
-    fn open_font(
-        &self,
-        name: &str,
-    ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
-        // Resolve the X11 font name to a file path via fontconfig. We can't
-        // rely on the high-level `Fontconfig::find`: when the requested family
-        // doesn't exist, fontconfig falls back to the *system default* (often
-        // a proportional sans-serif), which makes xterm/wmaker render with
-        // wrong metrics. Build the pattern ourselves and chain "monospace" as
-        // a secondary family — fontconfig prefers the first listed family but
-        // falls through the chain before reaching its system default.
-        let (family, style, xlfd_px) = if Self::is_xlfd_pattern(name) {
-            Self::parse_xlfd(name)
-        } else {
-            (Some(name.to_string()), None, None)
-        };
-        let query_family = family.as_deref().unwrap_or("monospace");
-
-        let cfamily = std::ffi::CString::new(query_family)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "font name has nul"))?;
-
-        let mut pat = fontconfig::Pattern::new(&self.fc);
-        pat.add_string(fontconfig::FC_FAMILY, &cfamily);
-        if query_family != "monospace" {
-            pat.add_string(fontconfig::FC_FAMILY, c"monospace");
-        }
-        let cstyle_storage;
-        if let Some(style) = style.as_deref() {
-            cstyle_storage = std::ffi::CString::new(style)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "font style has nul"))?;
-            pat.add_string(fontconfig::FC_STYLE, &cstyle_storage);
-        }
-        let matched = pat.font_match();
-        let path = matched.filename().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("font not found: {name}"))
-        })?;
-        let face_index: isize = matched.face_index().unwrap_or(0) as isize;
-        let face = self
-            .library
-            .new_face(path, face_index)
-            .map_err(|e| io::Error::other(format!("freetype new_face({path}) failed: {e:?}")))?;
-
-        // Honour XLFD PIXEL_SIZE if specified; otherwise default to 12pt @ 96dpi.
-        if let Some(px) = xlfd_px {
-            let _ = face.set_pixel_sizes(0, px);
-        } else {
-            let _ = face.set_char_size(12 << 6, 12 << 6, 96, 96);
-        }
-        let (metrics, char_cache) = compute_font_metrics(&face);
-        Ok((face, metrics, char_cache))
-    }
-}
-
-fn compute_char_info(face: &freetype::Face, ch: char) -> ProtocolCharInfo {
-    let glyph_idx = ch as usize;
-    let _ = face.load_char(glyph_idx, freetype::face::LoadFlag::RENDER);
-    let glyph = face.glyph();
-    let bitmap = glyph.bitmap();
-    let metrics = glyph.metrics();
-
-    let width = (metrics.horiAdvance >> 6) as i16;
-    let left_side_bearing = (metrics.horiBearingX >> 6) as i16;
-    let right_side_bearing = left_side_bearing + bitmap.width() as i16;
-    let ascent = (metrics.horiBearingY >> 6) as i16;
-    let descent = (bitmap.rows() as i16) - ascent;
-
-    ProtocolCharInfo {
-        left_side_bearing,
-        right_side_bearing,
-        character_width: width,
-        ascent,
-        descent,
-        attributes: 0,
-    }
-}
-
-fn compute_font_metrics(face: &freetype::Face) -> (FontMetrics, HashMap<char, ProtocolCharInfo>) {
-    let mut char_info_cache = HashMap::new();
-    // min_bounds tracks the per-glyph minimum across each metric, so each
-    // field starts at its type's MAX so the first observation overwrites it.
-    let mut min_bounds = ProtocolCharInfo {
-        left_side_bearing: i16::MAX,
-        right_side_bearing: i16::MAX,
-        character_width: i16::MAX,
-        ascent: i16::MAX,
-        descent: i16::MAX,
-        attributes: 0,
-    };
-    // max_bounds tracks the per-glyph maximum, so each field starts at MIN.
-    let mut max_bounds = ProtocolCharInfo {
-        left_side_bearing: i16::MIN,
-        right_side_bearing: i16::MIN,
-        character_width: i16::MIN,
-        ascent: i16::MIN,
-        descent: i16::MIN,
-        attributes: 0,
-    };
-
-    for code in 0x20u32..=0x7E {
-        let ch = char::from_u32(code).unwrap();
-        let ci = compute_char_info(face, ch);
-        min_bounds.left_side_bearing = min_bounds.left_side_bearing.min(ci.left_side_bearing);
-        max_bounds.left_side_bearing = max_bounds.left_side_bearing.max(ci.left_side_bearing);
-        min_bounds.right_side_bearing = min_bounds.right_side_bearing.min(ci.right_side_bearing);
-        max_bounds.right_side_bearing = max_bounds.right_side_bearing.max(ci.right_side_bearing);
-        min_bounds.character_width = min_bounds.character_width.min(ci.character_width);
-        max_bounds.character_width = max_bounds.character_width.max(ci.character_width);
-        min_bounds.ascent = min_bounds.ascent.min(ci.ascent);
-        max_bounds.ascent = max_bounds.ascent.max(ci.ascent);
-        min_bounds.descent = min_bounds.descent.min(ci.descent);
-        max_bounds.descent = max_bounds.descent.max(ci.descent);
-        char_info_cache.insert(ch, ci);
-    }
-
-    let font_ascent = max_bounds.ascent;
-    let font_descent = max_bounds.descent;
-
-    let metrics = FontMetrics {
-        min_bounds,
-        max_bounds,
-        min_char_or_byte2: 0x20,
-        max_char_or_byte2: 0x7E,
-        default_char: 0x20,
-        draw_direction: 0, // LeftToRight
-        min_byte1: 0,
-        max_byte1: 0,
-        all_chars_exist: true,
-        font_ascent,
-        font_descent,
-        properties: Vec::new(),
-        char_infos: char_info_cache.values().cloned().collect(),
-    };
-    (metrics, char_info_cache)
-}
+// FontLoader, FontState, compute_char_info, compute_font_metrics,
+// xlfd_weight / xlfd_slant / xlfd_spacing / sanitize_xlfd_field, and
+// build_font_catalog moved to `crate::kms::core` in Stage 1a (per
+// rendering-model-v2 spec § "KmsCore scope — narrowly drawn": fonts
+// are protocol-domain state). What previously lived here is now
+// imported via the `use crate::kms::core::*` at the top of this file.
+// The remaining font-protocol helper in this file is
+// xlfd_pattern_matches, which the ListFonts dispatcher still owns.
 
 impl KmsBackend {
     pub fn open(device_path: &str) -> io::Result<Self> {
@@ -1382,33 +959,8 @@ impl KmsBackend {
     #[doc(hidden)]
     #[must_use]
     pub fn for_tests() -> Self {
-        let ctx = XkbContext(xkbcommon::xkb::Context::new(
-            xkbcommon::xkb::CONTEXT_NO_FLAGS,
-        ));
-        let keymap = xkbcommon::xkb::Keymap::new_from_names(
-            &ctx.0,
-            "evdev",
-            "pc105",
-            "us",
-            "",
-            None,
-            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
-        )
-        .or_else(|| {
-            xkbcommon::xkb::Keymap::new_from_names(
-                &ctx.0,
-                "",
-                "",
-                "",
-                "",
-                None,
-                xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
-            )
-        })
-        .expect("test xkb keymap");
-        let xkb_state = XkbState(xkbcommon::xkb::State::new(&keymap));
-
         KmsBackend {
+            core: KmsCore::for_tests(),
             device: Arc::new(crate::drm::Device::for_tests().expect("test drm device")),
             render_node_fd: None,
             render_node_path: None,
@@ -1444,14 +996,6 @@ impl KmsBackend {
             fb_w: 800,
             fb_h: 600,
             windows: HashMap::new(),
-            next_host_xid: 0x0040_0000,
-            top_level_order: Vec::new(),
-            window_id: 1,
-            root_visual_xid: 0x21,
-            xid_map: HostXidMap::new(),
-            xkb_context: ctx,
-            xkb_keymap: XkbKeymap(keymap),
-            xkb_state,
             input_ctx: None,
             vk: None,
             first_pageflip_logged: vec![false; 1],
@@ -1475,41 +1019,13 @@ impl KmsBackend {
             copy_scratch: None,
             dst_readback: None,
             logic_fill_pipelines: None,
-            font_loader: FontLoader::new().expect("test font loader"),
-            fonts: HashMap::new(),
             pixmaps: HashMap::new(),
-            bg_pixel: None,
-            bg_pixmap: None,
-            // Initial cursor position: center of the 800×600 test
-            // framebuffer (matches the input_thread's own initial
-            // state). See parallel comment in the real constructor
-            // for the GTK gesture-drag rationale; tests don't rely
-            // on the cursor being at the origin and using midpoint
-            // here keeps the for_test backend internally consistent.
-            cursor_x: 400.0,
-            cursor_y: 300.0,
             cursors: HashMap::new(),
-            active_cursor: None,
             cursor_plane: None,
             hw_cursor_xid: None,
             hw_cursor_hotspot: (0, 0),
-            button_mask: 0,
-            prev_pointer_window: None,
-            pending_pointer_events: Vec::new(),
-            current_font: None,
-            current_function: GcFunction::Copy,
-            current_foreground: 0,
-            current_background: 0x00ff_ffff,
-            current_fill: FillState::Solid,
-            current_clip: ClipState::None,
             pictures: HashMap::new(),
             picture_rescued_images: HashMap::new(),
-            glyphsets: HashMap::new(),
-            shape_bounding: HashMap::new(),
-            shape_clip: HashMap::new(),
-            shape_input: HashMap::new(),
-            alias_registry: AliasRegistry::default(),
-            host_window_to_backing: HashMap::new(),
         }
     }
 
@@ -2047,35 +1563,7 @@ impl KmsBackend {
             }
         };
 
-        let ctx = XkbContext(xkbcommon::xkb::Context::new(
-            xkbcommon::xkb::CONTEXT_NO_FLAGS,
-        ));
-        let keymap = xkbcommon::xkb::Keymap::new_from_names(
-            &ctx.0,
-            "evdev",
-            "pc105",
-            "us",
-            "",
-            None,
-            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
-        )
-        .or_else(|| {
-            xkbcommon::xkb::Keymap::new_from_names(
-                &ctx.0,
-                "",
-                "",
-                "",
-                "",
-                None,
-                xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
-            )
-        })
-        .ok_or_else(|| io::Error::other("failed to create xkb keymap"))?;
-        let xkb_state = XkbState(xkbcommon::xkb::State::new(&keymap));
-        let xkb_keymap = XkbKeymap(keymap);
-
-        let mut xid_map: HostXidMap = HashMap::new();
-        xid_map.insert(0x0000_0001u32, ResourceId(0x0000_0100));
+        let core = KmsCore::new(fb_w, fb_h)?;
 
         // Phase 4.1.1: Vulkan is brought up alongside pixman but doesn't
         // drive any rendering yet. If no ICD is available (e.g. virtio-
@@ -2400,6 +1888,12 @@ impl KmsBackend {
         });
 
         let mut me = Self {
+            // Shared protocol-bookkeeping state. KmsCore::new seeds
+            // the root xid map entry, builds the XKB context+keymap,
+            // initialises the FontLoader, and centres the cursor at
+            // (fb_w/2, fb_h/2) — matching the input thread's seed and
+            // avoiding the GTK gesture-drag-anchor-at-origin bug.
+            core,
             device,
             render_node_fd,
             render_node_path,
@@ -2409,14 +1903,6 @@ impl KmsBackend {
             fb_w,
             fb_h,
             windows: HashMap::new(),
-            next_host_xid: 0x0040_0000,
-            top_level_order: Vec::new(),
-            window_id: 1,
-            root_visual_xid: 0x21,
-            xid_map,
-            xkb_context: ctx,
-            xkb_keymap,
-            xkb_state,
             input_ctx,
             vk,
             first_pageflip_logged: vec![false; layouts_len],
@@ -2440,47 +1926,13 @@ impl KmsBackend {
             copy_scratch,
             dst_readback,
             logic_fill_pipelines,
-            font_loader: FontLoader::new()?,
-            fonts: HashMap::new(),
             pixmaps: HashMap::new(),
-            bg_pixel: None,
-            bg_pixmap: None,
-            // Initial cursor position: screen center, matching
-            // input_thread::LibinputThreadState::new() which seeds
-            // its own cursor at (fb_w/2, fb_h/2). Without this,
-            // KMS-backend state tracks the cursor at (0, 0) until
-            // the first libinput motion arrives — and during that
-            // window, any synthetic EnterNotify generated by
-            // window-map / focus changes carries (0, 0). GTK's
-            // gesture-drag controller in caja-desktop anchors its
-            // drag-start at the first event it sees, so a stray
-            // (0, 0) Enter locks the anchor at screen origin and
-            // produces a rubber-band selection from origin to the
-            // click point on every subsequent single click.
-            cursor_x: f32::from(fb_w) / 2.0,
-            cursor_y: f32::from(fb_h) / 2.0,
             cursors: HashMap::new(),
-            active_cursor: None,
             cursor_plane: None,
             hw_cursor_xid: None,
             hw_cursor_hotspot: (0, 0),
-            button_mask: 0,
-            prev_pointer_window: None,
-            pending_pointer_events: Vec::new(),
-            current_font: None,
-            current_function: GcFunction::Copy,
-            current_foreground: 0,
-            current_background: 0x00ff_ffff,
-            current_fill: FillState::Solid,
-            current_clip: ClipState::None,
             pictures: HashMap::new(),
             picture_rescued_images: HashMap::new(),
-            glyphsets: HashMap::new(),
-            shape_bounding: HashMap::new(),
-            shape_clip: HashMap::new(),
-            shape_input: HashMap::new(),
-            alias_registry: AliasRegistry::default(),
-            host_window_to_backing: HashMap::new(),
         };
         // Try to bring up the DRM hardware cursor plane. A failure
         // here is non-fatal — the compositor falls back to the
@@ -2502,14 +1954,6 @@ impl KmsBackend {
         // any later DefineCursor on the root window will override it.
         me.install_default_cursor();
         Ok(me)
-    }
-
-    fn next_host_xid(&mut self) -> u32 {
-        self.next_host_xid = self
-            .next_host_xid
-            .checked_add(1)
-            .expect("xid space exhausted");
-        self.next_host_xid
     }
 
     /// Build the classic X-shaped default cursor and install it as the
@@ -2686,8 +2130,8 @@ impl KmsBackend {
             return;
         }
         let (hot_x, hot_y) = self.hw_cursor_hotspot;
-        let cursor_x = self.cursor_x as i32;
-        let cursor_y = self.cursor_y as i32;
+        let cursor_x = self.core.cursor_x as i32;
+        let cursor_y = self.core.cursor_y as i32;
         for layout in &self.outputs {
             // CRTC-local coords. The kernel clips outside the visible
             // rect on each CRTC (effectively hiding the cursor on that
@@ -2807,7 +2251,7 @@ impl KmsBackend {
                 packed[off..off + 4].copy_from_slice(&bgra);
             }
         }
-        let xid = self.next_host_xid();
+        let xid = self.core.next_host_xid();
         let mut vk_mirror = self.allocate_cursor_mirror(u32::from(w), u32::from(h));
         if let Some(mirror) = vk_mirror.as_mut()
             && let Err(e) = self.upload_bgra_to_mirror(mirror, &packed)
@@ -2826,7 +2270,7 @@ impl KmsBackend {
                 vk_mirror,
             },
         );
-        self.active_cursor = Some(xid);
+        self.core.active_cursor = Some(xid);
         // Push the freshly-installed default cursor onto the HW
         // plane (no-op when the plane isn't available).
         self.hw_cursor_refresh();
@@ -3237,7 +2681,7 @@ impl KmsBackend {
     /// the GC clip-origin already added). Returns `None` if the current GC
     /// clip is `None` or `Pixmap` (latter not yet enforced).
     fn current_clip_rects_in_dst_space(&self) -> Option<Vec<Rectangle16>> {
-        let ClipState::Rectangles { origin, rects } = &self.current_clip else {
+        let ClipState::Rectangles { origin, rects } = &self.core.current_clip else {
             return None;
         };
         let bytes = &rects.rectangles;
@@ -3295,7 +2739,7 @@ impl KmsBackend {
         out
     }
 
-    /// Fill `rects` on `dst_xid`, honoring `self.current_fill`. For
+    /// Fill `rects` on `dst_xid`, honoring `self.core.current_fill`. For
     /// `Solid`, paints with `fg`. For `Tiled`, repeats the tile pixmap
     /// (offset by the GC's tile origin). e16 paints popup backgrounds via
     /// Tiled — the menu chrome+text lives in the tile pixmap and the
@@ -3304,8 +2748,8 @@ impl KmsBackend {
     /// `Stippled`/`OpaqueStippled` fall through to solid for now (no real
     /// client driving that path on KMS yet).
     fn fill_rects_honoring_fill_state(&mut self, dst_xid: u32, fg: u32, rects: &[Rectangle16]) {
-        let function = self.current_function;
-        let fill = self.current_fill.clone();
+        let function = self.core.current_function;
+        let fill = self.core.current_fill.clone();
         let clipped = self.intersect_with_current_clip(rects);
         if clipped.is_empty() {
             return;
@@ -3454,7 +2898,7 @@ impl KmsBackend {
         if rects.is_empty() {
             return;
         }
-        let function = self.current_function;
+        let function = self.core.current_function;
         // Phase 4.1.5: Vk-only. `try_vk_fill_with_function` picks
         // the Copy fast path or the per-`VkLogicOp` pipeline.
         self.try_vk_fill_with_function(dst_xid, function, fg, rects);
@@ -5827,7 +5271,7 @@ impl KmsBackend {
             }
         };
 
-        if !self.glyphsets.contains_key(&host_gs) {
+        if !self.core.glyphsets.contains_key(&host_gs) {
             log::debug!("vk text bail: glyphset 0x{host_gs:x} not registered");
             return false;
         }
@@ -5906,7 +5350,7 @@ impl KmsBackend {
                         items[pos + 6],
                         items[pos + 7],
                     ]);
-                    if new_xid != 0 && self.glyphsets.contains_key(&new_xid) {
+                    if new_xid != 0 && self.core.glyphsets.contains_key(&new_xid) {
                         active_gs_xid = new_xid;
                     }
                 }
@@ -5925,7 +5369,7 @@ impl KmsBackend {
                 break;
             }
 
-            let Some(active_gs) = self.glyphsets.get(&active_gs_xid) else {
+            let Some(active_gs) = self.core.glyphsets.get(&active_gs_xid) else {
                 pos += 8 + padded;
                 continue;
             };
@@ -6777,11 +6221,11 @@ impl KmsBackend {
 
     fn window_under_cursor(&self) -> Option<u32> {
         // Top-levels are tracked in stacking order (bottom-to-top) on
-        // self.top_level_order. Walk back-to-front so the topmost match
+        // self.core.top_level_order. Walk back-to-front so the topmost match
         // wins.
-        let cx = self.cursor_x as f64;
-        let cy = self.cursor_y as f64;
-        for &window_id in self.top_level_order.iter().rev() {
+        let cx = self.core.cursor_x as f64;
+        let cy = self.core.cursor_y as f64;
+        for &window_id in self.core.top_level_order.iter().rev() {
             let Some(w) = self.windows.get(&window_id) else {
                 continue;
             };
@@ -6798,9 +6242,10 @@ impl KmsBackend {
             }
             // Input shape (kind=2) takes precedence; fall back to bounding (kind=0).
             let shape = self
+                .core
                 .shape_input
                 .get(&window_id)
-                .or_else(|| self.shape_bounding.get(&window_id));
+                .or_else(|| self.core.shape_bounding.get(&window_id));
             if let Some(rects) = shape {
                 // Empty shape = window is unhittable.
                 let inside = rects.iter().any(|r| {
@@ -6824,13 +6269,13 @@ impl KmsBackend {
         if !log::log_enabled!(log::Level::Trace) {
             return;
         }
-        let cx = self.cursor_x as f64;
-        let cy = self.cursor_y as f64;
-        let root_id = self.window_id;
+        let cx = self.core.cursor_x as f64;
+        let cy = self.core.cursor_y as f64;
+        let root_id = self.core.window_id;
         log::trace!("hit-test: cursor=({cx:.0},{cy:.0}) root_container=0x{root_id:x}");
         // Walk top-level stacking order from bottom (first painted) to
         // top (last painted) — same order as the compositor.
-        let top_levels = self.top_level_order.clone();
+        let top_levels = self.core.top_level_order.clone();
         for tl in &top_levels {
             let w = &self.windows[tl];
             let hit = cx >= w.x as f64
@@ -6904,8 +6349,8 @@ impl KmsBackend {
             Some(p) => p,
             None => return,
         };
-        let stack: &mut Vec<u32> = if parent_xid == self.window_id {
-            &mut self.top_level_order
+        let stack: &mut Vec<u32> = if parent_xid == self.core.window_id {
+            &mut self.core.top_level_order
         } else {
             match self.windows.get_mut(&parent_xid) {
                 Some(p) => &mut p.children,
@@ -6945,7 +6390,7 @@ impl KmsBackend {
     }
 
     fn serialize_modifiers(&self) -> u16 {
-        let state = &self.xkb_state.0;
+        let state = &self.core.xkb_state.0;
         let flags = xkbcommon::xkb::STATE_MODS_EFFECTIVE;
         let mut mask: u16 = 0;
         if state.mod_name_is_active("Shift", flags) {
@@ -6995,13 +6440,13 @@ impl KmsBackend {
         } else {
             xkbcommon::xkb::KeyDirection::Up
         };
-        self.xkb_state.0.update_key(xkb_keycode, direction);
+        self.core.xkb_state.0.update_key(xkb_keycode, direction);
         HostKeyEvent {
             state: self.serialize_modifiers(),
-            root_x: self.cursor_x as i16,
-            root_y: self.cursor_y as i16,
-            event_x: self.cursor_x as i16,
-            event_y: self.cursor_y as i16,
+            root_x: self.core.cursor_x as i16,
+            root_y: self.core.cursor_y as i16,
+            event_x: self.core.cursor_x as i16,
+            event_y: self.core.cursor_y as i16,
             time: Self::current_time_ms(),
             ..raw
         }
@@ -7028,9 +6473,9 @@ impl KmsBackend {
         // `maybe_composite` in-flight gate caps the actual rate at
         // vsync, so many pointer events between flips just bump dirty
         // generations idempotently.
-        if new_x != self.cursor_x || new_y != self.cursor_y {
-            self.cursor_x = new_x;
-            self.cursor_y = new_y;
+        if new_x != self.core.cursor_x || new_y != self.core.cursor_y {
+            self.core.cursor_x = new_x;
+            self.core.cursor_y = new_y;
             // Crossing into a window with a different `cursor`
             // attribute changes the effective cursor without any
             // explicit DefineCursor — refresh first so the HW plane
@@ -7055,8 +6500,8 @@ impl KmsBackend {
     /// origin from `cursor_x` / `cursor_y` (which are root-relative).
     fn event_relative_coords(&self, host_xid: u32) -> (i16, i16) {
         if let Some(w) = self.windows.get(&host_xid) {
-            let ex = (self.cursor_x as i32) - (w.x as i32);
-            let ey = (self.cursor_y as i32) - (w.y as i32);
+            let ex = (self.core.cursor_x as i32) - (w.x as i32);
+            let ey = (self.core.cursor_y as i32) - (w.y as i32);
             (
                 ex.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
                 ey.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
@@ -7065,14 +6510,14 @@ impl KmsBackend {
             // host_xid == 0 (no window under cursor) — fall back to root
             // coords; nested.rs treats event_x/y as a positional hint and
             // re-derives target coords from its own tree walk anyway.
-            (self.cursor_x as i16, self.cursor_y as i16)
+            (self.core.cursor_x as i16, self.core.cursor_y as i16)
         }
     }
 
     fn emit_pointer(&mut self, ev: HostPointerEvent) {
         // Buffer; the input thread drains and dispatches outside the
         // backend lock. See the doc on `pending_pointer_events`.
-        self.pending_pointer_events.push(ev);
+        self.core.pending_pointer_events.push(ev);
     }
 
     fn current_time_ms() -> u32 {
@@ -7100,8 +6545,8 @@ impl KmsBackend {
             host_xid,
             detail,
             time: Self::current_time_ms(),
-            root_x: self.cursor_x as i16,
-            root_y: self.cursor_y as i16,
+            root_x: self.core.cursor_x as i16,
+            root_y: self.core.cursor_y as i16,
             event_x,
             event_y,
             state,
@@ -7130,19 +6575,19 @@ impl KmsBackend {
         new_xid: u32,
         mask: u16,
     ) {
-        if self.prev_pointer_window == Some(new_xid) {
+        if self.core.prev_pointer_window == Some(new_xid) {
             return;
         }
 
-        let prev_host = self.prev_pointer_window;
-        // The KMS root container (self.window_id) is yserver's own
+        let prev_host = self.core.prev_pointer_window;
+        // The KMS root container (self.core.window_id) is yserver's own
         // top-level scaffolding window — never registered in xid_map
         // (only client-created windows are). When `window_under_cursor`
         // returns the root container, treat it as the X11 ROOT_WINDOW
         // for crossing-chain purposes so `update_pointer_window` can
         // emit a proper Leave-on-root with detail=NotifyInferior when
         // the cursor enters a top-level (the e16 hover-popup repro).
-        let root_container_host = self.window_id;
+        let root_container_host = self.core.window_id;
         let resolve_host_to_nested = |host: u32, xid_map: &HostXidMap| -> Option<ResourceId> {
             if host == root_container_host {
                 Some(yserver_core::resources::ROOT_WINDOW)
@@ -7150,8 +6595,8 @@ impl KmsBackend {
                 xid_map.get(&host).copied()
             }
         };
-        let prev_id = prev_host.and_then(|p| resolve_host_to_nested(p, &self.xid_map));
-        let new_id = resolve_host_to_nested(new_xid, &self.xid_map);
+        let prev_id = prev_host.and_then(|p| resolve_host_to_nested(p, &self.core.xid_map));
+        let new_id = resolve_host_to_nested(new_xid, &self.core.xid_map);
 
         if let (Some(from), Some(to)) = (prev_id, new_id) {
             let events = yserver_core::crossings::normal_mode_crossings(server_state, from, to);
@@ -7159,10 +6604,10 @@ impl KmsBackend {
                 // ROOT_WINDOW has no host_xid recorded in server-state
                 // (it's yserver's own scaffolding, not a client window),
                 // so route Leave/Enter events on root to the KMS root
-                // container host_xid (self.window_id). For all other
+                // container host_xid (self.core.window_id). For all other
                 // nested ResourceIds, look up the registered host_xid.
                 let win_host_xid = if ev.window == yserver_core::resources::ROOT_WINDOW {
-                    self.window_id
+                    self.core.window_id
                 } else {
                     server_state
                         .resources
@@ -7188,7 +6633,7 @@ impl KmsBackend {
             self.emit_crossing(new_xid, PointerEventKind::EnterNotify, 0, 0, 0, mask);
         }
 
-        self.prev_pointer_window = Some(new_xid);
+        self.core.prev_pointer_window = Some(new_xid);
     }
 
     fn dispatch_motion_event(&mut self, server_state: &yserver_core::server::ServerState) {
@@ -7196,9 +6641,9 @@ impl KmsBackend {
         // to root-window subscribers (e16's right-click-desktop menu,
         // fvwm3's root bindings) when the cursor is over the
         // wallpaper / no top-level window.
-        let host_xid = self.window_under_cursor().unwrap_or(self.window_id);
+        let host_xid = self.window_under_cursor().unwrap_or(self.core.window_id);
         // X11 KeyButMask: low byte modifiers, bits 8..=12 button1..button5.
-        let mask = self.serialize_modifiers() | self.button_mask;
+        let mask = self.serialize_modifiers() | self.core.button_mask;
         self.update_pointer_window(server_state, host_xid, mask);
         self.emit_motion_only(host_xid, mask);
     }
@@ -7216,8 +6661,8 @@ impl KmsBackend {
             host_xid,
             detail: 0,
             time: Self::current_time_ms(),
-            root_x: self.cursor_x as i16,
-            root_y: self.cursor_y as i16,
+            root_x: self.core.cursor_x as i16,
+            root_y: self.core.cursor_y as i16,
             event_x,
             event_y,
             state: mask,
@@ -7260,7 +6705,7 @@ impl KmsBackend {
         // to root-window subscribers (e16's right-click-desktop menu,
         // fvwm3's root bindings) when the cursor is over the
         // wallpaper / no top-level window.
-        let host_xid = self.window_under_cursor().unwrap_or(self.window_id);
+        let host_xid = self.window_under_cursor().unwrap_or(self.core.window_id);
         let (event_x, event_y) = self.event_relative_coords(host_xid);
         // X11 KeyButMask: low byte modifier mask, bits 8..=12 for
         // ButtonNMask. Per X11 spec, the `state` field describes the
@@ -7281,16 +6726,16 @@ impl KmsBackend {
         };
         let modifier_mask = self.serialize_modifiers();
         let state = if pressed {
-            modifier_mask | self.button_mask
+            modifier_mask | self.core.button_mask
         } else {
-            modifier_mask | self.button_mask | button_bit
+            modifier_mask | self.core.button_mask | button_bit
         };
         // Update held-button state AFTER computing the event's `state`,
         // so subsequent motions see the new mask.
         if pressed {
-            self.button_mask |= button_bit;
+            self.core.button_mask |= button_bit;
         } else {
-            self.button_mask &= !button_bit;
+            self.core.button_mask &= !button_bit;
         }
         let time = crate::clock::server_time_ms();
         let kind = if pressed {
@@ -7303,8 +6748,8 @@ impl KmsBackend {
             host_xid,
             detail,
             time,
-            root_x: self.cursor_x as i16,
-            root_y: self.cursor_y as i16,
+            root_x: self.core.cursor_x as i16,
+            root_y: self.core.cursor_y as i16,
             event_x,
             event_y,
             state,
@@ -7322,14 +6767,15 @@ impl KmsBackend {
         // pure helper `crossings::implicit_grab_crossings`. The
         // crossing-mode field marks the activation: 1 = NotifyGrab
         // on press, 2 = NotifyUngrab on release.
-        let post_state = self.serialize_modifiers() | self.button_mask;
+        let post_state = self.serialize_modifiers() | self.core.button_mask;
         let press_mode: u8 = if pressed { 1 } else { 2 };
 
         // Resolve focus + grab to nested ResourceIds via xid_map.
-        let grab_id = self.xid_map.get(&host_xid).copied();
+        let grab_id = self.core.xid_map.get(&host_xid).copied();
         let focus_id = self
+            .core
             .prev_pointer_window
-            .and_then(|prev| self.xid_map.get(&prev).copied());
+            .and_then(|prev| self.core.xid_map.get(&prev).copied());
 
         match (focus_id, grab_id) {
             (Some(focus), Some(grab)) => {
@@ -7752,7 +7198,7 @@ impl KmsBackend {
             self.scheduler.in_flight.len()
         );
 
-        let top_levels: Vec<u32> = self.top_level_order.clone();
+        let top_levels: Vec<u32> = self.core.top_level_order.clone();
 
         // Pre-filter visible top-levels per output (spec §2.5: avoid
         // descending whole off-screen subtrees).
@@ -8073,7 +7519,7 @@ impl KmsBackend {
         // Background clear color: bg_pixel (X11 0xRRGGBB) → linear
         // [r, g, b, a]. Falls back to mid-grey so unset roots stand
         // out, mirroring `paint_output`'s default.
-        let bg = self.bg_pixel.unwrap_or(0x0050_5050);
+        let bg = self.core.bg_pixel.unwrap_or(0x0050_5050);
         let bg_color = [
             ((bg >> 16) & 0xFF) as f32 / 255.0,
             ((bg >> 8) & 0xFF) as f32 / 255.0,
@@ -8092,7 +7538,7 @@ impl KmsBackend {
         // client frees the pixmap (Esetroot pattern), the mirror
         // disappears with it; the rescue path will move with the
         // picture_rescued_images cleanup.
-        if let Some(pm) = self.bg_pixmap
+        if let Some(pm) = self.core.bg_pixmap
             && let Some(pm_state) = self.pixmaps.get(&pm.as_raw())
             && let Some(mirror) = pm_state.vk_mirror.as_ref()
         {
@@ -8134,8 +7580,8 @@ impl KmsBackend {
         {
             let cw = cs.extent.width as f32;
             let ch = cs.extent.height as f32;
-            let cx = self.cursor_x as i32 - i32::from(cs.hot_x) - layout_x;
-            let cy = self.cursor_y as i32 - i32::from(cs.hot_y) - layout_y;
+            let cx = self.core.cursor_x as i32 - i32::from(cs.hot_x) - layout_x;
+            let cy = self.core.cursor_y as i32 - i32::from(cs.hot_y) - layout_y;
             draws.push(CompositeDraw {
                 image_view: mirror.vk_image_view,
                 dst_origin: [cx as f32, cy as f32],
@@ -8182,6 +7628,7 @@ impl KmsBackend {
         }
         // Skip windows with an explicitly-empty SHAPE region (rare).
         if self
+            .core
             .shape_bounding
             .get(&window_id)
             .is_some_and(|r| r.is_empty())
@@ -8240,7 +7687,7 @@ impl KmsBackend {
                     alpha_passthrough: true,
                 });
             };
-            match self.shape_bounding.get(&window_id) {
+            match self.core.shape_bounding.get(&window_id) {
                 None => push_rect(out, 0, 0, w, h),
                 Some(rects) => {
                     for r in rects {
@@ -8292,15 +7739,15 @@ impl KmsBackend {
     /// Resolve the effective cursor for the window currently under the
     /// pointer. Walks the window's parent chain looking for the
     /// closest non-None (non-zero) cursor attribute. Falls back to
-    /// `self.active_cursor` (the root container's cursor) and finally
+    /// `self.core.active_cursor` (the root container's cursor) and finally
     /// to `None` (no cursor drawn).
     fn effective_cursor(&self) -> Option<u32> {
         // Start at the deepest window the pointer is inside, then walk
         // up. window_under_cursor returns a top-level; we descend into
         // children using the current cursor coordinates.
         let mut current = self.window_under_cursor();
-        let cx = self.cursor_x as f64;
-        let cy = self.cursor_y as f64;
+        let cx = self.core.cursor_x as f64;
+        let cy = self.core.cursor_y as f64;
         if let Some(top) = current {
             // Walk down to deepest descendant containing cursor.
             current = Some(self.descend_for_cursor(top, cx, cy));
@@ -8316,7 +7763,7 @@ impl KmsBackend {
             }
             break;
         }
-        self.active_cursor
+        self.core.active_cursor
     }
 
     fn descend_for_cursor(&self, window: u32, cx: f64, cy: f64) -> u32 {
@@ -8349,7 +7796,7 @@ impl KmsBackend {
             if let Some(w) = self.windows.get(&xid) {
                 ox += w.x as f64;
                 oy += w.y as f64;
-                node = w._parent.filter(|p| *p != self.window_id);
+                node = w._parent.filter(|p| *p != self.core.window_id);
             } else {
                 break;
             }
@@ -8379,7 +7826,7 @@ impl KmsBackend {
         y: i32,
         text: &[char],
     ) -> io::Result<()> {
-        let Some(font_xid) = self.current_font else {
+        let Some(font_xid) = self.core.current_font else {
             return Ok(());
         };
 
@@ -8390,7 +7837,7 @@ impl KmsBackend {
         let mut cursor_x = x;
 
         {
-            let Some(fs) = self.fonts.get(&font_xid) else {
+            let Some(fs) = self.core.fonts.get(&font_xid) else {
                 return Ok(());
             };
             let face = fs.face.borrow();
@@ -9083,124 +8530,13 @@ fn xlfd_pattern_matches(pattern: &str, name: &str) -> bool {
     pi == pat.len()
 }
 
-/// Map a fontconfig integer `weight` (`FC_WEIGHT_*`) to the X11 XLFD
-/// weight name. Buckets follow the canonical fontconfig→XLFD mapping
-/// used by Xft and traditional X font path synthesis.
-fn xlfd_weight(w: i32) -> &'static str {
-    match w {
-        ..=49 => "thin",
-        50..=74 => "light",
-        75..=89 => "book",
-        90..=139 => "medium",
-        140..=189 => "demibold",
-        190..=209 => "bold",
-        _ => "black",
-    }
-}
-
-/// Map a fontconfig integer `slant` to the single-letter XLFD slant.
-fn xlfd_slant(s: i32) -> &'static str {
-    match s {
-        100 => "i", // italic
-        110 => "o", // oblique
-        _ => "r",   // roman
-    }
-}
-
-/// Map a fontconfig integer `spacing` to the single-letter XLFD spacing.
-fn xlfd_spacing(s: i32) -> &'static str {
-    match s {
-        100 => "m", // monospaced
-        110 => "c", // charcell
-        _ => "p",   // proportional
-    }
-}
-
-/// Make a fontconfig string safe to drop into a single XLFD field:
-/// dashes are field separators in XLFDs, so any embedded `-` is
-/// replaced with a space. XLFD is case-insensitive but conventionally
-/// lowercase.
-fn sanitize_xlfd_field(s: &str) -> String {
-    s.replace('-', " ").to_lowercase()
-}
-
-/// Enumerate the installed font set via fontconfig and synthesise one
-/// XLFD per (face × pixel-size × charset) combination. Every entry is
-/// a real font that `FontLoader::open_font` can resolve back to a
-/// `FreeType::Face` — there are no stub XLFDs.
-///
-/// Charsets are limited to `iso8859-1` and `iso10646-1` because those
-/// two are the universal subset every scalable font supports through
-/// FreeType's char-by-char lookup. Locale-specific charsets (jisx*,
-/// gb2312*, ksc*) need real fonts on disk to satisfy properly; rather
-/// than stub them, we let libXt warn "Missing charset X" and proceed
-/// with the iso* coverage that's guaranteed real.
-fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
-    // Pixel sizes that scalable fonts can satisfy and that Xt clients
-    // commonly request. Pointsize is `pixel * 10` (X11 convention:
-    // pointsize is decipoints).
-    const PIXEL_SIZES: &[u32] = &[8, 10, 12, 14, 16, 18, 24];
-    const CHARSETS: &[&str] = &["iso8859-1", "iso10646-1"];
-
-    let pat = fontconfig::Pattern::new(fc);
-    let mut objs = fontconfig::ObjectSet::new(fc);
-    objs.add(fontconfig::FC_FAMILY);
-    objs.add(fontconfig::FC_FOUNDRY);
-    objs.add(fontconfig::FC_WEIGHT);
-    objs.add(fontconfig::FC_SLANT);
-    objs.add(fontconfig::FC_SPACING);
-    let set = fontconfig::list_fonts(&pat, Some(&objs));
-
-    // Aliases the loader handles directly without an XLFD parse pass.
-    let mut entries: Vec<String> = vec!["fixed".into(), "cursor".into(), "nil2".into()];
-    let mut seen: HashSet<(String, String, i32, i32, i32)> = HashSet::new();
-
-    for font in set.iter() {
-        let Some(family) = font.get_string(fontconfig::FC_FAMILY) else {
-            continue;
-        };
-        let foundry = font.get_string(fontconfig::FC_FOUNDRY).unwrap_or("misc");
-        let weight = font.get_int(fontconfig::FC_WEIGHT).unwrap_or(80);
-        let slant = font.get_int(fontconfig::FC_SLANT).unwrap_or(0);
-        let spacing = font.get_int(fontconfig::FC_SPACING).unwrap_or(0);
-
-        let key = (
-            family.to_lowercase(),
-            foundry.to_lowercase(),
-            weight,
-            slant,
-            spacing,
-        );
-        if !seen.insert(key) {
-            continue;
-        }
-
-        let foundry_x = sanitize_xlfd_field(foundry);
-        let family_x = sanitize_xlfd_field(family);
-        let weight_x = xlfd_weight(weight);
-        let slant_x = xlfd_slant(slant);
-        let spacing_x = xlfd_spacing(spacing);
-
-        for &px in PIXEL_SIZES {
-            // Average width estimate: ~0.6 × pixel size, in 1/10 px.
-            // Approximation only — clients filter by name pattern, not
-            // by this field, and QueryFont returns the real widths.
-            let avg_width = (px * 6).clamp(1, 999);
-            for &charset in CHARSETS {
-                entries.push(format!(
-                    "-{foundry_x}-{family_x}-{weight_x}-{slant_x}-normal--{px}-{}-75-75-{spacing_x}-{avg_width}-{charset}",
-                    px * 10,
-                ));
-            }
-        }
-    }
-
-    entries
-}
+// xlfd_weight / xlfd_slant / xlfd_spacing / sanitize_xlfd_field /
+// build_font_catalog moved to `crate::kms::core` in Stage 1a
+// alongside FontLoader.
 
 impl Backend for KmsBackend {
     fn window_id(&self) -> u32 {
-        self.window_id
+        self.core.window_id
     }
 
     fn dri3_open(&mut self, _drawable: u32) -> io::Result<std::os::fd::OwnedFd> {
@@ -9257,7 +8593,7 @@ impl Backend for KmsBackend {
             }],
         )
         .map_err(|e| io::Error::other(format!("DRI3 import_dmabuf: {e:?}")))?;
-        let host_xid = self.next_host_xid();
+        let host_xid = self.core.next_host_xid();
         self.pixmaps.insert(
             host_xid,
             PixmapState {
@@ -9462,7 +8798,7 @@ impl Backend for KmsBackend {
     }
 
     fn root_visual_xid(&self) -> u32 {
-        self.root_visual_xid
+        self.core.root_visual_xid
     }
 
     fn argb_visual_xid(&self) -> Option<u32> {
@@ -9539,7 +8875,7 @@ impl Backend for KmsBackend {
     /// directly into `state`.
     ///
     /// Pointer events use the existing `process_pointer_*` methods,
-    /// which buffer into `self.pending_pointer_events`. We drain that
+    /// which buffer into `self.core.pending_pointer_events`. We drain that
     /// buffer immediately and route through
     /// `pointer_event_fanout_to_state`. The buffer is local to a
     /// single call — there is no cross-thread handoff.
@@ -9580,9 +8916,10 @@ impl Backend for KmsBackend {
         // and fan each one out directly into state. The buffer must
         // be empty after this — a future on_host_input call asserts
         // it via `take`.
-        let pending = std::mem::take(&mut self.pending_pointer_events);
+        let pending = std::mem::take(&mut self.core.pending_pointer_events);
         for ev in pending {
-            let _dropped = pointer_event_fanout_to_state(state, &self.xid_map, ev, true, false);
+            let _dropped =
+                pointer_event_fanout_to_state(state, &self.core.xid_map, ev, true, false);
         }
     }
 
@@ -9662,7 +8999,7 @@ impl Backend for KmsBackend {
         background_pixel: Option<u32>,
         _background_pixmap: Option<u32>,
     ) -> io::Result<WindowHandle> {
-        let host_xid = self.next_host_xid();
+        let host_xid = self.core.next_host_xid();
         let depth = match visual {
             HostSubwindowVisual::CopyFromParent => 24,
             HostSubwindowVisual::Explicit { depth, .. } => depth,
@@ -9704,9 +9041,9 @@ impl Backend for KmsBackend {
             },
         );
         let parent_raw = host_parent.as_raw();
-        if parent_raw == self.window_id {
+        if parent_raw == self.core.window_id {
             // Top-level: append to stacking order (newly created → on top).
-            self.top_level_order.push(host_xid);
+            self.core.top_level_order.push(host_xid);
         } else if let Some(parent) = self.windows.get_mut(&parent_raw) {
             parent.children.push(host_xid);
         }
@@ -9775,17 +9112,17 @@ impl Backend for KmsBackend {
             // Update parent's children list (or top-level stacking order
             // if this was a top-level window).
             if let Some(parent_xid) = parent_xid {
-                if parent_xid == self.window_id {
-                    self.top_level_order.retain(|&c| c != host_xid);
+                if parent_xid == self.core.window_id {
+                    self.core.top_level_order.retain(|&c| c != host_xid);
                 } else if let Some(parent) = self.windows.get_mut(&parent_xid) {
                     parent.children.retain(|&c| c != host_xid);
                 }
             }
-            self.shape_bounding.remove(&host_xid);
-            self.shape_clip.remove(&host_xid);
-            self.shape_input.remove(&host_xid);
+            self.core.shape_bounding.remove(&host_xid);
+            self.core.shape_clip.remove(&host_xid);
+            self.core.shape_input.remove(&host_xid);
         }
-        self.xid_map.remove(&host_xid);
+        self.core.xid_map.remove(&host_xid);
 
         // Dirty outputs that displayed this window (empty new = nothing to show).
         let empty = Rect {
@@ -10016,16 +9353,16 @@ impl Backend for KmsBackend {
         window.y = y;
         // Remove from old parent's stacking list (or top-level order).
         if let Some(old_parent_xid) = old_parent {
-            if old_parent_xid == self.window_id {
-                self.top_level_order.retain(|&c| c != host_xid);
+            if old_parent_xid == self.core.window_id {
+                self.core.top_level_order.retain(|&c| c != host_xid);
             } else if let Some(parent) = self.windows.get_mut(&old_parent_xid) {
                 parent.children.retain(|&c| c != host_xid);
             }
         }
         // Append to new parent's stacking list (top of stack — X11
         // ReparentWindow semantics).
-        if new_parent == self.window_id {
-            self.top_level_order.push(host_xid);
+        if new_parent == self.core.window_id {
+            self.core.top_level_order.push(host_xid);
         } else if let Some(parent) = self.windows.get_mut(&new_parent) {
             parent.children.push(host_xid);
         }
@@ -10090,7 +9427,7 @@ impl Backend for KmsBackend {
         nested_id: ResourceId,
         host_xid: u32,
     ) -> io::Result<()> {
-        self.xid_map.insert(host_xid, nested_id);
+        self.core.xid_map.insert(host_xid, nested_id);
         Ok(())
     }
 
@@ -10100,16 +9437,16 @@ impl Backend for KmsBackend {
         nested_id: ResourceId,
         host_xid: u32,
     ) -> io::Result<()> {
-        self.xid_map.insert(host_xid, nested_id);
+        self.core.xid_map.insert(host_xid, nested_id);
         Ok(())
     }
 
     fn unregister_host_window(&mut self, host_xid: u32) {
-        self.xid_map.remove(&host_xid);
+        self.core.xid_map.remove(&host_xid);
     }
 
     fn xid_map(&self) -> &HostXidMap {
-        &self.xid_map
+        &self.core.xid_map
     }
 
     fn name_window_pixmap(
@@ -10122,6 +9459,7 @@ impl Backend for KmsBackend {
         // by B.6a (`allocate_redirected_backing`) at REDIRECT
         // activation; here each NameWindowPixmap bumps the count.
         let backing = self
+            .core
             .host_window_to_backing
             .get(&host_window.as_raw())
             .copied()
@@ -10131,7 +9469,7 @@ impl Backend for KmsBackend {
                     "window is not redirected (no backing)",
                 )
             })?;
-        self.alias_registry.incref(backing);
+        self.core.alias_registry.incref(backing);
         Ok(backing)
     }
 
@@ -10147,8 +9485,10 @@ impl Backend for KmsBackend {
         // `name_window_pixmap` on the same window doesn't hand back
         // a stale handle.
         let raw = backing.as_raw();
-        self.host_window_to_backing.retain(|_, h| h.as_raw() != raw);
-        if self.alias_registry.decref(backing) {
+        self.core
+            .host_window_to_backing
+            .retain(|_, h| h.as_raw() != raw);
+        if self.core.alias_registry.decref(backing) {
             self.free_pixmap(origin, raw)?;
         }
         Ok(())
@@ -10168,6 +9508,7 @@ impl Backend for KmsBackend {
         // bumping the registry — the redirect's reason-1 hold is
         // still in place.
         if let Some(existing) = self
+            .core
             .host_window_to_backing
             .get(&host_window.as_raw())
             .copied()
@@ -10179,7 +9520,7 @@ impl Backend for KmsBackend {
         // it owns the host XID allocation + mirror allocation +
         // insert into `self.pixmaps`.
         let backing = self.create_pixmap(origin, depth, width, height)?;
-        self.alias_registry.insert(
+        self.core.alias_registry.insert(
             backing,
             AliasEntry {
                 refcount: 1,
@@ -10188,7 +9529,8 @@ impl Backend for KmsBackend {
                 depth,
             },
         );
-        self.host_window_to_backing
+        self.core
+            .host_window_to_backing
             .insert(host_window.as_raw(), backing);
         Ok(backing)
     }
@@ -10200,7 +9542,7 @@ impl Backend for KmsBackend {
         width: u16,
         height: u16,
     ) -> io::Result<PixmapHandle> {
-        let host_xid = self.next_host_xid();
+        let host_xid = self.core.next_host_xid();
         let mut vk_mirror = self.allocate_pixmap_mirror(u32::from(width), u32::from(height), depth);
         // Mark fresh pixmap mirror fully dirty (see CreateWindow for
         // rationale).
@@ -10363,11 +9705,11 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         name: &str,
     ) -> io::Result<(FontHandle, FontMetrics)> {
-        let (face, metrics, char_cache) = self.font_loader.open_font(name)?;
-        let host_xid = self.next_host_xid();
+        let (face, metrics, char_cache) = self.core.font_loader.open_font(name)?;
+        let host_xid = self.core.next_host_xid();
         let handle = FontHandle::from_raw(host_xid)
             .ok_or_else(|| io::Error::other("failed to create font handle"))?;
-        self.fonts.insert(
+        self.core.fonts.insert(
             host_xid,
             FontState {
                 handle: host_xid,
@@ -10380,7 +9722,7 @@ impl Backend for KmsBackend {
     }
 
     fn close_font(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
-        self.fonts.remove(&host_xid);
+        self.core.fonts.remove(&host_xid);
         Ok(())
     }
 
@@ -10401,7 +9743,7 @@ impl Backend for KmsBackend {
         // pixels carry `fore` where the source bit is set, `back`
         // otherwise. Invisible pixels stay (0, 0, 0, 0) — Vulkan
         // composite samples premultiplied alpha so transparent.
-        let host_xid = self.next_host_xid();
+        let host_xid = self.core.next_host_xid();
         let cursor_handle = CursorHandle::from_raw(host_xid)
             .ok_or_else(|| io::Error::other("failed to create cursor handle"))?;
 
@@ -10527,7 +9869,7 @@ impl Backend for KmsBackend {
         //                    carry `fore` if source bit set else `back`.
         //   no mask (None) → source doubles as mask: visible iff source
         //                    bit set; visible pixels always carry `fore`.
-        let host_xid = self.next_host_xid();
+        let host_xid = self.core.next_host_xid();
         let cursor_handle = CursorHandle::from_raw(host_xid)
             .ok_or_else(|| io::Error::other("failed to create cursor handle"))?;
 
@@ -10538,7 +9880,7 @@ impl Backend for KmsBackend {
         // bbox math still has something to work with.
         let rasterize =
             |this: &Self, font_xid: u32, ch: u16| -> Option<(Vec<u8>, i32, i32, i32, i32)> {
-                let fs = this.fonts.get(&font_xid)?;
+                let fs = this.core.fonts.get(&font_xid)?;
                 let face = fs.face.borrow();
                 let _ = face
                     .0
@@ -10708,8 +10050,8 @@ impl Backend for KmsBackend {
         // isn't tracked in self.windows, so the chain always runs out
         // there). It's seeded at startup with the built-in X-shaped
         // default; a DefineCursor on the root container overrides it.
-        if cursor_host_xid != 0 && host_window_xid == self.window_id {
-            self.active_cursor = Some(cursor_host_xid);
+        if cursor_host_xid != 0 && host_window_xid == self.core.window_id {
+            self.core.active_cursor = Some(cursor_host_xid);
         }
         // The window the pointer is over may have just had its
         // cursor changed under it — push the new image to the HW
@@ -10725,7 +10067,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         pixel: u32,
     ) -> io::Result<()> {
-        self.bg_pixel = Some(pixel);
+        self.core.bg_pixel = Some(pixel);
         Ok(())
     }
 
@@ -10734,12 +10076,12 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         host_pixmap_xid: u32,
     ) -> io::Result<()> {
-        self.bg_pixmap = PixmapHandle::from_raw(host_pixmap_xid);
+        self.core.bg_pixmap = PixmapHandle::from_raw(host_pixmap_xid);
         Ok(())
     }
 
     fn clear_clip_rectangles(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
-        self.current_clip = ClipState::None;
+        self.core.current_clip = ClipState::None;
         Ok(())
     }
 
@@ -10748,7 +10090,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         clip: Option<ClipRectangles>,
     ) -> io::Result<()> {
-        self.current_clip = match clip {
+        self.core.current_clip = match clip {
             Some(c) => ClipState::Rectangles {
                 origin: (c.x_origin, c.y_origin),
                 rects: c,
@@ -10770,10 +10112,10 @@ impl Backend for KmsBackend {
         // it up; right now this means a pixmap-mask GC clip is silently
         // ignored (matches pre-fix behaviour for that specific shape).
         let Some(handle) = PixmapHandle::from_raw(host_pixmap) else {
-            self.current_clip = ClipState::None;
+            self.core.current_clip = ClipState::None;
             return Ok(());
         };
-        self.current_clip = ClipState::Pixmap {
+        self.core.current_clip = ClipState::Pixmap {
             origin: (clip_x_origin, clip_y_origin),
             pixmap: handle,
         };
@@ -10781,7 +10123,7 @@ impl Backend for KmsBackend {
     }
 
     fn set_gc_fill_solid(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
-        self.current_fill = FillState::Solid;
+        self.core.current_fill = FillState::Solid;
         Ok(())
     }
 
@@ -10800,7 +10142,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         clip: &ClipState,
     ) -> io::Result<()> {
-        self.current_clip = clip.clone();
+        self.core.current_clip = clip.clone();
         Ok(())
     }
 
@@ -10809,7 +10151,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         fill: &FillState,
     ) -> io::Result<()> {
-        self.current_fill = fill.clone();
+        self.core.current_fill = fill.clone();
         Ok(())
     }
 
@@ -10819,11 +10161,11 @@ impl Backend for KmsBackend {
         state: &DrawState,
     ) -> io::Result<()> {
         if let Some(font) = state.font {
-            self.current_font = Some(font.as_raw());
+            self.core.current_font = Some(font.as_raw());
         }
-        self.current_function = state.function;
-        self.current_foreground = state.foreground;
-        self.current_background = state.background;
+        self.core.current_function = state.function;
+        self.core.current_foreground = state.foreground;
+        self.core.current_background = state.background;
         Ok(())
     }
 
@@ -10911,9 +10253,9 @@ impl Backend for KmsBackend {
             }
         }
 
-        let function = self.current_function;
-        let foreground = self.current_foreground;
-        let background = self.current_background;
+        let function = self.core.current_function;
+        let foreground = self.core.current_foreground;
+        let background = self.core.current_background;
         let foreground_rects = self.intersect_with_current_clip(&foreground_rects);
         let background_rects = self.intersect_with_current_clip(&background_rects);
         // Bg first, then fg (matches the previous pixman ordering so
@@ -11379,7 +10721,7 @@ impl Backend for KmsBackend {
             width,
             height,
         };
-        let function = self.current_function;
+        let function = self.core.current_function;
         self.try_vk_fill_with_function(host_xid, function, foreground, &[rect]);
         Ok(())
     }
@@ -11409,7 +10751,7 @@ impl Backend for KmsBackend {
                     break;
                 }
                 let font_xid = u32::from_be_bytes([items[1], items[2], items[3], items[4]]);
-                self.current_font = Some(font_xid);
+                self.core.current_font = Some(font_xid);
                 items = &items[5..];
                 continue;
             }
@@ -11422,7 +10764,9 @@ impl Backend for KmsBackend {
             cursor_x = cursor_x.saturating_add(i32::from(delta));
             if !text.is_empty() {
                 self.render_text_string(host_xid, foreground, cursor_x, y, text)?;
-                if let Some(font_state) = self.current_font.and_then(|f| self.fonts.get(&f)) {
+                if let Some(font_state) =
+                    self.core.current_font.and_then(|f| self.core.fonts.get(&f))
+                {
                     let advance: i32 = text
                         .iter()
                         .map(|&b| {
@@ -11468,7 +10812,7 @@ impl Backend for KmsBackend {
                     break;
                 }
                 let font_xid = u32::from_be_bytes([items[1], items[2], items[3], items[4]]);
-                self.current_font = Some(font_xid);
+                self.core.current_font = Some(font_xid);
                 items = &items[5..];
                 continue;
             }
@@ -11486,7 +10830,9 @@ impl Backend for KmsBackend {
             }
             if !chars.is_empty() {
                 self.render_text_chars(host_xid, foreground, cursor_x, y, &chars)?;
-                if let Some(font_state) = self.current_font.and_then(|f| self.fonts.get(&f)) {
+                if let Some(font_state) =
+                    self.core.current_font.and_then(|f| self.core.fonts.get(&f))
+                {
                     cursor_x = cursor_x.saturating_add(
                         chars
                             .iter()
@@ -11523,7 +10869,7 @@ impl Backend for KmsBackend {
         let y = i16::from_le_bytes([body[10], body[11]]) as i32;
 
         // Draw background rectangle first
-        if let Some(font_state) = self.current_font.and_then(|f| self.fonts.get(&f)) {
+        if let Some(font_state) = self.core.current_font.and_then(|f| self.core.fonts.get(&f)) {
             let total_width: i32 = body[12..]
                 .iter()
                 .take(text_len as usize)
@@ -11545,7 +10891,7 @@ impl Backend for KmsBackend {
                 width: total_width.clamp(0, u16::MAX as i32) as u16,
                 height: (ascent + descent).clamp(0, u16::MAX as i32) as u16,
             };
-            let function = self.current_function;
+            let function = self.core.current_function;
             let bg_rects = self.intersect_with_current_clip(&[rect]);
             if !bg_rects.is_empty() {
                 self.try_vk_fill_with_function(host_xid, function, background, &bg_rects);
@@ -11584,7 +10930,7 @@ impl Backend for KmsBackend {
             chars.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
         }
 
-        if let Some(font_state) = self.current_font.and_then(|f| self.fonts.get(&f)) {
+        if let Some(font_state) = self.core.current_font.and_then(|f| self.core.fonts.get(&f)) {
             let total_width: i32 = chars
                 .iter()
                 .map(|ch| {
@@ -11603,7 +10949,7 @@ impl Backend for KmsBackend {
                 width: total_width.clamp(0, u16::MAX as i32) as u16,
                 height: (ascent + descent).clamp(0, u16::MAX as i32) as u16,
             };
-            let function = self.current_function;
+            let function = self.core.current_function;
             let bg_rects = self.intersect_with_current_clip(&[rect]);
             if !bg_rects.is_empty() {
                 self.try_vk_fill_with_function(host_xid, function, background, &bg_rects);
@@ -11622,7 +10968,7 @@ impl Backend for KmsBackend {
         values: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
         let drawable_xid = host_drawable.as_raw();
-        let picture_xid = self.next_host_xid();
+        let picture_xid = self.core.next_host_xid();
         self.pictures
             .insert(picture_xid, default_drawable_picture(drawable_xid));
         if value_mask != 0 {
@@ -11826,11 +11172,11 @@ impl Backend for KmsBackend {
             RENDER_FMT_ARGB32 => GlyphSetFormat::Argb32,
             _ => GlyphSetFormat::Other,
         };
-        let id = self.next_host_xid();
+        let id = self.core.next_host_xid();
         log::debug!(
             "render_create_glyphset: client_format=0x{ynest_format:x} -> {format:?} host_gs=0x{id:x}"
         );
-        self.glyphsets.insert(
+        self.core.glyphsets.insert(
             id,
             GlyphSetState {
                 format,
@@ -11845,7 +11191,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         host_gs: u32,
     ) -> io::Result<()> {
-        self.glyphsets.remove(&host_gs);
+        self.core.glyphsets.remove(&host_gs);
         Ok(())
     }
 
@@ -11855,7 +11201,7 @@ impl Backend for KmsBackend {
         host_gs: u32,
         body_tail: &[u8],
     ) -> io::Result<()> {
-        if let Some(gs) = self.glyphsets.get_mut(&host_gs) {
+        if let Some(gs) = self.core.glyphsets.get_mut(&host_gs) {
             parse_add_glyphs(gs, body_tail);
         }
         Ok(())
@@ -11867,7 +11213,7 @@ impl Backend for KmsBackend {
         host_gs: u32,
         glyph_ids: &[u8],
     ) -> io::Result<()> {
-        let Some(gs) = self.glyphsets.get_mut(&host_gs) else {
+        let Some(gs) = self.core.glyphsets.get_mut(&host_gs) else {
             return Ok(());
         };
         for chunk in glyph_ids.chunks_exact(4) {
@@ -12173,7 +11519,7 @@ impl Backend for KmsBackend {
         let a = f32::from(a16) / 65535.0;
         let premul = [r, g, b, a];
 
-        let picture_xid = self.next_host_xid();
+        let picture_xid = self.core.next_host_xid();
         self.pictures.insert(
             picture_xid,
             PictureState::SolidFill {
@@ -12239,7 +11585,7 @@ impl Backend for KmsBackend {
                     return Ok(None);
                 }
             };
-        let picture_xid = self.next_host_xid();
+        let picture_xid = self.core.next_host_xid();
         self.pictures.insert(
             picture_xid,
             PictureState::Gradient {
@@ -12308,7 +11654,7 @@ impl Backend for KmsBackend {
                 return Ok(None);
             }
         };
-        let picture_xid = self.next_host_xid();
+        let picture_xid = self.core.next_host_xid();
         self.pictures.insert(
             picture_xid,
             PictureState::Gradient {
@@ -12353,7 +11699,7 @@ impl Backend for KmsBackend {
         //
         // Both cases produce the cursor mirror via vkCmdCopyImage —
         // no pixman path either way.
-        let id = self.next_host_xid();
+        let id = self.core.next_host_xid();
 
         if let Some(rescued) = self.picture_rescued_images.remove(&pic_xid) {
             log::debug!("render_create_cursor: using rescued mirror for pic {pic_xid}");
@@ -12557,10 +11903,10 @@ impl Backend for KmsBackend {
         let reply = match minor {
             // Reply minors with a real-data path.
             0 => Some(xkb_replies::reply_use_extension()),
-            6 => Some(xkb_replies::reply_get_controls(&self.xkb_keymap.0)),
-            8 => Some(xkb_replies::reply_get_map(&self.xkb_keymap.0)),
+            6 => Some(xkb_replies::reply_get_controls(&self.core.xkb_keymap.0)),
+            8 => Some(xkb_replies::reply_get_map(&self.core.xkb_keymap.0)),
             10 => Some(xkb_replies::reply_get_compat_map()),
-            17 => Some(xkb_replies::reply_get_names(&self.xkb_keymap.0)),
+            17 => Some(xkb_replies::reply_get_names(&self.core.xkb_keymap.0)),
             24 => Some(xkb_replies::reply_get_device_info()),
             // Reply minors we don't model — answer with a minimal
             // 32-byte zero reply so xcb completes the cookie.
@@ -12593,9 +11939,9 @@ impl Backend for KmsBackend {
         rects: &[xfixes::RegionRect],
     ) -> io::Result<()> {
         let map = match kind {
-            0 => &mut self.shape_bounding,
-            1 => &mut self.shape_clip,
-            2 => &mut self.shape_input,
+            0 => &mut self.core.shape_bounding,
+            1 => &mut self.core.shape_clip,
+            2 => &mut self.core.shape_input,
             _ => return Ok(()),
         };
         // Store always: server sends the full window rect when shape is cleared
@@ -12613,22 +11959,22 @@ impl Backend for KmsBackend {
         dst_y: i16,
     ) -> io::Result<()> {
         let (base_x, base_y) = if dst_host_xid == 0 {
-            (self.cursor_x, self.cursor_y)
+            (self.core.cursor_x, self.core.cursor_y)
         } else if let Some(w) = self.windows.get(&dst_host_xid) {
             (w.x as f32, w.y as f32)
         } else {
             return Ok(());
         };
 
-        self.cursor_x = (base_x + dst_x as f32).clamp(0.0, self.fb_w as f32 - 1.0);
-        self.cursor_y = (base_y + dst_y as f32).clamp(0.0, self.fb_h as f32 - 1.0);
+        self.core.cursor_x = (base_x + dst_x as f32).clamp(0.0, self.fb_w as f32 - 1.0);
+        self.core.cursor_y = (base_y + dst_y as f32).clamp(0.0, self.fb_h as f32 - 1.0);
         // XWarpPointer doesn't have ServerState in the Backend trait
         // scope, so we can't compute the spec-correct crossing chain
         // here today. Emit a motion event only; warp-driven crossings
         // are filed as a followup (the chain would mirror what
         // `update_pointer_window` does for libinput motion).
-        let host_xid = self.window_under_cursor().unwrap_or(self.window_id);
-        let mask = self.serialize_modifiers() | self.button_mask;
+        let host_xid = self.window_under_cursor().unwrap_or(self.core.window_id);
+        let mask = self.serialize_modifiers() | self.core.button_mask;
         self.emit_motion_only(host_xid, mask);
         Ok(())
     }
@@ -12636,8 +11982,8 @@ impl Backend for KmsBackend {
     fn query_pointer(&mut self, _origin: Option<OriginContext>) -> io::Result<PointerPosition> {
         Ok(PointerPosition {
             same_screen: true,
-            win_x: self.cursor_x as i16,
-            win_y: self.cursor_y as i16,
+            win_x: self.core.cursor_x as i16,
+            win_y: self.core.cursor_y as i16,
             mask: self.serialize_modifiers(),
         })
     }
@@ -12650,6 +11996,7 @@ impl Backend for KmsBackend {
     ) -> io::Result<Vec<u8>> {
         let cap = usize::from(max_names);
         let names: Vec<&str> = self
+            .core
             .font_loader
             .catalog
             .iter()
@@ -12691,6 +12038,7 @@ impl Backend for KmsBackend {
         // metrics agree with later QueryFont metrics on the same XLFD.
         let cap = usize::from(max_names);
         let matched: Vec<String> = self
+            .core
             .font_loader
             .catalog
             .iter()
@@ -12701,7 +12049,7 @@ impl Backend for KmsBackend {
 
         let mut entries: Vec<(String, FontMetrics)> = Vec::with_capacity(matched.len());
         for name in matched {
-            match self.font_loader.open_font(&name) {
+            match self.core.font_loader.open_font(&name) {
                 Ok((_face, metrics, _cache)) => entries.push((name, metrics)),
                 Err(err) => {
                     log::debug!("ListFontsWithInfo: skipping {name:?} — open_font: {err}");
@@ -12764,7 +12112,11 @@ impl Backend for KmsBackend {
         for kc in u16::from(first_keycode)..max_kc {
             let xkb_kc = xkbcommon::xkb::Keycode::new(u32::from(kc));
             for level in 0..LEVELS as u32 {
-                let syms = self.xkb_keymap.0.key_get_syms_by_level(xkb_kc, 0, level);
+                let syms = self
+                    .core
+                    .xkb_keymap
+                    .0
+                    .key_get_syms_by_level(xkb_kc, 0, level);
                 flat.push(syms.first().map_or(0, |s| s.raw()));
             }
         }
@@ -12901,7 +12253,8 @@ mod tests {
     use yserver_core::backend::Backend;
     use yserver_protocol::x11::ResourceId;
 
-    use super::{AliasEntry, AliasRegistry, KmsBackend, OutputLayout, WindowState};
+    use super::{AliasEntry, KmsBackend, OutputLayout, WindowState};
+    use crate::kms::core::AliasRegistry;
     use yserver_core::backend::PixmapHandle;
 
     #[test]
@@ -12922,6 +12275,7 @@ mod tests {
             .allocate_redirected_backing(None, host_window, 200, 150, 24)
             .expect("allocate_redirected_backing");
         let entry = backend
+            .core
             .alias_registry
             .get(backing)
             .copied()
@@ -12932,6 +12286,7 @@ mod tests {
         assert_eq!(entry.depth, 24);
         assert_eq!(
             backend
+                .core
                 .host_window_to_backing
                 .get(&host_window.as_raw())
                 .copied(),
@@ -12948,12 +12303,12 @@ mod tests {
         let backing = backend
             .allocate_redirected_backing(None, host_window, 100, 50, 24)
             .expect("allocate");
-        let pre = backend.alias_registry.get(backing).map(|e| e.refcount);
+        let pre = backend.core.alias_registry.get(backing).map(|e| e.refcount);
         let aliased = backend
             .name_window_pixmap(None, host_window)
             .expect("alias");
         assert_eq!(aliased, backing);
-        let post = backend.alias_registry.get(backing).map(|e| e.refcount);
+        let post = backend.core.alias_registry.get(backing).map(|e| e.refcount);
         assert_eq!(post, pre.map(|r| r + 1));
     }
 
@@ -12967,8 +12322,8 @@ mod tests {
         backend
             .release_redirected_backing(None, backing)
             .expect("release");
-        assert!(backend.alias_registry.get(backing).is_none());
-        assert!(backend.host_window_to_backing.is_empty());
+        assert!(backend.core.alias_registry.get(backing).is_none());
+        assert!(backend.core.host_window_to_backing.is_empty());
     }
 
     #[test]
@@ -12987,7 +12342,7 @@ mod tests {
             .release_redirected_backing(None, backing)
             .expect("release");
         assert_eq!(
-            backend.alias_registry.get(backing).map(|e| e.refcount),
+            backend.core.alias_registry.get(backing).map(|e| e.refcount),
             Some(1)
         );
     }
@@ -13169,16 +12524,16 @@ mod tests {
     #[test]
     fn warp_pointer_updates_cursor_position() {
         let mut b = make_test_backend();
-        let xid = b.next_host_xid;
-        b.next_host_xid += 1;
+        let xid = b.core.next_host_xid;
+        b.core.next_host_xid += 1;
         b.windows
             .insert(xid, make_test_window(100, 200, 300, 200, true));
-        b.top_level_order.push(xid);
+        b.core.top_level_order.push(xid);
 
         b.warp_pointer(None, xid, 10, 20).unwrap();
 
-        assert_eq!(b.cursor_x as i32, 110);
-        assert_eq!(b.cursor_y as i32, 220);
+        assert_eq!(b.core.cursor_x as i32, 110);
+        assert_eq!(b.core.cursor_y as i32, 220);
     }
 
     // ---------------------------------------------------------------------------
@@ -13189,11 +12544,11 @@ mod tests {
     fn window_intersects_bbox_filters_off_screen_top_levels() {
         let mut b = make_test_backend();
         // Top-level placed off the default test layout (0,0,800,600).
-        let xid = b.next_host_xid;
-        b.next_host_xid += 1;
+        let xid = b.core.next_host_xid;
+        b.core.next_host_xid += 1;
         b.windows
             .insert(xid, make_test_window(2000, 100, 100, 100, true));
-        b.top_level_order.push(xid);
+        b.core.top_level_order.push(xid);
 
         // Whole virtual screen including (0..1024, 0..768) — does not reach x=2000.
         assert!(!b.window_intersects(
@@ -13304,7 +12659,7 @@ mod tests {
     fn parse_xlfd_extracts_family_style_pixelsize() {
         // XLFD weight strings are lowercase; we pass them straight to fontconfig
         // which matches case-insensitively.
-        let (fam, style, px) = super::FontLoader::parse_xlfd(
+        let (fam, style, px) = crate::kms::core::FontLoader::parse_xlfd(
             "-adobe-helvetica-bold-i-normal--12-120-75-75-p-67-iso8859-1",
         );
         assert_eq!(fam.as_deref(), Some("helvetica"));
@@ -13315,7 +12670,8 @@ mod tests {
     #[test]
     fn parse_xlfd_treats_wildcards_as_unspecified() {
         // Wildcards in family/weight/slant ⇒ None; pixelsize "*" ⇒ no size.
-        let (fam, style, px) = super::FontLoader::parse_xlfd("-*-*-*-*-*-*-*-*-*-*-*-*-*-*");
+        let (fam, style, px) =
+            crate::kms::core::FontLoader::parse_xlfd("-*-*-*-*-*-*-*-*-*-*-*-*-*-*");
         assert!(fam.is_none());
         assert!(style.is_none());
         assert!(px.is_none());
@@ -13324,7 +12680,7 @@ mod tests {
     #[test]
     fn parse_xlfd_roman_slant_no_italic() {
         // Slant "r" (roman) shouldn't pull in "Italic"; weight "medium" carries through.
-        let (_, style, _) = super::FontLoader::parse_xlfd(
+        let (_, style, _) = crate::kms::core::FontLoader::parse_xlfd(
             "-adobe-courier-medium-r-normal--14-140-75-75-m-90-iso8859-1",
         );
         assert_eq!(style.as_deref(), Some("medium"));
@@ -13334,7 +12690,7 @@ mod tests {
     fn open_font_accepts_x11_alias_via_fontconfig() {
         // "fixed" is a classic X11 alias. fontconfig knows it, or falls back
         // to monospace — either way we must get a usable face.
-        let loader = super::FontLoader::new().expect("fontconfig+freetype init");
+        let loader = crate::kms::core::FontLoader::new().expect("fontconfig+freetype init");
         let (_face, metrics, _cache) = loader.open_font("fixed").expect("resolve fixed");
         assert!(metrics.font_ascent + metrics.font_descent > 0);
     }
@@ -13382,31 +12738,34 @@ mod tests {
     #[test]
     fn xlfd_weight_buckets() {
         // Spot-check the FC_WEIGHT_* → XLFD weight bucket boundaries.
-        assert_eq!(super::xlfd_weight(0), "thin");
-        assert_eq!(super::xlfd_weight(50), "light");
-        assert_eq!(super::xlfd_weight(80), "book"); // FC_WEIGHT_REGULAR
-        assert_eq!(super::xlfd_weight(100), "medium"); // FC_WEIGHT_MEDIUM
-        assert_eq!(super::xlfd_weight(180), "demibold"); // FC_WEIGHT_DEMIBOLD
-        assert_eq!(super::xlfd_weight(200), "bold"); // FC_WEIGHT_BOLD
-        assert_eq!(super::xlfd_weight(210), "black"); // FC_WEIGHT_BLACK
+        assert_eq!(crate::kms::core::xlfd_weight(0), "thin");
+        assert_eq!(crate::kms::core::xlfd_weight(50), "light");
+        assert_eq!(crate::kms::core::xlfd_weight(80), "book"); // FC_WEIGHT_REGULAR
+        assert_eq!(crate::kms::core::xlfd_weight(100), "medium"); // FC_WEIGHT_MEDIUM
+        assert_eq!(crate::kms::core::xlfd_weight(180), "demibold"); // FC_WEIGHT_DEMIBOLD
+        assert_eq!(crate::kms::core::xlfd_weight(200), "bold"); // FC_WEIGHT_BOLD
+        assert_eq!(crate::kms::core::xlfd_weight(210), "black"); // FC_WEIGHT_BLACK
     }
 
     #[test]
     fn xlfd_slant_and_spacing_codes() {
-        assert_eq!(super::xlfd_slant(0), "r");
-        assert_eq!(super::xlfd_slant(100), "i");
-        assert_eq!(super::xlfd_slant(110), "o");
-        assert_eq!(super::xlfd_spacing(0), "p");
-        assert_eq!(super::xlfd_spacing(100), "m");
-        assert_eq!(super::xlfd_spacing(110), "c");
+        assert_eq!(crate::kms::core::xlfd_slant(0), "r");
+        assert_eq!(crate::kms::core::xlfd_slant(100), "i");
+        assert_eq!(crate::kms::core::xlfd_slant(110), "o");
+        assert_eq!(crate::kms::core::xlfd_spacing(0), "p");
+        assert_eq!(crate::kms::core::xlfd_spacing(100), "m");
+        assert_eq!(crate::kms::core::xlfd_spacing(110), "c");
     }
 
     #[test]
     fn sanitize_xlfd_field_replaces_dashes_and_lowercases() {
         // Dashes inside an XLFD field would corrupt field separation.
-        assert_eq!(super::sanitize_xlfd_field("DejaVu Sans"), "dejavu sans");
         assert_eq!(
-            super::sanitize_xlfd_field("Liberation-Mono"),
+            crate::kms::core::sanitize_xlfd_field("DejaVu Sans"),
+            "dejavu sans"
+        );
+        assert_eq!(
+            crate::kms::core::sanitize_xlfd_field("Liberation-Mono"),
             "liberation mono"
         );
     }
@@ -13417,7 +12776,7 @@ mod tests {
         // XLFDs for both Latin-1 and Unicode charsets; libXt's fontset
         // assembly needs both.
         let fc = fontconfig::Fontconfig::new().expect("fontconfig init");
-        let catalog = super::build_font_catalog(&fc);
+        let catalog = crate::kms::core::build_font_catalog(&fc);
         assert!(
             catalog.iter().any(|x| x.ends_with("-iso8859-1")),
             "catalog has no iso8859-1 entries"
@@ -13529,7 +12888,7 @@ mod tests {
         body.extend_from_slice(&[0x12, 0x34, 0x56, 0x78]);
 
         b.poly_text8(None, 0, 0, &body).unwrap();
-        assert_eq!(b.current_font, Some(0x1234_5678));
+        assert_eq!(b.core.current_font, Some(0x1234_5678));
     }
 
     #[test]
@@ -13540,7 +12899,7 @@ mod tests {
         body.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
 
         b.poly_text8(None, 0, 0, &body).unwrap();
-        assert_eq!(b.current_font, Some(0xAABB_CCDD));
+        assert_eq!(b.core.current_font, Some(0xAABB_CCDD));
     }
 
     #[test]
@@ -13555,7 +12914,7 @@ mod tests {
         body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
 
         b.poly_text8(None, 0, 0, &body).unwrap();
-        assert_eq!(b.current_font, Some(0xDEAD_BEEF));
+        assert_eq!(b.core.current_font, Some(0xDEAD_BEEF));
     }
 
     #[test]
@@ -13570,7 +12929,7 @@ mod tests {
         body.extend_from_slice(&[0xCA, 0xFE, 0xF0, 0x0D]);
 
         b.poly_text16(None, 0, 0, &body).unwrap();
-        assert_eq!(b.current_font, Some(0xCAFE_F00D));
+        assert_eq!(b.core.current_font, Some(0xCAFE_F00D));
     }
 
     // ---------------------------------------------------------------------------

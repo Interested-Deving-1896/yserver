@@ -2,6 +2,7 @@ mod backend;
 pub mod compositor;
 #[cfg(target_os = "linux")]
 pub mod console;
+pub(crate) mod core;
 pub mod cpu_types;
 pub(crate) mod cursor_plane;
 pub mod event;
