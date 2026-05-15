@@ -125,7 +125,7 @@ enforcement of at least one. Violating any of them is the bug.
 | I4 | COMPOSITE redirect only changes the **target storage** for a window. It does not change which paint paths run, which RENDER ops are valid, which damage fires. Manual-mode redirect additionally **removes the window from server-managed scene composition** — yserver routes client paint into the backing and exposes it via `NameWindowPixmap`, but the external compositor decides what becomes visible (typically by painting to root or COW). The scene does **not** automatically draw the redirected backing; doing so would duplicate or bypass the compositor's policy. Automatic-mode redirect keeps the window in the scene (the compositor only observes damage, not presents). | `DrawableStore` + `SceneCompositor` |
 | I5 | Damage has **two sources** that both contribute to **output damage** (the per-output region that the next composite re-blits). (a) **Storage damage** — paint mutated a storage region (recorded in `DrawableStore`, in storage-local coords); projected through scene-entry transforms onto outputs. (b) **Scene-structure damage** — map/unmap/configure/stacking/shape/redirect-state/cursor/output changes that alter visible composition without changing storage pixels; recorded directly as output-coord rects. The scene re-blits any scene entry intersecting output damage, not just entries with storage damage — restacks, occlusion changes, and re-exposures hit this path. Damage is **acked only on successful present**, so a failed submit does not lose repaint state. | `DrawableStore` (storage) + `SceneCompositor` (scene-structure + output projection) |
 | I6 | Every image / buffer / fence has an **owner** and a **retirement generation**. v2 tracks **two distinct retirement signals** because they describe different consumers: **I6a — GPU render-completion fence** (signaled when the queue finishes executing a submitted CB; source storage sampled by the compose pass is releasable once this fires). **I6b — KMS page-flip retirement** (signaled when KMS hands back the previously-scanned-out BO; that BO is releasable for reuse only on this signal). Resources are freed only after **the relevant** retirement signal for their last consumer has fired. | Cross-cutting; `PlatformBackend` provides both fence primitives |
-| I7 | Direct scanout is disabled. The scanout BO is filled only by `SceneCompositor`'s composed pass. No per-window scanout shortcuts, no HW cursor plane shortcut (until it's reintroduced under invariant I6's retirement model). | `PlatformBackend` |
+| I7 | **Initial invariant**: direct scanout is disabled; the scanout BO is filled only by `SceneCompositor`'s composed pass. No per-window scanout shortcuts, no HW cursor plane shortcut, no bypass paths. **Future relaxation**: direct scanout, HW cursor plane, and HW plane assignment may be reintroduced later, but only as `SceneCompositor`-owned **strategy choices** over scene entries — never as side paths that bypass scene ownership. The contract stays "output equals the resolved scene"; the strategy chooses how scene entries reach the screen (composition, plane, direct present). | `PlatformBackend` (initial); `SceneCompositor` decides strategy when relaxed |
 
 ## Shape of the new code
 
@@ -602,13 +602,28 @@ exact failure mode v2 is designed to eliminate.
 - Stage done when: xfce menu shadows are alpha-correct, picom blur
   renders, no regression on non-composited WMs.
 
-### Stage 5 (optional, follow-up) — perf parity
+### Stage 5 (optional, follow-up) — advanced perf strategies
 
-- HW cursor plane returns under I6's retirement model.
-- Direct scanout for full-screen clients (Compiz/games eventually).
-- Damage-region clipping in the composed pass to skip whole-output
-  blits when only a corner changed.
-- Multi-queue if profiling justifies.
+Basic output-damage clipping is **load-bearing for v2** and lives
+in Stages 2/3 (Stage 2's `SceneCompositor` already operates on
+output-damage regions per I5; Stage 3 keeps that as RENDER paths
+come online). Stage 5 owns the advanced policy:
+
+- **Strategy selection per frame**: full-output redraw vs
+  clipped redraw choice based on damage fragmentation / coverage
+  thresholds; occlusion-driven scene entry skip; partial clears.
+- HW cursor plane returns under I6's retirement model, as a
+  `SceneCompositor` strategy choice over the cursor entry.
+- Direct scanout for eligible full-output entries (Compiz, games
+  eventually), as a `SceneCompositor` strategy choice.
+- Hardware plane assignment for video / overlay entries.
+- Submit aggregation across PaintBatch + scene compose.
+- Multi-queue (graphics + transfer split) if profiling justifies.
+- DRM in-fence / syncobj submission to replace CPU fence waits.
+
+The pattern: Stage 5 work is **strategy plug-ins** that the
+existing components select between. No new model, no new
+component, no new invariant.
 
 ## Performance — what the design allows, what it doesn't promise
 
@@ -692,6 +707,63 @@ is wrong, not the implementation.
   invariants (especially I3 — "visibility produced only by a
   compositor pass") rather than being expressible *as* compositor
   strategies.
+
+### Instrumentation — required, not optional
+
+The perf gates ("Stage 3 within 2× of v1", "no regression on
+fuji", "no GPU faults on bee", v1-deletion measured gates, etc.)
+are only enforceable if v2 emits the counters that let us judge
+them objectively. Hand-waving "feels fast" is what got us to the
+current "bee is laggy and we're not sure why" state.
+
+**Required counters / log lines** — wired from Stage 2 onwards,
+before judging "fast enough" at any stage:
+
+- **Submit counters** (separately, not aggregated):
+  - `paint_submits/sec` — `RenderEngine`'s `flush()` count.
+  - `composite_submits/sec` — `SceneCompositor` tick submits.
+  - `one_shot_submits/sec` — readback, dump, init clears.
+  - Total `queue_submit2/sec` — sum check.
+- **Wait counters**:
+  - `vk_queue_wait_idle/sec` — **target zero** in steady state.
+  - `cpu_fence_wait_ns/sec` — CPU time spent in `wait_for_fences`.
+  - `cpu_fence_wait_count/sec` — number of fence-wait calls.
+- **Damage / scene counters**:
+  - `damaged_pixels/frame` (per output) — sum of output-damage
+    region areas.
+  - `output_pixels/frame` (per output) — total scanout area.
+  - `damage_fraction` = damaged ÷ output (logged percentile).
+  - `scene_entries_visited/frame` — total entries the compositor
+    looked at.
+  - `scene_entries_drawn/frame` — entries that intersected damage
+    and got blitted.
+  - `full_redraw_fallback/sec` — count of frames that chose full
+    redraw over clipped (Stage 5 instrumentation; zero on
+    Stage 2/3).
+- **Resource counters**:
+  - `storage_allocations/sec` — `DrawableStore` allocations.
+  - `descriptor_allocations/sec` — per-frame vs cached split.
+  - `image_view_creates/sec` — should approach zero in steady
+    state with caching.
+  - `pixmap_pool_hit_rate` — keep parity with v1's pool numbers
+    or improve.
+- **Output / timing counters**:
+  - `frame_present_count/sec` — successful flips.
+  - `missed_pageflips/sec` — vblank misses.
+  - `gpu_render_ns/frame` — via `vkCmdWriteTimestamp` pair if
+    timestamp queries are available; otherwise skipped.
+  - `compose_cb_record_ns/frame` — CPU time building the
+    compose CB.
+
+**Emission shape**: same per-second-summary form as v1's existing
+telemetry (gated by `YSERVER_LOOP_TELEMETRY=1` or similar; verbose
+log lines once per second, parsable by grep+awk).
+
+**Acceptance discipline**: every stage's "stage done when" gate
+that names a perf criterion (e.g. "no `vkQueueWaitIdle` on hot
+path", "queue_submit2 rate no higher than v1") must cite the
+specific counter being checked. Verbal claims without counter
+evidence don't close a stage.
 
 ### Expectations per hardware class
 
