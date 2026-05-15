@@ -57,7 +57,25 @@ The v2 model addresses both axes together. Patching either in
 isolation would mean retrofitting onto assumptions the other axis
 needs to change.
 
-## Load-bearing outcomes
+## End-goal (project-wide, not v2-scoped)
+
+**On non-ancient hardware, yserver flies.** Concretely: 60+ fps
+sustained for typical desktop interactions (window drag, terminal
+text scroll, GTK rendering, compositor blur), subjectively snappy
+input → display response, no catastrophic-lag failure modes like
+the current bee + adapta-mate-cc cliff. "Non-ancient" = anything
+that already meets yserver's Vulkan 1.3 requirement (~Skylake+
+Intel, RDNA2+ AMD, M-series Apple, modern discrete cards).
+
+This is the project's perf goal, not v2's. v2's job is to be the
+**substrate that makes reaching this goal possible**. The "flies"
+outcome itself is delivered by a series of perf plans built on
+v2 — submit aggregation, glyph atlas rework, hardware plane
+assignment, etc.
+
+## Load-bearing outcomes (v2-specific)
+
+What v2 itself ships:
 
 1. **Compositing WMs work.** xfwm4 with compositing enabled, picom's
    xrender backend, xcompmgr, compton render their visible output
@@ -69,6 +87,12 @@ needs to change.
    marco, mate-without-compositor, xfce without compositing all
    continue to render correctly.
 4. **rendercheck passes at least at parity with current baseline.**
+5. **The end-goal is unblocked.** Every optimization needed to make
+   yserver fly on non-ancient hardware (output-damage clipping,
+   submit aggregation, hardware-plane assignment, direct scanout,
+   async via DRM in-fences) must be implementable as a strategy
+   choice inside v2's four components, not requiring another model
+   change. See the "Performance" section for the full list.
 
 Out of scope (handled later, or never):
 
@@ -669,33 +693,38 @@ is wrong, not the implementation.
   compositor pass") rather than being expressible *as* compositor
   strategies.
 
-### Honest expectations per hardware class
+### Expectations per hardware class
 
-v1 is the **minimum bar** — not the target. v1 is incorrect (no
-compositing) and slow on RDNA2 / high-end discrete. Hitting v1's
-perf isn't a win; it's the floor.
+The **end-goal** is "yserver flies on non-ancient hardware"
+(see top of document). v2 doesn't deliver that by itself; it's
+the substrate the perf plans run on. v1 is the **minimum bar**:
+v1 is incorrect (no compositing) and slow on RDNA2 / high-end
+discrete. Matching v1 isn't a win; it's the floor.
 
-- **fuji (Intel)**: no worse than v1 by Stage 3 (floor); should be
-  measurably better from Stage 4 onwards on damage-intensive
-  workloads, since damage-clipped composition is the load-bearing
-  v2 win. "Snappy" must survive.
-- **bee (RDNA2)**: model change alone won't fix adapta-mate-cc.
-  bee's bottleneck is submit rate + per-submit RADV tax + glyph
-  atlas churn. The floor is "no worse than v1, no GPU faults" —
-  v2 fixes the fault-safety (I6) but the submit-rate / glyph
-  work is separate plans implemented *on top of v2*. The model
-  must make those plans tractable, not block them.
-- **silence (high-end discrete)**: same story as bee. Model isn't
-  the bottleneck; absolute submit / driver-tax dominates. Floor:
-  no regression. Ceiling: depends on subsequent perf work.
+At each stage:
 
-The honest framing: **v2 is the model change that unblocks future
-perf work**. The future perf work is a separate set of plans,
-gated by hardware profiling. v1 isn't fast — matching it isn't a
-goal. The goal is "v2 is correct where v1 isn't, no worse where
-v1 was acceptable, and clearly better where the model change can
-deliver." Anything less is a wasted rewrite; anything implying
-v2 will fix RDNA2 perf by itself overpromises again.
+- **fuji (Intel, Kaby Lake)**: at v2 Stage 3 close — no worse than
+  v1. At Stage 4 — measurably better on damage-intensive workloads
+  (damage-clipped composition is the load-bearing v2 win). With
+  perf plans on top — solidly in "flies" territory.
+- **bee (RDNA2)**: at Stage 2 — no GPU faults under reproducer
+  workloads (I6 fault-safety, the load-bearing correctness win).
+  At Stage 3 — no worse than v1 (no fix to submit-rate cliff yet;
+  that needs separate work). With submit-aggregation + glyph
+  rework plans on top of v2 — "flies" territory.
+- **silence (high-end discrete)**: same path as bee. Model isn't
+  the bottleneck; absolute submit / driver-tax dominates. v2 puts
+  the substrate in place; subsequent perf work delivers.
+- **air / m4 (Apple M-series)**: untested currently. Should be
+  fine — the model is hardware-agnostic and Apple's drivers are
+  conservative about lifetime. "Flies" should fall out without
+  hardware-specific work.
+
+The honest framing: **v2 is the model change that unblocks
+"yserver flies"**. It is not itself the perf work. Anyone
+expecting v2-only to make bee fly is being mis-sold; anyone
+expecting "flies on non-ancient hardware" to be unreachable
+after v2 + the subsequent perf plans is selling v2 short.
 
 ## Risks + open questions
 
