@@ -123,7 +123,7 @@ enforcement of at least one. Violating any of them is the bug.
 | I2 | Client drawing mutates **only drawable storage**. Paint paths do not write to scanout BOs, do not bypass storage, do not have a "live window" fast path. | `RenderEngine` |
 | I3 | Window visibility is produced **only by a compositor pass**. Scanout is the output of a scene-graph composition over drawable storage, never a direct view onto window mirrors. | `SceneCompositor` |
 | I4 | COMPOSITE redirect only changes the **target storage** for a window. It does not change which paint paths run, which RENDER ops are valid, which damage fires. Manual-mode redirect additionally **removes the window from server-managed scene composition** — yserver routes client paint into the backing and exposes it via `NameWindowPixmap`, but the external compositor decides what becomes visible (typically by painting to root or COW). The scene does **not** automatically draw the redirected backing; doing so would duplicate or bypass the compositor's policy. Automatic-mode redirect keeps the window in the scene (the compositor only observes damage, not presents). | `DrawableStore` + `SceneCompositor` |
-| I5 | Damage has **two sources** that both contribute to **output damage** (the per-output region that the next composite re-blits). (a) **Storage damage** — paint mutated a storage region (recorded in `DrawableStore`, in storage-local coords); projected through scene-entry transforms onto outputs. (b) **Scene-structure damage** — map/unmap/configure/stacking/shape/redirect-state/cursor/output changes that alter visible composition without changing storage pixels; recorded directly as output-coord rects. The scene re-blits any scene entry intersecting output damage, not just entries with storage damage — restacks, occlusion changes, and re-exposures hit this path. Damage is **acked only on successful present**, so a failed submit does not lose repaint state. | `DrawableStore` (storage) + `SceneCompositor` (scene-structure + output projection) |
+| I5 | Damage is **two separate concerns** with overlapping inputs. **Presentation damage** drives the scene's next re-blit and has two sources: (a) per-storage paint-mutated region (in storage-local coords, only on scene-participating storage); (b) scene-structure damage from map/unmap/configure/stacking/shape/redirect-state/cursor/output changes (in output coords). Both feed **per-output damage**, which is what the compositor re-blits — restacks and occlusion re-expose regions even when storage didn't change. Acked only on successful present; failed submits don't lose repaint state. **Protocol damage** is the X11 DAMAGE-extension's per-drawable region: accumulates on every paint to any storage, regardless of scene participation, drives DamageNotify events to subscribed clients, acked by `DamageSubtract`. Manual-redirected backings get protocol damage but **no** presentation damage — the external compositor reads via NameWindowPixmap on the DamageNotify, repaints root, root's presentation damage drives the scene. | `DrawableStore` (both kinds) + `SceneCompositor` (presentation + scene-structure) + DAMAGE-ext dispatcher (protocol) |
 | I6 | Every image / buffer / fence has an **owner** and a **retirement generation**. v2 tracks **two distinct retirement signals** because they describe different consumers: **I6a — GPU render-completion fence** (signaled when the queue finishes executing a submitted CB; source storage sampled by the compose pass is releasable once this fires). **I6b — KMS page-flip retirement** (signaled when KMS hands back the previously-scanned-out BO; that BO is releasable for reuse only on this signal). Resources are freed only after **the relevant** retirement signal for their last consumer has fired. | Cross-cutting; `PlatformBackend` provides both fence primitives |
 | I7 | **Initial invariant**: direct scanout is disabled; the scanout BO is filled only by `SceneCompositor`'s composed pass. No per-window scanout shortcuts, no HW cursor plane shortcut, no bypass paths. **Future relaxation**: direct scanout, HW cursor plane, and HW plane assignment may be reintroduced later, but only as `SceneCompositor`-owned **strategy choices** over scene entries — never as side paths that bypass scene ownership. The contract stays "output equals the resolved scene"; the strategy chooses how scene entries reach the screen (composition, plane, direct present). | `PlatformBackend` (initial); `SceneCompositor` decides strategy when relaxed |
 
@@ -177,33 +177,60 @@ Tracks:
   storage).
 - Retirement generation per storage: storage is freed only after the
   last frame that referenced it has retired (I6).
-- Damage region per storage (I5): a rectangle set, accumulated by paint
-  ops, peeked by `SceneCompositor` during composition and acked
-  after successful present (snapshot semantics — see `peek_damage`
-  / `ack_damage` below).
+- **Two damage regions per storage** (I5). They accumulate from the
+  same paint ops but serve different consumers and have independent
+  ack lifecycles:
+  - **Presentation damage** — region the scene needs to re-blit.
+    Only meaningful for storage that participates in the scene
+    (root, mapped non-redirected windows + descendants, COW,
+    cursor). Peeked by `SceneCompositor` at composite time, acked
+    after successful present. Pixmaps not in the scene, unmapped
+    windows, and Manual-redirected backings do **not** accumulate
+    presentation damage — the scene doesn't draw from them, so
+    there's nothing for `SceneCompositor` to ack.
+  - **Protocol damage** — region the X11 DAMAGE extension reports
+    to clients that have called `DamageCreate` on this drawable.
+    Accumulates on every storage regardless of scene participation.
+    Peeked + acked by the DAMAGE-extension dispatch path on
+    `DamageSubtract`. Distinct from presentation damage so that
+    paint to an offscreen pixmap (e.g., RENDER source) fires the
+    correct `DamageNotify` events without polluting scene state,
+    and so paint to a Manual-redirected backing fires
+    `DamageNotify` to the external compositor (which then reads
+    via NameWindowPixmap → RENDER Composite → root's presentation
+    damage → scene redraw).
 
 Exposes:
 
-- `allocate(width, height, format, owner) -> DrawableId`
+- `allocate(width, height, format, owner, scene_participating: bool)
+  -> DrawableId` — `scene_participating` decides whether
+  presentation damage accumulates. Root, windows (set/unset at
+  map/unmap), COW, cursor: true. Pixmaps, Manual-redirected
+  backings: false.
+- `set_scene_participating(id, bool)` — flip the flag when a
+  window maps/unmaps or its redirect state changes.
 - `borrow(id) -> &Storage` (read-only access for paint, composition)
 - `borrow_mut(id) -> &mut Storage` (write access for paint)
-- `damage(id, rect)` (accumulate damage)
-- `peek_damage(id) -> DamageSnapshot { epoch: u64, region: RegionSet }`
-  — return a versioned snapshot of the current damage. The epoch
-  is a monotonic counter incremented every time damage is
-  acked; the region is the union of all damage rects accumulated
-  so far. Used by `SceneCompositor` when building the composed CB.
-- `ack_damage(id, frame_id, snapshot: DamageSnapshot)` — subtract
-  **only the snapshot's region** from the live damage state, gated
-  on the snapshot's epoch still being current (i.e. no other ack
-  has happened since this snapshot was taken). Damage that arrived
-  between peek and ack (typically: paint that landed while frame N
-  was in flight) has a higher implicit epoch and **survives the
-  ack**, so the next composite tick re-blits it. Called only on the
-  I6b page-flip retirement for the frame the snapshot was built
-  into. A failed submit means no ack call is made; the next tick
-  re-peeks and sees both the original snapshot AND any new damage,
-  re-composes the union.
+- `damage(id, rect)` — accumulate damage on **both** lists for the
+  storage. Presentation list is updated only if `scene_participating`.
+  Protocol list is always updated.
+- `peek_presentation_damage(id) -> DamageSnapshot { epoch: u64, region: RegionSet }`
+  — return a versioned snapshot of the presentation damage. Used
+  by `SceneCompositor` when building the composed CB.
+- `ack_presentation_damage(id, frame_id, snapshot: DamageSnapshot)`
+  — subtract **only the snapshot's region** from the live
+  presentation-damage state, gated on the snapshot's epoch still
+  being current (no other ack happened since this snapshot was
+  taken). Damage that arrived between peek and ack (paint that
+  landed while frame N was in flight) has a higher implicit epoch
+  and **survives the ack**, so the next composite tick re-blits
+  it. Called only on the I6b page-flip retirement for the frame
+  the snapshot was built into. A failed submit means no ack call;
+  the next tick re-peeks and re-composes the union.
+- `peek_protocol_damage(id) -> RegionSet` / `subtract_protocol_damage(id, region)`
+  — the X11 DAMAGE extension's `DamageSubtract` semantics, used
+  by the DAMAGE dispatcher, independent of `SceneCompositor`'s
+  lifecycle.
 - `retire(id)` (drop the reference; storage freed when last ref +
   I6a render-completion + I6b page-flip retirement allow it)
 - `set_redirected_target(window_id, backing_id)` (COMPOSITE redirect —
@@ -248,6 +275,9 @@ Owns:
 - Stack of `(DrawableId, transform, region)` describing what to put
   on screen each frame.
 - Per-output scanout image rotation.
+- **Per-BO repaint generation tracking** for buffer-age-style
+  damage accumulation across the rotation (see "Damage-clipped
+  redraw + scanout BO rotation" below).
 - Scene-structure damage (I5 source b): a flag set by map / unmap /
   configure / restack / SHAPE change / redirect-state change /
   cursor move / output reconfigure.
@@ -273,12 +303,53 @@ Owns:
    called `GetOverlayWindow`. Drawn on top of all regular windows.
 4. **Cursor** — always on top.
 
+#### Damage-clipped redraw + scanout BO rotation
+
+KMS rotates between N scanout BOs (typically 2 or 3). Each frame
+the compositor renders into a BO that was previously presented and
+is now off-screen. If we only draw the damaged region of the next
+BO, **the rest of that BO contains whatever was last drawn N
+frames ago** — stale content from a prior generation. Damage
+clipping without accounting for this produces visible corruption.
+
+v2 uses the **buffer-age pattern** (wlroots / Weston-style) to
+keep partial redraws correct:
+
+- Each scanout BO carries a "last present generation" (`u64`
+  monotonic counter, bumped per output per successful present).
+- `SceneCompositor` maintains a **per-output damage history**: a
+  ring of generation → output-damage-region entries, one per
+  recent frame. Ring depth = max(BO count) + 1.
+- When picking the next BO to render into:
+  - If the BO's last-present-generation is known AND every
+    generation between it and the current frame is in the history:
+    **repaint region = union of all output-damage regions from
+    (BO's generation + 1) through (current frame's generation)**.
+    Render only that region; the rest of the BO already holds
+    pixels equivalent to the front buffer at the BO's generation,
+    plus all intervening damage (which we're about to repaint).
+  - If the BO is fresh (never presented), the history was lost
+    (a long pause where damage accumulated past the ring), or
+    we're recovering from a failed flip: **fall back to full
+    redraw**. The whole BO gets re-composed. Log `full_redraw_fallback`
+    counter increment so we can tune ring depth + detect pathology.
+- After successful present, push the current frame's
+  output-damage region onto the history; record the BO's new
+  last-present-generation; trim the ring.
+
+This is load-bearing for v2: the design promise of "damage-clipped
+composition is the v2 perf win" only holds if partial redraws into
+rotating BOs are correct. Full-redraw fallback is the safety
+net, not the default path.
+
+#### Composite tick algorithm
+
 On each composite tick:
 
 1. Compute **per-output damage region** in output coords. Two
    contributing sources:
    - **Projected storage damage**: for each scene entry, take
-     `snap = peek_damage(storage_id)` and project `snap.region`
+     `snap = peek_presentation_damage(storage_id)` and project `snap.region`
      through the entry's transform onto the output. Record `snap`
      keyed by `storage_id` for the upcoming ack. Union the
      projected region into output damage.
@@ -291,36 +362,52 @@ On each composite tick:
    - Previous-submit-failed damage (pending repaint state from a
      failed prior tick): union into output damage.
 2. If output damage is empty, skip — no flip, no submit, no ack.
-3. Build one command buffer that:
-   - Clears the output-damage region (or skips clear if root
-     storage covers it — usually).
+3. **Pick next scanout BO + decide repaint region** per the
+   buffer-age algorithm above. Result is either a full-output
+   region (fallback path) or a buffer-age-clipped region (steady
+   state).
+4. Build one command buffer that:
+   - Clears the repaint region (or skips clear if root storage
+     covers it — usually).
    - For each scene entry in z-order **whose projected bounds
-     intersect output damage**: blit `(storage, intersection of
-     entry-bounds with output-damage)` into the scanout image,
-     applying transform. The blit source-region uses the
+     intersect the repaint region**: blit `(storage, intersection
+     of entry-bounds with repaint-region)` into the chosen scanout
+     BO, applying transform. The blit source-region uses the
      intersected rect projected back to storage-local coords.
-     Scene entries that don't intersect output damage are skipped.
-4. Submit via `PlatformBackend::submit(cb, render_fence)`. Wait on
+     Scene entries that don't intersect the repaint region are
+     skipped.
+5. Submit via `PlatformBackend::submit(cb, render_fence)`. Wait on
    `render_fence` (I6a) before driving the page-flip — the scanout
    image's content is only valid after the queue has finished
    executing the compose CB.
-5. `PlatformBackend::present(scanout)` returns a page-flip fence
-   (I6b). On **page-flip retirement only**, for each storage that
-   contributed: call `ack_damage(storage_id, frame_id, snap)` with
-   the snapshot recorded in step 1. Damage that arrived between
-   the peek and the ack survives — it's not in the snapshot, so
-   the next composite tick re-blits it. Also clear the
-   scene-structure damage state captured in step 1. A failed submit
-   (or a flip that never lands) leaves all damage pending — no ack
-   call — so the next tick re-peeks (a new snapshot that includes
-   both the old region and anything new) and re-composites.
+6. `PlatformBackend::present(scanout)` returns a page-flip fence
+   (I6b). On **page-flip retirement only**:
+   - For each storage that contributed: call
+     `ack_presentation_damage(storage_id, frame_id, snap)` with
+     the snapshot recorded in step 1.
+     Damage that arrived between the peek and the ack survives —
+     it's not in the snapshot, so the next composite tick re-blits
+     it.
+   - Push the current frame's **output damage** (not the per-BO
+     repaint region) onto the per-output damage history ring,
+     keyed by this frame's generation.
+   - Record the BO's new last-present-generation.
+   - Clear the scene-structure damage state captured in step 1.
+
+   A failed submit (or a flip that never lands) leaves all damage
+   pending and **does not advance the BO's generation** — no ack
+   call, history unchanged. The next tick re-peeks (a new snapshot
+   union'd with the old) and re-composites; the BO's age means the
+   next pick may have to full-redraw, which is correct.
 
 The key correction over a "damage-on-storage only" model: occlusion
 changes, restacks, and map/unmap re-expose regions of the screen
 where source storage didn't change but the output did. Output
 damage is the union of all such causes, not a per-storage drain.
 And the snapshot semantics keep paint arriving mid-frame safe: it
-doesn't get ack'd away with the in-flight frame's damage.
+doesn't get ack'd away with the in-flight frame's damage. Combined
+with buffer-age accumulation, partial redraws into rotating BOs
+stay correct.
 
 There are no scanout shortcuts. There is no per-window scanout walk.
 Root storage, top-level storage, COW storage all go through the same
@@ -541,7 +628,7 @@ exact failure mode v2 is designed to eliminate.
 - `SceneCompositor` minimal: one Vk pipeline that reads storage
   images and writes the scanout image with z-order blits.
   Scene-structure damage + storage damage both wired through
-  `peek_damage` / `ack_damage` per I5.
+  `peek_presentation_damage` / `ack_presentation_damage` per I5.
 - Acceptance is **synthetic**, not real-app. Real apps (xterm,
   MATE) need glyphs/text/RENDER which Stage 2 deliberately doesn't
   implement; gating Stage 2 on them confuses the milestone.
@@ -580,11 +667,34 @@ exact failure mode v2 is designed to eliminate.
 - This is the **first stage where real apps make sense as
   acceptance gates** — Stage 2 deliberately skipped them because
   it doesn't paint text.
-- Stage done when: rendercheck passes at parity with v1, real-app
-  smoke (xterm under fvwm3, xclock + xeyes under e16, gedit text
-  scroll, MATE desktop no-compositor) renders identical to v1, no
-  GPU faults on bee under window-drag + gedit + adapta-mate-cc for
-  30 minutes, perf within 2× of v1 on representative workloads.
+- Stage done when:
+  - **Correctness gates**: rendercheck passes; real-app smoke
+    (xterm under fvwm3, xclock + xeyes under e16, gedit text
+    scroll, MATE desktop no-compositor) renders identical to v1.
+  - **Stability gate**: bee, 30-minute session under window-drag
+    + gedit text scroll + adapta-mate-cc, **zero** GPU faults
+    (counter: `amdgpu PERMISSION_FAULTS` from dmesg) and
+    **zero** `vk_queue_wait_idle` calls in steady state (counter:
+    `vk_queue_wait_idle/sec` from v2 instrumentation).
+  - **Per-workload perf gates** with named counters (see
+    "Instrumentation — required, not optional" below), each
+    measured on fuji under the same recipe v1 was measured on:
+    - Window drag (xfce4 + xfwm4-no-compositor + xterm dragged
+      across screen for 10s): `compose_cb_record_ns/frame` and
+      `gpu_render_ns/frame` ≤ 2× v1 baseline; sustained 60 fps
+      (`frame_present_count/sec` ≥ 59); `damage_fraction`
+      noticeably <1.0 (proving damage clipping is engaging).
+    - Terminal scroll (gedit page-down 100 times):
+      `paint_submits/sec` ≤ 2× v1 baseline; `cpu_fence_wait_ns/sec`
+      ≤ v1 baseline.
+    - GTK redraw (mate-control-center open with default theme,
+      no compositor): `composite_submits/sec` ≤ v1 baseline;
+      no `full_redraw_fallback` spikes.
+
+  All numbers logged via the v2 instrumentation panel
+  (`YSERVER_LOOP_TELEMETRY=1`); the "≤" comparisons are against
+  v1 captures taken with the same recipe under the same hardware.
+  Verbal "feels fine" claims do not close this stage.
 
 ### Stage 4 — re-enable COMPOSITE redirect + COW
 
@@ -710,11 +820,14 @@ is wrong, not the implementation.
 
 ### Instrumentation — required, not optional
 
-The perf gates ("Stage 3 within 2× of v1", "no regression on
-fuji", "no GPU faults on bee", v1-deletion measured gates, etc.)
-are only enforceable if v2 emits the counters that let us judge
-them objectively. Hand-waving "feels fast" is what got us to the
-current "bee is laggy and we're not sure why" state.
+The perf gates (Stage 3's per-workload thresholds on
+`compose_cb_record_ns/frame`, `gpu_render_ns/frame`,
+`paint_submits/sec`, `frame_present_count/sec`,
+`damage_fraction`, `full_redraw_fallback`, etc.; "no GPU faults
+on bee"; v1-deletion measured gates) are only enforceable if v2
+emits the counters that let us judge them objectively. Hand-waving
+"feels fast" is what got us to the current "bee is laggy and
+we're not sure why" state.
 
 **Required counters / log lines** — wired from Stage 2 onwards,
 before judging "fast enough" at any stage:
