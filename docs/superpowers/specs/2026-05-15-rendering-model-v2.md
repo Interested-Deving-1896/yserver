@@ -602,9 +602,13 @@ Two **independently-verifiable** commits, in this order:
 ### Stage 2 — minimal-Vk correct baseline
 
 The whole vertical slice in Vk, narrowly scoped to ops we need to
-prove the model. No pixman, no CPU shadow buffers, no readback path.
-The complexity that bit v1 was sync, not Vk operations — v2's I6
-addresses sync directly, so we don't need a CPU intermediate.
+prove the model. No pixman, no CPU shadow buffers, **no readback
+on the rendering / composition hot path**. The complexity that bit
+v1 was sync, not Vk operations — v2's I6 addresses sync directly,
+so we don't need a CPU intermediate. The existing scanout-dump
+path (SIGUSR1 → PPM file, the debug / test harness route) is
+explicitly exempt: it's an off-hot-path readback used only when
+asked for and doesn't bypass scene ownership.
 
 **Critically: no per-method fallback to v1.** `YSERVER_RENDER_MODEL=v2`
 instantiates `KmsBackendV2` as the whole `Backend` impl for the
@@ -638,6 +642,18 @@ exact failure mode v2 is designed to eliminate.
     image uploads through the X11 protocol, observes the scanout
     via the existing dump path, asserts pixel-correctness against
     a CPU oracle.
+  - **Buffer-age partial-redraw correctness test**: a synthetic
+    test that paints alternating small damaged rects across the
+    output for **at least 2× the scanout BO count** consecutive
+    frames (so every BO gets reused multiple times). The test
+    dumps every presented frame and compares the full output
+    (not just the damaged rect) against a CPU oracle. This is
+    the load-bearing test for the buffer-age algorithm — if the
+    BO-rotation history is wrong, unchanged regions show stale
+    pixels from prior generations and the diff catches it. Stage
+    2 must pass this with `full_redraw_fallback/sec` at near-zero
+    (a small number during BO warmup is acceptable; sustained
+    fallback indicates the algorithm is broken).
   - Zero `vkQueueWaitIdle` calls on the hot path under that harness.
   - Cold-start session into a non-WM `xsetroot`-style flow: yserver
     comes up, root is cleared to a known color, the cursor renders,
@@ -850,9 +866,18 @@ before judging "fast enough" at any stage:
     looked at.
   - `scene_entries_drawn/frame` — entries that intersected damage
     and got blitted.
-  - `full_redraw_fallback/sec` — count of frames that chose full
-    redraw over clipped (Stage 5 instrumentation; zero on
-    Stage 2/3).
+  - `full_redraw_fallback/sec` — count of frames where the
+    buffer-age algorithm couldn't reconstruct a clipped repaint
+    region and fell back to a full-output redraw. **Required
+    from Stage 2** (the buffer-age algorithm depends on it as the
+    safety net). Allowed during BO warmup (a freshly-acquired BO
+    with no recorded last-present-generation), damage-history
+    loss (a pause that overflowed the ring), failed-flip recovery
+    (the BO's age advanced but the recorded history didn't), and
+    output reconfigure (mode change, hotplug). Expected
+    **near-zero in steady-state clipped redraw**; sustained
+    non-zero rates indicate either ring depth needs tuning or a
+    bug in the buffer-age logic.
 - **Resource counters**:
   - `storage_allocations/sec` — `DrawableStore` allocations.
   - `descriptor_allocations/sec` — per-frame vs cached split.
@@ -921,12 +946,37 @@ the differences are entirely metadata (no Pixmap has its own backing
 window for `ClearArea` etc.). Lean toward one storage type with a
 metadata field.
 
-**Risk 2 — damage projection from storage to outputs.** I5 says
-damage attaches to storage; the scene projects to outputs. Open
-question: does damage carry coords in storage-local space or
-virtual-screen space? Storage-local seems right but the scene then
-has to translate via window position at composite time. Probably
-fine; need to validate with multi-output cases.
+**Risk 2 — projecting storage-local damage onto outputs.** I5
+fixes the coordinate space (presentation damage is storage-local;
+the scene projects to per-output coords at composite time). The
+remaining risk is the projection's correctness across the cases
+that exercise transform / clipping logic:
+
+- **Multi-output layouts.** A window straddling two outputs has a
+  single storage-local damage region but needs to project onto
+  two output-damage regions, each clipped to that output's
+  geometry. Both outputs' history rings must record consistent
+  contributions.
+- **Output transforms / scales.** Rotated / scaled outputs: the
+  projection has to compose the entry transform with the output
+  transform. Sign of the transform must not flip the damaged
+  region.
+- **SHAPE-bounded windows.** The window's bounding region clips
+  storage→output projection: damage outside the SHAPE region
+  must not appear in output damage.
+- **Reparented or moved windows.** Between damage accumulation
+  and composite, the window might move (ConfigureWindow) or
+  reparent. Scene-structure damage covers the move itself, but
+  pre-existing storage damage projects through the **new**
+  position — buggy if the scene takes pre-move coords or uses
+  stale entry-bounds.
+- **Manual-redirect backings that the scene doesn't draw.** Per
+  I4 these don't participate in presentation damage at all; this
+  risk only confirms that the early-skip in projection doesn't
+  accidentally fire on a still-scene-participating window.
+
+These need targeted tests during Stage 4 onwards. None of them
+threaten the model; they're projection-implementation correctness.
 
 **Risk 3 — `Backend` adapter completeness.** Some Backend methods
 mix protocol semantics and rendering semantics
