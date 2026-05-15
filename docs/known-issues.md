@@ -81,23 +81,39 @@ from.
 - [ ] **`CreateCursor` `XColor` struct layout.** Xlib `XColor` layout
       must match the system Xlib headers; verify on non-CachyOS target
       platforms. (Phase 2 follow-up.)
-- [ ] **Crossing-event `child` field hard-coded to 0.** `EnterNotify`
-      and `LeaveNotify` always wire `child = 0` —
-      `encode_crossing_event` at
-      `crates/yserver-protocol/src/x11/mod.rs:2621` does
-      `write_u32(order, out, 0); // child — descendant hit-testing
-      not implemented`, and `CrossingEvent` in the same file lacks a
-      `child` field entirely. WMs that select Enter/Leave on the
-      root and gate behavior on `child` (is the pointer over bare
-      root or over a child of root?) can't distinguish, so e16's
-      hover popup over the desktop *also* shows when the cursor
-      moves over xterm and other top-levels. Same bug-class as the
-      old `PointerEvent.child = 0` issue (fixed for ButtonPress via
-      `pointer_propagation_target_by_id`'s `propagation_child`); fix
-      is to add `child` to `CrossingEvent`, compute the topmost
-      descendant of `event` containing the pointer, and thread it
-      through the encoder. Bare-HW e16 surfaced this; observed
-      2026-05-09. (Phase 1/2 follow-up.)
+- [~] **Crossing-event `child` field + detail codes.** Partially
+      fixed 2026-05-15. The protocol-level wire issues that this
+      entry originally claimed (no `child` field, hardcoded
+      `detail=0`) are addressed: `CrossingEvent` now has a `child`
+      field, encoder writes it, and `update_pointer_window`'s chain
+      walk computes proper detail codes
+      (NotifyInferior/Ancestor/Virtual/Nonlinear/NonlinearVirtual)
+      via `crossings::normal_mode_crossings`, plus
+      `crossings::implicit_grab_crossings` now also populates
+      `child` per spec.
+      Original repro (e16 hover popup fires over xterm) is **not
+      fixed** by these changes. x11trace analysis showed e16 IS
+      selecting Enter/Leave + Motion on root, and is receiving
+      Enter events with correct detail codes after the fix — but
+      the popup still fires. Whatever signal e16 uses for the
+      "click on desktop" hover gating isn't load-bearing on
+      Enter/Leave-with-detail semantics in a way these changes
+      affect. Needs a side-by-side wire-trace comparison against
+      real Xorg+e16 to identify the actual signal e16 relies on
+      (candidate: motion-event delivery semantics for embedded
+      widgets, or a XEmbed-protocol interaction). Deferred.
+      Followup gap noted during investigation: yserver's
+      `update_pointer_window` only emits crossings on **top-level**
+      transitions. Per X11 spec, when cursor enters a top-level
+      with descendants, Enter events should fire on EACH window in
+      the chain (deepest descendant → ancestors), with detail codes
+      indicating position-in-chain. yserver instead fires only on
+      the top-level; for now the propagation walk in
+      `pointer_fanout::pointer_propagation_target_by_id` covers the
+      common case (subscribers on ancestors get events from
+      descendants via walk-up). This is non-spec-compliant but
+      practically works for xfce/mate/marco. Re-do as deepest-target
+      tracking if a real client surfaces a bug here.
 - [ ] **GTK3 tree-view expander triangles don't reliably toggle.**
       Surfaced during Phase J ynest+fvwm3+gtk3-demo / ynest+e16+gtk3-demo
       smoke. After fixing two prerequisite routing bugs (the
@@ -138,17 +154,18 @@ from.
       off-screen / fully behind another) is the proper fix and is
       deferred. Re-open if a real validation scenario demonstrates a
       backing-store gap.
-- [ ] **KMS: `render_set_picture_filter` is not picture-local.** The
-      filter is set on the picture's *backing pixman image* via
-      `pixman_image_set_filter`. If two RENDER pictures wrap the same
-      drawable (a common GTK pattern: client creates a Picture for
-      drawing and another for compositing onto the same window), the
-      latter SetPictureFilter wins for both and any composite using
-      either picture sees the wrong filter. Real fix: track
-      `filter: pixman_filter_t` on `PictureState::Drawable`, apply
-      around each composite call (set → composite → restore), same
-      shape as the existing per-picture clip path in `render_composite`
-      / `render_fill_rectangles`. Touches every RENDER op call site.
+- [ ] **KMS: `render_set_picture_filter` is currently a no-op.**
+      With pixman removed, `render_set_picture_filter`
+      (`crates/yserver/src/kms/backend.rs:12392`) accepts the request
+      but ignores the filter — the Vk Composite shader uses a fixed
+      `LINEAR` sampler. Clients that request `Nearest` /
+      `Convolution` / `Best` get LINEAR regardless. To honor the
+      request: store filter on `PictureState::Drawable`, create
+      multiple samplers per filter mode in `RenderPipelineCache`,
+      pick the matching one at composite time. RENDER's default
+      filter is `Nearest`; defaulting to LINEAR is the wrong
+      direction for pixel-art / 1:1 blits, so this is a correctness
+      gap, not just polish.
 - [ ] **KMS: `MapSubwindows` doesn't re-Expose deep descendants
       promoted by the map_window viewable cascade.** After commit
       `304858f` (`fix(resources): propagate Viewable down through

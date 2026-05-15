@@ -98,6 +98,7 @@ impl Backend for HostX11Backend {
                     event_y: y as i16,
                     state: 0,
                     crossing_mode: 0,
+                    child: 0,
                 }));
             }
             HostInputEvent::PointerButton {
@@ -141,6 +142,7 @@ impl Backend for HostX11Backend {
                     event_y: 0,
                     state: 0,
                     crossing_mode: 0,
+                    child: 0,
                 }));
             }
         }

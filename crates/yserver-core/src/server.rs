@@ -1385,6 +1385,7 @@ fn pointer_event_fanout_inner(
                     time: event.time,
                     root: crate::resources::ROOT_WINDOW,
                     event: nested_id,
+                    child: ResourceId(event.child),
                     root_x: event.root_x,
                     root_y: event.root_y,
                     event_x,
@@ -1402,6 +1403,7 @@ fn pointer_event_fanout_inner(
                     time: event.time,
                     root: crate::resources::ROOT_WINDOW,
                     event: nested_id,
+                    child: ResourceId(event.child),
                     root_x: event.root_x,
                     root_y: event.root_y,
                     event_x,
@@ -2039,6 +2041,7 @@ mod tests {
                 event_y: 10,
                 state: 0,
                 crossing_mode: 0,
+                child: 0,
             },
         );
 
@@ -2147,6 +2150,7 @@ mod tests {
                 event_y: 4,
                 state: 0,
                 crossing_mode: 0,
+                child: 0,
             },
         );
 
@@ -2260,6 +2264,7 @@ mod tests {
                 event_y: 5,
                 state: 0x0100,
                 crossing_mode: 0,
+                child: 0,
             },
         );
 
@@ -2292,6 +2297,7 @@ mod tests {
                 event_y: 5,
                 state: 0,
                 crossing_mode: 0,
+                child: 0,
             },
         );
         let a_read2 = a_reader_remote.read(&mut buf);
@@ -2348,6 +2354,7 @@ mod tests {
                 event_y: 0,
                 state: 0,
                 crossing_mode: 0,
+                child: 0,
             },
         );
 

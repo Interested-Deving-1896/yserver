@@ -168,7 +168,16 @@ pub fn pointer_event_fanout_to_state(
     }
 
     // Step 4 — normal core propagation, only when no grab took ownership.
-    if !handled_core_via_grab && top_level_id.is_some() {
+    //
+    // For Crossing events we also run when top_level_id is None: the
+    // producer (`update_pointer_window`) emits Leave/Enter chain events
+    // with host_xid pointing at the KMS root container for the
+    // ROOT_WINDOW endpoint, and that host_xid isn't in xid_map.
+    let is_crossing = matches!(
+        event.kind,
+        PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
+    );
+    if !handled_core_via_grab && (top_level_id.is_some() || is_crossing) {
         let mask_bit = pointer_mask_bit(event.kind, event.state);
         let (nested_id, event_x, event_y, core_targets, propagation_child) =
             pointer_propagation_target_by_id(state, target, target_x, target_y, mask_bit)
@@ -561,6 +570,17 @@ fn encode_pointer_event(
                 ..pointer
             },
         ),
+        // For Crossing events, `child` and `detail` come from the
+        // producer (HostPointerEvent), which has the spec-correct
+        // values computed by `crossings::normal_mode_crossings` /
+        // `implicit_grab_crossings`. The fanout-walk's
+        // `propagation_child` is the right value for Button/Motion
+        // (where it identifies the immediate descendant of the
+        // propagation target on the path to the source), but NOT for
+        // crossings — crossing `child` per X11 spec is per-event in
+        // the chain (None on endpoints, the next inferior on virtual
+        // intermediates) and the propagation walk can't know which is
+        // which.
         PointerEventKind::EnterNotify => x11::encode_enter_notify_event(
             buf,
             order,
@@ -569,12 +589,13 @@ fn encode_pointer_event(
                 time,
                 root: ROOT_WINDOW,
                 event: target_window,
+                child: yserver_protocol::x11::ResourceId(event.child),
                 root_x: event.root_x,
                 root_y: event.root_y,
                 event_x,
                 event_y,
                 state: event.state,
-                detail,
+                detail: event.detail,
                 mode: event.crossing_mode,
             },
         ),
@@ -586,12 +607,13 @@ fn encode_pointer_event(
                 time,
                 root: ROOT_WINDOW,
                 event: target_window,
+                child: yserver_protocol::x11::ResourceId(event.child),
                 root_x: event.root_x,
                 root_y: event.root_y,
                 event_x,
                 event_y,
                 state: event.state,
-                detail,
+                detail: event.detail,
                 mode: event.crossing_mode,
             },
         ),

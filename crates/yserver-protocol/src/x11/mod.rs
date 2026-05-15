@@ -154,6 +154,14 @@ pub struct CrossingEvent {
     pub time: u32,
     pub root: ResourceId,
     pub event: ResourceId,
+    /// X11 EnterNotify/LeaveNotify `child`: if the source window is an
+    /// inferior of `event`, this is the child of `event` on the path to
+    /// the source (or the source itself if it IS a direct child of
+    /// `event`). `ResourceId(0)` (the X11 `None` sentinel) when the
+    /// source IS the event window. WMs that select Enter/Leave on the
+    /// root gate hover behavior on whether `child == None` (pointer on
+    /// bare root) vs. some xid (pointer over a child of root).
+    pub child: ResourceId,
     pub root_x: i16,
     pub root_y: i16,
     pub event_x: i16,
@@ -2746,7 +2754,7 @@ fn encode_crossing_event(
     write_u32(order, out, event.time);
     write_u32(order, out, event.root.0);
     write_u32(order, out, event.event.0);
-    write_u32(order, out, 0); // child — descendant hit-testing not implemented
+    write_u32(order, out, event.child.0);
     write_i16(order, out, event.root_x);
     write_i16(order, out, event.root_y);
     write_i16(order, out, event.event_x);
@@ -3733,6 +3741,7 @@ mod tests {
                     time: 0xdead_beef,
                     root: ResourceId(0x100),
                     event: ResourceId(0x0010_0002),
+                    child: ResourceId(0x0010_0042),
                     root_x: 100,
                     root_y: 200,
                     event_x: 10,
@@ -3749,7 +3758,7 @@ mod tests {
             assert_eq!(&buf[4..8], &0xdead_beefu32.to_le_bytes());
             assert_eq!(&buf[8..12], &0x100u32.to_le_bytes());
             assert_eq!(&buf[12..16], &0x0010_0002u32.to_le_bytes());
-            assert_eq!(&buf[16..20], &0u32.to_le_bytes()); // child = 0
+            assert_eq!(&buf[16..20], &0x0010_0042u32.to_le_bytes()); // child
             assert_eq!(&buf[20..22], &100i16.to_le_bytes());
             assert_eq!(&buf[22..24], &200i16.to_le_bytes());
             assert_eq!(&buf[24..26], &10i16.to_le_bytes());
@@ -3770,6 +3779,7 @@ mod tests {
                     time: 0,
                     root: ResourceId(0x100),
                     event: ResourceId(0x0010_0002),
+                    child: ResourceId(0),
                     root_x: 0,
                     root_y: 0,
                     event_x: 0,
@@ -3794,6 +3804,7 @@ mod tests {
                 time in any::<u32>(),
                 root in any::<u32>(),
                 event_window in any::<u32>(),
+                child_xid in any::<u32>(),
                 root_x in any::<i16>(),
                 root_y in any::<i16>(),
                 event_x in any::<i16>(),
@@ -3828,7 +3839,7 @@ mod tests {
                                 root_y,
                                 event_x,
                                 event_y,
-                                child: ResourceId(0),
+                                child: ResourceId(child_xid),
                                 state,
                             },
                         );
@@ -3849,7 +3860,7 @@ mod tests {
                                 root_y,
                                 event_x,
                                 event_y,
-                                child: ResourceId(0),
+                                child: ResourceId(child_xid),
                                 state,
                             },
                         );
@@ -3870,7 +3881,7 @@ mod tests {
                                 root_y,
                                 event_x,
                                 event_y,
-                                child: ResourceId(0),
+                                child: ResourceId(child_xid),
                                 state,
                             },
                         );
@@ -3886,6 +3897,7 @@ mod tests {
                                 time,
                                 root: ResourceId(root),
                                 event: ResourceId(event_window),
+                                child: ResourceId(child_xid),
                                 root_x,
                                 root_y,
                                 event_x,
@@ -3907,6 +3919,7 @@ mod tests {
                                 time,
                                 root: ResourceId(root),
                                 event: ResourceId(event_window),
+                                child: ResourceId(child_xid),
                                 root_x,
                                 root_y,
                                 event_x,
@@ -3939,7 +3952,12 @@ mod tests {
                 let event_bytes = if big_endian { event_window.to_be_bytes() } else { event_window.to_le_bytes() };
                 prop_assert_eq!(&buf[12..16], &event_bytes[..]);
 
-                prop_assert_eq!(&buf[16..20], &[0u8; 4][..]); // child = 0
+                let child_bytes = if big_endian {
+                    child_xid.to_be_bytes()
+                } else {
+                    child_xid.to_le_bytes()
+                };
+                prop_assert_eq!(&buf[16..20], &child_bytes[..]);
 
                 let rx = if big_endian { root_x.to_be_bytes() } else { root_x.to_le_bytes() };
                 prop_assert_eq!(&buf[20..22], &rx[..]);

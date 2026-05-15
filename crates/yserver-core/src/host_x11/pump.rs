@@ -154,6 +154,12 @@ pub(super) fn decode_host_event(event: &[u8; 32]) -> Option<HostEvent> {
                 event_y: read_i16(&event[26..28]),
                 state: read_u16(&event[28..30]),
                 crossing_mode: 0,
+                // Pointer events (Button/Motion) have `child` at bytes
+                // 16..20 on the X11 wire (xcb_motion_notify_event_t
+                // .child / etc.); pass it through so downstream
+                // encoders that want the host server's computed child
+                // can use it directly.
+                child: read_u32(&event[16..20]),
             }))
         }
         7 | 8 => {
@@ -162,7 +168,8 @@ pub(super) fn decode_host_event(event: &[u8; 32]) -> Option<HostEvent> {
             } else {
                 PointerEventKind::LeaveNotify
             };
-            // Crossing wire layout: detail at byte 1, mode at byte 30.
+            // Crossing wire layout: detail at byte 1, child at 16..20,
+            // mode at byte 30.
             Some(HostEvent::Pointer(HostPointerEvent {
                 kind,
                 host_xid: read_u32(&event[12..16]),
@@ -174,6 +181,7 @@ pub(super) fn decode_host_event(event: &[u8; 32]) -> Option<HostEvent> {
                 event_y: read_i16(&event[26..28]),
                 state: read_u16(&event[28..30]),
                 crossing_mode: event[30],
+                child: read_u32(&event[16..20]),
             }))
         }
         12 => {
@@ -258,6 +266,13 @@ pub struct HostPointerEvent {
     /// X11 crossing mode: 0=NotifyNormal, 1=NotifyGrab, 2=NotifyUngrab.
     /// Only meaningful when `kind` is `EnterNotify`/`LeaveNotify`.
     pub crossing_mode: u8,
+    /// X11 EnterNotify/LeaveNotify `child` field, as computed by the
+    /// producer per X11 spec (see `crossings::CrossingEvent::child`).
+    /// 0 = X11 `None`. The encoder layer uses this directly for
+    /// Crossing events rather than the propagation walk's child,
+    /// since spec-correct child semantics aren't a function of the
+    /// fanout walk.
+    pub child: u32,
 }
 
 #[derive(Clone, Copy, Debug)]

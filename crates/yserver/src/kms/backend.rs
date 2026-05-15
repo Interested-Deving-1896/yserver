@@ -7007,7 +7007,12 @@ impl KmsBackend {
         }
     }
 
-    fn process_pointer_absolute(&mut self, x: f32, y: f32) {
+    fn process_pointer_absolute(
+        &mut self,
+        server_state: &yserver_core::server::ServerState,
+        x: f32,
+        y: f32,
+    ) {
         let new_x = x.clamp(0.0, self.fb_w as f32 - 1.0);
         let new_y = y.clamp(0.0, self.fb_h as f32 - 1.0);
         // When the hardware cursor plane is active, the kernel
@@ -7039,7 +7044,7 @@ impl KmsBackend {
                 self.mark_all_outputs_dirty();
             }
         }
-        self.dispatch_motion_event();
+        self.dispatch_motion_event(server_state);
     }
 
     /// Compute event-window-relative coords for an event whose `host_xid`
@@ -7074,20 +7079,26 @@ impl KmsBackend {
         crate::clock::server_time_ms()
     }
 
-    /// Synthesize an EnterNotify/LeaveNotify on `host_xid` with the given
-    /// `crossing_mode` (0=NotifyNormal, 1=NotifyGrab, 2=NotifyUngrab).
+    /// Synthesize an EnterNotify/LeaveNotify on `host_xid` with the
+    /// given `detail` (NotifyAncestor / Virtual / Inferior / Nonlinear
+    /// / NonlinearVirtual), `crossing_mode` (Normal=0 / Grab=1 /
+    /// Ungrab=2), and `child` (immediate descendant on the path to
+    /// source/destination for virtual intermediates; `ResourceId(0)` /
+    /// X11 `None` for source/destination endpoints).
     fn emit_crossing(
         &mut self,
         host_xid: u32,
         kind: PointerEventKind,
+        detail: u8,
         crossing_mode: u8,
+        child: u32,
         state: u16,
     ) {
         let (event_x, event_y) = self.event_relative_coords(host_xid);
         let ev = HostPointerEvent {
             kind,
             host_xid,
-            detail: 0, // NotifyAncestor
+            detail,
             time: Self::current_time_ms(),
             root_x: self.cursor_x as i16,
             root_y: self.cursor_y as i16,
@@ -7095,35 +7106,111 @@ impl KmsBackend {
             event_y,
             state,
             crossing_mode,
+            child,
         };
         self.emit_pointer(ev);
     }
 
-    /// If the top-level under the cursor changed since the last motion,
-    /// emit Leave(NotifyNormal) on the old top-level and Enter(NotifyNormal)
-    /// on the new one. Hover-tracking widgets (and toolkits' button-state
-    /// machines) need these to know when the cursor enters/leaves them.
-    fn update_pointer_window(&mut self, new_xid: u32, state: u16) {
+    /// Spec-correct Normal-mode crossing chain for a top-level
+    /// transition. Walks the window tree from the previous pointer
+    /// window to the new one via [`crossings::normal_mode_crossings`]
+    /// — generates Leave/Enter pairs with proper detail codes
+    /// (NotifyInferior / NotifyVirtual / etc.) and child fields, so
+    /// WMs that select Enter/Leave on root can tell "cursor went into
+    /// a descendant" (NotifyInferior) from "cursor stayed on bare
+    /// root" (no crossing at all) — required for e16's hover-popup
+    /// gating.
+    ///
+    /// Falls back to a single Leave/Enter pair with detail=0 if either
+    /// the previous or new host_xid isn't in `xid_map` — that case is
+    /// the first-motion bootstrap before any top-level has been seen.
+    fn update_pointer_window(
+        &mut self,
+        server_state: &yserver_core::server::ServerState,
+        new_xid: u32,
+        mask: u16,
+    ) {
         if self.prev_pointer_window == Some(new_xid) {
             return;
         }
-        if let Some(prev) = self.prev_pointer_window {
-            self.emit_crossing(prev, PointerEventKind::LeaveNotify, 0, state);
+
+        let prev_host = self.prev_pointer_window;
+        // The KMS root container (self.window_id) is yserver's own
+        // top-level scaffolding window — never registered in xid_map
+        // (only client-created windows are). When `window_under_cursor`
+        // returns the root container, treat it as the X11 ROOT_WINDOW
+        // for crossing-chain purposes so `update_pointer_window` can
+        // emit a proper Leave-on-root with detail=NotifyInferior when
+        // the cursor enters a top-level (the e16 hover-popup repro).
+        let root_container_host = self.window_id;
+        let resolve_host_to_nested = |host: u32, xid_map: &HostXidMap| -> Option<ResourceId> {
+            if host == root_container_host {
+                Some(yserver_core::resources::ROOT_WINDOW)
+            } else {
+                xid_map.get(&host).copied()
+            }
+        };
+        let prev_id = prev_host.and_then(|p| resolve_host_to_nested(p, &self.xid_map));
+        let new_id = resolve_host_to_nested(new_xid, &self.xid_map);
+
+        if let (Some(from), Some(to)) = (prev_id, new_id) {
+            let events = yserver_core::crossings::normal_mode_crossings(server_state, from, to);
+            for ev in events {
+                // ROOT_WINDOW has no host_xid recorded in server-state
+                // (it's yserver's own scaffolding, not a client window),
+                // so route Leave/Enter events on root to the KMS root
+                // container host_xid (self.window_id). For all other
+                // nested ResourceIds, look up the registered host_xid.
+                let win_host_xid = if ev.window == yserver_core::resources::ROOT_WINDOW {
+                    self.window_id
+                } else {
+                    server_state
+                        .resources
+                        .window(ev.window)
+                        .and_then(|w| w.host_xid.map(|h| h.as_raw()))
+                        .unwrap_or(new_xid)
+                };
+                let kind = match ev.kind {
+                    yserver_core::crossings::CrossingKind::Enter => PointerEventKind::EnterNotify,
+                    yserver_core::crossings::CrossingKind::Leave => PointerEventKind::LeaveNotify,
+                };
+                self.emit_crossing(win_host_xid, kind, ev.detail, 0, ev.child.0, mask);
+            }
+        } else {
+            // First-motion bootstrap (no prev top-level recorded yet)
+            // or unmapped host_xid — fall back to a single Leave/Enter
+            // pair with detail=0. Less spec-correct but matches the
+            // legacy behavior; doesn't regress anything that was
+            // working before.
+            if let Some(prev) = prev_host {
+                self.emit_crossing(prev, PointerEventKind::LeaveNotify, 0, 0, 0, mask);
+            }
+            self.emit_crossing(new_xid, PointerEventKind::EnterNotify, 0, 0, 0, mask);
         }
-        self.emit_crossing(new_xid, PointerEventKind::EnterNotify, 0, state);
+
         self.prev_pointer_window = Some(new_xid);
     }
 
-    fn dispatch_motion_event(&mut self) {
+    fn dispatch_motion_event(&mut self, server_state: &yserver_core::server::ServerState) {
         // Fall back to the root container so server.rs can deliver
         // to root-window subscribers (e16's right-click-desktop menu,
         // fvwm3's root bindings) when the cursor is over the
         // wallpaper / no top-level window.
         let host_xid = self.window_under_cursor().unwrap_or(self.window_id);
-        let (event_x, event_y) = self.event_relative_coords(host_xid);
         // X11 KeyButMask: low byte modifiers, bits 8..=12 button1..button5.
         let mask = self.serialize_modifiers() | self.button_mask;
-        self.update_pointer_window(host_xid, mask);
+        self.update_pointer_window(server_state, host_xid, mask);
+        self.emit_motion_only(host_xid, mask);
+    }
+
+    /// Emit a MotionNotify on `host_xid` without computing any
+    /// crossing chain. Used by [`dispatch_motion_event`] (after it has
+    /// called [`update_pointer_window`]) and by [`warp_pointer`]
+    /// (which doesn't have access to `ServerState` from the Backend
+    /// trait and so can't compute the chain today — warp-driven
+    /// crossings are filed as a known followup).
+    fn emit_motion_only(&mut self, host_xid: u32, mask: u16) {
+        let (event_x, event_y) = self.event_relative_coords(host_xid);
         let ev = HostPointerEvent {
             kind: PointerEventKind::MotionNotify,
             host_xid,
@@ -7135,6 +7222,7 @@ impl KmsBackend {
             event_y,
             state: mask,
             crossing_mode: 0,
+            child: 0,
         };
         self.emit_pointer(ev);
     }
@@ -7221,6 +7309,7 @@ impl KmsBackend {
             event_y,
             state,
             crossing_mode: 0,
+            child: 0,
         };
         self.emit_pointer(ptr_event);
         // G3: spec-correct implicit-grab crossings. X11 protocol:
@@ -7270,7 +7359,14 @@ impl KmsBackend {
                             PointerEventKind::LeaveNotify
                         }
                     };
-                    self.emit_crossing(win_host_xid, kind, press_mode, post_state);
+                    self.emit_crossing(
+                        win_host_xid,
+                        kind,
+                        ev.detail,
+                        press_mode,
+                        ev.child.0,
+                        post_state,
+                    );
                 }
             }
             _ => {
@@ -9464,7 +9560,7 @@ impl Backend for KmsBackend {
 
         match ev {
             HostInputEvent::PointerMotion { x, y, time: _ } => {
-                self.process_pointer_absolute(x as f32, y as f32);
+                self.process_pointer_absolute(state, x as f32, y as f32);
             }
             HostInputEvent::PointerButton {
                 button,
@@ -12526,7 +12622,14 @@ impl Backend for KmsBackend {
 
         self.cursor_x = (base_x + dst_x as f32).clamp(0.0, self.fb_w as f32 - 1.0);
         self.cursor_y = (base_y + dst_y as f32).clamp(0.0, self.fb_h as f32 - 1.0);
-        self.dispatch_motion_event();
+        // XWarpPointer doesn't have ServerState in the Backend trait
+        // scope, so we can't compute the spec-correct crossing chain
+        // here today. Emit a motion event only; warp-driven crossings
+        // are filed as a followup (the chain would mirror what
+        // `update_pointer_window` does for libinput motion).
+        let host_xid = self.window_under_cursor().unwrap_or(self.window_id);
+        let mask = self.serialize_modifiers() | self.button_mask;
+        self.emit_motion_only(host_xid, mask);
         Ok(())
     }
 

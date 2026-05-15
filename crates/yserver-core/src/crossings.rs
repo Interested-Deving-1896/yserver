@@ -47,11 +47,21 @@ pub struct CrossingEvent {
     pub kind: CrossingKind,
     /// One of the `NOTIFY_*` constants.
     pub detail: u8,
+    /// X11 EnterNotify/LeaveNotify `child` field:
+    /// - For source/destination endpoints: `ResourceId(0)` (X11 None),
+    ///   matching Xorg's `CoreEnterLeaveEvent(..., None)` for these.
+    /// - For virtual intermediates (NotifyVirtual / NotifyNonlinearVirtual):
+    ///   the immediate descendant of `window` on the path to whichever
+    ///   endpoint is in `window`'s subtree (source for Leave virtuals,
+    ///   destination for Enter virtuals).
+    pub child: ResourceId,
 }
 
 /// Compute Leave/Enter events for moving the pointer's logical
 /// "window" from `focus` to `grab`. Order in the returned `Vec` is
-/// the wire-emission order required by X11.
+/// the wire-emission order required by X11. Used for the
+/// implicit-grab activation/release path (caller sets X11 `mode` to
+/// `NotifyGrab` / `NotifyUngrab`).
 ///
 /// `focus == grab` returns an empty `Vec`. Cycles or missing windows
 /// (defensive — `state.resources.window` returns `None`) terminate
@@ -63,83 +73,124 @@ pub fn implicit_grab_crossings(
     focus: ResourceId,
     grab: ResourceId,
 ) -> Vec<CrossingEvent> {
-    if focus == grab {
+    compute_crossing_chain(state, focus, grab)
+}
+
+/// Compute Leave/Enter events for moving the pointer's logical
+/// "window" from `from` to `to` under X11 Normal mode (no grab).
+/// Caller sets X11 `mode` to `NotifyNormal`.
+///
+/// Same chain-computation as [`implicit_grab_crossings`] — the only
+/// difference is the `mode` value the caller emits with each event;
+/// detail codes and child fields are identical (per X11 spec).
+#[must_use]
+pub fn normal_mode_crossings(
+    state: &ServerState,
+    from: ResourceId,
+    to: ResourceId,
+) -> Vec<CrossingEvent> {
+    compute_crossing_chain(state, from, to)
+}
+
+fn compute_crossing_chain(
+    state: &ServerState,
+    from: ResourceId,
+    to: ResourceId,
+) -> Vec<CrossingEvent> {
+    if from == to {
         return Vec::new();
     }
 
-    let focus_chain = ancestor_chain(state, focus);
-    let grab_chain = ancestor_chain(state, grab);
+    let from_chain = ancestor_chain(state, from);
+    let to_chain = ancestor_chain(state, to);
 
-    // Case A: grab is an ancestor of focus (pointer "moves up" out of
-    // a deeper subtree into a parent).
-    if focus_chain.iter().skip(1).any(|w| *w == grab) {
+    // Case A: `to` is an ancestor of `from` (pointer "moves up" out of
+    // a deeper subtree into a parent). Leaves walk from_chain up to
+    // (not including) `to`; final Enter on `to`.
+    if from_chain.iter().skip(1).any(|w| *w == to) {
         let mut events = vec![CrossingEvent {
-            window: focus,
+            window: from,
             kind: CrossingKind::Leave,
             detail: NOTIFY_ANCESTOR,
+            child: ResourceId(0),
         }];
-        for w in focus_chain.iter().skip(1) {
-            if *w == grab {
+        // Virtual leaves on intermediates: for each W in from_chain
+        // (skipping `from` itself, stopping before `to`), W is ancestor
+        // of `from` so `child` = immediate descendant of W on path to
+        // `from` = the previous chain entry.
+        for (i, w) in from_chain.iter().enumerate().skip(1) {
+            if *w == to {
                 break;
             }
             events.push(CrossingEvent {
                 window: *w,
                 kind: CrossingKind::Leave,
                 detail: NOTIFY_VIRTUAL,
+                child: from_chain[i - 1],
             });
         }
         events.push(CrossingEvent {
-            window: grab,
+            window: to,
             kind: CrossingKind::Enter,
             detail: NOTIFY_INFERIOR,
+            child: ResourceId(0),
         });
         return events;
     }
 
-    // Case B: focus is an ancestor of grab (pointer "moves down" into
-    // a descendant subtree).
-    if grab_chain.iter().skip(1).any(|w| *w == focus) {
+    // Case B: `from` is an ancestor of `to` (pointer "moves down" into
+    // a descendant subtree). Leave on `from`, then virtual Enters on
+    // ancestors of `to` from (not including) `from` down to (not
+    // including) `to`, final Enter on `to`.
+    if to_chain.iter().skip(1).any(|w| *w == from) {
         let mut events = vec![CrossingEvent {
-            window: focus,
+            window: from,
             kind: CrossingKind::Leave,
             detail: NOTIFY_INFERIOR,
+            child: ResourceId(0),
         }];
-        let mut intermediates: Vec<ResourceId> = Vec::new();
-        for w in grab_chain.iter().skip(1) {
-            if *w == focus {
+        // Gather intermediates (W where W is ancestor of `to`, but W !=
+        // `to` and W != `from`). to_chain is [to, parent_of_to, ...,
+        // from, ...]. Skip head (`to`), stop when we hit `from`. Reverse
+        // to get downward emission order.
+        let mut intermediate_indices: Vec<usize> = Vec::new();
+        for (i, w) in to_chain.iter().enumerate().skip(1) {
+            if *w == from {
                 break;
             }
-            intermediates.push(*w);
+            intermediate_indices.push(i);
         }
-        // grab_chain is [grab, parent, parent, ..., focus]; skipping
-        // the head gives parents in upward order. Reverse so the wire
-        // order is "ancestor closest to focus first, ancestor closest
-        // to grab last" — matching X11 spec downward propagation.
-        intermediates.reverse();
-        for w in intermediates {
+        intermediate_indices.reverse();
+        for i in intermediate_indices {
+            // Virtual Enter on to_chain[i]: destination=`to` is inferior
+            // of W=to_chain[i], child = immediate descendant of W on
+            // path to `to` = to_chain[i - 1].
             events.push(CrossingEvent {
-                window: w,
+                window: to_chain[i],
                 kind: CrossingKind::Enter,
                 detail: NOTIFY_VIRTUAL,
+                child: to_chain[i - 1],
             });
         }
         events.push(CrossingEvent {
-            window: grab,
+            window: to,
             kind: CrossingKind::Enter,
             detail: NOTIFY_ANCESTOR,
+            child: ResourceId(0),
         });
         return events;
     }
 
-    // Case C: disjoint subtrees. Walk up from focus to the lowest
-    // common ancestor (LCA), then back down to grab.
-    let common = lowest_common_ancestor(&focus_chain, &grab_chain);
+    // Case C: disjoint subtrees. Walk up from `from` to the lowest
+    // common ancestor (LCA), then back down to `to`.
+    let common = lowest_common_ancestor(&from_chain, &to_chain);
     let mut events = vec![CrossingEvent {
-        window: focus,
+        window: from,
         kind: CrossingKind::Leave,
         detail: NOTIFY_NONLINEAR,
+        child: ResourceId(0),
     }];
-    for w in focus_chain.iter().skip(1) {
+    for (i, w) in from_chain.iter().enumerate().skip(1) {
         if Some(*w) == common {
             break;
         }
@@ -147,27 +198,30 @@ pub fn implicit_grab_crossings(
             window: *w,
             kind: CrossingKind::Leave,
             detail: NOTIFY_NONLINEAR_VIRTUAL,
+            child: from_chain[i - 1],
         });
     }
-    let mut downward: Vec<ResourceId> = Vec::new();
-    for w in grab_chain.iter().skip(1) {
+    let mut downward_indices: Vec<usize> = Vec::new();
+    for (i, w) in to_chain.iter().enumerate().skip(1) {
         if Some(*w) == common {
             break;
         }
-        downward.push(*w);
+        downward_indices.push(i);
     }
-    downward.reverse();
-    for w in downward {
+    downward_indices.reverse();
+    for i in downward_indices {
         events.push(CrossingEvent {
-            window: w,
+            window: to_chain[i],
             kind: CrossingKind::Enter,
             detail: NOTIFY_NONLINEAR_VIRTUAL,
+            child: to_chain[i - 1],
         });
     }
     events.push(CrossingEvent {
-        window: grab,
+        window: to,
         kind: CrossingKind::Enter,
         detail: NOTIFY_NONLINEAR,
+        child: ResourceId(0),
     });
     events
 }
@@ -248,6 +302,10 @@ mod tests {
         events.iter().map(|e| e.kind).collect()
     }
 
+    fn children_only(events: &[CrossingEvent]) -> Vec<ResourceId> {
+        events.iter().map(|e| e.child).collect()
+    }
+
     #[test]
     fn equal_windows_emit_no_events() {
         let mut state = ServerState::new();
@@ -275,6 +333,14 @@ mod tests {
         assert_eq!(
             details_only(&events),
             vec![NOTIFY_ANCESTOR, NOTIFY_VIRTUAL, NOTIFY_INFERIOR],
+        );
+        // child: Leave on focus → None. Virtual Leave on B (ancestor of
+        // focus on path to focus) → child = f (immediate descendant of
+        // B on path to f). Enter on grab (a) → None (source IS event
+        // for Inferior detail; Xorg emits child=None on the dest).
+        assert_eq!(
+            children_only(&events),
+            vec![ResourceId(0), f, ResourceId(0)],
         );
     }
 
@@ -308,6 +374,34 @@ mod tests {
                 NOTIFY_ANCESTOR,
             ],
         );
+        // child: Leave on focus → None. Virtual Enter on A → child = b
+        // (immediate descendant of A on path to g). Virtual Enter on B
+        // → child = g. Enter on grab → None.
+        assert_eq!(
+            children_only(&events),
+            vec![ResourceId(0), b, g, ResourceId(0)],
+        );
+    }
+
+    #[test]
+    fn root_to_direct_child_has_no_virtuals() {
+        // root → frame (direct child). Cursor moves from root to frame.
+        // This is the e16 hover-popup case: yserver must emit
+        // LeaveNotify on root with detail=NotifyInferior so the WM
+        // knows the cursor went into an inferior subtree.
+        let mut state = ServerState::new();
+        let frame = make_window(&mut state, 0x0010_0424, ROOT_WINDOW);
+        let events = normal_mode_crossings(&state, ROOT_WINDOW, frame);
+        assert_eq!(windows_only(&events), vec![ROOT_WINDOW, frame]);
+        assert_eq!(
+            kinds_only(&events),
+            vec![CrossingKind::Leave, CrossingKind::Enter],
+        );
+        assert_eq!(
+            details_only(&events),
+            vec![NOTIFY_INFERIOR, NOTIFY_ANCESTOR]
+        );
+        assert_eq!(children_only(&events), vec![ResourceId(0), ResourceId(0)]);
     }
 
     #[test]
@@ -340,6 +434,14 @@ mod tests {
                 NOTIFY_NONLINEAR,
             ],
         );
+        // child: Leave on focus → None. NonlinearVirtual Leave on A →
+        // child = f (descendant of A on path to source f).
+        // NonlinearVirtual Enter on B → child = g (descendant of B on
+        // path to destination g). Enter on grab → None.
+        assert_eq!(
+            children_only(&events),
+            vec![ResourceId(0), f, g, ResourceId(0)],
+        );
     }
 
     #[test]
@@ -359,6 +461,7 @@ mod tests {
             details_only(&events),
             vec![NOTIFY_NONLINEAR, NOTIFY_NONLINEAR],
         );
+        assert_eq!(children_only(&events), vec![ResourceId(0), ResourceId(0)]);
     }
 
     #[test]

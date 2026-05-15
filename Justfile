@@ -396,6 +396,33 @@ yserver-e16-xterm-hw log="debug":
         echo "yserver log: yserver-hw.log";\
         echo "e16 log:   e16-hw.log"'
 
+# e16 + wezterm on yserver with x11trace recording the X11 wire
+# protocol between clients and yserver. e16 connects to the fake
+# display `:8`; x11trace tunnels everything to yserver on `:7` and
+# dumps a human-readable per-request/per-event trace to `e16.xtrace`.
+# Use to diff against an Xorg-side capture when debugging e16
+# hover-popup gating or other event-flow oddities.
+yserver-e16-xterm-hw-trace log="debug":
+    cargo build --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -d :7 -D :8 -n -o e16.xtrace &\
+        xtrace_pid=$!;\
+        sleep 1;\
+        DISPLAY=:8 e16 > e16-hw.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:8 wezterm;\
+        kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "yserver log: yserver-hw.log";\
+        echo "x11trace:    e16.xtrace";\
+        echo "e16 log:     e16-hw.log"'
+
 yserver-wmaker-xterm-hw log="debug":
     cargo build --bin yserver
     bash -c '\
