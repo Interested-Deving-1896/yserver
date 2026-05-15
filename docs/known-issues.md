@@ -10,32 +10,6 @@ Add items as you find them. Tick them off when fixed. Prefer concise
 entries with enough context for a future debugging session to start
 from.
 
-## Host-error noise (surfaced by Phase 6.3)
-
-Phase 6.3's `OriginContext` made async host errors visible. Most are
-pre-existing host complaints that ynest has been generating since
-earlier phases; they were silently absorbed by the legacy
-`reply_buffer`. Logged at WARN today; could be downgraded to DEBUG
-once the underlying patterns are understood.
-
-- [ ] **CopyArea BadMatch (~100/wmaker startup).** `error 8 major=64
-      minor=0 bad=<container_xid>`. wmaker calls `CopyArea` between
-      drawables of differing depth and the host rejects. Investigation:
-      grep wmaker's source / x11trace one wmaker session and compare
-      the failing CopyArea source/dest pairs against ynest's depth
-      tracking. Visible behavior is unaffected (other CopyAreas in
-      the cascade succeed) so this is purely log-noise.
-- [ ] **PolyFillRectangle BadMatch (~15/wmaker startup).** `error 8
-      major=70`. Same shape as the CopyArea pattern; likely the same
-      root cause (depth/drawable mismatch on the container).
-- [ ] **Composite NameWindowPixmap BadAccess (~28/wmaker startup).**
-      `error 1 major=138 minor=23` on un-redirected windows. Phase 3.5
-      added partial COMPOSITE support but ynest calls `NameWindowPixmap`
-      on windows that haven't been redirected — host returns BadAccess.
-      Either ynest should redirect first, or only call NameWindowPixmap
-      from a context where redirection is guaranteed. Affects: nothing
-      under non-compositing WMs; matters for picom-like compositors.
-
 ## Input, grabs, event routing
 
 - [~] **GTK wheel scroll needs another app to open first (residual
@@ -209,18 +183,9 @@ once the underlying patterns are understood.
       wallpaper + Chrome icon now render correctly. Test fixture
       doc + the three PutImage/CopyArea alpha_invariant inputs
       updated to feed wire bytes in spec order.
-- [ ] **Text rendering broken under xfce4 / GTK heavy workloads.**
-      Observed 2026-05-13 with `just yserver-xfce-hw`: xfwm4
-      decorations render fine, but text inside two pop-up dialogs
-      was illegible (user: "can't read the text"). Black background
-      where panel/wallpaper should be (separate issue — see listener
-      starvation entry below). Likely candidates: glyph atlas upload
-      timing (the L2-deferred MaskScratch / glyph-atlas migration in
-      phase 3E will touch this); the CompositeGlyphs xSrc/ySrc-vs-pen
-      bug pattern (already in feedback memory); or a GTK font-rendering
-      pipeline that uses RENDER paths yserver hasn't fully wired.
-      Repro under ynest first to isolate from KMS-side issues. Defer
-      until phase 3E lands text-run migration; revisit then.
+- [x] **Text rendering broken under xfce4 / GTK heavy workloads.**
+      Fixed by Phase 3E text-run migration + downstream rework;
+      confirmed working on fuji 2026-05-15.
 
 ## wmaker on KMS
 
@@ -530,24 +495,13 @@ that the host hides for us.
       to probe each font's `FcCharSet` in `build_font_catalog` and
       emit jisx*/gb2312*/ksc*/big5 entries when a real CJK font is
       installed. Defer until a CJK rendering client matters.
-- [ ] **MIT-SHM `XShmPutImage` host fast path.** Currently we chunk
-      regular `PutImage` because the 16-bit length field caps a single
-      image at ~262 KB. `XShmPutImage` against a host-shared shm
-      segment would avoid the chunking. Revisit if large-image upload
-      latency becomes a bottleneck.
-
-## Validation surface
-
-- [ ] **gtk3-demo / gtk4 demo runs in this dev environment.**
-      gtk-demo (gtk4) starts then exits silently on the host's `:0`
-      regardless of whether it's run nested under ynest or directly.
-      Pre-existing environment / dconf / stdin quirk; needs
-      investigation. Blocks the gtk3-demo arm of the WM smoke matrix.
-
 ## Core loop fairness
 
-- [ ] **Listener accept starves under high-volume per-client request
-      streams.** Observed 2026-05-13 with `just yserver-xfce-hw`:
+- [~] **Listener accept starves under high-volume per-client request
+      streams.** Not currently reproducible (as of 2026-05-15) but
+      the unbounded per-iteration read budget that underlies it is
+      still present, so the shape remains. Original observation
+      from 2026-05-13 with `just yserver-xfce-hw`:
       xfce4-panel made 5 attempts to open `:7.0` over ~50ms, all
       returned "cannot open display"; yserver-hw.log shows zero new
       client setups between 13:00:48 (client 38) and the user's
@@ -574,10 +528,6 @@ that the host hides for us.
 
 ## Dev-loop / observability
 
-- [ ] **Down-grade known-benign host errors to DEBUG.** A small
-      classifier in `BackendEventSink::handle_backend_event` that
-      maps specific `(major, minor, code)` tuples to DEBUG level
-      so the WARN log is actually scannable.
 - [x] **~~X11 error encoder hard-codes `minor_code = 0` for
       extension errors.~~ FIXED 2026-05-15.** Threaded the minor
       opcode through 76 extension-dispatcher call sites in
@@ -591,3 +541,33 @@ that the host hides for us.
       decode the failing minor immediately.
 - [ ] **README pointer to this file.** So the next reader knows
       where the bug ticklist lives.
+
+## Archived: ynest-era (pre-rendering-rework, KMS-direct supersedes)
+
+yserver now runs KMS-direct (no host X server). The items below
+were filed when yserver ran nested under `ynest` against the
+host Xorg; many of the failure modes simply don't exist on the
+KMS path. Kept here for reference if we ever revive ynest-based
+WM smoke testing.
+
+- [ ] **CopyArea BadMatch (~100/wmaker startup).** ynest passed
+      `CopyArea` requests through to the host X server, which
+      rejected drawable pairs of mismatching depth. Pre-rework
+      noise from wmaker on ynest.
+- [ ] **PolyFillRectangle BadMatch (~15/wmaker startup).** Same
+      shape as the CopyArea pattern (ynest forwarded; host
+      rejected).
+- [ ] **Composite NameWindowPixmap BadAccess (~28/wmaker
+      startup).** ynest called `NameWindowPixmap` on un-redirected
+      windows; host rejected with BadAccess. Mattered for
+      picom-like compositors under the old setup.
+- [ ] **MIT-SHM `XShmPutImage` host fast path.** Would have let
+      ynest forward a single 256-KB+ image to the host without
+      chunking. Irrelevant on the KMS path (no host server).
+- [ ] **gtk3-demo / gtk4 demo silent-exits.** gtk-demo started
+      and exited silently against the host `:0`, nested or not.
+      Pre-existing dconf/stdin quirk in the dev environment.
+- [ ] **Down-grade known-benign host errors to DEBUG.** Small
+      classifier in `BackendEventSink::handle_backend_event` to
+      drop the WARN noise from ynest-host error replies. No host
+      server on the KMS path.
