@@ -586,6 +586,117 @@ exact failure mode v2 is designed to eliminate.
   blits when only a corner changed.
 - Multi-queue if profiling justifies.
 
+## Performance — what the design allows, what it doesn't promise
+
+The previous (v1) rework was a sync/lifetime spec, not a perf spec.
+It scoped to "no `vkQueueWaitIdle` on hot path" and delivered that.
+Some users read "snappy" into it more broadly than the doc claimed,
+and bee's residual lag (submit-rate-bound, not wait-bound) became a
+disappointment relative to those implied promises.
+
+v2 is intentionally honest about this: **the model change does not
+promise perf wins by itself**. What it promises is that the perf
+optimizations we'll eventually need are **allowed by the design as
+strategy choices, not as alternate rendering models**. The
+correctness contract (invariants I1-I7) stays stable; perf work
+becomes pluggable.
+
+### Optimization strategies the design allows (Stage 5+)
+
+All of these are implementation choices inside `SceneCompositor`,
+`RenderEngine`, and `PlatformBackend`. None require changing the
+core model, the invariants, or the four-component split.
+
+- **Output-damage clipped redraw.** Already I5. `SceneCompositor`
+  blits only entries intersecting per-output damage.
+- **Whole-screen fallback.** When damage is too fragmented or
+  edge cases bite, fall back to full-output redraw. Same model;
+  identical output.
+- **Strategy-per-frame choice.** `SceneCompositor` is free to pick
+  per frame: full redraw / clipped redraw / direct scanout /
+  hardware cursor / hardware plane assignment. The contract: the
+  output must equal what the scene says, and I6 lifetime rules
+  must hold. Strategies are not alternate models.
+- **Submit aggregation.** `RenderEngine` can collapse paint ops
+  into fewer command buffers; `SceneCompositor` can submit one CB
+  per output frame. Bee's queue_submit2 rate problem becomes
+  tractable here.
+- **Persistent storage handles + descriptor caching.**
+  `DrawableStore`'s `DrawableId`s are stable across frames, so
+  descriptor sets / image views for "draw storage X with these
+  bindings" can be cached and reused. Later: bindless indices.
+- **Async GPU work via DRM in-fences / syncobj.** I6 separates
+  GPU render completion (I6a) from KMS page-flip retirement (I6b).
+  Stage 2 may CPU-wait on I6a fences for safety. Later swap in
+  DRM in-fence / syncobj submission so the CPU never blocks — no
+  semantic change to `SceneCompositor`.
+- **Hardware cursor plane.** I7 parks it. When reintroduced, it's
+  a strategy: the cursor entry in the scene is *assigned* to a
+  plane instead of blitted. Same scene, different render target
+  for that one entry.
+- **Direct scanout.** "Scene has one eligible full-output entry,
+  present that storage directly." Strategy choice, not a separate
+  model. Must not reintroduce live-window scanout.
+- **Hardware plane assignment.** Per-entry strategy: if a plane
+  is available and the entry's transform/format fit, assign;
+  else fall back to composition. The scene model doesn't change.
+- **Occlusion culling.** Scene entries are explicit, so entries
+  fully covered by opaque entries above them can be skipped.
+- **Damage as a region, not a rect.** Output damage is a
+  `RegionSet`, not a bounding box; clipping is per-rect.
+
+### Red flags — if any of these surface, stop and revise the model
+
+Before adding more features. These are the signals that the design
+is wrong, not the implementation.
+
+- Stage 2 cannot implement output-damage-clipped redraw without
+  redesign of `DrawableStore` or `SceneCompositor`.
+- Storage ownership makes descriptor caching hard — e.g.,
+  storage handles aren't stable across frames, or alias-bookkeeping
+  forces re-binding.
+- Every paint op needs an immediate submit. (PaintBatch from v1
+  already solved this; v2 must not regress.)
+- Composition requires CPU readback anywhere. (Including the
+  Stage 2 → Stage 3 transition; if Stage 2's choices force a
+  readback to make Stage 3 work, the model has a flaw.)
+- COMPOSITE redirect forces special scanout rules again. I4 says
+  redirect is "target storage moves"; if the scanout/scene logic
+  needs a special branch for redirected windows, the model leaked.
+- The v2 path needs `vkQueueWaitIdle` to stay stable.
+- Hardware-cursor or direct-scanout strategies require breaking
+  invariants (especially I3 — "visibility produced only by a
+  compositor pass") rather than being expressible *as* compositor
+  strategies.
+
+### Honest expectations per hardware class
+
+v1 is the **minimum bar** — not the target. v1 is incorrect (no
+compositing) and slow on RDNA2 / high-end discrete. Hitting v1's
+perf isn't a win; it's the floor.
+
+- **fuji (Intel)**: no worse than v1 by Stage 3 (floor); should be
+  measurably better from Stage 4 onwards on damage-intensive
+  workloads, since damage-clipped composition is the load-bearing
+  v2 win. "Snappy" must survive.
+- **bee (RDNA2)**: model change alone won't fix adapta-mate-cc.
+  bee's bottleneck is submit rate + per-submit RADV tax + glyph
+  atlas churn. The floor is "no worse than v1, no GPU faults" —
+  v2 fixes the fault-safety (I6) but the submit-rate / glyph
+  work is separate plans implemented *on top of v2*. The model
+  must make those plans tractable, not block them.
+- **silence (high-end discrete)**: same story as bee. Model isn't
+  the bottleneck; absolute submit / driver-tax dominates. Floor:
+  no regression. Ceiling: depends on subsequent perf work.
+
+The honest framing: **v2 is the model change that unblocks future
+perf work**. The future perf work is a separate set of plans,
+gated by hardware profiling. v1 isn't fast — matching it isn't a
+goal. The goal is "v2 is correct where v1 isn't, no worse where
+v1 was acceptable, and clearly better where the model change can
+deliver." Anything less is a wasted rewrite; anything implying
+v2 will fix RDNA2 perf by itself overpromises again.
+
 ## Risks + open questions
 
 **Risk 1 — storage representation.** I1 says "drawable is storage."
@@ -615,19 +726,51 @@ v1, `KmsBackendV2` for v2), picked by `YSERVER_RENDER_MODEL` at
 startup. Both embed the same `KmsCore` for protocol bookkeeping.
 Per-method fallback is explicitly NOT supported (would create
 split-brain storage). **v1 stays in tree until v2 is the proven
-production default** — not just "parity at Stage 3 close" but
-"used as the default for an extended period without regressions,
-across real workloads and hardware classes." Concretely, v1 is
-deletable when:
+production default**. v1 itself is **not the goal — it's the
+minimum bar**. v1 has known correctness gaps (no compositing
+support) and known perf gaps (bee/silence submit-rate-bound,
+glyph atlas churn, no damage-clipped composition). "Match v1"
+would normalize a broken floor. The target is meaningfully better
+than v1 on damage-driven workloads + correct where v1 is broken,
+while **not regressing below v1** on the workloads v1 handles
+well.
+
+v1 is deletable when **all** of the following hold:
 
 - v2 has been the `YSERVER_RENDER_MODEL` default for ≥1 month
-  across daily use,
-- no v2-only regression has been filed and stayed open over a
-  recent window,
-- compositor support (Stage 4) and any perf work (Stage 5) have
-  landed and stabilized,
-- the cost of maintaining `KmsBackend` is felt to exceed its value
-  as a fallback (subjective judgment call, made deliberately).
+  across daily use.
+- No v2-only regression has been filed and stayed open over a
+  recent window.
+- **Correctness gates v1 doesn't meet, that v2 does**:
+  - Compositing WM support: xfwm4 with compositing + picom
+    xrender backend both render correctly on v2 (Stage 4 work
+    landed and validated on hardware).
+  - bee/RDNA2: no GPU faults over a 30-minute session under
+    real workloads (e.g. window-drag, gedit text scroll, MATE
+    + compositor).
+- **No-regression gates against v1**:
+  - rendercheck full-suite passes on v2; pass time no worse than
+    v1's. (v2's damage clipping should make it *faster* in
+    practice; the gate is just "not worse.")
+  - fuji + xfce4 typical session (idle + occasional drag) feels
+    no less responsive than v1 — explicit subjective check,
+    because "snappy" is what users notice.
+  - Steady-state composite queue_submit2 rate no higher than v1.
+- **Headroom gates — places v2 should be measurably better,
+  because that's what the model change is for**:
+  - Damage-clipped composition demonstrably reduces per-frame
+    GPU work on typical workloads (compose-time microbenchmark
+    on cursor-only-moves, single-window-typing, etc).
+  - Steady-state `vkQueueWaitIdle` call count is zero (v1 has a
+    handful in lifecycle paths; v2 should have none by I6).
+- The cost of maintaining `KmsBackend` is felt to exceed its
+  value as a fallback (subjective judgment call, made deliberately).
+
+Note these gates are **deletion gates**, not Stage 3 acceptance.
+Stage 3 close = "v2 is a viable default to switch on." v1
+deletion = "we no longer need the escape hatch, AND v2 has
+delivered on its design promises beyond just not regressing."
+The gap is deliberate.
 
 Keeping both indefinitely is a maintenance cost; deleting too
 early loses a known-good fallback during a stuck point. The
