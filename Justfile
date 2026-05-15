@@ -479,6 +479,29 @@ thunar-xorg-trace real="$DISPLAY":
         kill -TERM $xtrace_pid 2>/dev/null;\
         echo "x11trace: thunar-xorg.xtrace"'
 
+# MATE on yserver with x11trace recording the full X11 wire
+# protocol between clients and yserver. Mirrors the xfce recipe
+# but launches mate-session and dumps to `mate.xtrace`. Use to
+# diff Caja's wheel-handling code path before and after the
+# stateful view-switch "fix".
+yserver-mate-hw-trace log="debug":
+    cargo build --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -d :7 -D :8 -n -o mate.xtrace &\
+        xtrace_pid=$!;\
+        sleep 1;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session mate-session --display :8 > mate.log 2>&1;\
+        kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "yserver log: yserver-hw.log";\
+        echo "x11trace:    mate.xtrace";\
+        echo "mate log:    mate.log"'
+
 # Release-mode mate with logging turned down to `warn`. Use this to
 # test whether pointer lag under hover is dominated by env_logger /
 # stderr formatting cost (observed at ~5% of CPU under debug+debug
