@@ -390,13 +390,23 @@ that the host hides for us.
       `GlyphAtlas::intern`'s per-glyph `queue_wait_idle` is the
       dominant remaining cost (each new glyph drains the queue
       completely before the next can be uploaded). Phase 5 scope.
-      Phase 4 (`vkQueueWaitIdle` retirement from
-      `PaintBatch::submit_and_wait`) helps input fluidity but does
-      not reduce the absolute submission count; both Phase 4 and
-      Phase 5 likely need to land before adapta-nokto becomes usable
-      on `bee`. A reproducer on `silence` with adapta-nokto would
-      still help separate "hardware drains too slowly" from "absolute
-      op count exceeds frame budget on any hardware."
+
+      **Post-Phase-5 / pool / GPU-trap update (2026-05-15)**: Phase 5
+      sync rework, the pixmap pool, and GPU trap rasterization all
+      landed; perceived lag on fuji (Intel) improved dramatically.
+      `bee` (AMD RDNA2) is "no GPU faults but laggy" per status.md.
+      `silence` (powerful machine with discrete GPU) **still
+      reproduces the catastrophic mate-cc + adapta-nokto cliff**,
+      which rules OUT "the slow machine just can't keep up" — the
+      absolute submission count or per-frame work exceeds the
+      budget even on capable hardware. Remaining suspects:
+      `GlyphAtlas::intern` per-glyph wait still present (filed
+      separately); RENDER Composite path's per-op submission rate
+      under heavy GTK-glyph workloads; or a higher-level frame
+      management gap that lets one workload starve subsequent ones.
+      Cross-vendor reproduction (Intel-fuji OK, AMD-bee residual,
+      AMD-silence catastrophic) suggests hardware/driver factors
+      compound on top of an absolute-rate problem.
 
 ## WM-specific behaviour
 
