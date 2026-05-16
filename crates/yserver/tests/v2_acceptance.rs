@@ -662,3 +662,130 @@ fn v2_tiled_fill_replicates_tile_pixmap() {
     // Reset fill state so trailing test wiring doesn't inherit it.
     b.set_gc_fill_solid(None).expect("reset solid");
 }
+
+/// Stage 3f.14 acceptance: `set_container_background_pixmap`
+/// tiles the source pixmap across the **entire root extent**, not
+/// just the top-left corner. Pre-3f.14 v2 did a single `copy_area`
+/// at (0, 0) and left the rest of root unchanged — fvwm3's floral
+/// wallpaper covered only the top-left of the screen on bee. v1
+/// tiles via its compositor pipeline; v2 routes through
+/// `engine.render_composite` with `OP_SRC + Repeat::Normal`.
+///
+/// Test: 4×4 pixmap pre-filled red, set as root bg, read back two
+/// points on root storage: (0, 0) and (5, 5) (which maps to tile
+/// (1, 1) under the wrap rule). Both should read red. A point
+/// outside the for_tests fb (`fb_w` = 800) is not exercised — the
+/// fb is much larger than the tile so any (x, y) within
+/// [0, 800) × [0, 600) hits a tiled tile.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_set_container_background_pixmap_tiles_across_root() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let tile = b.create_pixmap(None, 32, 4, 4).expect("tile pixmap");
+    b.fill_rectangle(None, tile.as_raw(), 0xFFFF_0000, 0, 0, 4, 4)
+        .expect("tile fill red");
+
+    b.set_container_background_pixmap(None, tile.as_raw())
+        .expect("set bg pixmap");
+
+    // Read 8×8 of root from the origin. With a 4×4 red tile the
+    // first 8×8 must be entirely red. The root xid is 1 in v2's
+    // test fixture (`KmsCore.window_id`).
+    let root_xid = 1u32;
+    let out = b
+        .get_image(None, root_xid, 2, 0, 0, 8, 8, !0)
+        .expect("get_image")
+        .expect("Some");
+    assert_eq!(out.len(), 8 * 8 * 4, "8×8 BGRA8");
+    for (i, px) in out.chunks_exact(4).enumerate() {
+        // BGRA wire bytes for red (alpha-pre-applied opaque):
+        // B=0, G=0, R=0xFF, A=0xFF.
+        assert_eq!(
+            &px[0..4],
+            &[0x00, 0x00, 0xFF, 0xFF],
+            "tiled root pixel #{i} must be red (got {:?})",
+            &px[0..4],
+        );
+    }
+}
+
+/// Stage 3f.14 acceptance: a fresh window storage allocated with
+/// `bg_pixel == None` (no `CWBackPixel` attribute) reads back as a
+/// depth-appropriate safe-default colour, **not** whatever bytes
+/// the pool returner left. Pre-3f.14 the alloc path skipped the
+/// fill entirely when `bg_pixel.is_none()`, so the v2 PixmapPool
+/// (3f.10) handed back stale content — caja's drag exhibited this
+/// as widget-rect islands on black. Test: create a 16×16 depth-32
+/// subwindow, register it through the Backend trait, then
+/// get_image its xid and assert every pixel is transparent black
+/// (depth-32 safe default).
+///
+/// We don't directly exercise the pool here — the test fixture's
+/// platform has no `pixmap_pool` attached, so fresh allocs always
+/// come from a Vk allocator. The test still asserts the
+/// fill-on-alloc invariant via the *initial* read: depth-32 →
+/// `(0, 0, 0, 0)` BGRA bytes. Without the 3f.14 fill, the freshly
+/// allocated Vk image would have UNDEFINED layout content and the
+/// readback would be either driver-defined zero or
+/// garbage — driver-dependent. The fill makes it explicit.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_window_storage_no_bg_pixel_inits_to_safe_default() {
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // create_subwindow with `background_pixel=None` +
+    // `background_pixmap=None` (no CWBackPixel / CWBackPixmap on
+    // the request — pre-3f.14 v2 left fresh storage at pool
+    // returner content for this case).
+    let parent = WindowHandle::from_raw(1).expect("root WindowHandle");
+    let child = b
+        .create_subwindow(
+            None,
+            parent,
+            0, // x
+            0, // y
+            16,
+            16,
+            0, // border_width
+            // Depth-32 (ARGB) needs an explicit visual config.
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None, // background_pixel
+            None, // background_pixmap
+        )
+        .expect("create_subwindow");
+    let child_xid = child.as_raw();
+
+    let out = b
+        .get_image(None, child_xid, 2, 0, 0, 16, 16, !0)
+        .expect("get_image")
+        .expect("Some");
+    assert_eq!(out.len(), 16 * 16 * 4);
+    // Depth-32 → transparent black `(0, 0, 0, 0)` per
+    // `default_window_init_color`.
+    for (i, px) in out.chunks_exact(4).enumerate() {
+        assert_eq!(
+            &px[0..4],
+            &[0x00, 0x00, 0x00, 0x00],
+            "fresh depth-32 storage pixel #{i} must be transparent black (got {:?})",
+            &px[0..4],
+        );
+    }
+}

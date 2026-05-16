@@ -1195,16 +1195,16 @@ impl KmsBackendV2 {
                 bg_pixmap: None,
             },
         );
-        // Stage 3f.6: clear newly-allocated storage to `bg_pixel`
-        // so freshly-mapped windows have a defined colour. v1 does
-        // this at the same hook (`create_subwindow`). Skips when
-        // storage wasn't allocated (test fixture) or when there's
-        // no bg_pixel (caller didn't pass one — depth-1/8 mask
-        // pixmaps or windows with bg=None).
-        if storage_allocated
-            && let Some(pixel) = bg_pixel
-            && let Some(id) = self.store.lookup(host_xid)
-        {
+        // Stage 3f.6 + 3f.14: clear newly-allocated storage to a
+        // defined colour so freshly-mapped windows don't surface
+        // the pool returner's pixels (3f.10 PixmapPool recycles
+        // image/view/memory triples — the bytes are whatever the
+        // previous owner left). When `bg_pixel` is set, use it
+        // (v1's create_subwindow behaviour); otherwise paint a
+        // depth-appropriate safe default (3f.14).
+        if storage_allocated && let Some(id) = self.store.lookup(host_xid) {
+            let color =
+                bg_pixel.map_or_else(|| default_window_init_color(depth), decode_x11_pixel_bgra);
             let rect = ash::vk::Rect2D {
                 offset: ash::vk::Offset2D::default(),
                 extent: ash::vk::Extent2D {
@@ -1212,13 +1212,12 @@ impl KmsBackendV2 {
                     height: u32::from(height.max(1)),
                 },
             };
-            let color = decode_x11_pixel_bgra(pixel);
             if let Err(e) =
                 self.engine
                     .fill_rect(&mut self.store, &mut self.platform, id, rect, color)
             {
                 log::debug!(
-                    "v2 allocate_window_storage: initial bg_pixel fill failed for xid {host_xid:#x}: {e:?}"
+                    "v2 allocate_window_storage: initial fill failed for xid {host_xid:#x}: {e:?}"
                 );
             }
         }
@@ -1736,6 +1735,27 @@ fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
 /// drawable backing has gone away. The engine treats this as a
 /// gap and silently no-ops (matches v1's
 /// `resolve_render_pic_with_gradient_xid` shape).
+/// Stage 3f.14: depth-appropriate safe-default init colour for
+/// fresh window storage when the X11 attribute `background-pixel`
+/// is `None`. The v2 PixmapPool (3f.10) recycles
+/// (image, view, memory) triples between drawables; a pool-take
+/// inherits the returner's pixels, so leaving fresh storage at
+/// pool content surfaces visually as widget-rect islands on
+/// black (caja's drag artifact, 3f.10 + 3f.14 reproducer).
+///
+/// - Depth 32 windows are premultiplied-α; transparent black
+///   `(0, 0, 0, 0)` is the no-op contribution to compositing.
+/// - Depth 24 and other non-alpha visuals get opaque black
+///   `(0, 0, 0, 1)` — matches "uninitialised window shows black"
+///   which is the historical X11 behaviour clients expect.
+fn default_window_init_color(depth: u8) -> [f32; 4] {
+    if depth == 32 {
+        [0.0, 0.0, 0.0, 0.0]
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    }
+}
+
 /// Stage 3f.13 glyph fallback: pull the first stop's premultiplied
 /// RGBA from a gradient picture record. Returns `None` if `host_pic`
 /// isn't a gradient or has zero stops. Used by `composite_glyphs`
@@ -2201,33 +2221,35 @@ impl Backend for KmsBackendV2 {
                         log::warn!(
                             "v2 configure_subwindow: store.allocate failed for xid {host_xid:#x}: {e:?}",
                         );
-                    } else {
-                        // Stage 3f.6: clear the fresh storage to
-                        // bg_pixel so resize doesn't leave Vk-
-                        // undefined content visible until the
-                        // client's next repaint.
-                        if let Some(pixel) = bg_pixel
-                            && let Some(id) = self.store.lookup(host_xid)
-                        {
-                            let rect = ash::vk::Rect2D {
-                                offset: ash::vk::Offset2D::default(),
-                                extent: ash::vk::Extent2D {
-                                    width: u32::from(new_w),
-                                    height: u32::from(new_h),
-                                },
-                            };
-                            let color = decode_x11_pixel_bgra(pixel);
-                            if let Err(e) = self.engine.fill_rect(
-                                &mut self.store,
-                                &mut self.platform,
-                                id,
-                                rect,
-                                color,
-                            ) {
-                                log::debug!(
-                                    "v2 configure_subwindow: bg_pixel fill on resize failed for xid {host_xid:#x}: {e:?}"
-                                );
-                            }
+                    } else if let Some(id) = self.store.lookup(host_xid) {
+                        // Stage 3f.6 + 3f.14: clear the fresh
+                        // storage so resize doesn't leave pool-
+                        // returner content (or Vk-undefined bytes)
+                        // visible until the client's next repaint.
+                        // Bg_pixel-set: paint that colour;
+                        // otherwise depth-appropriate safe default
+                        // (matches `allocate_window_storage`).
+                        let color = bg_pixel.map_or_else(
+                            || default_window_init_color(depth),
+                            decode_x11_pixel_bgra,
+                        );
+                        let rect = ash::vk::Rect2D {
+                            offset: ash::vk::Offset2D::default(),
+                            extent: ash::vk::Extent2D {
+                                width: u32::from(new_w),
+                                height: u32::from(new_h),
+                            },
+                        };
+                        if let Err(e) = self.engine.fill_rect(
+                            &mut self.store,
+                            &mut self.platform,
+                            id,
+                            rect,
+                            color,
+                        ) {
+                            log::debug!(
+                                "v2 configure_subwindow: storage init fill failed for xid {host_xid:#x}: {e:?}"
+                            );
                         }
                     }
                 }
@@ -2615,30 +2637,84 @@ impl Backend for KmsBackendV2 {
         _origin: Option<OriginContext>,
         host_pixmap_xid: u32,
     ) -> io::Result<()> {
+        use crate::kms::{v2::engine::ResolvedSource, vk::ops::render::CompositeRect};
         self.core.bg_pixmap = PixmapHandle::from_raw(host_pixmap_xid);
         self.core.bg_pixel = None;
-        if let (Some(src), Some(dst)) = (
-            self.store.lookup(host_pixmap_xid),
-            self.store.lookup(self.core.window_id),
+        let Some(dst) = self.store.lookup(self.core.window_id) else {
+            self.scene.mark_scene_structure_dirty();
+            return Ok(());
+        };
+        let Some(src) = self.store.lookup(host_pixmap_xid) else {
+            log::debug!(
+                "v2 set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} not in store"
+            );
+            self.scene.mark_scene_structure_dirty();
+            return Ok(());
+        };
+        // Stage 3f.14: X11 bg_pixmap tiles across the drawable
+        // extent. Pre-3f.14 v2 did a single copy_area at (0, 0)
+        // and left the rest of root unchanged — fvwm3 wallpaper
+        // covered only the top-left of the screen on bee. Route
+        // through `engine.render_composite` with OP_SRC + Repeat::
+        // Normal so the source pixmap tiles across the whole root
+        // extent in a single submit. Same shape as `try_tiled_fill`
+        // (3f.3) but unconditioned by GC clip.
+        if src == dst {
+            // Defensive: a pixmap aliased as bg of its own drawable
+            // is not a meaningful X11 op. v1's path treats it the
+            // same (copy_area with src == dst is logged + skipped).
+            log::debug!("v2 set_container_background_pixmap: src == root, skipping");
+            self.scene.mark_scene_structure_dirty();
+            return Ok(());
+        }
+        let src_format = self.store.get(src).map(|d| d.storage.format);
+        if src_format != Some(ash::vk::Format::B8G8R8A8_UNORM) {
+            // Tile path requires BGRA8 src (matches `try_tiled_fill`
+            // gate). Other formats fall through with no paint —
+            // v1-parity-ish; rare in practice for root bg.
+            log::debug!(
+                "v2 set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} format \
+                 {src_format:?} not BGRA8, skipping tile"
+            );
+            self.scene.mark_scene_structure_dirty();
+            return Ok(());
+        }
+        let dst_extent = ash::vk::Extent2D {
+            width: u32::from(self.platform.fb_w.max(1)),
+            height: u32::from(self.platform.fb_h.max(1)),
+        };
+        let rects = [CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: 0,
+            dst_y: 0,
+            width: dst_extent.width,
+            height: dst_extent.height,
+        }];
+        const OP_SRC: u8 = 1;
+        match self.engine.render_composite(
+            &mut self.store,
+            &mut self.platform,
+            OP_SRC,
+            ResolvedSource::Drawable(src),
+            ResolvedSource::None,
+            dst,
+            &rects,
+            None,
+            Repeat::Normal,
+            Repeat::None,
+            None,
+            None,
+            false,
         ) {
-            let src_extent = self.store.get(src).map(|d| d.storage.extent);
-            if let Some(extent) = src_extent {
-                match self.engine.copy_area(
-                    &mut self.store,
-                    &mut self.platform,
-                    src,
-                    dst,
-                    ash::vk::Rect2D {
-                        offset: ash::vk::Offset2D::default(),
-                        extent,
-                    },
-                    ash::vk::Offset2D::default(),
-                ) {
-                    Ok(()) => self.telemetry.record_paint_submit(),
-                    Err(e) => {
-                        log::warn!("v2 set_container_background_pixmap: root copy failed: {e:?}");
-                    }
-                }
+            Ok(s) if s.recorded_draws > 0 => self.telemetry.record_paint_submit(),
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!(
+                    "v2 set_container_background_pixmap: render_composite tile failed: {e:?}"
+                );
             }
         }
         self.scene.mark_scene_structure_dirty();
@@ -5560,6 +5636,21 @@ mod tests {
         b.render_free_picture(None, xid).expect("free");
         assert!(!b.core.pictures.contains_key(&xid));
         assert_eq!(b.engine.picture_paint_len(), 0);
+    }
+
+    /// Stage 3f.14: depth-32 windows are premultiplied-α and a
+    /// transparent-black default is the no-op contribution to
+    /// compositing; depth-24 (and other non-α visuals) get opaque
+    /// black. Locks the contract in the test suite so a refactor
+    /// doesn't silently flip 32-bit windows to opaque black (which
+    /// would visually look the same on top of the root but break
+    /// compositors that depend on alpha for blending).
+    #[test]
+    fn v2_default_window_init_color_per_depth() {
+        assert_eq!(super::default_window_init_color(32), [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(super::default_window_init_color(24), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(super::default_window_init_color(1), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(super::default_window_init_color(8), [0.0, 0.0, 0.0, 1.0]);
     }
 
     /// `render_set_picture_clip_rectangles` parses + stores rects
