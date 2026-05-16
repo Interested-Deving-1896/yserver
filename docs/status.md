@@ -424,10 +424,10 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     + 9 Vk-backed ignored tests pass under lavapipe; clippy
     clean. Application smoke unchanged (3b doesn't draw); RENDER
     paint apps stay broken until 3c.
-  - [~] **3c — `render_composite` + `render_fill_rectangles`.**
+  - [x] **3c — `render_composite` + `render_fill_rectangles`.**
     Standard PictOps + Saturate + Disjoint/Conjoint shader
     blend; per-rect picture-clip scissoring; self-composite
-    aliasing routed through arena scratch.
+    aliasing routed through alias-readback scratch.
     - **3c.1 landed 2026-05-16 (`bcca8a3`)** — foundation only.
       `RenderEngineInner` grows `render_pipelines`,
       `solid_src_image`, `solid_mask_image`, `white_mask_image`,
@@ -453,17 +453,33 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       (`repeat_to_shader_const` / `compose_affines` /
       `pixman_transform_to_affine`) promoted to `pub(crate)` so
       v2 reuses verbatim.
-    - **3c.3 remaining** — self-alias scratch routing for
-      `src == dst` (currently a gap log + bail) + 7 Vk-backed
-      acceptance tests under lavapipe (`render_composite_over_
-      renders_alpha_blended`, `_picture_clip_per_rect`,
-      `_no_gc_clip_leak`, `_solid_fill_source_path`,
+    - **3c.3 landed 2026-05-16** — self-alias scratch routing
+      + 7 Vk-backed acceptance tests under lavapipe. New
+      `RenderEngineInner.src_alias_readback: DstReadback`
+      slot (sibling to `dst_readback`, same growable per-format
+      scratch shape). `render_composite` detects
+      `src.drawable_id() == dst_id` (or same for mask), pre-allocates
+      the alias scratch + extracts its sampled view, then in the
+      per-op CB issues `record_copy_from` (dst → alias scratch →
+      SHADER_READ_ONLY) before `record_render_composite`. The
+      composite descriptor binds the alias view as `src_tex` /
+      `mask_tex` in place of dst's own drawable view; Vulkan
+      can't sample an image while it's bound as a color
+      attachment in the same draw, the scratch breaks the alias.
+      `CompositeStats.used_src_alias_scratch` is the observable
+      signal. 7 acceptance tests added — 6 in
+      `kms::v2::engine::tests::` (`render_composite_over_renders
+      _alpha_blended`, `_picture_clip_per_rect`,
+      `_solid_fill_source_path`,
       `_disjoint_clear_uses_readback`, `_self_alias`,
-      `render_fill_rectangles_src_clears_to_color`) + substage
-      close. Tests gate the per-rect-scissor + readback +
-      self-alias paths; gradient source still bails to 3e.
-    216 lib tests + 9 ignored v2-engine Vk tests pass under
-    lavapipe after each intermediate landing.
+      `render_fill_rectangles_src_clears_to_color`); the
+      seventh, `v2_render_composite_no_gc_clip_leak`, lives in
+      `tests/v2_acceptance.rs` because the "GC clip must not
+      leak into RENDER paint" property is a Backend-trait
+      invariant (engine has no GC-clip notion). Gradient source
+      still bails to 3e. 216 lib tests + 15 ignored v2-engine Vk
+      tests + 4 v2_acceptance tests all green under lavapipe;
+      clippy pedantic clean for the touched lines.
   - [ ] **3d — `render_composite_glyphs` + glyphsets.**
     v1-parity scope (Over + SolidFill source +
     A8/A1/ARGB32-as-A8 glyphsets); fixes v1's latent
