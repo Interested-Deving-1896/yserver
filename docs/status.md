@@ -996,11 +996,153 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       per-second telemetry line. `GLOBAL_LATEST_POOL` hook is
       registered, so the existing v1 emitter sees them too;
       a v2-side per-second emitter line is post-3f.5 polish.
+    - [x] **3f.11 — reparent removes from top_level_order +
+      ConfigureWindow stack_mode for top-levels landed
+      2026-05-16.** Two related fixes after the MATE clock-
+      applet PPM dump showed a left-edge ghost of the right-
+      edge clock:
+      - `reparent_subwindow` now reconciles
+        `core.top_level_order` with the resolved parent. Pre-
+        fix, an xid registered as a top-level (parent=root)
+        stayed in the order even after being reparented INTO
+        another container. `build_scene` then emitted the
+        same window twice — once at child-relative coords via
+        the top-level walk (treated as absolute → (0,0)) and
+        once at its real position via the parent's recurse.
+        MATE clock-applet was the reproducer: created with
+        parent=root, reparented into mate-panel's container,
+        rendered at both edges. Click on the LEFT ghost hit-
+        tested against the RIGHT clock's geom (since geom.x
+        was correctly updated by reparent) — visual at left
+        + input-route at right confirmed the same-window-
+        emitted-twice diagnosis.
+        Belt-and-suspenders fix: `destroy_subwindow` also
+        drops from top_level_order so a destroyed top-level
+        doesn't ghost-render until the next register_top_level
+        fills the slot.
+      - `configure_subwindow` honours `stack_mode`: caja-
+        desktop occluded mate-panel because v2 dropped the
+        `stack_mode` field from `HostSubwindowConfig`. marco's
+        `ConfigureWindow stack_mode=Below` was a no-op in v2;
+        caja-desktop (last-registered top-level) drew on top
+        of everything. Ported v1's `restack_window` for the
+        top-level case — Above/Below/TopIf/BottomIf/Opposite
+        all route through `core.top_level_order`. Subwindow
+        sibling stack order is still HashMap-iteration-order
+        (post-3f.11 polish; doesn't affect caja-on-top).
+      Tests: 5 new unit tests covering both bugs +
+      restack-corner cases. 245 lib tests green; clippy
+      clean. Hardware smoke confirmed by user:
+      cursor tracks, MATE panels render correctly, caja-
+      desktop stays beneath.
+    - [x] **3f.12 — gradient src/mask collapses to first-stop
+      SolidFill landed 2026-05-16.** MATE caja PPM dump
+      revealed caja's offscreen render buffer was painted
+      black-with-isolated-widget-rects. Cause: every Cairo
+      widget background uses an XRender Composite op with a
+      gradient source; v2's `render_composite` logged a gap
+      and bailed; caja's pixmap stayed mostly UNDEFINED Vk
+      content; CopyArea propagated that to the on-screen
+      window.
+
+      Stage planning miss (same shape as 3f.6 / 3f.7): a 3c.2
+      comment promised "gradient src bails to 3e", but 3e's
+      actual plan was trapezoids + triangles + copy_plane and
+      never picked up gradients. Gradients are mentioned only
+      in 3e's Risks list as "risk-listed for follow-up." Fell
+      through the gap.
+
+      Pragmatic fallback (not the real fix): in
+      `resolve_picture_for_render`, collapse a LinearGradient
+      / RadialGradient picture to a SolidFill of its first
+      stop's premultiplied colour. The existing SolidFill
+      path in `engine.render_composite` already works end-to-
+      end. Most GTK gradients are mild light→lighter so flat
+      first-stop colour is visually approximate. Same
+      collapse benefits `render_composite_glyphs` — used to
+      drop with `composite_glyphs_dropped_unsupported++`,
+      now gradient glyph paints flow through.
+
+      v1's `kms::vk::gradient::GradientPicture` (256×1 LUT
+      for linear, 256×256 for radial) is fully built and in
+      tree — just not wired into v2. **Real fix tracked as
+      3f.13 below.**
+
+      245 lib tests pass; clippy clean. Test renamed:
+      `v2_composite_glyphs_non_solidfill_source_drops` →
+      `v2_composite_glyphs_gradient_source_collapses_to_solidfill`
+      (counter stays at 0 since gradient now flows through).
+    - [ ] **3f.13 — full gradient LUT sampling (post-3f.5
+      polish).** Wire v1's `GradientPicture` (linear +
+      radial, already in tree at `kms/vk/gradient.rs`) into
+      v2's `engine.render_composite`:
+      - `render_create_linear_gradient` /
+        `render_create_radial_gradient` lazy-build a
+        `GradientPicture` and store on
+        `engine.picture_paint[xid]`.
+      - `render_composite` checks
+        `ResolvedSource::Gradient(xid)` (which currently
+        unreachable due to the 3f.12 collapse — needs
+        reinstatement once LUT path exists), binds the
+        gradient view + push-constants the
+        `axis_projection` affine, samples in the fragment
+        shader.
+      - `render_free_picture` drops the gradient entry via
+        the existing `engine.picture_paint_remove` hook.
+      Sizing: ~300-500 LoC porting + tests. Not blocking
+      3f.5 — fallback covers GTK.
+    - [ ] **3f.14 — bg_pixmap tiling + window-storage-on-
+      pool-take init.** Two related items uncovered by the
+      fvwm3 hardware smoke + MATE drag artifacts:
+      - `set_container_background_pixmap` copies the pixmap
+        once at (0,0); X11 says bg_pixmap **tiles**. fvwm3's
+        floral wallpaper covered only the top-left because
+        of this. Quick fix: iterate copy_area across root
+        extent at pixmap-stride origins, or route through
+        the existing tiled-fill RENDER composite (3f.3).
+      - Window storage taken from the pixmap pool with stale
+        content (caja's window during drag showed widget-rect
+        islands on black). When `windows_v2[xid].bg_pixel`
+        is None, fresh storage is left at whatever the pool
+        returned. Should either always-zero on take, or fill
+        with a safe default (transparent black for depth-32,
+        opaque black for depth-24).
+      Sizing: ~60-100 LoC + 2-3 tests.
+    - [ ] **3f.15 — submit aggregation for stroke ops
+      (post-3f.5 polish, may slip to Stage 5).** fvwm3 drag
+      stutter + caja apparent "hang" both trace back to
+      PolySegment fan-out → many tiny per-segment Vk
+      submits. v1's `PaintBatch` coalesces; v2 has no
+      submit aggregation. Spec § Stage 5 names this as the
+      submit-rate-bound perf class. Stage-3-close-acceptable
+      if Stage 3f.5 hardware smoke shows the choppiness is
+      tolerable; Stage 5 owns the real fix.
     - [ ] **3f.5 — acceptance.** rendercheck parity, real-app
-      smoke matrix, bee 30-min stability, fuji v1/v2 perf
-      capture diff. Stage 3 close. **Depends on 3f.6 + 3f.7**
-      — neither rendercheck nor any matrix client can reach
-      its first paint without subwindow composition + input.
+      smoke matrix (xterm / xclock / xeyes / gedit / MATE /
+      xfce4 / xfd), bee 30-min stability, fuji v1/v2 perf
+      capture diff. Stage 3 close. **Depends on 3f.6 + 3f.7
+      + 3f.11** (subwindow + input + stacking) — visual,
+      input, and z-order all required for matrix clients to
+      reach their first paint. 3f.12-3f.15 are observed/
+      recorded but not blocking.
+
+  ### Stage 3f planning-gap retrospective
+
+  Three substages landed during 3f close that were NOT in
+  the original Stage 3 plan:
+  - **3f.6 subwindow scene composition** — spec
+    §scene-layering item 2 ("top-level + descendants") was
+    deferred to Stage 4 in our stage plan; the cursor-trail
+    diagnosis proved the deferral was unsound. Codex picked
+    this up in 3f.9 with root storage + descendant recurse.
+  - **3f.7 input dispatch** — no substage owned it; the spec
+    only listed input as a `PlatformBackend` primitive.
+  - **3f.13 full gradient LUT** — Stage 3c.2 comment
+    promised 3e, but 3e's plan didn't include it.
+
+  Common pattern: spec-correct invariant got deferred / lost
+  in stage planning. Future stages: an explicit "spec
+  invariant coverage" checklist per stage would catch these.
 - [ ] **Stage 4 — re-enable COMPOSITE + COW.** Manual-redirect
   backing routing, NameWindowPixmap, scene treats COW as
   always-on-top entry. xfce drop-shadow renders correctly. picom
