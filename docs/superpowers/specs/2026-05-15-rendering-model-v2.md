@@ -123,7 +123,7 @@ enforcement of at least one. Violating any of them is the bug.
 | I2 | Client drawing mutates **only drawable storage**. Paint paths do not write to scanout BOs, do not bypass storage, do not have a "live window" fast path. | `RenderEngine` |
 | I3 | Window visibility is produced **only by a compositor pass**. Scanout is the output of a scene-graph composition over drawable storage, never a direct view onto window mirrors. | `SceneCompositor` |
 | I4 | COMPOSITE redirect only changes the **target storage** for a window. It does not change which paint paths run, which RENDER ops are valid, which damage fires. Manual-mode redirect additionally **removes the window from server-managed scene composition** — yserver routes client paint into the backing and exposes it via `NameWindowPixmap`, but the external compositor decides what becomes visible (typically by painting to root or COW). The scene does **not** automatically draw the redirected backing; doing so would duplicate or bypass the compositor's policy. Automatic-mode redirect keeps the window in the scene (the compositor only observes damage, not presents). | `DrawableStore` + `SceneCompositor` |
-| I5 | Damage is **two separate concerns** with overlapping inputs. **Presentation damage** drives the scene's next re-blit and has two sources: (a) per-storage paint-mutated region (in storage-local coords, only on scene-participating storage); (b) scene-structure damage from map/unmap/configure/stacking/shape/redirect-state/cursor/output changes (in output coords). Both feed **per-output damage**, which is what the compositor re-blits — restacks and occlusion re-expose regions even when storage didn't change. Acked only on successful present; failed submits don't lose repaint state. **Protocol damage** is the X11 DAMAGE-extension's per-drawable region: accumulates on every paint to any storage, regardless of scene participation, drives DamageNotify events to subscribed clients, acked by `DamageSubtract`. Manual-redirected backings get protocol damage but **no** presentation damage — the external compositor reads via NameWindowPixmap on the DamageNotify, repaints root, root's presentation damage drives the scene. | `DrawableStore` (both kinds) + `SceneCompositor` (presentation + scene-structure) + DAMAGE-ext dispatcher (protocol) |
+| I5 | Damage is **two separate concerns** with overlapping inputs. **Presentation damage** drives the scene's next re-blit and has two sources: (a) per-storage paint-mutated region (in storage-local coords, only on scene-participating storage); (b) scene-structure damage from map/unmap/configure/stacking/shape/redirect-state/cursor/output changes (in output coords). Both feed **per-output damage**, which is what the compositor re-blits — restacks and occlusion re-expose regions even when storage didn't change. Acked only on successful present; failed submits don't lose repaint state. **Protocol damage** is the X11 DAMAGE-extension's per-drawable region: accumulates on every paint to any storage, regardless of scene participation, drives DamageNotify events to subscribed clients, acked by `DamageSubtract`. **Owned at the request layer in `yserver-core`** (see I5 amendment under `DrawableStore`), not by the backend's storage type — fanout fires per paint request and is identical for v1/v2. Manual-redirected backings get protocol damage but **no** presentation damage — the external compositor reads via NameWindowPixmap on the DamageNotify, repaints root, root's presentation damage drives the scene. | `DrawableStore` (presentation) + `SceneCompositor` (presentation + scene-structure) + `yserver-core::damage_fanout` (protocol) |
 | I6 | Every image / buffer / fence has an **owner** and a **retirement generation**. v2 tracks **two distinct retirement signals** because they describe different consumers: **I6a — GPU render-completion fence** (signaled when the queue finishes executing a submitted CB; source storage sampled by the compose pass is releasable once this fires). **I6b — KMS page-flip retirement** (signaled when KMS hands back the previously-scanned-out BO; that BO is releasable for reuse only on this signal). Resources are freed only after **the relevant** retirement signal for their last consumer has fired. | Cross-cutting; `PlatformBackend` provides both fence primitives |
 | I7 | **Initial invariant**: direct scanout is disabled; the scanout BO is filled only by `SceneCompositor`'s composed pass. No per-window scanout shortcuts, no HW cursor plane shortcut, no bypass paths. **Future relaxation**: direct scanout, HW cursor plane, and HW plane assignment may be reintroduced later, but only as `SceneCompositor`-owned **strategy choices** over scene entries — never as side paths that bypass scene ownership. The contract stays "output equals the resolved scene"; the strategy chooses how scene entries reach the screen (composition, plane, direct present). | `PlatformBackend` (initial); `SceneCompositor` decides strategy when relaxed |
 
@@ -190,15 +190,21 @@ Tracks:
     there's nothing for `SceneCompositor` to ack.
   - **Protocol damage** — region the X11 DAMAGE extension reports
     to clients that have called `DamageCreate` on this drawable.
-    Accumulates on every storage regardless of scene participation.
-    Peeked + acked by the DAMAGE-extension dispatch path on
-    `DamageSubtract`. Distinct from presentation damage so that
-    paint to an offscreen pixmap (e.g., RENDER source) fires the
-    correct `DamageNotify` events without polluting scene state,
-    and so paint to a Manual-redirected backing fires
-    `DamageNotify` to the external compositor (which then reads
-    via NameWindowPixmap → RENDER Composite → root's presentation
-    damage → scene redraw).
+    **Amendment 2026-05-16**: protocol damage is **request-layer
+    fanout, not store-resident**. Each paint request handler in
+    `yserver-core` calls `damage_fanout::accumulate_damage_to_state`,
+    which walks the per-client `damage_objects` map, accumulates
+    the per-drawable rect list, and emits a `DamageNotify` to
+    every subscribed client. This runs upstream of the `Backend`
+    trait and is identical for v1 and v2 — neither backend's
+    `DrawableStore` needs to participate. `DamageSubtract` consumes
+    the per-client rect list directly. Distinct from presentation
+    damage so that paint to an offscreen pixmap (e.g., RENDER
+    source) fires the correct `DamageNotify` events without
+    polluting scene state, and so paint to a Manual-redirected
+    backing fires `DamageNotify` to the external compositor
+    (which then reads via NameWindowPixmap → RENDER Composite
+    → root's presentation damage → scene redraw).
 
 Exposes:
 
@@ -211,9 +217,10 @@ Exposes:
   window maps/unmaps or its redirect state changes.
 - `borrow(id) -> &Storage` (read-only access for paint, composition)
 - `borrow_mut(id) -> &mut Storage` (write access for paint)
-- `damage(id, rect)` — accumulate damage on **both** lists for the
-  storage. Presentation list is updated only if `scene_participating`.
-  Protocol list is always updated.
+- `damage(id, rect)` — accumulate **presentation** damage for the
+  storage, only if `scene_participating`. (Protocol damage is
+  handled at the request layer per the amendment above; `DrawableStore`
+  does not own a protocol-damage list.)
 - `peek_presentation_damage(id) -> DamageSnapshot { epoch: u64, region: RegionSet }`
   — return a versioned snapshot of the presentation damage. Used
   by `SceneCompositor` when building the composed CB.
@@ -227,10 +234,6 @@ Exposes:
   it. Called only on the I6b page-flip retirement for the frame
   the snapshot was built into. A failed submit means no ack call;
   the next tick re-peeks and re-composes the union.
-- `peek_protocol_damage(id) -> RegionSet` / `subtract_protocol_damage(id, region)`
-  — the X11 DAMAGE extension's `DamageSubtract` semantics, used
-  by the DAMAGE dispatcher, independent of `SceneCompositor`'s
-  lifecycle.
 - `retire(id)` (drop the reference; storage freed when last ref +
   I6a render-completion + I6b page-flip retirement allow it)
 - `set_redirected_target(window_id, backing_id)` (COMPOSITE redirect —
@@ -694,10 +697,28 @@ exact failure mode v2 is designed to eliminate.
 >    and all of 3. Belongs in Stage 2 conceptually (substrate);
 >    retro-fitted into 3f.7. Future stage plans should treat
 >    "substrate" as including input, not just paint.
+> 3. **Subwindow sibling z-order** (3f.16). Scene-layering item
+>    2 says "top-level windows + descendants **in z-order**".
+>    3f.6 added descendant traversal; 3f.11 added top-level
+>    z-order. The sibling-of-subwindow stacking case (matching
+>    v1's `WindowState.children: Vec<u32>` + `restack_window`
+>    subwindow branch) was missed by both. Retro-fitted as 3f.16.
+> 4. **Protocol damage ownership** (spec amendment under I5).
+>    The original spec assigned `peek_protocol_damage` /
+>    `subtract_protocol_damage` to `DrawableStore`. The actual
+>    request-layer implementation in `yserver-core::damage_fanout`
+>    predates the v2 design and works upstream of the `Backend`
+>    trait for both v1 and v2. v2's store-side `protocol_damage`
+>    field landed at 2b but was never consumed by any dispatcher
+>    — dead code. Spec amended to match implementation; dead
+>    fields removed from `DrawableStore`.
 >
 > Lesson for future stages: acceptance harnesses must include
 > a representative real-app shape, not only synthetic Backend-
-> trait drivers, even when the stage is correctness-first.
+> trait drivers, even when the stage is correctness-first. Also:
+> spec the **owner**, not just the **invariant** — if a "this is
+> required" sentence has no explicit substage assignment, it
+> tends to fall through gaps in the migration plan.
 
 - Add the RENDER pipelines on the same Vk substrate built in Stage 2:
   `render_composite`, `render_fill_rectangles`, `render_trapezoids`,
