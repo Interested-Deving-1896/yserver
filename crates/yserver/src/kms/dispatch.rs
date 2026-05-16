@@ -47,16 +47,20 @@ impl KmsBackendKind {
     /// value.
     pub fn open_from_env(device_path: &str) -> io::Result<Self> {
         match std::env::var("YSERVER_RENDER_MODEL").as_deref() {
-            Ok("v2") => {
-                log::info!("yserver: render model = v2 (Stage 1b skeleton — paint paths log gaps)");
+            // v2 is the boot default per the rendering-model-v2
+            // status doc + Stage 1b dispatch wiring. `=v1` is the
+            // explicit opt-out for fallback testing; unset / empty
+            // selects v2.
+            Ok("v2") | Err(_) => {
+                log::info!("yserver: render model = v2");
                 Ok(Self::V2(KmsBackendV2::open(device_path)?))
             }
-            Ok("v1") | Err(_) => {
-                log::info!("yserver: render model = v1");
-                Ok(Self::V1(KmsBackend::open(device_path)?))
-            }
             Ok("") => {
-                log::info!("yserver: render model = v1 (empty YSERVER_RENDER_MODEL)");
+                log::info!("yserver: render model = v2 (empty YSERVER_RENDER_MODEL)");
+                Ok(Self::V2(KmsBackendV2::open(device_path)?))
+            }
+            Ok("v1") => {
+                log::info!("yserver: render model = v1 (explicit fallback)");
                 Ok(Self::V1(KmsBackend::open(device_path)?))
             }
             Ok(other) => Err(io::Error::other(format!(

@@ -527,6 +527,21 @@ impl DrawableStore {
         }
     }
 
+    /// Detach the xid → DrawableId mapping for `xid`, without
+    /// touching the drawable's refcount. The drawable stays alive
+    /// in `entries` for any holders that captured the id (Pictures,
+    /// in-flight compose ops). Used by `configure_subwindow`'s
+    /// resize path: the window's storage is being replaced with a
+    /// fresh allocation, so the xid map needs to retarget, but
+    /// existing Picture refcounts on the old storage must not be
+    /// dropped (the picture's next `store.lookup(xid)` will return
+    /// the new id — which is what the caller installs next).
+    ///
+    /// Idempotent: missing mappings are silently ignored.
+    pub(crate) fn detach_xid(&mut self, xid: u32) {
+        self.by_xid.remove(&xid);
+    }
+
     /// Drop one reference. If refcount hits zero, decide
     /// retirement: synchronous-destroy if no fence is
     /// pending; otherwise park in `pending_retire`.
@@ -959,6 +974,44 @@ mod tests {
             "new drawable still alive in entries",
         );
         assert!(s.get(old_id).is_none(), "old drawable destroyed",);
+    }
+
+    /// xeyes resize regression with Picture refs: a Picture
+    /// wrapping a window increfs the drawable. Pre-fix:
+    /// `configure_subwindow`'s `decref(old) → StillReferenced`
+    /// kept by_xid mapped to old → `allocate(xid, new)` failed
+    /// `XidInUse` → window stayed at old size (heavy visible
+    /// artifact). Now: `detach_xid` runs unconditionally,
+    /// re-allocate succeeds, old drawable lingers for the
+    /// picture's lifetime.
+    #[test]
+    fn detach_xid_lets_realloc_succeed_even_with_picture_refcount() {
+        let mut s = DrawableStore::new();
+        let mut platform = PlatformBackend::for_tests();
+        let id = s
+            .allocate(0x42, DrawableKind::Window, 24, true, stub_storage())
+            .unwrap();
+        // Simulate a Picture wrapping the window: bump refcount.
+        s.incref(id);
+        assert_eq!(s.get(id).unwrap().refcount, 2);
+        // Simulate configure_subwindow resize sequence:
+        s.detach_xid(0x42);
+        let r = s.decref(&mut platform, id);
+        assert_eq!(
+            r,
+            RetireDecision::StillReferenced,
+            "picture still references the old drawable",
+        );
+        // Old drawable survives in entries (picture still has it),
+        // but its xid mapping is gone.
+        assert!(s.get(id).is_some(), "old drawable kept alive by picture");
+        assert!(s.lookup(0x42).is_none(), "xid map free for re-alloc");
+        // Re-allocate the same xid — pre-fix: XidInUse.
+        let new_id = s
+            .allocate(0x42, DrawableKind::Window, 24, true, stub_storage())
+            .expect("re-alloc must succeed after detach_xid");
+        assert_ne!(new_id, id);
+        assert_eq!(s.lookup(0x42), Some(new_id));
     }
 
     #[test]

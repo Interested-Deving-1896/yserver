@@ -2204,10 +2204,27 @@ impl Backend for KmsBackendV2 {
         let scene_participating = geom.mapped;
         let bg_pixel = geom.bg_pixel;
         if size_changed && let Some(old_id) = self.store.lookup(host_xid) {
-            // Allocate fresh storage, decref the old. Stage 2d
-            // doesn't preserve content across resize — clients
-            // are expected to repaint after configure anyway
-            // (X11 semantics).
+            // Replace window storage. Stage 2d doesn't preserve
+            // content across resize — clients are expected to
+            // repaint after configure (X11 semantics).
+            //
+            // Detach `by_xid[host_xid]` BEFORE decref + allocate.
+            // Any Picture wrapping this window (e.g. marco's frame
+            // compositing) holds an extra refcount on the old
+            // drawable; without the explicit detach, `decref`
+            // returns `StillReferenced` and leaves the xid map
+            // pointing at the old drawable → `store.allocate(xid)`
+            // below fails with `XidInUse` → the window silently
+            // stays at the old storage. xeyes resize regression
+            // observed on bee + fuji.
+            //
+            // The old drawable stays alive in `entries` until its
+            // last refcount drops; its in-flight ticket still
+            // retires correctly. Picture's next `lookup(xid)`
+            // returns the NEW DrawableId, which matches X11 RENDER
+            // semantics (a Picture on a window references the
+            // window's *current* storage).
+            self.store.detach_xid(host_xid);
             self.store.decref(&mut self.platform, old_id);
             match self.platform.allocate_drawable_storage(new_w, new_h, depth) {
                 Ok(storage) => {
