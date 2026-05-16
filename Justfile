@@ -155,6 +155,47 @@ yserver-venus mode="1024x768" log="info":
         --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- bash -c 'RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver'
 
+# Stage 2 rendering-model-v2 boot under Venus (Vulkan in guest).
+# Headless variant — log lands at yserver-v2.log on the host
+# filesystem via --rw. Expect bg_pixel-cleared root + no clients
+# (no fvwm3/xterm yet — Stage 2 ships textless). Watch for
+# "v2_telemetry: ..." per-second summary lines.
+yserver-v2 mode="1024x768" log="info":
+    cargo build --bin yserver
+    vng -r {{KERNEL}} --disable-microvm --rw \
+        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        -- bash -c 'RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            YSERVER_RENDER_MODEL=v2 YSERVER_LOOP_TELEMETRY=1 \
+            YSERVER_MODE={{mode}} \
+            target/debug/yserver 2>&1 | tee yserver-v2.log'
+
+# Stage 2 rendering-model-v2 + fvwm3 + xterm under Venus.
+# Stage 2 has NO text rendering (RENDER + glyphs are Stage 3)
+# and NO cursor (also Stage 3); fvwm3 chrome renders as solid
+# rectangles, xterm shows a blank window. The point of this
+# recipe is to confirm window-map / configure / scene compose
+# all work without crashing.
+#
+# Headless-friendly: pair with `-display egl-headless,gl=on`
+# instead of `gtk,gl=on` if you have no DISPLAY (e.g. running
+# from a sandbox without X access). The visible window goes
+# away but yserver still composes + flips.
+yserver-v2-fvwm3-xterm mode="1024x768" log="info":
+    cargo build --bin yserver
+    vng -r {{KERNEL}} --disable-microvm --rw \
+        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        -- bash -c '\
+            export MESA_LOADER_DRIVER_OVERRIDE=zink;\
+            YSERVER_RENDER_MODEL=v2 YSERVER_LOOP_TELEMETRY=1 \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} \
+            target/debug/yserver > yserver-v2.log 2>&1 &\
+            yserver_pid=$!;\
+            for i in $(seq 1 60); do [ -S /tmp/.X11-unix/X7 ] && break; sleep 1; done;\
+            DISPLAY=:7 fvwm3 > fvwm3.log 2>&1 &\
+            sleep 3;\
+            DISPLAY=:7 xterm &\
+            wait $yserver_pid'
+
 # Run yserver headless + wait 8 s + start xterm inside the guest.
 # Use to smoke-test the xterm path without needing two terminals.
 yserver-xterm:
