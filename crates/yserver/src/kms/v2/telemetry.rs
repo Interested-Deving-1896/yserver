@@ -23,40 +23,40 @@ use std::time::Instant;
 
 /// Single-second accumulator. Reset on every emission tick.
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct Bucket {
-    pub(crate) paint_submits: u64,
-    pub(crate) composite_submits: u64,
-    pub(crate) one_shot_submits: u64,
-    pub(crate) queue_submit2: u64,
-    pub(crate) vk_queue_wait_idle: u64,
-    pub(crate) cpu_fence_wait_ns: u64,
-    pub(crate) cpu_fence_wait_count: u64,
-    pub(crate) damaged_pixels: u64,
-    pub(crate) output_pixels: u64,
-    pub(crate) scene_entries_visited: u64,
-    pub(crate) scene_entries_drawn: u64,
-    pub(crate) full_redraw_fallback: u64,
-    pub(crate) storage_allocations: u64,
-    pub(crate) descriptor_allocations: u64,
-    pub(crate) image_view_creates: u64,
-    pub(crate) frame_present_count: u64,
-    pub(crate) missed_pageflips: u64,
-    pub(crate) gpu_render_ns: u64,
-    pub(crate) compose_cb_record_ns: u64,
-    pub(crate) frames_with_compose: u64,
+pub struct Bucket {
+    pub paint_submits: u64,
+    pub composite_submits: u64,
+    pub one_shot_submits: u64,
+    pub queue_submit2: u64,
+    pub vk_queue_wait_idle: u64,
+    pub cpu_fence_wait_ns: u64,
+    pub cpu_fence_wait_count: u64,
+    pub damaged_pixels: u64,
+    pub output_pixels: u64,
+    pub scene_entries_visited: u64,
+    pub scene_entries_drawn: u64,
+    pub full_redraw_fallback: u64,
+    pub storage_allocations: u64,
+    pub descriptor_allocations: u64,
+    pub image_view_creates: u64,
+    pub frame_present_count: u64,
+    pub missed_pageflips: u64,
+    pub gpu_render_ns: u64,
+    pub compose_cb_record_ns: u64,
+    pub frames_with_compose: u64,
 }
 
 /// v2 telemetry state. One per `KmsBackendV2`. Counter sites
 /// call `record_*` directly; the emitter ticks once per second
 /// from the core loop (driven through `maybe_emit`).
-pub(crate) struct Telemetry {
+pub struct Telemetry {
     enabled: bool,
     last_emit: Instant,
     bucket: Bucket,
     /// Lifetime-aggregate counts (not reset per-emit). Useful
     /// for the acceptance harness which compares totals after
     /// driving a test sequence.
-    pub(crate) lifetime: Bucket,
+    pub lifetime: Bucket,
 }
 
 impl Telemetry {

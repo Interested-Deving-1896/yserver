@@ -178,25 +178,29 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     repaint picker fallback cases. Stage 2f's synthetic harness
     is the load-bearing buffer-age oracle test (deferred).
   - [~] **2f — Telemetry + acceptance harness + hardware smoke.**
-    **Telemetry landed 2026-05-16**: `kms::v2::telemetry::Telemetry`
-    owns the per-second counter bucket + lifetime aggregates per
-    spec §"Required counters". Counter sites wired:
-    `record_paint_submit` on fill/put/copy success;
-    `record_one_shot_submit` + `record_fence_wait` on get_image;
-    `record_composite_submit` on scene tick success;
-    `record_frame_present` on page-flip retirement;
-    `record_storage_allocation` + `record_image_view_create` on
-    pixmap/window backing alloc. `YSERVER_LOOP_TELEMETRY=1`
-    triggers the per-second summary line via `maybe_emit`
-    (called from `maybe_composite`). 4 unit tests cover counter
-    accumulation, fence-wait aggregation, bucket reset, and
-    backend-level "only successful ops increment" wiring.
-    **Pending**: synthetic acceptance harness binary (driving
-    PutImage/CopyArea/PolyFillRectangle/GetImage through the
-    X11 protocol + asserting pixel correctness vs CPU oracle +
-    asserting `vk_queue_wait_idle == 0` outside get_image),
-    and user-run hardware smoke on bee + fuji
-    (`YSERVER_RENDER_MODEL=v2 just yserver-xfce-hw`).
+    **Telemetry + acceptance landed 2026-05-16**:
+    `kms::v2::telemetry::Telemetry` owns per-second counter
+    bucket + lifetime aggregates per spec §"Required counters".
+    Counter sites wired (paint_submit on fill/put/copy success,
+    one_shot_submit + fence_wait on get_image, composite_submit
+    on scene tick, frame_present on page-flip retirement,
+    storage_allocation + image_view_create on pixmap/window
+    alloc). `YSERVER_LOOP_TELEMETRY=1` enables the per-second
+    summary line via `maybe_emit` from `maybe_composite`.
+    `crates/yserver/tests/v2_acceptance.rs` ships 3 Vk-backed
+    acceptance tests (PutImage→GetImage byte-identical;
+    fill+gradient compose oracle; CopyArea disjoint oracle;
+    telemetry-lifetime assertion confirming `vk_queue_wait_idle
+    == 0`), driving `KmsBackendV2` through the `Backend` trait
+    surface. Functionally equivalent to the plan's "synthetic
+    harness binary" minus the X11 protocol encoding layer —
+    correctness is at the Backend-trait boundary, not protocol
+    bytes. `KmsBackendV2::for_tests_with_vk` constructs a live-Vk
+    fixture for these. 4 lib telemetry unit tests + 3 acceptance
+    tests all green under lavapipe.
+    **Pending**: user-run hardware smoke on bee + fuji
+    (`YSERVER_RENDER_MODEL=v2 just yserver-xfce-hw`) — the
+    Stage 2 close gate.
 
 ### Pending
 - [ ] **Stage 3 — RENDER + glyphs coverage.** RENDER pipelines on

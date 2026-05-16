@@ -159,6 +159,37 @@ impl KmsBackendV2 {
         })
     }
 
+    /// Test fixture with live Vulkan attached. Falls back to the
+    /// headless `for_tests` shape if `VkContext::new` fails. Used
+    /// by the Stage 2f acceptance harness which needs real paint
+    /// + readback on the v2 path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` only when Vk init fails AND the caller
+    /// explicitly wanted Vk-backed tests; callers that can fall
+    /// back to headless use `for_tests` directly.
+    #[doc(hidden)]
+    pub fn for_tests_with_vk() -> Result<Self, io::Error> {
+        use std::sync::Arc;
+        let mut base = Self::for_tests();
+        let vk = crate::kms::vk::device::VkContext::new()
+            .map_err(|e| io::Error::other(format!("v2 for_tests_with_vk: VkContext: {e:?}")))?;
+        let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)).map_err(|e| {
+            io::Error::other(format!("v2 for_tests_with_vk: OpsCommandPool: {e:?}"))
+        })?;
+        let fence_pool = crate::kms::v2::platform::FencePool::new(Arc::clone(&vk));
+        base.platform.vk = Some(vk);
+        base.platform.ops_command_pool = Some(ops_pool);
+        base.platform.fence_pool = Some(fence_pool);
+        // Replace the stub engine with a live one now that Vk
+        // is attached. Scene compositor stays stubbed (no
+        // scanout pool on the test fixture).
+        base.engine = crate::kms::v2::engine::RenderEngine::new(&base.platform)
+            .map_err(|e| io::Error::other(format!("v2 for_tests_with_vk: RenderEngine: {e:?}")))?;
+        Ok(base)
+    }
+
     /// Headless test seed. Single 800×600 stub output; no
     /// Vulkan; no real DRM device. Mirrors `KmsBackend::for_tests`
     /// in shape so unit tests that drive v2 through
@@ -224,6 +255,13 @@ impl KmsBackendV2 {
                 }
             })
             .collect()
+    }
+
+    /// Telemetry accessor — used by the acceptance harness to
+    /// read lifetime counters after driving a test sequence.
+    #[must_use]
+    pub fn telemetry(&self) -> &Telemetry {
+        &self.telemetry
     }
 
     /// Hand the libinput context off to the dedicated input thread.
