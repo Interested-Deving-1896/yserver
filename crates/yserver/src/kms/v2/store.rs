@@ -357,11 +357,6 @@ pub(crate) struct Drawable {
     /// [`ack_presentation_damage`].
     pub(crate) presentation_damage: RegionSet,
     pub(crate) presentation_damage_epoch: u64,
-
-    /// Protocol damage — region reported to DAMAGE-ext clients.
-    /// Accumulates on every paint, regardless of scene
-    /// participation. Drained via the DAMAGE-ext dispatcher.
-    pub(crate) protocol_damage: RegionSet,
 }
 
 impl Drawable {
@@ -499,7 +494,6 @@ impl DrawableStore {
             last_render_ticket: None,
             presentation_damage: RegionSet::new(),
             presentation_damage_epoch: 0,
-            protocol_damage: RegionSet::new(),
         };
         self.entries.insert(id, drawable);
         self.by_xid.insert(xid, id);
@@ -596,15 +590,19 @@ impl DrawableStore {
         }
     }
 
-    /// Accumulate damage. Presentation list only if
-    /// `scene_participating`; protocol list always. Bumps
-    /// presentation_damage_epoch when presentation_damage
-    /// was actually mutated.
+    /// Accumulate presentation damage. No-op on non-scene-
+    /// participating drawables (pixmaps, Manual-redirected
+    /// backings). Bumps `presentation_damage_epoch` whenever
+    /// damage was actually appended.
+    ///
+    /// Protocol-side `DamageNotify` fanout is handled by
+    /// `yserver-core::core_loop::damage_fanout` at the request
+    /// layer (see spec §I5 amendment), independent of this
+    /// store.
     pub(crate) fn damage(&mut self, id: DrawableId, rect: vk::Rect2D) {
         let Some(d) = self.entries.get_mut(&id) else {
             return;
         };
-        d.protocol_damage.add(rect);
         if d.scene_participating {
             d.presentation_damage.add(rect);
             d.presentation_damage_epoch = d.presentation_damage_epoch.checked_add(1).unwrap_or(0);
@@ -642,22 +640,6 @@ impl DrawableStore {
             d.presentation_damage.clear();
         } else {
             d.presentation_damage.subtract(&snap.region);
-        }
-    }
-
-    /// Peek protocol damage. Distinct from presentation
-    /// damage: DAMAGE-ext clients see this independently of
-    /// scene participation.
-    pub(crate) fn peek_protocol_damage(&self, id: DrawableId) -> RegionSet {
-        self.entries
-            .get(&id)
-            .map(|d| d.protocol_damage.clone())
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn subtract_protocol_damage(&mut self, id: DrawableId, region: &RegionSet) {
-        if let Some(d) = self.entries.get_mut(&id) {
-            d.protocol_damage.subtract(region);
         }
     }
 
@@ -798,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn damage_pixmap_only_accumulates_protocol() {
+    fn damage_pixmap_is_no_op() {
         let mut s = DrawableStore::new();
         let id = s
             .allocate(0x1, DrawableKind::Pixmap, 32, false, stub_storage())
@@ -806,12 +788,11 @@ mod tests {
         s.damage(id, rect(0, 0, 4, 4));
         let d = s.get(id).unwrap();
         assert!(d.presentation_damage.is_empty());
-        assert_eq!(d.protocol_damage.rects().len(), 1);
         assert_eq!(d.presentation_damage_epoch, 0);
     }
 
     #[test]
-    fn damage_window_accumulates_both_and_bumps_epoch() {
+    fn damage_window_accumulates_presentation_and_bumps_epoch() {
         let mut s = DrawableStore::new();
         let id = s
             .allocate(0x1, DrawableKind::Window, 24, true, stub_storage())
@@ -819,7 +800,6 @@ mod tests {
         s.damage(id, rect(0, 0, 4, 4));
         let d = s.get(id).unwrap();
         assert_eq!(d.presentation_damage.rects().len(), 1);
-        assert_eq!(d.protocol_damage.rects().len(), 1);
         assert_eq!(d.presentation_damage_epoch, 1);
         s.damage(id, rect(8, 8, 2, 2));
         assert_eq!(s.get(id).unwrap().presentation_damage_epoch, 2);
@@ -868,8 +848,6 @@ mod tests {
         let d = s.get(id).unwrap();
         assert!(d.presentation_damage.is_empty());
         assert!(d.presentation_damage_epoch > epoch_before);
-        // Protocol damage is unaffected.
-        assert_eq!(d.protocol_damage.rects().len(), 1);
     }
 
     #[test]
@@ -888,24 +866,6 @@ mod tests {
         let d = s.get(id).unwrap();
         assert!(d.presentation_damage.is_empty());
         assert!(!d.scene_participating);
-    }
-
-    #[test]
-    fn protocol_damage_independent_of_presentation() {
-        let mut s = DrawableStore::new();
-        let id = s
-            .allocate(0x1, DrawableKind::Pixmap, 32, false, stub_storage())
-            .unwrap();
-        s.damage(id, rect(0, 0, 4, 4));
-        s.damage(id, rect(8, 8, 2, 2));
-        let proto = s.peek_protocol_damage(id);
-        assert_eq!(proto.rects().len(), 2);
-        let mut to_drop = RegionSet::new();
-        to_drop.add(rect(0, 0, 4, 4));
-        s.subtract_protocol_damage(id, &to_drop);
-        let remaining = s.peek_protocol_damage(id);
-        assert_eq!(remaining.rects().len(), 1);
-        assert_eq!(remaining.rects()[0].offset, vk::Offset2D { x: 8, y: 8 });
     }
 
     #[test]

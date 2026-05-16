@@ -4925,17 +4925,31 @@ mod tests {
         w: u16,
         h: u16,
     ) -> DrawableId {
+        alloc_drawable_3a_with_kind(
+            platform,
+            store,
+            xid,
+            w,
+            h,
+            super::super::store::DrawableKind::Pixmap,
+            false,
+        )
+    }
+
+    fn alloc_drawable_3a_with_kind(
+        platform: &PlatformBackend,
+        store: &mut DrawableStore,
+        xid: u32,
+        w: u16,
+        h: u16,
+        kind: super::super::store::DrawableKind,
+        scene_participating: bool,
+    ) -> DrawableId {
         let storage = platform
             .allocate_drawable_storage(w, h, 32)
             .expect("alloc storage");
         store
-            .allocate(
-                xid,
-                super::super::store::DrawableKind::Pixmap,
-                32,
-                false,
-                storage,
-            )
+            .allocate(xid, kind, 32, scene_participating, storage)
             .expect("store allocate")
     }
 
@@ -4962,7 +4976,19 @@ mod tests {
         let mut store = DrawableStore::new();
         let mut engine = RenderEngine::new(&platform).expect("engine");
 
-        let id = alloc_drawable_3a(&platform, &mut store, 0x1, 64, 32);
+        // Window-kind + scene-participating so presentation damage
+        // accumulates (per the I5 spec amendment, pixmaps no longer
+        // accumulate any damage in the store — protocol DamageNotify
+        // fanout lives at the request layer).
+        let id = alloc_drawable_3a_with_kind(
+            &platform,
+            &mut store,
+            0x1,
+            64,
+            32,
+            super::super::store::DrawableKind::Window,
+            true,
+        );
         // Two glyphs spanning x=[10..22] × y=[5..17].
         let glyphs = vec![
             build_glyph(u32::from(b'A'), 10, 5, 6, 12),
@@ -4984,8 +5010,8 @@ mod tests {
 
         // Damage union covers the two glyph quads.
         let d = store.get(id).expect("drawable");
-        let rects: Vec<vk::Rect2D> = d.protocol_damage.rects().to_vec();
-        assert!(!rects.is_empty(), "protocol damage should be set");
+        let rects: Vec<vk::Rect2D> = d.presentation_damage.rects().to_vec();
+        assert!(!rects.is_empty(), "presentation damage should be set");
         let mut min_x = i32::MAX;
         let mut min_y = i32::MAX;
         let mut max_x = i32::MIN;
