@@ -354,12 +354,44 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     lavapipe; clippy clean. Application smoke (xeyes/xclock
     on hardware) deferred to a follow-up run; FreeType-path
     real-app text gates at 3f.
-  - [ ] **3b — picture records + pipelines.** Promote every
-    `render_create_*` / `render_change_picture` /
-    `render_set_picture_*` stub; lazy-build
-    `RenderPipelineCache` + SolidFill / DstReadback /
-    white-mask scratch images on `RenderEngine`; gradient
-    parsing.
+  - [x] **3b — picture records + pipelines.** Landed
+    2026-05-16. `KmsCore.pictures: HashMap<u32, PictureRecord>`
+    added with v2-side `PictureRecord` enum (`Drawable` +
+    `SolidFill` + `LinearGradient` + `RadialGradient` variants,
+    plus `PictureFilter` for nearest/bilinear/convolution) and
+    `GradientStop` helper. `KmsBackendV2` promotes every
+    `render_create_picture` / `render_change_picture` /
+    `render_free_picture` / `render_create_solid_fill` /
+    `render_create_{linear,radial}_gradient` /
+    `render_create_glyphset` / `render_free_glyphset` /
+    `render_add_glyphs` / `render_free_glyphs` /
+    `render_set_picture_clip_rectangles` / `_filter` /
+    `_transform` stub to a real record on `KmsCore.pictures`
+    (or `core.glyphsets`). 13 RENDER value-mask bits (CPRepeat
+    through CPComponentAlpha) flow through a shared
+    `change_picture_apply_mask` helper; gradient bodies parse
+    endpoints + stops; clip-rectangles pre-shift by the
+    clip-origin; filter names map by ASCII (`nearest`/`fast` →
+    Nearest, `bilinear`/`good`/`best` → Bilinear,
+    `convolution` → Convolution). DrawableStore refcount
+    raised on `render_create_picture` against a wrapped
+    Drawable, dropped on `render_free_picture` — `free_pixmap`
+    now survives so long as a picture still references the
+    pixmap (verified). `RenderEngine` grows a
+    `picture_paint: HashMap<u32, PicturePaintState>` slot with
+    `Empty` placeholder; `render_free_picture` calls
+    `engine.picture_paint_remove` so the teardown hook is in
+    place for 3c's gradient LUT lazy-build. `parse_add_glyphs`
+    promoted from v1's `pub(super)` to `pub(crate)` so v2
+    reuses it verbatim. No paint side effects yet — Stage 3c
+    lights up `render_composite`. 5 new unit tests: lifecycle
+    (every value-mask bit), drawable-refcount blocks
+    free_pixmap, solid-fill stores wire color as-is (v1-parity
+    against rendercheck premul convention), linear gradient
+    parsing, clip-rectangles pre-shift. 216 yserver lib tests
+    + 9 Vk-backed ignored tests pass under lavapipe; clippy
+    clean. Application smoke unchanged (3b doesn't draw); RENDER
+    paint apps stay broken until 3c.
   - [ ] **3c — `render_composite` + `render_fill_rectangles`.**
     Standard PictOps + Saturate + Disjoint/Conjoint shader
     blend; per-rect picture-clip scissoring; self-composite

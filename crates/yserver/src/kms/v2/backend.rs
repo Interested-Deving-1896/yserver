@@ -32,12 +32,16 @@ use yserver_core::{
     host_x11::{HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition},
     server::ServerState,
 };
-use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, xfixes};
+use yserver_protocol::x11::{
+    ClipRectangles, FontMetrics, RENDER_FMT_A1, RENDER_FMT_A8, RENDER_FMT_ARGB32, ResourceId,
+    xfixes,
+};
 
 use crate::{
     drm,
     kms::{
-        core::KmsCore,
+        core::{GradientStop, KmsCore, PictureFilter, PictureRecord},
+        cpu_types::{PictTransform, Rectangle16, Repeat},
         v2::{
             engine::{RenderEngine, decode_x11_pixel_bgra},
             platform::PlatformBackend,
@@ -522,6 +526,193 @@ impl KmsBackendV2 {
             self.telemetry.record_paint_submit();
         }
         Ok(())
+    }
+}
+
+/// Parse gradient stops (Stage 3b helper shared by linear +
+/// radial). `stops_offset` is the offset in `body` where the
+/// `n_stops` u32 starts. Returns `None` if the body is short.
+/// Stops carry pos (FIXED 16.16) + 4 × u16 colour (straight).
+fn parse_gradient_stops(body: &[u8], stops_offset: usize) -> Option<Vec<GradientStop>> {
+    if body.len() < stops_offset + 4 {
+        return None;
+    }
+    let n = u32::from_le_bytes(body[stops_offset..stops_offset + 4].try_into().ok()?) as usize;
+    let pos_base = stops_offset + 4;
+    let color_base = pos_base + n * 4;
+    if body.len() < color_base + n * 8 {
+        return None;
+    }
+    let mut stops: Vec<GradientStop> = Vec::with_capacity(n);
+    for i in 0..n {
+        let pos = i32::from_le_bytes(
+            body[pos_base + i * 4..pos_base + i * 4 + 4]
+                .try_into()
+                .ok()?,
+        );
+        let cb = color_base + i * 8;
+        let r = u16::from_le_bytes(body[cb..cb + 2].try_into().ok()?);
+        let g = u16::from_le_bytes(body[cb + 2..cb + 4].try_into().ok()?);
+        let b = u16::from_le_bytes(body[cb + 4..cb + 6].try_into().ok()?);
+        let a = u16::from_le_bytes(body[cb + 6..cb + 8].try_into().ok()?);
+        stops.push(GradientStop { pos, r, g, b, a });
+    }
+    Some(stops)
+}
+
+/// Apply a `RenderChangePicture` value-mask body to the picture
+/// record. Mirrors v1's per-bit handler in shape; differences are
+/// the v2 record's type and `KmsCore.pictures` as the map.
+/// `body` is the full request body shape:
+/// `picture(4) + value_mask(4) + values[…]`.
+fn change_picture_apply_mask(core: &mut KmsCore, host_pic: u32, body: &[u8]) {
+    if body.len() < 8 {
+        return;
+    }
+    let value_mask = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    let values = &body[8..];
+    let mut off = 0usize;
+    let next_u32 = |off: &mut usize| -> Option<u32> {
+        let bytes = values.get(*off..*off + 4)?;
+        *off += 4;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    };
+    for bit in 0..13 {
+        let mask_bit = 1u32 << bit;
+        if value_mask & mask_bit == 0 {
+            continue;
+        }
+        let Some(v) = next_u32(&mut off) else {
+            break;
+        };
+        match mask_bit {
+            // CPRepeat
+            0x0001 => {
+                let repeat = match v {
+                    1 => Repeat::Normal,
+                    2 => Repeat::Pad,
+                    3 => Repeat::Reflect,
+                    _ => Repeat::None,
+                };
+                match core.pictures.get_mut(&host_pic) {
+                    Some(PictureRecord::Drawable { repeat: r, .. })
+                    | Some(PictureRecord::SolidFill { repeat: r, .. })
+                    | Some(PictureRecord::LinearGradient { repeat: r, .. })
+                    | Some(PictureRecord::RadialGradient { repeat: r, .. }) => *r = repeat,
+                    None => {}
+                }
+            }
+            // CPAlphaMap
+            0x0002 => {
+                if let Some(PictureRecord::Drawable { alpha_map, .. }) =
+                    core.pictures.get_mut(&host_pic)
+                {
+                    *alpha_map = if v == 0 { None } else { Some(v) };
+                }
+            }
+            // CPAlphaXOrigin
+            0x0004 => {
+                if let Some(PictureRecord::Drawable { alpha_x, .. }) =
+                    core.pictures.get_mut(&host_pic)
+                {
+                    *alpha_x = v as i16;
+                }
+            }
+            // CPAlphaYOrigin
+            0x0008 => {
+                if let Some(PictureRecord::Drawable { alpha_y, .. }) =
+                    core.pictures.get_mut(&host_pic)
+                {
+                    *alpha_y = v as i16;
+                }
+            }
+            // CPClipXOrigin
+            0x0010 => {
+                if let Some(PictureRecord::Drawable { clip_x, .. }) =
+                    core.pictures.get_mut(&host_pic)
+                {
+                    *clip_x = v as i16;
+                }
+            }
+            // CPClipYOrigin
+            0x0020 => {
+                if let Some(PictureRecord::Drawable { clip_y, .. }) =
+                    core.pictures.get_mut(&host_pic)
+                {
+                    *clip_y = v as i16;
+                }
+            }
+            // CPClipMask: a depth-1 pixmap xid (or `None` = 0).
+            // For Stage 3b parity with v1, we don't synthesize the
+            // pixmap → rect-list conversion (v1 needs the pixmap's
+            // dimensions, which it had on KmsBackend.pixmaps). v2's
+            // DrawableStore exposes the same dims via the storage's
+            // extent, but for the common path (Cairo never sets a
+            // bitmap mask via ChangePicture — it uses
+            // SetPictureClipRectangles) this stays a logged no-op.
+            // Risk-listed for the rendercheck clip-mask category.
+            0x0040 => {
+                if v == 0 {
+                    if let Some(PictureRecord::Drawable { clip, .. }) =
+                        core.pictures.get_mut(&host_pic)
+                    {
+                        *clip = None;
+                    }
+                } else {
+                    log::debug!(
+                        "v2 ChangePicture CPClipMask=pixmap {v:#x} on picture {host_pic:#x}: \
+                         bitmap-mask clip not yet wired (Stage 3b TODO; rendercheck-only path)"
+                    );
+                }
+            }
+            // CPGraphicsExposure
+            0x0080 => {
+                if let Some(PictureRecord::Drawable {
+                    graphics_exposure, ..
+                }) = core.pictures.get_mut(&host_pic)
+                {
+                    *graphics_exposure = v != 0;
+                }
+            }
+            // CPSubwindowMode
+            0x0100 => {
+                if let Some(PictureRecord::Drawable { subwindow_mode, .. }) =
+                    core.pictures.get_mut(&host_pic)
+                {
+                    *subwindow_mode = v as u8;
+                }
+            }
+            // CPPolyEdge
+            0x0200 => {
+                if let Some(PictureRecord::Drawable { poly_edge, .. }) =
+                    core.pictures.get_mut(&host_pic)
+                {
+                    *poly_edge = v as u8;
+                }
+            }
+            // CPPolyMode
+            0x0400 => {
+                if let Some(PictureRecord::Drawable { poly_mode, .. }) =
+                    core.pictures.get_mut(&host_pic)
+                {
+                    *poly_mode = v as u8;
+                }
+            }
+            // CPDither: consumed but intentionally not stored
+            // (v1 same behaviour).
+            0x0800 => {}
+            // CPComponentAlpha
+            0x1000 => match core.pictures.get_mut(&host_pic) {
+                Some(PictureRecord::Drawable {
+                    component_alpha, ..
+                })
+                | Some(PictureRecord::SolidFill {
+                    component_alpha, ..
+                }) => *component_alpha = v != 0,
+                _ => {}
+            },
+            _ => {}
+        }
     }
 }
 
@@ -1708,71 +1899,135 @@ impl Backend for KmsBackendV2 {
     fn render_create_picture(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_drawable: AnyHandle,
+        host_drawable: AnyHandle,
         _ynest_format: u32,
-        _value_mask: u32,
-        _values: &[u8],
+        value_mask: u32,
+        values: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
-        self.log_v2_gap("render_create_picture");
-        let xid = self.core.next_host_xid();
-        Ok(PictureHandle::from_raw(xid))
+        // Stage 3b: real picture record. Insert default
+        // `PictureRecord::Drawable`, incref the backing drawable in
+        // the store (so a `free_pixmap` on the backing survives
+        // while this picture wraps it — picture_record_drawable_
+        // refcount test), then delegate to render_change_picture for
+        // the value-mask body.
+        let drawable_xid = host_drawable.as_raw();
+        let picture_xid = self.core.next_host_xid();
+        self.core
+            .pictures
+            .insert(picture_xid, PictureRecord::drawable_default(drawable_xid));
+        if let Some(id) = self.store.lookup(drawable_xid) {
+            self.store.incref(id);
+        }
+        if value_mask != 0 {
+            // Recompose the body shape that render_change_picture
+            // expects: picture(4) + value_mask(4) + values.
+            let mut body = Vec::with_capacity(8 + values.len());
+            body.extend_from_slice(&picture_xid.to_le_bytes());
+            body.extend_from_slice(&value_mask.to_le_bytes());
+            body.extend_from_slice(values);
+            self.render_change_picture(None, picture_xid, &body)?;
+        }
+        Ok(PictureHandle::from_raw(picture_xid))
     }
 
     fn render_change_picture(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
-        _body: &[u8],
+        host_pic: u32,
+        body: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("render_change_picture");
+        change_picture_apply_mask(&mut self.core, host_pic, body);
         Ok(())
     }
 
     fn render_free_picture(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
+        host_pic: u32,
     ) -> io::Result<()> {
-        self.log_v2_gap("render_free_picture");
+        // Drop the record; if it was a Drawable variant, decref the
+        // backing drawable in the store. SolidFill / Gradient
+        // variants have no backing drawable — they own only the
+        // GPU-side state on RenderEngine.picture_paint (Stage 3c).
+        if let Some(record) = self.core.pictures.remove(&host_pic)
+            && let Some(drawable_xid) = record.drawable_host_xid()
+            && let Some(id) = self.store.lookup(drawable_xid)
+        {
+            self.store.decref(&mut self.platform, id);
+        }
+        // Drop any GPU-side state cached for this picture. Stage
+        // 3b never populates the map (no gradient LUT built yet),
+        // so this is a HashMap::remove no-op today; Stage 3c lazy-
+        // builds gradient picture state through the same key, and
+        // this teardown hook becomes load-bearing once that lands.
+        self.engine.picture_paint_remove(host_pic);
         Ok(())
     }
 
     fn render_create_glyphset(
         &mut self,
         _origin: Option<OriginContext>,
-        _ynest_format: u32,
+        ynest_format: u32,
     ) -> io::Result<Option<GlyphSetHandle>> {
-        self.log_v2_gap("render_create_glyphset");
-        let xid = self.core.next_host_xid();
-        Ok(GlyphSetHandle::from_raw(xid))
+        use crate::kms::core::{GlyphSetFormat, GlyphSetState};
+
+        let format = match ynest_format {
+            RENDER_FMT_A8 => GlyphSetFormat::A8,
+            RENDER_FMT_A1 => GlyphSetFormat::A1,
+            RENDER_FMT_ARGB32 => GlyphSetFormat::Argb32,
+            _ => GlyphSetFormat::Other,
+        };
+        let id = self.core.next_host_xid();
+        self.core.glyphsets.insert(
+            id,
+            GlyphSetState {
+                format,
+                glyphs: HashMap::new(),
+            },
+        );
+        Ok(GlyphSetHandle::from_raw(id))
     }
 
     fn render_free_glyphset(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_gs: u32,
+        host_gs: u32,
     ) -> io::Result<()> {
-        self.log_v2_gap("render_free_glyphset");
+        // Drop the glyphset record. Atlas-side slot reclamation
+        // is Stage 5 (per Stage 3a glyph atlas: shelf packer is
+        // monotonic), so the atlas pixels stay until atlas-full.
+        self.core.glyphsets.remove(&host_gs);
         Ok(())
     }
 
     fn render_add_glyphs(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_gs: u32,
-        _body_tail: &[u8],
+        host_gs: u32,
+        body_tail: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("render_add_glyphs");
+        // Reuses v1's parse_add_glyphs — purely CPU-side, operates
+        // on the KmsCore.glyphsets entry. Atlas-side upload (the
+        // Vk part) is Stage 3d's render_composite_glyphs path.
+        if let Some(gs) = self.core.glyphsets.get_mut(&host_gs) {
+            crate::kms::backend::parse_add_glyphs(gs, body_tail);
+        }
         Ok(())
     }
 
     fn render_free_glyphs(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_gs: u32,
-        _glyph_ids: &[u8],
+        host_gs: u32,
+        glyph_ids: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("render_free_glyphs");
+        let Some(gs) = self.core.glyphsets.get_mut(&host_gs) else {
+            return Ok(());
+        };
+        for chunk in glyph_ids.chunks_exact(4) {
+            let id = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            gs.glyphs.remove(&id);
+        }
         Ok(())
     }
 
@@ -1867,31 +2122,100 @@ impl Backend for KmsBackendV2 {
     fn render_create_solid_fill(
         &mut self,
         _origin: Option<OriginContext>,
-        _color: [u8; 8],
+        color: [u8; 8],
     ) -> io::Result<Option<PictureHandle>> {
-        self.log_v2_gap("render_create_solid_fill");
-        let xid = self.core.next_host_xid();
-        Ok(PictureHandle::from_raw(xid))
+        // X RENDER CreateSolidFill: 16-bit-per-channel colour,
+        // little-endian, already premultiplied on the wire (per
+        // rendercheck main.c:337-345). Store the channels as f32
+        // exactly as received — the pipeline samples them
+        // unchanged. Layout: r[0..2] g[2..4] b[4..6] a[6..8].
+        let r16 = u16::from_le_bytes([color[0], color[1]]);
+        let g16 = u16::from_le_bytes([color[2], color[3]]);
+        let b16 = u16::from_le_bytes([color[4], color[5]]);
+        let a16 = u16::from_le_bytes([color[6], color[7]]);
+        let premul = [
+            f32::from(r16) / 65535.0,
+            f32::from(g16) / 65535.0,
+            f32::from(b16) / 65535.0,
+            f32::from(a16) / 65535.0,
+        ];
+        let picture_xid = self.core.next_host_xid();
+        self.core.pictures.insert(
+            picture_xid,
+            PictureRecord::SolidFill {
+                premul,
+                repeat: Repeat::Normal,
+                component_alpha: false,
+            },
+        );
+        Ok(PictureHandle::from_raw(picture_xid))
     }
 
     fn render_create_linear_gradient(
         &mut self,
         _origin: Option<OriginContext>,
-        _body: &[u8],
+        body: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
-        self.log_v2_gap("render_create_linear_gradient");
-        let xid = self.core.next_host_xid();
-        Ok(PictureHandle::from_raw(xid))
+        // Wire body: p1.x(4) + p1.y(4) + p2.x(4) + p2.y(4) +
+        // n_stops(4) + n × stop_pos(4) + n × stop_color(8).
+        // Caller passes only the request payload from offset 4 —
+        // the first u32 is interpreted as p1.x (sliced at body[4..]).
+        if body.len() < 24 {
+            return Ok(None);
+        }
+        let p1x = i32::from_le_bytes(body[4..8].try_into().unwrap());
+        let p1y = i32::from_le_bytes(body[8..12].try_into().unwrap());
+        let p2x = i32::from_le_bytes(body[12..16].try_into().unwrap());
+        let p2y = i32::from_le_bytes(body[16..20].try_into().unwrap());
+        let Some(stops) = parse_gradient_stops(body, 20) else {
+            return Ok(None);
+        };
+        let picture_xid = self.core.next_host_xid();
+        self.core.pictures.insert(
+            picture_xid,
+            PictureRecord::LinearGradient {
+                p1: (p1x, p1y),
+                p2: (p2x, p2y),
+                stops,
+                repeat: Repeat::None,
+                transform: None,
+            },
+        );
+        Ok(PictureHandle::from_raw(picture_xid))
     }
 
     fn render_create_radial_gradient(
         &mut self,
         _origin: Option<OriginContext>,
-        _body: &[u8],
+        body: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
-        self.log_v2_gap("render_create_radial_gradient");
-        let xid = self.core.next_host_xid();
-        Ok(PictureHandle::from_raw(xid))
+        // Wire body: icx(4) icy(4) ocx(4) ocy(4) ir(4) or(4)
+        // n_stops(4) + stops + colors. Same offset-by-4 convention
+        // as linear (first u32 in `body` is past the request header).
+        if body.len() < 32 {
+            return Ok(None);
+        }
+        let icx = i32::from_le_bytes(body[4..8].try_into().unwrap());
+        let icy = i32::from_le_bytes(body[8..12].try_into().unwrap());
+        let ocx = i32::from_le_bytes(body[12..16].try_into().unwrap());
+        let ocy = i32::from_le_bytes(body[16..20].try_into().unwrap());
+        let ir = i32::from_le_bytes(body[20..24].try_into().unwrap());
+        let or_ = i32::from_le_bytes(body[24..28].try_into().unwrap());
+        let Some(stops) = parse_gradient_stops(body, 28) else {
+            return Ok(None);
+        };
+        let picture_xid = self.core.next_host_xid();
+        self.core.pictures.insert(
+            picture_xid,
+            PictureRecord::RadialGradient {
+                inner: (icx, icy, ir),
+                outer: (ocx, ocy, or_),
+                stops,
+                repeat: Repeat::None,
+                transform: None,
+            },
+        );
+        Ok(PictureHandle::from_raw(picture_xid))
     }
 
     fn render_create_cursor(
@@ -1901,6 +2225,16 @@ impl Backend for KmsBackendV2 {
         _x: u16,
         _y: u16,
     ) -> io::Result<Option<CursorHandle>> {
+        // Stage 3b plan §3b: cursor rasterisation reads pixels back
+        // from the source picture via get_image then builds a
+        // CursorState. Off the hot path so the synchronous readback
+        // is acceptable. Cursor-state plumbing lives on KmsBackendV2
+        // (cursors map; Stage 2 stub) — Stage 4 wires the actual
+        // composite blit. For now the record-side path mints an xid
+        // so clients that probe the handle don't see protocol drift.
+        // Real rasterisation deferred to a follow-up alongside
+        // Stage 4's cursor scene-layer work; Cairo cursor themes
+        // load is the gate.
         self.log_v2_gap("render_create_cursor");
         let xid = self.core.next_host_xid();
         Ok(CursorHandle::from_raw(xid))
@@ -1909,30 +2243,118 @@ impl Backend for KmsBackendV2 {
     fn render_set_picture_clip_rectangles(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
-        _body: &[u8],
+        host_pic: u32,
+        body: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("render_set_picture_clip_rectangles");
+        // Wire body: picture(4) + clip_x_origin(INT16) +
+        // clip_y_origin(INT16) + N × [x y w h]. Pre-shift each
+        // rectangle by the clip-origin so the stored list is in
+        // dst-coords; the per-rect scissoring path in Stage 3c
+        // doesn't track origin separately.
+        if body.len() < 8 {
+            return Ok(());
+        }
+        let x_origin = i16::from_le_bytes([body[4], body[5]]) as i32;
+        let y_origin = i16::from_le_bytes([body[6], body[7]]) as i32;
+        let rects_data = &body[8..];
+        let mut rects = Vec::with_capacity(rects_data.len() / 8);
+        for chunk in rects_data.chunks_exact(8) {
+            let x = (i16::from_le_bytes([chunk[0], chunk[1]]) as i32 + x_origin)
+                .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            let y = (i16::from_le_bytes([chunk[2], chunk[3]]) as i32 + y_origin)
+                .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            let w = u16::from_le_bytes([chunk[4], chunk[5]]);
+            let h = u16::from_le_bytes([chunk[6], chunk[7]]);
+            rects.push(Rectangle16 {
+                x,
+                y,
+                width: w,
+                height: h,
+            });
+        }
+        if let Some(PictureRecord::Drawable {
+            clip,
+            clip_x,
+            clip_y,
+            ..
+        }) = self.core.pictures.get_mut(&host_pic)
+        {
+            *clip = if rects.is_empty() { None } else { Some(rects) };
+            // The X RENDER protocol carries clip-origin once per
+            // SetPictureClipRectangles; we fold it into the stored
+            // rects (above) but also keep clip_x/clip_y so a
+            // subsequent CPClipXOrigin / CPClipYOrigin override
+            // via ChangePicture composes correctly.
+            *clip_x = x_origin.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            *clip_y = y_origin.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        }
+        // SolidFill / Gradient pictures: clip is a no-op (no
+        // backing drawable to clip).
         Ok(())
     }
 
     fn render_set_picture_filter(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
-        _body: &[u8],
+        host_pic: u32,
+        body: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("render_set_picture_filter");
+        // Wire body: picture(4) + name_len(u16) + pad(2) + name +
+        // pad + N × FIXED(4) parameters. Stage 3 only honours
+        // `nearest`; other filters parse + store so the record-
+        // round-trip is honest but `RenderEngine` ignores them at
+        // draw time (per Risk 6).
+        if body.len() < 8 {
+            return Ok(());
+        }
+        let name_len = u16::from_le_bytes([body[4], body[5]]) as usize;
+        if body.len() < 8 + name_len {
+            return Ok(());
+        }
+        let name = &body[8..8 + name_len];
+        let filter = match name {
+            b"nearest" | b"fast" => PictureFilter::Nearest,
+            b"bilinear" | b"good" | b"best" => PictureFilter::Bilinear,
+            b"convolution" => PictureFilter::Convolution,
+            _ => PictureFilter::Nearest,
+        };
+        if let Some(PictureRecord::Drawable { filter: f, .. }) =
+            self.core.pictures.get_mut(&host_pic)
+        {
+            *f = filter;
+        }
         Ok(())
     }
 
     fn render_set_picture_transform(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
-        _body: &[u8],
+        host_pic: u32,
+        body: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("render_set_picture_transform");
+        // Wire body: picture(4) + 9 × FIXED(4) matrix entries (row-
+        // major). 16.16 fixed-point; identity is [[1,0,0],[0,1,0],
+        // [0,0,1]] in floating shape, [[0x10000, 0, 0], [0, 0x10000,
+        // 0], [0, 0, 0x10000]] in fixed.
+        if body.len() < 40 {
+            return Ok(());
+        }
+        let mut matrix = [[0i32; 3]; 3];
+        for (idx, slot) in matrix.iter_mut().flatten().enumerate() {
+            let off = 4 + idx * 4;
+            *slot = i32::from_le_bytes(body[off..off + 4].try_into().unwrap());
+        }
+        let transform = if matrix == [[0x10000, 0, 0], [0, 0x10000, 0], [0, 0, 0x10000]] {
+            None
+        } else {
+            Some(PictTransform { matrix })
+        };
+        match self.core.pictures.get_mut(&host_pic) {
+            Some(PictureRecord::Drawable { transform: t, .. })
+            | Some(PictureRecord::LinearGradient { transform: t, .. })
+            | Some(PictureRecord::RadialGradient { transform: t, .. }) => *t = transform,
+            _ => {}
+        }
         Ok(())
     }
 
@@ -2114,7 +2536,8 @@ impl Backend for KmsBackendV2 {
 
 #[cfg(test)]
 mod tests {
-    use super::KmsBackendV2;
+    use super::{KmsBackendV2, PictureRecord};
+    use crate::kms::cpu_types::Repeat;
     use yserver_core::backend::Backend;
 
     /// Stage 1b acceptance gate (synthetic): v2 constructs through
@@ -2255,5 +2678,338 @@ mod tests {
         // change. The parse runs the second text item with this
         // font value in scope.
         assert_eq!(b.core.current_font, Some(0xDEAD_BEEF));
+    }
+
+    // ─── Stage 3b: picture record lifecycle tests ──────────────
+
+    /// `picture_record_lifecycle` per plan §3b: create → change →
+    /// free, with every value-mask bit exercised at least once.
+    /// Round-trip via `KmsCore.pictures.get` after each step.
+    #[test]
+    fn v2_picture_record_lifecycle_exercises_every_value_mask_bit() {
+        use crate::kms::core::PictureFilter;
+        use yserver_core::backend::{AnyHandle, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        // Pre-create a fake drawable xid so render_create_picture's
+        // store.lookup doesn't have to be Some — the picture record
+        // just stores the host_xid; the incref path is exercised
+        // in the next test.
+        let drawable =
+            AnyHandle::Pixmap(PixmapHandle::from_raw(0x4242_4242).expect("PixmapHandle"));
+
+        // CPRepeat=Pad, CPAlphaMap=0xDEAD_BEEF, CPAlphaXOrigin=10,
+        // CPAlphaYOrigin=20, CPClipXOrigin=30, CPClipYOrigin=40,
+        // CPClipMask=0 (= None), CPGraphicsExposure=1,
+        // CPSubwindowMode=1, CPPolyEdge=1, CPPolyMode=1,
+        // CPDither=1 (consumed-but-not-stored), CPComponentAlpha=1.
+        let value_mask: u32 = 0x0001
+            | 0x0002
+            | 0x0004
+            | 0x0008
+            | 0x0010
+            | 0x0020
+            | 0x0040
+            | 0x0080
+            | 0x0100
+            | 0x0200
+            | 0x0400
+            | 0x0800
+            | 0x1000;
+        let mut values: Vec<u8> = Vec::new();
+        for v in [
+            2_u32,       // Repeat::Pad
+            0xDEAD_BEEF, // alpha_map
+            10,          // alpha_x
+            20,          // alpha_y
+            30,          // clip_x
+            40,          // clip_y
+            0,           // clip_mask = None
+            1,           // graphics_exposure
+            1,           // subwindow_mode
+            1,           // poly_edge
+            1,           // poly_mode
+            1,           // dither (consumed, not stored)
+            1,           // component_alpha
+        ] {
+            values.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let picture = b
+            .render_create_picture(None, drawable, 0, value_mask, &values)
+            .expect("create_picture")
+            .expect("Some(handle)");
+        let pic_xid = picture.as_raw();
+
+        // Find and unpack the resulting record.
+        let rec = b.core.pictures.get(&pic_xid).expect("record present");
+        match rec {
+            PictureRecord::Drawable {
+                host_xid,
+                clip,
+                clip_x,
+                clip_y,
+                repeat,
+                alpha_map,
+                alpha_x,
+                alpha_y,
+                component_alpha,
+                transform,
+                filter,
+                graphics_exposure,
+                subwindow_mode,
+                poly_edge,
+                poly_mode,
+            } => {
+                assert_eq!(*host_xid, 0x4242_4242);
+                assert!(clip.is_none(), "clip stays None for clip_mask=0");
+                assert_eq!(*clip_x, 30);
+                assert_eq!(*clip_y, 40);
+                assert_eq!(*repeat, Repeat::Pad);
+                assert_eq!(*alpha_map, Some(0xDEAD_BEEF));
+                assert_eq!(*alpha_x, 10);
+                assert_eq!(*alpha_y, 20);
+                assert!(*component_alpha);
+                assert!(transform.is_none());
+                assert_eq!(*filter, PictureFilter::Nearest);
+                assert!(*graphics_exposure);
+                assert_eq!(*subwindow_mode, 1);
+                assert_eq!(*poly_edge, 1);
+                assert_eq!(*poly_mode, 1);
+            }
+            other => panic!("expected Drawable, got {other:?}"),
+        }
+
+        // ChangePicture override of a single bit (CPRepeat=Normal).
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&pic_xid.to_le_bytes());
+        body.extend_from_slice(&0x0001_u32.to_le_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes()); // Repeat::Normal
+        b.render_change_picture(None, pic_xid, &body)
+            .expect("change_picture");
+        match b.core.pictures.get(&pic_xid) {
+            Some(PictureRecord::Drawable { repeat, .. }) => {
+                assert_eq!(*repeat, Repeat::Normal);
+            }
+            _ => panic!("record dropped"),
+        }
+
+        // FreePicture removes the record.
+        b.render_free_picture(None, pic_xid).expect("free_picture");
+        assert!(!b.core.pictures.contains_key(&pic_xid));
+    }
+
+    /// `picture_record_drawable_refcount` per plan §3b: a picture
+    /// wrapping a pixmap incref's the pixmap on create; the pixmap
+    /// survives `free_pixmap` while a picture still references it;
+    /// `render_free_picture` decref's, allowing the pending retire
+    /// to complete on the next poll.
+    #[test]
+    fn v2_picture_record_drawable_refcount_blocks_free_pixmap() {
+        use ash::vk;
+
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        use yserver_core::backend::{AnyHandle, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        // The `for_tests` fixture has no VkContext, so the
+        // production `create_pixmap` path falls back to a logged
+        // gap (no storage allocated). Use the store's test-stub
+        // path directly so refcount accounting is exercised
+        // without needing a live Vk.
+        let pix_xid = 0xDEAD_BABE;
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 4,
+                height: 4,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let pix_id = b
+            .store
+            .allocate(pix_xid, DrawableKind::Pixmap, 32, false, storage)
+            .expect("store allocate");
+        assert_eq!(b.store.get(pix_id).expect("entry").refcount, 1);
+
+        // Create a picture wrapping the pixmap; refcount → 2.
+        let pix_handle = PixmapHandle::from_raw(pix_xid).expect("PixmapHandle");
+        let any = AnyHandle::Pixmap(pix_handle);
+        let pic = b
+            .render_create_picture(None, any, 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some");
+        let pic_xid = pic.as_raw();
+        assert_eq!(b.store.get(pix_id).expect("entry").refcount, 2);
+
+        // free_pixmap drops one ref → 1; the entry survives because
+        // the picture still references it.
+        b.free_pixmap(None, pix_xid).expect("free_pixmap");
+        assert_eq!(b.store.get(pix_id).expect("entry survives").refcount, 1);
+
+        // free_picture drops the second ref → 0; the entry retires.
+        // The test-stub storage has no in-flight fence, so
+        // `destroy_now` runs immediately and the entry is removed.
+        b.render_free_picture(None, pic_xid).expect("free_picture");
+        assert!(b.store.get(pix_id).is_none(), "entry destroyed on last ref");
+    }
+
+    /// `picture_solid_fill_premul_correct` per plan §3b. NB: the
+    /// X RENDER wire colour is **already premultiplied** per the
+    /// protocol + rendercheck (`main.c:337-345`), so v2 stores the
+    /// channels as-is rather than multiplying by alpha. The plan's
+    /// `0x80808080 → [0.25, 0.25, 0.25, 0.5]` example assumed
+    /// straight-alpha input; v1 has been parity with rendercheck
+    /// since Phase 4.1.4.6, and v2 matches v1.
+    #[test]
+    fn v2_render_create_solid_fill_stores_wire_color_as_is() {
+        // Wire colour: r16=0xFFFF (1.0), g16=0x8080 (≈0.50196),
+        // b16=0x0000 (0.0), a16=0x8080 (≈0.50196). Stored f32
+        // values should be (r=1.0, g=0.5019, b=0.0, a=0.5019)
+        // exactly — no premultiplication applied at store time.
+        let mut b = KmsBackendV2::for_tests();
+        let color: [u8; 8] = [0xFF, 0xFF, 0x80, 0x80, 0x00, 0x00, 0x80, 0x80];
+        let pic = b
+            .render_create_solid_fill(None, color)
+            .expect("solid_fill")
+            .expect("Some");
+        let rec = b.core.pictures.get(&pic.as_raw()).expect("record");
+        match rec {
+            PictureRecord::SolidFill {
+                premul,
+                repeat,
+                component_alpha,
+            } => {
+                assert!((premul[0] - 1.0).abs() < 1e-4, "r = {}", premul[0]);
+                assert!(
+                    (premul[1] - (0x8080_u16 as f32 / 65535.0)).abs() < 1e-6,
+                    "g = {}",
+                    premul[1],
+                );
+                assert!(premul[2].abs() < 1e-6, "b = {}", premul[2]);
+                assert!(
+                    (premul[3] - (0x8080_u16 as f32 / 65535.0)).abs() < 1e-6,
+                    "a = {}",
+                    premul[3],
+                );
+                // Solid-fill defaults to Repeat::Normal; component_alpha=false.
+                assert_eq!(*repeat, Repeat::Normal);
+                assert!(!*component_alpha);
+            }
+            other => panic!("expected SolidFill, got {other:?}"),
+        }
+    }
+
+    /// `picture_gradient_record_stored` per plan §3b: a linear
+    /// gradient body parses; endpoints + stops round-trip through
+    /// the record.
+    #[test]
+    fn v2_render_create_linear_gradient_parses_endpoints_and_stops() {
+        let mut b = KmsBackendV2::for_tests();
+        // Wire body: pad(4) + p1.x(4) + p1.y(4) + p2.x(4) + p2.y(4)
+        // + n_stops(4) + n*pos(4) + n*color(8).
+        // p1 = (0, 0) fixed-point; p2 = (256<<16, 0); two stops at
+        // pos=0 with color=(0xFFFF, 0, 0, 0xFFFF) and pos=1<<16 with
+        // color=(0, 0xFFFF, 0, 0xFFFF).
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&0_u32.to_le_bytes()); // request padding (skipped)
+        body.extend_from_slice(&0_i32.to_le_bytes()); // p1.x
+        body.extend_from_slice(&0_i32.to_le_bytes()); // p1.y
+        body.extend_from_slice(&(256_i32 << 16).to_le_bytes()); // p2.x
+        body.extend_from_slice(&0_i32.to_le_bytes()); // p2.y
+        body.extend_from_slice(&2_u32.to_le_bytes()); // n_stops
+        // positions
+        body.extend_from_slice(&0_i32.to_le_bytes());
+        body.extend_from_slice(&0x0001_0000_i32.to_le_bytes());
+        // colours
+        body.extend_from_slice(&0xFFFF_u16.to_le_bytes()); // r0
+        body.extend_from_slice(&0_u16.to_le_bytes());
+        body.extend_from_slice(&0_u16.to_le_bytes());
+        body.extend_from_slice(&0xFFFF_u16.to_le_bytes());
+        body.extend_from_slice(&0_u16.to_le_bytes()); // r1=0
+        body.extend_from_slice(&0xFFFF_u16.to_le_bytes()); // g1
+        body.extend_from_slice(&0_u16.to_le_bytes());
+        body.extend_from_slice(&0xFFFF_u16.to_le_bytes());
+
+        let pic = b
+            .render_create_linear_gradient(None, &body)
+            .expect("linear_gradient")
+            .expect("Some");
+        let rec = b.core.pictures.get(&pic.as_raw()).expect("record");
+        match rec {
+            PictureRecord::LinearGradient {
+                p1,
+                p2,
+                stops,
+                repeat,
+                transform,
+            } => {
+                assert_eq!(*p1, (0, 0));
+                assert_eq!(*p2, (256 << 16, 0));
+                assert_eq!(stops.len(), 2);
+                assert_eq!(stops[0].pos, 0);
+                assert_eq!(stops[0].r, 0xFFFF);
+                assert_eq!(stops[0].g, 0);
+                assert_eq!(stops[1].pos, 0x0001_0000);
+                assert_eq!(stops[1].g, 0xFFFF);
+                assert_eq!(*repeat, Repeat::None);
+                assert!(transform.is_none());
+            }
+            other => panic!("expected LinearGradient, got {other:?}"),
+        }
+    }
+
+    /// `render_set_picture_clip_rectangles` parses + stores rects
+    /// pre-shifted by the clip-origin. Then `render_free_picture`
+    /// teardown also drops the engine-side picture_paint slot.
+    #[test]
+    fn v2_set_picture_clip_rectangles_pre_shifts_by_origin() {
+        use yserver_core::backend::{AnyHandle, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let drawable =
+            AnyHandle::Pixmap(PixmapHandle::from_raw(0xAA00_BB00).expect("PixmapHandle"));
+        let pic = b
+            .render_create_picture(None, drawable, 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some");
+        let pic_xid = pic.as_raw();
+
+        // Wire body: picture(4) + x_origin(2) + y_origin(2) +
+        // 1 × [x=5, y=6, w=20, h=30].
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&pic_xid.to_le_bytes());
+        body.extend_from_slice(&10_i16.to_le_bytes()); // x_origin
+        body.extend_from_slice(&20_i16.to_le_bytes()); // y_origin
+        body.extend_from_slice(&5_i16.to_le_bytes());
+        body.extend_from_slice(&6_i16.to_le_bytes());
+        body.extend_from_slice(&20_u16.to_le_bytes());
+        body.extend_from_slice(&30_u16.to_le_bytes());
+        b.render_set_picture_clip_rectangles(None, pic_xid, &body)
+            .expect("set_picture_clip");
+        // Pre-shift: stored rect.x = 5 + 10 = 15; .y = 6 + 20 = 26.
+        match b.core.pictures.get(&pic_xid).expect("rec") {
+            PictureRecord::Drawable {
+                clip,
+                clip_x,
+                clip_y,
+                ..
+            } => {
+                let rects = clip.as_ref().expect("Some(rects)");
+                assert_eq!(rects.len(), 1);
+                assert_eq!(rects[0].x, 15);
+                assert_eq!(rects[0].y, 26);
+                assert_eq!(rects[0].width, 20);
+                assert_eq!(rects[0].height, 30);
+                assert_eq!(*clip_x, 10);
+                assert_eq!(*clip_y, 20);
+            }
+            _ => panic!("not Drawable"),
+        }
+
+        // free_picture removes both record + engine-side slot.
+        assert_eq!(b.engine.picture_paint_len(), 0);
+        b.render_free_picture(None, pic_xid).expect("free");
+        assert!(!b.core.pictures.contains_key(&pic_xid));
+        assert_eq!(b.engine.picture_paint_len(), 0);
     }
 }

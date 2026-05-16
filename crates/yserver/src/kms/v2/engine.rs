@@ -36,7 +36,11 @@
     reason = "RenderEngine primitives are consumed by Stages 2d–2f"
 )]
 
-use std::{collections::VecDeque, ptr::NonNull, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    ptr::NonNull,
+    sync::Arc,
+};
 
 use ash::vk;
 
@@ -229,6 +233,14 @@ struct RenderEngineInner {
     /// [`RenderEngine::poll_retired`] (called periodically by
     /// `KmsBackendV2` and at shutdown).
     submitted: VecDeque<SubmittedOp>,
+    /// Stage 3b: per-picture GPU-side state. Today only carries
+    /// gradient `GradientPicture` instances built lazily by Stage
+    /// 3c's first `render_composite`; Stage 3b just ensures
+    /// `render_free_picture` has a cleanup hook so an in-flight
+    /// gradient's Vk handles get destroyed at the right moment.
+    /// The empty `PicturePaintState` placeholder enum sits here
+    /// until 3c needs to differentiate variants.
+    picture_paint: HashMap<u32, PicturePaintState>,
     /// Stage 3a: glyph atlas. Lazy — first text run pays the
     /// 16 MiB R8 allocation. `None` until first image_text op.
     glyph_atlas: Option<V2GlyphAtlas>,
@@ -263,6 +275,7 @@ impl RenderEngine {
             inner: Some(RenderEngineInner {
                 vk,
                 submitted: VecDeque::new(),
+                picture_paint: HashMap::new(),
                 glyph_atlas: None,
                 text_pipeline: None,
                 atlas_last_upload_ticket: None,
@@ -338,6 +351,26 @@ impl RenderEngine {
     /// this to assert the lifecycle book-keeping.
     pub(crate) fn pending_count(&self) -> usize {
         self.inner.as_ref().map(|i| i.submitted.len()).unwrap_or(0)
+    }
+
+    /// Stage 3b: drop any GPU-side state cached for `host_pic`.
+    /// `KmsBackendV2::render_free_picture` calls this after
+    /// removing the picture record from `KmsCore.pictures`. Stage
+    /// 3b's `PicturePaintState::Empty` carries no Vk resources so
+    /// the call is a HashMap::remove; Stage 3c gradients get the
+    /// same teardown site for their LUT image.
+    pub(crate) fn picture_paint_remove(&mut self, host_pic: u32) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.picture_paint.remove(&host_pic);
+        }
+    }
+
+    /// Stage 3b test helper: how many picture-paint entries are
+    /// currently tracked. Used to assert that
+    /// `render_free_picture` drops its slot.
+    #[cfg(test)]
+    pub(crate) fn picture_paint_len(&self) -> usize {
+        self.inner.as_ref().map_or(0, |i| i.picture_paint.len())
     }
 
     // ── Op: fill_rect ───────────────────────────────────────────
@@ -1401,6 +1434,22 @@ pub(crate) struct ImageTextStats {
     pub atlas_interns: u32,
     pub glyph_uploads: u32,
     pub glyphs_dropped: u32,
+}
+
+/// Per-picture GPU-side state. Stage 3b only carries an empty
+/// placeholder variant; Stage 3c adds `Gradient(GradientPicture)`
+/// (the v1-side LUT-image type) when the first `render_composite`
+/// against a gradient picture lazy-builds it.
+#[allow(
+    dead_code,
+    reason = "Variant set fills out in Stage 3c when gradients render"
+)]
+#[derive(Debug)]
+pub(crate) enum PicturePaintState {
+    /// Reserved slot — the picture record exists in `KmsCore`,
+    /// but no GPU-side state has been built yet. Stage 3b leaves
+    /// every entry in this state.
+    Empty,
 }
 
 /// Adapter implementing [`TextRunTarget`] over a v2 `Drawable`'s

@@ -31,6 +31,8 @@ use yserver_core::{
 };
 use yserver_protocol::x11::{CharInfo as ProtocolCharInfo, FontMetrics, ResourceId, xfixes};
 
+use crate::kms::cpu_types::{PictTransform, Rectangle16, Repeat};
+
 // ───────────────────────────────────────────────────────────────
 // `Send` newtype wrappers around `!Send` third-party types.
 // The kms backend is driven from a single core thread, so manual
@@ -434,6 +436,160 @@ pub(crate) struct GlyphSetState {
 }
 
 // ───────────────────────────────────────────────────────────────
+// RENDER picture records (CPU-only, Stage 3b).
+//
+// Per the v2 spec § "KmsCore scope", picture *records* (the
+// protocol's idea of a picture: op, src/dst xid, transform,
+// filter, clip, repeat, alpha-map) live in `KmsCore`. The Vk
+// pipeline / sampler / image-view side belongs to
+// `RenderEngine`'s `picture_paint` map. v1 keeps its own
+// `KmsBackend.pictures: HashMap<u32, PictureState>` (which
+// carries Vk-typed gradients) — these `PictureRecord` types
+// are v2-only.
+// ───────────────────────────────────────────────────────────────
+
+/// One stop in a gradient. `pos` is X11 fixed-point 16.16;
+/// colour channels are 16-bit straight (non-premultiplied) per
+/// the X RENDER wire format. v2's `RenderEngine` premultiplies
+/// at gradient-LUT build time. Layout-compatible with
+/// `crate::kms::vk::gradient::Stop` (a deliberate mirror so the
+/// engine can `mem::transmute`-equivalent the slice on
+/// conversion; never actually transmuted but a layout-check
+/// `#[allow(unused)]` guard sits next to the v1 type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GradientStop {
+    pub(crate) pos: i32,
+    pub(crate) r: u16,
+    pub(crate) g: u16,
+    pub(crate) b: u16,
+    pub(crate) a: u16,
+}
+
+/// Stage 3b: protocol record of an X RENDER Picture. CPU-only;
+/// every variant is `Copy`-friendly except for the small `Vec`s
+/// (clip rects, gradient stops).
+#[allow(
+    dead_code,
+    reason = "Gradient endpoint + stops fields are consumed by Stage 3c \
+              when RenderEngine builds the gradient LUT"
+)]
+#[derive(Debug, Clone)]
+pub(crate) enum PictureRecord {
+    /// Picture wraps a Drawable (window or pixmap). Composite ops
+    /// read pixels from the backing drawable's storage; paint ops
+    /// (Composite as dst, FillRectangles, etc.) write into it.
+    Drawable {
+        /// XID of the backing window or pixmap.
+        host_xid: u32,
+        /// Optional clip rectangles (set by
+        /// `RenderSetPictureClipRectangles`). Stored in dst-coord
+        /// space — the clip-origin has already been folded in.
+        clip: Option<Vec<Rectangle16>>,
+        clip_x: i16,
+        clip_y: i16,
+        repeat: Repeat,
+        alpha_map: Option<u32>,
+        alpha_x: i16,
+        alpha_y: i16,
+        component_alpha: bool,
+        transform: Option<PictTransform>,
+        /// X RENDER `RENDER_FILTER` enum. `Nearest` is the only
+        /// honoured filter in Stage 3 (per spec § "Out of scope");
+        /// `Bilinear`/`Convolution` parse + store but the
+        /// `RenderEngine` ignores them at draw time.
+        filter: PictureFilter,
+        graphics_exposure: bool,
+        subwindow_mode: u8,
+        poly_edge: u8,
+        poly_mode: u8,
+    },
+    /// `RenderCreateSolidFill` source. The X RENDER wire colour
+    /// is **already premultiplied** (per the protocol spec, and
+    /// confirmed by rendercheck `main.c:337-345`); v2 stores it
+    /// as-is so the pipeline's sampler reads exactly what the
+    /// client sent.
+    SolidFill {
+        premul: [f32; 4],
+        repeat: Repeat,
+        component_alpha: bool,
+    },
+    /// `RenderCreateLinearGradient` source. Stops are kept
+    /// straight (non-premultiplied) — the v2 RenderEngine
+    /// premultiplies when building the gradient LUT in Stage 3c.
+    LinearGradient {
+        /// Endpoints in X11 fixed-point 16.16 (`p1`, `p2`).
+        p1: (i32, i32),
+        p2: (i32, i32),
+        stops: Vec<GradientStop>,
+        repeat: Repeat,
+        transform: Option<PictTransform>,
+    },
+    /// `RenderCreateRadialGradient` source. `(cx, cy, r)` for
+    /// both the inner and outer circles, X11 fixed-point.
+    RadialGradient {
+        inner: (i32, i32, i32),
+        outer: (i32, i32, i32),
+        stops: Vec<GradientStop>,
+        repeat: Repeat,
+        transform: Option<PictTransform>,
+    },
+}
+
+/// X RENDER picture filter selector. The protocol carries the
+/// filter as a byte-string name; v2 maps the standard names into
+/// this enum at request time. Unknown filters degrade to
+/// `Nearest` per Stage 3's "only Nearest is honoured" rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PictureFilter {
+    #[default]
+    Nearest,
+    Bilinear,
+    /// Server-known convolution kernel selector. The kernel bytes
+    /// live in the request's value-list; v2 doesn't apply them
+    /// (Stage 5 territory), but parsing them as `Convolution`
+    /// keeps the picture-record round-trip honest.
+    Convolution,
+}
+
+impl PictureRecord {
+    /// Construct a default `PictureRecord::Drawable` against
+    /// `host_xid`. All optional / typed fields take their X RENDER
+    /// protocol defaults; subsequent `RenderChangePicture` /
+    /// `RenderSetPicture*` calls mutate them.
+    pub(crate) fn drawable_default(host_xid: u32) -> Self {
+        PictureRecord::Drawable {
+            host_xid,
+            clip: None,
+            clip_x: 0,
+            clip_y: 0,
+            repeat: Repeat::None,
+            alpha_map: None,
+            alpha_x: 0,
+            alpha_y: 0,
+            component_alpha: false,
+            transform: None,
+            filter: PictureFilter::Nearest,
+            graphics_exposure: false,
+            subwindow_mode: 0,
+            poly_edge: 0,
+            poly_mode: 0,
+        }
+    }
+
+    /// Convenience: the backing drawable host xid for a `Drawable`
+    /// variant, or `None` for the source-only variants
+    /// (SolidFill / Gradient). Used by `render_free_picture` to
+    /// decide whether to call `DrawableStore::decref`.
+    pub(crate) fn drawable_host_xid(&self) -> Option<u32> {
+        if let PictureRecord::Drawable { host_xid, .. } = self {
+            Some(*host_xid)
+        } else {
+            None
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────
 // COMPOSITE redirect alias bookkeeping.
 //
 // `AliasRegistry::decref` returns `true` when the refcount hit zero,
@@ -597,6 +753,11 @@ pub(crate) struct KmsCore {
 
     // RENDER glyphset source data (atlas storage is backend-specific)
     pub(crate) glyphsets: HashMap<u32, GlyphSetState>,
+
+    // RENDER picture records (Stage 3b, v2-only). v1 carries its
+    // own `KmsBackend.pictures` with Vk-typed gradient state;
+    // these are CPU-only and v2 reads/writes them directly.
+    pub(crate) pictures: HashMap<u32, PictureRecord>,
 }
 
 impl KmsCore {
@@ -677,6 +838,7 @@ impl KmsCore {
             alias_registry: AliasRegistry::default(),
             host_window_to_backing: HashMap::new(),
             glyphsets: HashMap::new(),
+            pictures: HashMap::new(),
         })
     }
 
@@ -745,6 +907,7 @@ impl KmsCore {
             alias_registry: AliasRegistry::default(),
             host_window_to_backing: HashMap::new(),
             glyphsets: HashMap::new(),
+            pictures: HashMap::new(),
         }
     }
 

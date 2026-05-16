@@ -12205,7 +12205,7 @@ impl Backend for KmsBackend {
 
 /// Parse an AddGlyphs `body_tail` and insert glyphs into `gs`.
 /// `body_tail` is everything after the 4-byte glyphset XID.
-pub(super) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
+pub(crate) fn parse_add_glyphs(gs: &mut GlyphSetState, body_tail: &[u8]) {
     if !matches!(
         gs.format,
         GlyphSetFormat::A8 | GlyphSetFormat::A1 | GlyphSetFormat::Argb32
