@@ -452,6 +452,31 @@ fn tick_one_output(
     platform: &mut PlatformBackend,
     windows_v2: &super::backend::WindowsV2Map,
 ) -> Result<bool, SceneError> {
+    // 0. **Per-output flip-pending gate.** KMS only allows one
+    //    pending atomic commit per CRTC at a time; a second
+    //    `drmModeAtomicCommit` while the first hasn't fired
+    //    page-flip-complete returns EBUSY. Without this check
+    //    the loop fires submit-after-submit faster than vblank,
+    //    every second submit takes the 9b recovery path
+    //    (BO invalidated, repaint deferred), nothing ever
+    //    actually displays. Observed catastrophic on RADV/bee
+    //    + mate + 2560x1440 (screen stays at the initial
+    //    pageflip frame; bg_pixel-unset = black).
+    //
+    //    Skip cleanly: pending_ack non-empty means a flip is in
+    //    flight. `scene_structure_dirty` stays set so the next
+    //    tick (post-page-flip-complete) picks up the deferred
+    //    damage. The KMS-rate cap is now structural; the rest
+    //    of the pipeline can fire at whatever cadence
+    //    `maybe_composite` calls us — wasted cycles bounded
+    //    here.
+    {
+        let s = inner.outputs.get(output_idx).expect("range");
+        if !s.pending_acks.is_empty() {
+            return Ok(false);
+        }
+    }
+
     // 1. Snapshot live output state so we can fold cleanly
     //    into pending_ack later (codex round 2 point 2 —
     //    transactional generation advance).
