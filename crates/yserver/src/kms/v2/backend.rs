@@ -2055,6 +2055,12 @@ impl Backend for KmsBackendV2 {
             self.store.decref(&mut self.platform, id);
         }
         self.windows_v2.remove(&host_xid);
+        // Stage 3f.11: also drop from top_level_order so build_scene
+        // doesn't walk a stale xid. Same hazard as reparent — pre-fix
+        // a destroyed top-level lingered in the order and produced
+        // ghost draws until the next register_top_level filled the
+        // slot.
+        self.core.top_level_order.retain(|&x| x != host_xid);
         self.scene.mark_scene_structure_dirty();
         Ok(())
     }
@@ -2189,6 +2195,18 @@ impl Backend for KmsBackendV2 {
         // `windows_v2` — typically root, 0x100) means the window
         // becomes a top-level under root; we record `None` so the
         // recurse treats it as a top-level entry.
+        //
+        // Stage 3f.11 bug-fix: also reconcile `core.top_level_order`
+        // with the new parent. Pre-3f.11, an xid that was originally
+        // registered as a top-level (parent=root) stayed in
+        // `top_level_order` even after being reparented under
+        // another window. `build_scene` then emitted the same xid
+        // TWICE: once via the `top_level_order` walk (at its now-
+        // child-relative coords interpreted as absolute → typically
+        // (0,0)) and once via the recurse from its real parent (at
+        // its correct screen position). Observable as MATE's clock
+        // applet rendered at BOTH ends of the panel: the right edge
+        // is the real position, the left edge is the ghost.
         let parent = if host_parent == 0 || !self.windows_v2.contains_key(&host_parent) {
             None
         } else {
@@ -2198,6 +2216,21 @@ impl Backend for KmsBackendV2 {
             geom.x = x;
             geom.y = y;
             geom.parent = parent;
+        }
+        // Reconcile top_level_order:
+        // - parent == None  → window is now (or stays) a top-level
+        //   under root; ensure it's in top_level_order.
+        // - parent == Some  → window is now a sub-window; remove
+        //   from top_level_order so the scene doesn't double-emit.
+        match parent {
+            None => {
+                if !self.core.top_level_order.contains(&host_xid) {
+                    self.core.top_level_order.push(host_xid);
+                }
+            }
+            Some(_) => {
+                self.core.top_level_order.retain(|&x| x != host_xid);
+            }
         }
         self.scene.mark_scene_structure_dirty();
         Ok(())
@@ -6180,5 +6213,120 @@ mod tests {
         assert_eq!(geom.width, 100);
         assert_eq!(geom.height, 50);
         assert!(!geom.mapped, "mapped is set later via map_subwindow");
+    }
+
+    /// Stage 3f.11: reparenting a top-level window INTO another
+    /// window removes it from `core.top_level_order` so
+    /// `build_scene` only emits it once (via the recurse from the
+    /// new parent). Reproducer for the MATE clock-applet duplicate-
+    /// render: clock was first registered as a top-level under
+    /// root, then reparented INTO mate-panel's container. Pre-fix,
+    /// build_scene emitted it twice — once at child-relative coords
+    /// (treated as absolute) and once at real screen position.
+    #[test]
+    fn reparent_into_container_removes_from_top_level_order() {
+        let mut b = KmsBackendV2::for_tests();
+        // Two stub windows: the parent container, and the would-be
+        // child (initially registered as a top-level).
+        b.windows_v2.insert(
+            0xC0FFEE,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 100,
+                depth: 32,
+                mapped: true,
+                parent: None,
+                bg_pixel: None,
+                bg_pixmap: None,
+            },
+        );
+        b.windows_v2.insert(
+            0xCAFED00D,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 20,
+                depth: 32,
+                mapped: true,
+                parent: None,
+                bg_pixel: None,
+                bg_pixmap: None,
+            },
+        );
+        b.core.top_level_order.push(0xC0FFEE);
+        b.core.top_level_order.push(0xCAFED00D);
+        assert!(b.core.top_level_order.contains(&0xCAFED00D));
+
+        // Reparent 0xCAFED00D under 0xC0FFEE at (30, 10).
+        b.reparent_subwindow(None, 0xCAFED00D, 0xC0FFEE, 30, 10)
+            .expect("reparent");
+
+        // top_level_order must no longer contain the reparented xid.
+        assert!(
+            !b.core.top_level_order.contains(&0xCAFED00D),
+            "reparenting into a non-root parent must remove from top_level_order \
+             — otherwise build_scene emits the window twice"
+        );
+        // Geometry record reflects new parent + position.
+        let geom = b.windows_v2[&0xCAFED00D];
+        assert_eq!(geom.parent, Some(0xC0FFEE));
+        assert_eq!(geom.x, 30);
+        assert_eq!(geom.y, 10);
+    }
+
+    /// Stage 3f.11: reparenting back to root re-adds to
+    /// `core.top_level_order` so the window resumes top-level
+    /// rendering. The Backend trait's reparent call carries the new
+    /// parent xid; `host_parent==0` or an untracked xid (root is
+    /// `core.window_id`, not in `windows_v2`) maps to `parent=None`.
+    #[test]
+    fn reparent_to_root_re_adds_to_top_level_order() {
+        let mut b = KmsBackendV2::for_tests();
+        b.windows_v2.insert(
+            0xC0FFEE,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 100,
+                depth: 32,
+                mapped: true,
+                parent: None,
+                bg_pixel: None,
+                bg_pixmap: None,
+            },
+        );
+        b.windows_v2.insert(
+            0xCAFED00D,
+            super::WindowGeometryV2 {
+                x: 30,
+                y: 10,
+                width: 50,
+                height: 20,
+                depth: 32,
+                mapped: true,
+                parent: Some(0xC0FFEE),
+                bg_pixel: None,
+                bg_pixmap: None,
+            },
+        );
+        // Start: child not in top_level_order.
+        assert!(!b.core.top_level_order.contains(&0xCAFED00D));
+
+        // Reparent to root (host_parent=0 maps to parent=None).
+        b.reparent_subwindow(None, 0xCAFED00D, 0, 100, 200)
+            .expect("reparent");
+
+        assert!(
+            b.core.top_level_order.contains(&0xCAFED00D),
+            "reparenting to root must add to top_level_order"
+        );
+        let geom = b.windows_v2[&0xCAFED00D];
+        assert_eq!(geom.parent, None);
+        assert_eq!(geom.x, 100);
+        assert_eq!(geom.y, 200);
     }
 }
