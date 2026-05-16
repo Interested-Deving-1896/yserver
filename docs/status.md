@@ -27,13 +27,41 @@ Cross-cutting bugs and followups that don't fit a stage live in
   abandoned `render-convolution-filter` branch: QueryFilters
   standard list, NameWindowPixmap diagnosis docs, Justfile xtrace
   `rm`, picom validation harness.
-- Spec branch: `rendering-model-v2`, off `graphics-followups`.
-  Contains only the v2 spec at HEAD. Approved by codex across
-  multiple review rounds; ready to drive implementation.
+- Active dev branch: `rendering-model-v2`, off
+  `graphics-followups`. v2 spec at base; Stages 1a/1b/2a–2f/3a/3b
+  landed on top (see "Done" / "In progress" below for commit
+  hashes). `YSERVER_RENDER_MODEL=v2` is the **boot default**
+  (Stage 1b dispatch wiring); v1 still selectable via
+  `YSERVER_RENDER_MODEL=v1`.
 - Abandoned branch: `render-convolution-filter`. Left untouched
   as historical reference for T1-T4 of the Manual-redirect work,
   convolution Phase 1+2, the rotate fix, and the
   parallel-implementation lessons. Don't ship anything from there.
+
+### What runs on v2 today (after 3b)
+
+- Core paint ops via Stage 2: `xsetroot -solid <color>` cycles
+  colours on bee (verified 2026-05-16).
+- Core text via Stage 3a: `image_text8`/`image_text16`/
+  `poly_text8`/`poly_text16` against any drawable; glyph atlas
+  + FenceTicket discipline live; back-to-back upload race test
+  passes under lavapipe. **No real app exercises this in
+  isolation** — Core-text-only clients (twm window labels,
+  pre-Xrender `xsetroot -name`) are the only path; xclock /
+  xeyes / xterm / Cairo / Pango all reach for RENDER first.
+- Picture-record protocol via Stage 3b: every
+  `RenderCreatePicture` / `RenderChangePicture` /
+  `RenderCreateSolidFill` / gradient lifecycle / clip / filter /
+  transform op stores its record correctly. **No paint side
+  effect** — Stage 3c is the substage where these records start
+  driving draws.
+
+**RENDER-painting apps stay black on v2 until 3c–3e land.** A
+`just yserver-xclock-only-hw` smoke on 2026-05-16 confirmed this
+shape: clean v2 boot + RADV ready + first pageflip + xclock
+connects + `render_create_picture` / `render_create_solid_fill`
+/ `render_trapezoids` gap-logs fire on first paint — i.e.
+expected. No crash, no atomic-commit failure.
 
 ## v1 → v2 transition
 
@@ -323,7 +351,7 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     sites in 3c). Landed 2026-05-16 (`5d88295`). Counter
     storage + `record_*` hooks + emitter line additions; no
     call sites yet. Pure additions; no v1 path touched.
-  - [x] **3a-atlas+text** — landed 2026-05-16. New
+  - [x] **3a-atlas+text** — landed 2026-05-16 (`459da11`). New
     `kms::v2::glyph_atlas::V2GlyphAtlas` forks v1's atlas to
     drop the persistent staging buffer; each upload owns its
     own `StagingBuffer` slice for the lifetime of its
@@ -351,11 +379,15 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     atlas_full_drops_glyph_and_increments_counter,
     v2_poly_text8_font_change_advances_current_font. All
     211 yserver lib tests + 9 ignored Vk tests pass under
-    lavapipe; clippy clean. Application smoke (xeyes/xclock
-    on hardware) deferred to a follow-up run; FreeType-path
-    real-app text gates at 3f.
+    lavapipe; clippy clean. **Plan claim that 3a unlocks
+    xclock/xeyes was wrong** — both of those use Xrender for
+    their analog/eye geometry and won't render until 3c–3e;
+    Core-text-only apps (twm labels, fvwm decorations) are the
+    actual 3a smoke surface. FreeType-path real-app text
+    correctness gates land at 3f via xterm + gedit.
   - [x] **3b — picture records + pipelines.** Landed
-    2026-05-16. `KmsCore.pictures: HashMap<u32, PictureRecord>`
+    2026-05-16 (`4a01e68`).
+    `KmsCore.pictures: HashMap<u32, PictureRecord>`
     added with v2-side `PictureRecord` enum (`Drawable` +
     `SolidFill` + `LinearGradient` + `RadialGradient` variants,
     plus `PictureFilter` for nearest/bilinear/convolution) and
