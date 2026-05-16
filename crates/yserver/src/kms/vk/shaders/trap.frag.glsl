@@ -66,11 +66,16 @@ void main() {
     vec2 p = gl_FragCoord.xy + pc.bbox_origin_pixel;
 
     // Top edge: y >= top is inside (top is the upper Y, trap
-    // extends downward). c_top = 1 when the pixel is fully below
-    // the top line, 0 when fully above, 0..1 straddling.
-    float c_top = clamp(p.y - top, 0.0, 1.0);
-    // Bottom edge: y <= bottom is inside.
-    float c_bot = clamp(bottom - p.y, 0.0, 1.0);
+    // extends downward). The `+0.5` matches the slanted-edge
+    // formula (edge_coverage_linear → clamp(0.5 - signed_dist, …)):
+    // when the edge passes exactly through a pixel center, coverage
+    // is 0.5 (half pixel above, half below), not 0. Without the
+    // offset, adjacent stacked traps sharing a horizontal boundary
+    // (e.g. xeyes' eye-white traps) under-cover the boundary row by
+    // 0.5 — visible as horizontal stripes inside the eye whites.
+    float c_top = clamp(0.5 + (p.y - top), 0.0, 1.0);
+    // Bottom edge: y <= bottom is inside. Same +0.5 reasoning.
+    float c_bot = clamp(0.5 + (bottom - p.y), 0.0, 1.0);
 
     // Slanted sides — inside-side convention per the RENDER
     // Trapezoid spec: left_p1→left_p2 keeps the interior on the

@@ -740,6 +740,125 @@ fn v2_back_to_back_trapezoids_different_solidfill_colors() {
     );
 }
 
+/// xeyes "stripes-in-the-eye-white" repro. xeyes builds each eye
+/// out of ~16 stacked horizontal trapezoids that share their
+/// top/bottom edges (trap N's bottom = trap N+1's top). The shared
+/// edge sits on a non-integer Y coordinate (xeyes' ellipse math
+/// rounds to fixed-point 16.16). For pixels straddling the
+/// boundary, the AA edge formula must produce coverages from the
+/// two adjacent traps that SUM to ~1.0 — otherwise the boundary
+/// rows under-cover and you see horizontal stripes inside the
+/// eye whites.
+///
+/// Pre-3f.x fix: trap.frag.glsl's `c_top` / `c_bot` formulas
+/// computed `clamp(p.y - top, 0, 1)` instead of
+/// `clamp(0.5 + (p.y - top), 0, 1)` — off by 0.5 vs the slanted-
+/// edge formula. At a shared boundary y=12.788, pixel center
+/// y=12.5: trap1 c_bot = clamp(0.288, 0, 1) = 0.288; trap2 c_top
+/// = clamp(-0.288, 0, 1) = 0; total = 0.288, leaving 0.712
+/// missing coverage at that row.
+///
+/// Test: two adjacent axis-aligned traps sharing y=4.5. Centre
+/// row (y=4) should read fully opaque white.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_adjacent_trapezoids_share_horizontal_boundary_cleanly() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let dst_pix = b.create_pixmap(None, 32, 10, 10).expect("create_pixmap");
+    let dst_xid = dst_pix.as_raw();
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 10, 10)
+        .expect("pre-fill blue");
+
+    let src_pic = b
+        .render_create_solid_fill(None, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+        .expect("solid_fill white")
+        .expect("Some");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("dst_pic")
+        .expect("Some");
+
+    // Two adjacent trapezoids sharing y=4.5 boundary.
+    // Both span x∈[2, 8].
+    // 16.16 fixed-point: pixel * 65536; half-pixel = 32768.
+    let fields1: [i32; 10] = [
+        2 << 16,            // top = 2
+        (4 << 16) | 0x8000, // bottom = 4.5
+        2 << 16,
+        2 << 16,
+        2 << 16,
+        (4 << 16) | 0x8000,
+        8 << 16,
+        2 << 16,
+        8 << 16,
+        (4 << 16) | 0x8000,
+    ];
+    let fields2: [i32; 10] = [
+        (4 << 16) | 0x8000, // top = 4.5
+        7 << 16,            // bottom = 7
+        2 << 16,
+        (4 << 16) | 0x8000,
+        2 << 16,
+        7 << 16,
+        8 << 16,
+        (4 << 16) | 0x8000,
+        8 << 16,
+        7 << 16,
+    ];
+    let mut traps: Vec<u8> = Vec::with_capacity(80);
+    for v in fields1 {
+        traps.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in fields2 {
+        traps.extend_from_slice(&v.to_le_bytes());
+    }
+    b.render_trapezoids(
+        None,
+        3,
+        src_pic.as_raw(),
+        dst_pic.as_raw(),
+        0,
+        0,
+        0,
+        &traps,
+        0,
+        0,
+    )
+    .expect("render_trapezoids");
+
+    let out = b
+        .get_image(None, dst_xid, 2, 0, 0, 10, 10, !0)
+        .expect("get_image")
+        .expect("Some");
+    let pixel = |x: usize, y: usize| -> [u8; 4] {
+        let off = (y * 10 + x) * 4;
+        [out[off], out[off + 1], out[off + 2], out[off + 3]]
+    };
+
+    // Row 4 (centre y=4.5, straddles the trap boundary). Should
+    // read white (≈ full coverage). Pre-fix: ≈ partial coverage,
+    // pixel is mostly white but blended with blue under-fill →
+    // visible stripe.
+    for x in 3..7 {
+        let p = pixel(x, 4);
+        // Each channel near 0xFF (allow ±16 for AA softening at
+        // slanted side edges — but x=3..7 is well-inside the
+        // trapezoid horizontally so the slanted-edge AA is full).
+        assert!(
+            p[0] >= 0xE0 && p[1] >= 0xE0 && p[2] >= 0xE0,
+            "row 4 should be ~white at x={x} (got {:?}); pre-fix bug = horizontal stripe",
+            p,
+        );
+    }
+}
+
 /// Diagnostic: same trap geometry shape as
 /// v2_render_trapezoids_renders_filled_rect but with a LARGE bbox
 /// (covering most of mask_scratch's 256×256 default extent). If
