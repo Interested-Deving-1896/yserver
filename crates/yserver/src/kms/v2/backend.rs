@@ -1485,17 +1485,162 @@ impl Backend for KmsBackendV2 {
     fn copy_plane(
         &mut self,
         _origin: Option<OriginContext>,
-        _src_host_xid: u32,
-        _dst_host_xid: u32,
-        _src_x: i16,
-        _src_y: i16,
-        _dst_x: i16,
-        _dst_y: i16,
-        _width: u16,
-        _height: u16,
-        _plane: u32,
+        src_host_xid: u32,
+        dst_host_xid: u32,
+        src_x: i16,
+        src_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
+        plane: u32,
     ) -> io::Result<()> {
-        self.log_v2_gap("copy_plane");
+        // Stage 3e.1 scope: GXcopy only. v1 routes via
+        // `try_vk_fill_with_function` so non-GXcopy gets the logic-op
+        // pipeline; that path lives on v2 at Stage 3f when the
+        // LogicFillPipeline ports. For now: log + skip the non-default
+        // function (xfd / xfontsel — the typical copy_plane callers —
+        // use GXcopy).
+        if !matches!(
+            self.core.current_function,
+            yserver_core::backend::GcFunction::Copy
+        ) {
+            self.log_v2_gap("copy_plane_non_gxcopy");
+            return Ok(());
+        }
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        // Resolve src + dst drawables. Both must exist in the store
+        // (otherwise the request is a protocol error — log + skip).
+        let Some(src_id) = self.store.lookup(src_host_xid) else {
+            log::debug!("v2 copy_plane gap: src 0x{src_host_xid:x} not in store");
+            return Ok(());
+        };
+        let Some(_dst_id) = self.store.lookup(dst_host_xid) else {
+            log::debug!("v2 copy_plane gap: dst 0x{dst_host_xid:x} not in store");
+            return Ok(());
+        };
+
+        let src_depth = match self.store.get(src_id) {
+            Some(d) => d.depth,
+            None => return Ok(()),
+        };
+
+        // Read the full src extent via the engine. We pull the
+        // whole pixmap once (rather than only `src_rect`) because
+        // the wire format's row stride is computed from the
+        // pixmap's width; reading a sub-rect would still produce a
+        // wire-shaped reply but with a different row stride per
+        // pixmap.width. Easier to pull everything, index inside
+        // the (src_x, src_y, width, height) window, and let v2's
+        // per-op CB amortise the synchronous get_image cost. xfd
+        // / xfontsel CopyPlane the entire glyph pixmap each draw
+        // anyway, so the "full extent" overhead matches the call
+        // pattern.
+        let src_extent = match self.store.get(src_id) {
+            Some(d) => d.storage.extent,
+            None => return Ok(()),
+        };
+        let src_w = src_extent.width;
+        let src_h = src_extent.height;
+        if src_w == 0 || src_h == 0 {
+            return Ok(());
+        }
+        let src_bytes = match self.engine.get_image(
+            &mut self.store,
+            &mut self.platform,
+            src_id,
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: src_extent,
+            },
+            src_depth,
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                log::warn!("v2 copy_plane: src get_image failed: {e:?}");
+                return Ok(());
+            }
+        };
+        self.telemetry.record_one_shot_submit();
+
+        // Wire row stride for the src depth (matches pack_from_storage).
+        let row_bytes: usize = match src_depth {
+            1 => src_w.div_ceil(32) as usize * 4,
+            8 => (src_w as usize + 3) & !3,
+            24 | 32 => src_w as usize * 4,
+            _ => {
+                log::debug!("v2 copy_plane gap: src depth {src_depth} unsupported");
+                return Ok(());
+            }
+        };
+
+        // For each (sx, sy) in the requested src window, classify
+        // the pixel into foreground / background and emit a 1×1
+        // fill rect at the corresponding dst position. Caller
+        // saturates over i16 because dst coords are protocol-i16.
+        let mut fg_rects: Vec<u8> = Vec::new();
+        let mut bg_rects: Vec<u8> = Vec::new();
+        for row in 0..height {
+            let sy = i32::from(src_y).saturating_add(i32::from(row));
+            let dy = dst_y.saturating_add(row as i16);
+            if sy < 0 || sy >= i32::try_from(src_h).unwrap_or(i32::MAX) {
+                continue;
+            }
+            for col in 0..width {
+                let sx = i32::from(src_x).saturating_add(i32::from(col));
+                let dx = dst_x.saturating_add(col as i16);
+                if sx < 0 || sx >= i32::try_from(src_w).unwrap_or(i32::MAX) {
+                    continue;
+                }
+                let pixel: u32 = match src_depth {
+                    1 => {
+                        let row_off = sy as usize * row_bytes;
+                        let byte = src_bytes[row_off + (sx as usize) / 8];
+                        let bit = (byte >> (7 - (sx as usize & 7))) & 1;
+                        u32::from(bit)
+                    }
+                    8 => {
+                        let row_off = sy as usize * row_bytes;
+                        u32::from(src_bytes[row_off + sx as usize])
+                    }
+                    24 | 32 => {
+                        let off = sy as usize * row_bytes + sx as usize * 4;
+                        u32::from_le_bytes([
+                            src_bytes[off],
+                            src_bytes[off + 1],
+                            src_bytes[off + 2],
+                            src_bytes[off + 3],
+                        ])
+                    }
+                    _ => 0,
+                };
+                let mut rect = Vec::with_capacity(8);
+                rect.extend_from_slice(&i16::to_le_bytes(dx));
+                rect.extend_from_slice(&i16::to_le_bytes(dy));
+                rect.extend_from_slice(&u16::to_le_bytes(1));
+                rect.extend_from_slice(&u16::to_le_bytes(1));
+                if pixel & plane != 0 {
+                    fg_rects.extend_from_slice(&rect);
+                } else {
+                    bg_rects.extend_from_slice(&rect);
+                }
+            }
+        }
+
+        let foreground = self.core.current_foreground;
+        let background = self.core.current_background;
+
+        // Bg first, then fg — matches v1's overlap ordering so the
+        // foreground wins on any aliased rect.
+        if !bg_rects.is_empty() {
+            self.poly_fill_rectangle(None, dst_host_xid, background, &bg_rects)?;
+        }
+        if !fg_rects.is_empty() {
+            self.poly_fill_rectangle(None, dst_host_xid, foreground, &fg_rects)?;
+        }
         Ok(())
     }
 

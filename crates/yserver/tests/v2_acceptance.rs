@@ -23,7 +23,7 @@
 #![cfg(target_os = "linux")]
 
 use yserver::kms::v2::KmsBackendV2;
-use yserver_core::backend::{AnyHandle, Backend};
+use yserver_core::backend::{AnyHandle, Backend, DrawState};
 use yserver_protocol::x11::ClipRectangles;
 
 /// Acceptance sequence:
@@ -425,5 +425,86 @@ fn v2_composite_glyphs_clip_intersects_picture() {
                 &out[off..off + 4],
             );
         }
+    }
+}
+
+/// Stage 3e.1 acceptance: CopyPlane on a depth-1 source pixmap.
+/// Wire bits MSB-first packed at 1 bpp; bit set → foreground,
+/// bit clear → background. Test exercises the depth-1 reader +
+/// rect decomposition + fg/bg fill ordering.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_copy_plane_depth1_extracts_mask_bits() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // depth-1 source 8×1. Bits MSB-first in one byte:
+    // 0b1010_0000 → [1, 0, 1, 0, 0, 0, 0, 0].
+    let src_pix = b
+        .create_pixmap(None, 1, 8, 1)
+        .expect("create_pixmap depth=1");
+    // Depth-1 wire row stride = ceil(w/32)*4 = 4 bytes (one
+    // scanline). Bit pattern in the high byte, zero pad.
+    let src_bytes: Vec<u8> = vec![0b1010_0000, 0, 0, 0];
+    b.put_image(None, src_pix.as_raw(), 1, 8, 1, 0, 0, &src_bytes)
+        .expect("put_image depth=1");
+
+    // 8×1 dst pixmap, opaque green pre-fill so untouched pixels
+    // are visibly distinct from fg/bg.
+    let dst_pix = b.create_pixmap(None, 32, 8, 1).expect("dst pixmap");
+    b.fill_rectangle(None, dst_pix.as_raw(), 0xFF00FF00, 0, 0, 8, 1)
+        .expect("dst pre-fill green");
+
+    // Foreground = red (0xFFFF0000), background = blue
+    // (0xFF0000FF). copy_plane reads these from KmsCore via
+    // apply_draw_state.
+    b.apply_draw_state(
+        None,
+        &DrawState {
+            foreground: 0xFFFF_0000,
+            background: 0xFF00_00FF,
+            ..DrawState::default()
+        },
+    )
+    .expect("apply_draw_state");
+
+    b.copy_plane(
+        None,
+        src_pix.as_raw(),
+        dst_pix.as_raw(),
+        0,
+        0,
+        0,
+        0,
+        8,
+        1,
+        1, // plane = bit 0
+    )
+    .expect("copy_plane");
+
+    let out = b
+        .get_image(None, dst_pix.as_raw(), 2, 0, 0, 8, 1, !0)
+        .expect("get_image dst")
+        .expect("Some(bytes)");
+    // Expected per-pixel: bit set → red BGRA = [0,0,0xFF,0xFF];
+    // bit clear → blue BGRA = [0xFF,0,0,0xFF].
+    let want = [
+        [0x00, 0x00, 0xFF, 0xFF], // x=0 bit=1 red
+        [0xFF, 0x00, 0x00, 0xFF], // x=1 bit=0 blue
+        [0x00, 0x00, 0xFF, 0xFF], // x=2 bit=1 red
+        [0xFF, 0x00, 0x00, 0xFF], // x=3 bit=0 blue
+        [0xFF, 0x00, 0x00, 0xFF], // x=4 bit=0
+        [0xFF, 0x00, 0x00, 0xFF], // x=5 bit=0
+        [0xFF, 0x00, 0x00, 0xFF], // x=6 bit=0
+        [0xFF, 0x00, 0x00, 0xFF], // x=7 bit=0
+    ];
+    for (x, exp) in want.iter().enumerate() {
+        let off = x * 4;
+        assert_eq!(&out[off..off + 4], exp, "copy_plane mismatch at x={x}",);
     }
 }
