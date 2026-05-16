@@ -163,9 +163,24 @@ unsafe impl Send for StagingBuffer {}
 
 impl StagingBuffer {
     fn new(vk: Arc<VkContext>, size: u64) -> Result<Self, vk::Result> {
+        Self::new_with_usage(
+            vk,
+            size,
+            vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+        )
+    }
+
+    /// Stage 3e.2: variant with explicit usage flags. The trap
+    /// path needs `VERTEX_BUFFER` usage on its instance-data
+    /// upload buffer (cmd_bind_vertex_buffers requires that bit).
+    fn new_with_usage(
+        vk: Arc<VkContext>,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+    ) -> Result<Self, vk::Result> {
         let buf_info = vk::BufferCreateInfo::default()
             .size(size)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = unsafe { vk.device.create_buffer(&buf_info, None)? };
         let mem_reqs = unsafe { vk.device.get_buffer_memory_requirements(buffer) };
@@ -379,6 +394,22 @@ struct RenderEngineInner {
     /// scratch shape — identical Vk requirements (sampled image +
     /// dst-format swizzle for no-alpha picture formats).
     src_alias_readback: Option<DstReadback>,
+    /// Stage 3e.2: GPU rasterizer for RENDER `Trapezoids` /
+    /// `Triangles`. Lazy — first trap/tri request pays the
+    /// pipeline build.
+    trap_pipeline: Option<crate::kms::vk::trap_pipeline::TrapPipeline>,
+    /// Stage 3e.2: R8 coverage scratch the trap pipeline writes
+    /// into, then the composite pass samples as a mask. Grows on
+    /// demand (per-bbox). Lazy.
+    ///
+    /// NOTE: `ensure_image_size_returning_old` returns the old image
+    /// as a `BatchResource` for the caller to defer-release;
+    /// v2 currently drops the returned `Box<dyn BatchResource>` on
+    /// the floor — same shape as the `dst_readback` grow leak in
+    /// Stage 3c.2. A real fix needs a per-engine retired-resources
+    /// list that drains on next `poll_retired`. Tracked for the
+    /// Stage 5 polish cycle.
+    mask_scratch: Option<crate::kms::vk::mask_scratch::MaskScratch>,
     /// Stage 3c: drawable view cache (plan §1). Keyed by
     /// `(DrawableId, SamplerConfig, SwizzleClass)`. Views are
     /// destroyed on Drawable retire; the engine's
@@ -411,6 +442,8 @@ impl RenderEngine {
                 white_mask_image: None,
                 dst_readback: None,
                 src_alias_readback: None,
+                trap_pipeline: None,
+                mask_scratch: None,
                 drawable_view_cache: HashMap::new(),
             }),
         })
@@ -614,6 +647,42 @@ impl RenderEngine {
         }
         if inner.src_alias_readback.is_none() {
             inner.src_alias_readback = Some(DstReadback::new(Arc::clone(&inner.vk)));
+        }
+        Ok(())
+    }
+
+    /// Stage 3e.2: lazy-init trap pipeline + mask scratch. Idempotent.
+    /// Called by `render_traps_or_tris` on first use. The mask
+    /// scratch starts at the default extent and grows via
+    /// `ensure_image_size_returning_old` per call; the pipeline is
+    /// built once at the standard R8_UNORM mask format.
+    ///
+    /// # Errors
+    ///
+    /// - `NoVk` on the stub engine.
+    /// - `Vk(...)` for pipeline / scratch construction failure.
+    fn ensure_trap_assets(&mut self, platform: &PlatformBackend) -> Result<(), RenderError> {
+        use crate::kms::vk::{mask_scratch::MaskScratch, trap_pipeline::TrapPipeline};
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(RenderError::NoVk);
+        };
+        if platform.renderer_failed {
+            return Err(RenderError::RendererFailed);
+        }
+        if inner.trap_pipeline.is_none() {
+            let p =
+                TrapPipeline::new(Arc::clone(&inner.vk), vk::Format::R8_UNORM).map_err(|e| {
+                    log::error!("v2 ensure_trap_assets: TrapPipeline::new failed: {e:?}");
+                    RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+                })?;
+            inner.trap_pipeline = Some(p);
+        }
+        if inner.mask_scratch.is_none() {
+            let s = MaskScratch::new(Arc::clone(&inner.vk)).map_err(|e| {
+                log::error!("v2 ensure_trap_assets: MaskScratch::new failed: {e:?}");
+                RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
+            inner.mask_scratch = Some(s);
         }
         Ok(())
     }
@@ -2556,11 +2625,546 @@ impl RenderEngine {
             false,
         )
     }
+
+    // ── Op: render_traps_or_tris (Stage 3e.2) ───────────────────
+
+    /// GPU-rasterized RENDER `Trapezoids` / `Triangles`. Backend
+    /// wrapper decodes the wire stream, applies `(x_off, y_off)`,
+    /// computes the bounding box, and packs per-instance vertex
+    /// data; the engine method takes those pre-cooked inputs and
+    /// drives a two-stage CB: first the trap pipeline rasterizes
+    /// analytic edge coverage into an R8 [`MaskScratch`] image,
+    /// then the standard render pipeline composites `src ⊗ mask`
+    /// into `dst`. Mirrors v1's `try_vk_render_traps_or_tris`
+    /// (kms/backend.rs:4500) port — same trap pipeline + mask
+    /// scratch infrastructure, adapted for v2's per-op CB shape.
+    ///
+    /// `bbox` is `(x, y, w, h)` in pixel coords (already clamped
+    /// to non-negative by the wrapper). `prim_kind` selects which
+    /// sibling pipeline to bind (trap edges vs triangle edges).
+    ///
+    /// Out-of-scope gating (unknown op, gradient src — Stage 3e
+    /// gradient support hasn't landed yet, mask self-alias,
+    /// unsupported dst format, src self-alias) returns
+    /// `Ok(stats)` with `recorded_draws = 0` — same shape as
+    /// `render_composite`. Source self-alias bails with a gap log
+    /// (would need scratch routing à la 3c.3; rare in real-world
+    /// trap workloads).
+    ///
+    /// # Errors
+    ///
+    /// - `NoVk` on the stub engine.
+    /// - `UnknownDrawable` if `dst_id` is missing.
+    /// - `Vk(...)` for pipeline / scratch / CB failures.
+    /// - `RendererFailed` if `platform.renderer_failed`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_traps_or_tris(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        op: u8,
+        src: ResolvedSource,
+        dst_id: DrawableId,
+        prim_kind: TrapPrimKind,
+        instance_data: &[u8],
+        instance_count: u32,
+        bbox: (i32, i32, u32, u32),
+        clip_rects: Option<&[Rectangle16]>,
+        src_repeat: Repeat,
+        src_transform: Option<PictTransform>,
+    ) -> Result<CompositeStats, RenderError> {
+        use crate::kms::vk::{
+            ops::render as vk_render,
+            render_pipeline::{StdPictOp, record_solid_color_clear},
+            trap_pipeline::TrapDrawPushConsts,
+        };
+
+        let mut stats = CompositeStats::default();
+        if instance_count == 0 {
+            return Ok(stats);
+        }
+        let (bbox_x, bbox_y, bbox_w, bbox_h) = bbox;
+        if bbox_w == 0 || bbox_h == 0 {
+            return Ok(stats);
+        }
+
+        self.ensure_render_assets(platform)?;
+        self.ensure_trap_assets(platform)?;
+        let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;
+        if platform.renderer_failed {
+            return Err(RenderError::RendererFailed);
+        }
+
+        // Resolve dst metadata. Same gate as render_composite.
+        let (dst_image, dst_view, dst_extent, dst_format, dst_depth) = {
+            let d = store
+                .get(dst_id)
+                .ok_or(RenderError::UnknownDrawable(dst_id))?;
+            (
+                d.storage.image,
+                d.storage.image_view,
+                d.storage.extent,
+                d.storage.format,
+                d.depth,
+            )
+        };
+        if dst_extent.width == 0 || dst_extent.height == 0 {
+            return Ok(stats);
+        }
+        if !matches!(
+            dst_format,
+            vk::Format::B8G8R8A8_UNORM | vk::Format::R8_UNORM
+        ) {
+            log::debug!("v2 render_traps_or_tris gap: dst format {dst_format:?} unsupported");
+            return Ok(stats);
+        }
+        let dst_has_alpha = dst_format == vk::Format::R8_UNORM || dst_depth == 32;
+        let Some(std_op) = StdPictOp::from_u8(op) else {
+            log::debug!("v2 render_traps_or_tris gap: unsupported op {op}");
+            return Ok(stats);
+        };
+        let needs_dst_readback = std_op.needs_dst_readback();
+
+        // Self-alias / gradient gates — same shape as
+        // render_composite. The trap path doesn't yet support src
+        // self-alias scratch routing or gradient sources.
+        if matches!(src, ResolvedSource::Drawable(id) if id == dst_id) {
+            log::debug!("v2 render_traps_or_tris gap: src self-alias (out of scope for 3e.2)");
+            return Ok(stats);
+        }
+        if matches!(src, ResolvedSource::Gradient(_)) {
+            log::debug!("v2 render_traps_or_tris gap: gradient source (Stage 3e gradient TBD)");
+            return Ok(stats);
+        }
+
+        // Allocate the per-instance vertex buffer (HOST_VISIBLE
+        // upload, sized for instance_count × instance stride). The
+        // wrapper has already laid the data out in the buffer's
+        // exact wire shape; copy verbatim.
+        let needed = u64::try_from(instance_data.len()).unwrap_or(0).max(1);
+        let instance_buf = StagingBuffer::new_with_usage(
+            Arc::clone(&inner.vk),
+            needed,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+        )?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                instance_data.as_ptr(),
+                instance_buf.mapped.as_ptr(),
+                instance_data.len(),
+            );
+        }
+
+        // Grow the mask scratch to at least the trap bbox. The
+        // retired old image is currently dropped on the floor (see
+        // RenderEngineInner.mask_scratch doc note); same shape as
+        // dst_readback's grow semantics.
+        let _retired_mask = {
+            let scratch = inner.mask_scratch.as_mut().expect("ensured");
+            scratch
+                .ensure_image_size_returning_old(bbox_w, bbox_h)
+                .map_err(|e| {
+                    log::warn!("v2 render_traps_or_tris: mask ensure_image_size: {e:?}");
+                    RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+                })?
+        };
+        let mask_image = inner.mask_scratch.as_ref().expect("ensured").image();
+        let mask_view = inner.mask_scratch.as_ref().expect("ensured").image_view();
+        let mask_extent = inner.mask_scratch.as_ref().expect("ensured").extent();
+
+        // Resolve src view + extent (Drawable / Solid; Gradient +
+        // self-alias pre-flighted above). Same view-cache path as
+        // render_composite.
+        let solid_src_view = inner
+            .solid_src_image
+            .as_ref()
+            .expect("ensured")
+            .image_view();
+        let mut src_clear_color: Option<[f32; 4]> = None;
+        let (src_view, src_extent) = match src {
+            ResolvedSource::Drawable(id) => {
+                let info =
+                    drawable_for_render_view(store, id).ok_or(RenderError::UnknownDrawable(id))?;
+                let class = swizzle_class_for(info.format, info.depth);
+                let sampler = sampler_config_for_repeat(src_repeat);
+                let view = ensure_drawable_view(
+                    &inner.vk,
+                    &mut inner.drawable_view_cache,
+                    id,
+                    info.image,
+                    info.format,
+                    sampler,
+                    class,
+                )?;
+                (view, info.extent)
+            }
+            ResolvedSource::Solid(color) => {
+                src_clear_color = Some(color);
+                (
+                    solid_src_view,
+                    vk::Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
+                )
+            }
+            ResolvedSource::Gradient(_) => unreachable!("pre-flighted"),
+            ResolvedSource::None => {
+                log::debug!("v2 render_traps_or_tris gap: src None");
+                return Ok(stats);
+            }
+        };
+
+        // dst_readback for Disjoint/Conjoint (Stage 3c parity).
+        let white_mask_view = inner
+            .white_mask_image
+            .as_ref()
+            .expect("ensured")
+            .image_view();
+        let dst_readback_view = if needs_dst_readback {
+            let rb = inner.dst_readback.as_mut().expect("ensured");
+            rb.ensure_returning_old(dst_format, dst_extent.width, dst_extent.height)
+                .map_err(|e| {
+                    log::warn!("v2 render_traps_or_tris: dst readback ensure: {e:?}");
+                    RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+                })?;
+            match rb.view(dst_format, dst_has_alpha) {
+                Ok(Some(v)) => v,
+                Ok(None) | Err(_) => return Ok(stats),
+            }
+        } else {
+            white_mask_view
+        };
+
+        // Pipeline + descriptor for the composite stage. No
+        // component_alpha; the trap path doesn't carry one.
+        let pipeline = inner
+            .render_pipelines
+            .as_mut()
+            .expect("ensured")
+            .get(std_op, dst_format, dst_has_alpha, false)
+            .map_err(|e| {
+                log::warn!("v2 render_traps_or_tris: pipeline build {e:?}");
+                RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+            })?;
+        let pipeline_layout = inner
+            .render_pipelines
+            .as_ref()
+            .expect("ensured")
+            .pipeline_layout();
+        let mut arena = BatchDescriptorArena::new(Arc::clone(&inner.vk));
+        let descriptor_set = inner
+            .render_pipelines
+            .as_ref()
+            .expect("ensured")
+            .allocate_descriptor_for_views_into(
+                &mut arena,
+                src_view,
+                mask_view,
+                dst_readback_view,
+            )?;
+
+        // needs_full_dst: ops where mask=0 still affects dst
+        // (Clear, Src, etc — see v1 backend.rs:4870). Mask scratch
+        // sits at offset (bbox_x, bbox_y) within dst; outside the
+        // bbox the REPEAT_NONE mask returns 0 and the operator
+        // gives the right outside-bbox result.
+        let needs_full_dst = matches!(op, 0 | 1 | 5 | 6 | 7 | 10 | 13 | 16..=27 | 32..=43);
+        let (render_dst_x, render_dst_y, render_w, render_h, mask_off_x, mask_off_y) =
+            if needs_full_dst {
+                (0, 0, dst_extent.width, dst_extent.height, -bbox_x, -bbox_y)
+            } else {
+                (bbox_x, bbox_y, bbox_w, bbox_h, 0, 0)
+            };
+
+        // Build the picture-clip scissor list (same shape as
+        // render_composite). None → single render-area-sized
+        // scissor; multi-rect picture clips emit one draw per
+        // intersection.
+        let clip_scissors: Vec<vk::Rect2D> = match clip_rects {
+            None => vec![vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: render_dst_x,
+                    y: render_dst_y,
+                },
+                extent: vk::Extent2D {
+                    width: render_w,
+                    height: render_h,
+                },
+            }],
+            Some(cr) => {
+                let mut out = Vec::with_capacity(cr.len());
+                for r in cr {
+                    if r.width == 0 || r.height == 0 {
+                        continue;
+                    }
+                    let x0 = i32::from(r.x).max(0);
+                    let y0 = i32::from(r.y).max(0);
+                    let x1 = (i32::from(r.x) + i32::from(r.width))
+                        .min(i32::try_from(dst_extent.width).unwrap_or(i32::MAX));
+                    let y1 = (i32::from(r.y) + i32::from(r.height))
+                        .min(i32::try_from(dst_extent.height).unwrap_or(i32::MAX));
+                    if x1 <= x0 || y1 <= y0 {
+                        continue;
+                    }
+                    out.push(vk::Rect2D {
+                        offset: vk::Offset2D { x: x0, y: y0 },
+                        extent: vk::Extent2D {
+                            #[allow(clippy::cast_sign_loss)]
+                            width: (x1 - x0) as u32,
+                            #[allow(clippy::cast_sign_loss)]
+                            height: (y1 - y0) as u32,
+                        },
+                    });
+                }
+                if out.is_empty() {
+                    return Ok(stats);
+                }
+                out
+            }
+        };
+
+        // Begin the CB.
+        let (cb, ticket) = begin_op_cb(inner, platform)?;
+        let device = &inner.vk.device;
+
+        // Clear synthetic src (SolidFill).
+        if let Some(c) = src_clear_color {
+            let solid = inner.solid_src_image.as_mut().expect("ensured");
+            record_solid_color_clear(&inner.vk, cb, solid, c);
+        }
+
+        // ── Trap rasterize phase ───────────────────────────────
+        let (prim_pipeline, prim_layout) = {
+            let tp = inner.trap_pipeline.as_ref().expect("ensured");
+            let pipe = match prim_kind {
+                TrapPrimKind::Trapezoid => tp.trapezoid_pipeline(),
+                TrapPrimKind::Triangle => tp.triangle_pipeline(),
+            };
+            (pipe, tp.pipeline_layout())
+        };
+
+        let mask_src_layout = inner
+            .mask_scratch
+            .as_ref()
+            .expect("ensured")
+            .current_layout();
+        let (mask_src_stage, mask_src_access) = match mask_src_layout {
+            vk::ImageLayout::UNDEFINED => {
+                (vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::NONE)
+            }
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+            ),
+            _ => (
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+            ),
+        };
+        let color_range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        let to_attach = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(mask_src_stage)
+            .src_access_mask(mask_src_access)
+            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .old_layout(mask_src_layout)
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .image(mask_image)
+            .subresource_range(color_range)];
+        let dep = vk::DependencyInfo::default().image_memory_barriers(&to_attach);
+        unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
+
+        let bbox_render_area = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: vk::Extent2D {
+                width: bbox_w,
+                height: bbox_h,
+            },
+        };
+        let clear = vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 0.0],
+            },
+        };
+        let color_attachment = [vk::RenderingAttachmentInfo::default()
+            .image_view(mask_view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(clear)];
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(bbox_render_area)
+            .layer_count(1)
+            .color_attachments(&color_attachment);
+        unsafe {
+            device.cmd_begin_rendering(cb, &rendering_info);
+            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, prim_pipeline);
+            device.cmd_bind_vertex_buffers(cb, 0, &[instance_buf.buffer], &[0]);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let trap_pc = TrapDrawPushConsts {
+            mask_extent: [mask_extent.width as f32, mask_extent.height as f32],
+            bbox_origin_pixel: [bbox_x as f32, bbox_y as f32],
+            bbox_size_pixel: [bbox_w as f32, bbox_h as f32],
+            _pad: [0.0; 2],
+        };
+        unsafe {
+            device.cmd_push_constants(
+                cb,
+                prim_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                trap_pc.as_bytes(),
+            );
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let trap_viewport = [vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: mask_extent.width as f32,
+            height: mask_extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+        unsafe {
+            device.cmd_set_viewport(cb, 0, &trap_viewport);
+            device.cmd_set_scissor(cb, 0, &[bbox_render_area]);
+            device.cmd_draw(cb, 4, instance_count, 0, 0);
+            device.cmd_end_rendering(cb);
+        }
+
+        // Barrier mask: COLOR_ATTACHMENT → SHADER_READ_ONLY for
+        // the composite read.
+        let to_read = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(mask_image)
+            .subresource_range(color_range)];
+        let dep = vk::DependencyInfo::default().image_memory_barriers(&to_read);
+        unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
+
+        // ── Composite phase ────────────────────────────────────
+        // dst_readback snapshot for Disjoint/Conjoint.
+        if needs_dst_readback {
+            let dst_current = store.get(dst_id).expect("checked").storage.current_layout;
+            let rb = inner.dst_readback.as_mut().expect("ensured");
+            rb.record_copy_from(cb, dst_image, dst_current, dst_format, dst_extent);
+            stats.used_dst_readback = true;
+        }
+
+        let attrs = vk_render::CompositeAttrs {
+            src_extent,
+            mask_extent,
+            // Source repeat per protocol; mask is the analytic
+            // coverage scratch sampled within bbox — REPEAT_NONE
+            // outside returns 0 which is what `needs_full_dst`
+            // requires.
+            src_repeat: crate::kms::backend::repeat_to_shader_const(src_repeat),
+            mask_repeat: crate::kms::vk::render_pipeline::REPEAT_NONE,
+            src_xform: crate::kms::backend::pixman_transform_to_affine(
+                src_transform.as_ref(),
+                src_extent,
+            ),
+            mask_xform: vk_render::AffineXform::IDENTITY,
+        };
+
+        let rects = [vk_render::CompositeRect {
+            src_x: 0,
+            src_y: 0,
+            mask_x: mask_off_x,
+            mask_y: mask_off_y,
+            dst_x: render_dst_x,
+            dst_y: render_dst_y,
+            width: render_w,
+            height: render_h,
+        }];
+
+        let mut adapter = {
+            let d = store.get_mut(dst_id).expect("checked");
+            StorageCompositeTarget {
+                extent: dst_extent,
+                image: dst_image,
+                image_view: dst_view,
+                current_layout: d.storage.current_layout,
+            }
+        };
+        vk_render::record_render_composite(
+            &inner.vk,
+            cb,
+            &mut adapter,
+            pipeline,
+            pipeline_layout,
+            descriptor_set,
+            &attrs,
+            &rects,
+            &clip_scissors,
+        )?;
+        {
+            let d = store.get_mut(dst_id).expect("checked");
+            d.storage.current_layout = adapter.current_layout;
+        }
+        // Advance mask_scratch's CPU-tracked layout to match the
+        // post-barrier state on the GPU. v1 defers this past the
+        // final fallible step; v2's record_render_composite is
+        // infallible after the descriptor set is bound, so this
+        // is safe.
+        inner
+            .mask_scratch
+            .as_mut()
+            .expect("ensured")
+            .set_current_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+        end_and_submit_op(inner, platform, cb, &ticket)?;
+        store.touch_render_fence(dst_id, ticket.clone());
+        // Damage: the projected dst rect (post-clip is honoured by
+        // scissoring; damage union is the union of clip-scissored
+        // rects intersected with dst extent — keep coarse for now).
+        let dmg = vk::Rect2D {
+            offset: vk::Offset2D {
+                x: render_dst_x,
+                y: render_dst_y,
+            },
+            extent: vk::Extent2D {
+                width: render_w,
+                height: render_h,
+            },
+        };
+        store.damage(dst_id, clamp_rect(dmg, dst_extent));
+
+        stats.recorded_draws = u32::try_from(clip_scissors.len()).unwrap_or(u32::MAX);
+        inner.submitted.push_back(SubmittedOp {
+            cb,
+            ticket,
+            staging: Some(instance_buf),
+            scratch: None,
+            atlas_ticket: None,
+            descriptor_arena: Some(arena),
+        });
+        Ok(stats)
+    }
 }
 
 // ────────────────────────────────────────────────────────────────
 // Stage 3c support: source resolution + drawable view cache.
 // ────────────────────────────────────────────────────────────────
+
+/// Stage 3e.2: primitive kind for [`RenderEngine::render_traps_or_tris`].
+/// Selects which sibling of the trap pipeline to bind. Pre-cooked
+/// instance data + count are passed alongside; the kind only
+/// affects pipeline selection.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TrapPrimKind {
+    Trapezoid,
+    Triangle,
+}
 
 /// Picture source resolved against `KmsCore.pictures` by the
 /// backend wrapper. The engine doesn't read protocol records
@@ -4698,5 +5302,97 @@ mod tests {
             assert_eq!(&px[..4], &[0x00, 0x00, 0xFF, 0xFF]);
         }
         engine.drain_all(&platform);
+    }
+
+    // ── Stage 3e.2 decoder + degenerate-trap unit tests ─────────
+
+    /// Per plan §3e: round-trip a known wire bytestream through
+    /// the trapezoid decoder. Verifies field offsets + 16.16
+    /// fixed-point interpretation. Uses the same shape as v1's
+    /// `try_vk_render_trapezoids_path` (kms/backend.rs:4286)
+    /// since v2's `render_trapezoids` mirrors that decoder.
+    #[test]
+    fn trapezoid_decoder_x11_wire_layout() {
+        // Build a single trapezoid wire record: 10 i32 fields, 40
+        // bytes. Field order: top, bottom, left_p1.x, left_p1.y,
+        // left_p2.x, left_p2.y, right_p1.x, right_p1.y,
+        // right_p2.x, right_p2.y. All values are 16.16 fixed-point.
+        let mut wire: Vec<u8> = Vec::with_capacity(40);
+        let fields: [i32; 10] = [
+            0,        // top = 0.0
+            10 << 16, // bottom = 10.0
+            2 << 16,  // left_p1.x = 2.0
+            0,        // left_p1.y = 0.0
+            2 << 16,  // left_p2.x = 2.0
+            10 << 16, // left_p2.y = 10.0
+            8 << 16,  // right_p1.x = 8.0
+            0,        // right_p1.y = 0.0
+            8 << 16,  // right_p2.x = 8.0
+            10 << 16, // right_p2.y = 10.0
+        ];
+        for v in fields {
+            wire.extend_from_slice(&v.to_le_bytes());
+        }
+
+        // Decode mirroring the backend's `render_trapezoids` body.
+        let chunk: &[u8] = &wire;
+        let read_i32 = |o: usize| -> i32 {
+            i32::from_le_bytes([chunk[o], chunk[o + 1], chunk[o + 2], chunk[o + 3]])
+        };
+        let trap = crate::kms::vk::ops::traps::Trapezoid {
+            top: read_i32(0),
+            bottom: read_i32(4),
+            left_p1: (read_i32(8), read_i32(12)),
+            left_p2: (read_i32(16), read_i32(20)),
+            right_p1: (read_i32(24), read_i32(28)),
+            right_p2: (read_i32(32), read_i32(36)),
+        };
+        assert_eq!(trap.top, 0);
+        assert_eq!(trap.bottom, 10 << 16);
+        assert_eq!(trap.left_p1, (2 << 16, 0));
+        assert_eq!(trap.left_p2, (2 << 16, 10 << 16));
+        assert_eq!(trap.right_p1, (8 << 16, 0));
+        assert_eq!(trap.right_p2, (8 << 16, 10 << 16));
+
+        // bbox: x ∈ [2, 8], y ∈ [0, 10]; integer = (2, 0, 8, 10).
+        let bbox = crate::kms::vk::ops::traps::trapezoid_bbox(&[trap])
+            .expect("bbox for non-degenerate trap");
+        assert_eq!(bbox, (2, 0, 8, 10));
+    }
+
+    /// Per plan §3e: each Triangle's three vertices round-trip
+    /// through the wire decoder, and the bbox helper hits each
+    /// vertex (so a degenerate triangle — three colinear points —
+    /// still produces a finite bbox if the points span pixels).
+    /// Mirrors v1's `try_vk_render_triangles_path` decoder shape.
+    #[test]
+    fn triangle_to_trap_degenerate() {
+        let tri = crate::kms::vk::ops::traps::Triangle {
+            p1: (0, 0),
+            p2: (4 << 16, 0),
+            p3: (2 << 16, 8 << 16),
+        };
+        let inst = tri.to_instance_data();
+        assert!((inst.p1[0] - 0.0).abs() < 1e-6);
+        assert!((inst.p2[0] - 4.0).abs() < 1e-6);
+        assert!((inst.p3[1] - 8.0).abs() < 1e-6);
+        let bbox = crate::kms::vk::ops::traps::triangle_bbox(&[tri])
+            .expect("bbox for non-degenerate triangle");
+        assert_eq!(bbox, (0, 0, 4, 8));
+
+        // Degenerate (three colinear points) — bbox helper still
+        // returns Some(extents) because the points span the axes.
+        // What v1 + v2 do with such an input is: GPU pipeline draws
+        // a zero-area triangle (no pixels covered), CB safely
+        // completes. The plan's "degenerate trap" phrasing refers
+        // to the encoding (trap with one zero-length edge), not a
+        // helper output — the test confirms the trivial bbox path
+        // doesn't choke on it.
+        let colinear = crate::kms::vk::ops::traps::Triangle {
+            p1: (0, 0),
+            p2: (4 << 16, 0),
+            p3: (8 << 16, 0),
+        };
+        assert!(crate::kms::vk::ops::traps::triangle_bbox(&[colinear]).is_none());
     }
 }

@@ -508,3 +508,88 @@ fn v2_copy_plane_depth1_extracts_mask_bits() {
         assert_eq!(&out[off..off + 4], exp, "copy_plane mismatch at x={x}",);
     }
 }
+
+/// Stage 3e.2 acceptance: a 4×4 axis-aligned trapezoid (= filled
+/// rect) painted via `render_trapezoids` must produce full coverage
+/// in the trap interior. Validates the entire GPU pipeline: trap
+/// rasterize → mask scratch → composite with SolidFill src. v1
+/// has the equivalent rendercheck-driven gate; this is the v2
+/// in-tree oracle.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_render_trapezoids_renders_filled_rect() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let dst_pix = b.create_pixmap(None, 32, 8, 8).expect("create_pixmap");
+    let dst_xid = dst_pix.as_raw();
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 8, 8)
+        .expect("pre-fill blue");
+
+    let src_pic = b
+        .render_create_solid_fill(None, [0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF])
+        .expect("solid_fill red")
+        .expect("Some");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("dst_pic")
+        .expect("Some");
+
+    // 16.16 fixed-point axis-aligned trapezoid:
+    // top=2, bottom=6, left x=2, right x=6 → 4×4 inset rect.
+    let mut traps: Vec<u8> = Vec::with_capacity(40);
+    let fields: [i32; 10] = [
+        2 << 16, // top
+        6 << 16, // bottom
+        2 << 16, // left_p1.x
+        2 << 16, // left_p1.y
+        2 << 16, // left_p2.x
+        6 << 16, // left_p2.y
+        6 << 16, // right_p1.x
+        2 << 16, // right_p1.y
+        6 << 16, // right_p2.x
+        6 << 16, // right_p2.y
+    ];
+    for v in fields {
+        traps.extend_from_slice(&v.to_le_bytes());
+    }
+
+    b.render_trapezoids(
+        None,
+        3, // Over
+        src_pic.as_raw(),
+        dst_pic.as_raw(),
+        0, // mask_format — ignored at parity scope
+        0,
+        0,
+        &traps,
+        0,
+        0,
+    )
+    .expect("render_trapezoids");
+
+    let out = b
+        .get_image(None, dst_xid, 2, 0, 0, 8, 8, !0)
+        .expect("get_image")
+        .expect("Some");
+    // Trap interior pixel (3, 3) — solidly inside — must be red.
+    let off_inside = (3 * 8 + 3) * 4;
+    assert_eq!(
+        &out[off_inside..off_inside + 4],
+        &[0x00, 0x00, 0xFF, 0xFF],
+        "trap interior should be red (got {:?})",
+        &out[off_inside..off_inside + 4],
+    );
+    // Outside the trap (0, 0) must stay blue.
+    assert_eq!(
+        &out[0..4],
+        &[0xFF, 0x00, 0x00, 0xFF],
+        "outside trap should stay blue (got {:?})",
+        &out[0..4],
+    );
+}

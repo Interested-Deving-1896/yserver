@@ -2721,35 +2721,274 @@ impl Backend for KmsBackendV2 {
     fn render_trapezoids(
         &mut self,
         _origin: Option<OriginContext>,
-        _op: u8,
-        _host_src: u32,
-        _host_dst: u32,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
         _host_mask_format: u32,
         _src_x: i16,
         _src_y: i16,
-        _traps: &[u8],
-        _x_off: i16,
-        _y_off: i16,
+        traps: &[u8],
+        x_off: i16,
+        y_off: i16,
     ) -> io::Result<()> {
-        self.log_v2_gap("render_trapezoids");
+        use crate::kms::{v2::engine::TrapPrimKind, vk::ops::traps as vk_traps};
+
+        // Wire layout: each trapezoid is 40 bytes (10 × i32 16.16
+        // fixed-point). Mirrors v1's try_vk_render_trapezoids_path
+        // decoder (kms/backend.rs:4286).
+        if traps.is_empty() {
+            return Ok(());
+        }
+        let n_traps = traps.len() / 40;
+        if n_traps == 0 {
+            return Ok(());
+        }
+        let mut decoded: Vec<vk_traps::Trapezoid> = Vec::with_capacity(n_traps);
+        for chunk in traps.chunks_exact(40) {
+            let read_i32 = |o: usize| -> i32 {
+                i32::from_le_bytes([chunk[o], chunk[o + 1], chunk[o + 2], chunk[o + 3]])
+            };
+            decoded.push(vk_traps::Trapezoid {
+                top: read_i32(0),
+                bottom: read_i32(4),
+                left_p1: (read_i32(8), read_i32(12)),
+                left_p2: (read_i32(16), read_i32(20)),
+                right_p1: (read_i32(24), read_i32(28)),
+                right_p2: (read_i32(32), read_i32(36)),
+            });
+        }
+        let dx = i32::from(x_off) << 16;
+        let dy = i32::from(y_off) << 16;
+        if dx != 0 || dy != 0 {
+            for t in &mut decoded {
+                t.top = t.top.wrapping_add(dy);
+                t.bottom = t.bottom.wrapping_add(dy);
+                t.left_p1.0 = t.left_p1.0.wrapping_add(dx);
+                t.left_p1.1 = t.left_p1.1.wrapping_add(dy);
+                t.left_p2.0 = t.left_p2.0.wrapping_add(dx);
+                t.left_p2.1 = t.left_p2.1.wrapping_add(dy);
+                t.right_p1.0 = t.right_p1.0.wrapping_add(dx);
+                t.right_p1.1 = t.right_p1.1.wrapping_add(dy);
+                t.right_p2.0 = t.right_p2.0.wrapping_add(dx);
+                t.right_p2.1 = t.right_p2.1.wrapping_add(dy);
+            }
+        }
+        let Some((bx, by, bx1, by1)) = vk_traps::trapezoid_bbox(&decoded) else {
+            return Ok(());
+        };
+        let bx = bx.max(0);
+        let by = by.max(0);
+        if bx1 <= bx || by1 <= by {
+            return Ok(());
+        }
+        #[allow(clippy::cast_sign_loss)]
+        let bw = (bx1 - bx) as u32;
+        #[allow(clippy::cast_sign_loss)]
+        let bh = (by1 - by) as u32;
+
+        // Pack instance bytes (40 bytes per trap; no padding —
+        // asserted by `const _:()` in trap_pipeline.rs).
+        let stride = std::mem::size_of::<crate::kms::vk::trap_pipeline::TrapInstanceData>();
+        let mut instance_bytes = vec![0u8; stride * decoded.len()];
+        for (i, t) in decoded.iter().enumerate() {
+            let inst = t.to_instance_data();
+            instance_bytes[i * stride..(i + 1) * stride].copy_from_slice(inst.as_bytes());
+        }
+
+        // Resolve src + dst via the same helpers render_composite
+        // uses. The trap path doesn't read GC clip — picture clip
+        // (from dst) is what scopes the draw (plan §4).
+        let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
+            resolve_picture_for_render(&self.core, &self.store, host_src)
+        else {
+            log::debug!("v2 render_trapezoids gap: src 0x{host_src:x} not resolvable");
+            return Ok(());
+        };
+        let Some((dst_id, dst_clip)) =
+            resolve_dst_picture_for_render(&self.core, &self.store, host_dst)
+        else {
+            log::debug!("v2 render_trapezoids gap: dst 0x{host_dst:x} not Drawable picture");
+            return Ok(());
+        };
+        let stats = self.engine.render_traps_or_tris(
+            &mut self.store,
+            &mut self.platform,
+            op,
+            src_resolved,
+            dst_id,
+            TrapPrimKind::Trapezoid,
+            &instance_bytes,
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                decoded.len() as u32
+            },
+            (bx, by, bw, bh),
+            dst_clip.as_deref(),
+            src_repeat,
+            src_transform,
+        );
+        if let Ok(s) = stats {
+            if s.recorded_draws > 0 {
+                self.telemetry.record_paint_submit();
+            }
+            if s.used_dst_readback {
+                self.telemetry.record_disjoint_readback();
+            }
+        } else if let Err(e) = stats {
+            log::warn!("v2 render_trapezoids: engine returned {e:?}");
+        }
         Ok(())
     }
 
     fn render_triangles_op(
         &mut self,
         _origin: Option<OriginContext>,
-        _minor: u8,
-        _op: u8,
-        _host_src: u32,
-        _host_dst: u32,
+        minor: u8,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
         _host_mask_format: u32,
         _src_x: i16,
         _src_y: i16,
-        _primitives: &[u8],
-        _x_off: i16,
-        _y_off: i16,
+        primitives: &[u8],
+        x_off: i16,
+        y_off: i16,
     ) -> io::Result<()> {
-        self.log_v2_gap("render_triangles_op");
+        use crate::kms::{v2::engine::TrapPrimKind, vk::ops::traps as vk_traps};
+
+        let read_point = |off: usize, chunk: &[u8]| -> (i32, i32) {
+            let x =
+                i32::from_le_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
+            let y = i32::from_le_bytes([
+                chunk[off + 4],
+                chunk[off + 5],
+                chunk[off + 6],
+                chunk[off + 7],
+            ]);
+            (x, y)
+        };
+        let mut tris: Vec<vk_traps::Triangle> = match minor {
+            11 => {
+                if !primitives.len().is_multiple_of(24) {
+                    return Ok(());
+                }
+                primitives
+                    .chunks_exact(24)
+                    .map(|c| vk_traps::Triangle {
+                        p1: read_point(0, c),
+                        p2: read_point(8, c),
+                        p3: read_point(16, c),
+                    })
+                    .collect()
+            }
+            12 => {
+                if !primitives.len().is_multiple_of(8) || primitives.len() < 24 {
+                    return Ok(());
+                }
+                let pts: Vec<(i32, i32)> = primitives
+                    .chunks_exact(8)
+                    .map(|c| read_point(0, c))
+                    .collect();
+                (0..pts.len() - 2)
+                    .map(|i| vk_traps::Triangle {
+                        p1: pts[i],
+                        p2: pts[i + 1],
+                        p3: pts[i + 2],
+                    })
+                    .collect()
+            }
+            13 => {
+                if !primitives.len().is_multiple_of(8) || primitives.len() < 24 {
+                    return Ok(());
+                }
+                let pts: Vec<(i32, i32)> = primitives
+                    .chunks_exact(8)
+                    .map(|c| read_point(0, c))
+                    .collect();
+                (1..pts.len() - 1)
+                    .map(|i| vk_traps::Triangle {
+                        p1: pts[0],
+                        p2: pts[i],
+                        p3: pts[i + 1],
+                    })
+                    .collect()
+            }
+            _ => return Ok(()),
+        };
+        if tris.is_empty() {
+            return Ok(());
+        }
+        let dx = i32::from(x_off) << 16;
+        let dy = i32::from(y_off) << 16;
+        if dx != 0 || dy != 0 {
+            for t in &mut tris {
+                t.p1.0 = t.p1.0.wrapping_add(dx);
+                t.p1.1 = t.p1.1.wrapping_add(dy);
+                t.p2.0 = t.p2.0.wrapping_add(dx);
+                t.p2.1 = t.p2.1.wrapping_add(dy);
+                t.p3.0 = t.p3.0.wrapping_add(dx);
+                t.p3.1 = t.p3.1.wrapping_add(dy);
+            }
+        }
+        let Some((bx, by, bx1, by1)) = vk_traps::triangle_bbox(&tris) else {
+            return Ok(());
+        };
+        let bx = bx.max(0);
+        let by = by.max(0);
+        if bx1 <= bx || by1 <= by {
+            return Ok(());
+        }
+        #[allow(clippy::cast_sign_loss)]
+        let bw = (bx1 - bx) as u32;
+        #[allow(clippy::cast_sign_loss)]
+        let bh = (by1 - by) as u32;
+
+        let stride = std::mem::size_of::<crate::kms::vk::trap_pipeline::TriangleInstanceData>();
+        let mut instance_bytes = vec![0u8; stride * tris.len()];
+        for (i, t) in tris.iter().enumerate() {
+            let inst = t.to_instance_data();
+            instance_bytes[i * stride..(i + 1) * stride].copy_from_slice(inst.as_bytes());
+        }
+
+        let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
+            resolve_picture_for_render(&self.core, &self.store, host_src)
+        else {
+            log::debug!("v2 render_triangles gap: src 0x{host_src:x} not resolvable");
+            return Ok(());
+        };
+        let Some((dst_id, dst_clip)) =
+            resolve_dst_picture_for_render(&self.core, &self.store, host_dst)
+        else {
+            log::debug!("v2 render_triangles gap: dst 0x{host_dst:x} not Drawable picture");
+            return Ok(());
+        };
+        let stats = self.engine.render_traps_or_tris(
+            &mut self.store,
+            &mut self.platform,
+            op,
+            src_resolved,
+            dst_id,
+            TrapPrimKind::Triangle,
+            &instance_bytes,
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                tris.len() as u32
+            },
+            (bx, by, bw, bh),
+            dst_clip.as_deref(),
+            src_repeat,
+            src_transform,
+        );
+        if let Ok(s) = stats {
+            if s.recorded_draws > 0 {
+                self.telemetry.record_paint_submit();
+            }
+            if s.used_dst_readback {
+                self.telemetry.record_disjoint_readback();
+            }
+        } else if let Err(e) = stats {
+            log::warn!("v2 render_triangles: engine returned {e:?}");
+        }
         Ok(())
     }
 
