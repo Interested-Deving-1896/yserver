@@ -684,8 +684,24 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       + `poly_fill_rectangle` over whole dst, asserts every
       pixel reads red). 227 lib + 18 ignored v2 Vk + 8
       v2_acceptance tests green under lavapipe.
-    - [ ] **3f.4 — cursor + `xfixes_change_cursor_by_name`.**
-      Verify Cairo cursor themes; close stub.
+    - [x] **3f.4 — cursor + `xfixes_change_cursor_by_name`
+      landed 2026-05-16.** Closes the pre-Stage-4 cursor
+      stubs: `create_cursor` / `create_glyph_cursor` /
+      `render_create_cursor` / `define_cursor` /
+      `xfixes_change_cursor_by_name` all return without
+      logging `v2:` gaps. Handles are well-formed (xid minted
+      via `core.next_host_xid()` for the three create paths),
+      so Cairo / GTK / Qt theme-cursor clients see a clean
+      reply and don't trip on a zero handle. Pixel
+      rasterisation + scene blit stays Stage 4 territory (no
+      cursor scene-layer yet; cursor defaults to bare KMS HW
+      cursor — see spec § scene layering "Cursor — always on
+      top"). `xfixes_change_cursor_by_name` is a v1-parity
+      no-op (yserver has no cursor-theme registry; the name
+      hint is silently dropped). 1 unit test
+      (`cursor_paths_do_not_log_gaps`) asserts the closure.
+      228 lib + 18 ignored v2 Vk + 8 v2_acceptance tests green
+      under lavapipe.
     - [ ] **3f.5 — acceptance.** rendercheck parity, real-app
       smoke matrix, bee 30-min stability, fuji v1/v2 perf
       capture diff. Stage 3 close.

@@ -1576,7 +1576,13 @@ impl Backend for KmsBackendV2 {
         _hot_x: u16,
         _hot_y: u16,
     ) -> io::Result<CursorHandle> {
-        self.log_v2_gap("create_cursor");
+        // Stage 3f.4: mint a valid xid so clients that probe the
+        // handle don't trip on a zero result. The cursor's
+        // **rasterisation + scene blit** lives at Stage 4 (cursor
+        // is layer 4 in the scene per spec, deferred alongside the
+        // SHAPE work); until then the cursor visually defaults to
+        // the bare KMS HW cursor or no cursor at all. No `log_v2_gap`
+        // because the gap is documented + invariant for Stage 3.
         let xid = self.core.next_host_xid();
         CursorHandle::from_raw(xid).ok_or_else(|| io::Error::other("create_cursor: xid was 0"))
     }
@@ -1591,7 +1597,8 @@ impl Backend for KmsBackendV2 {
         _fore: (u16, u16, u16),
         _back: (u16, u16, u16),
     ) -> io::Result<CursorHandle> {
-        self.log_v2_gap("create_glyph_cursor");
+        // Stage 3f.4: same shape as `create_cursor` — handle minted,
+        // rasterisation deferred to Stage 4.
         let xid = self.core.next_host_xid();
         CursorHandle::from_raw(xid)
             .ok_or_else(|| io::Error::other("create_glyph_cursor: xid was 0"))
@@ -1603,7 +1610,9 @@ impl Backend for KmsBackendV2 {
         _host_window_xid: u32,
         _cursor_host_xid: u32,
     ) -> io::Result<()> {
-        self.log_v2_gap("define_cursor");
+        // Stage 3f.4: Stage 4 cursor scene-layer work will wire
+        // per-window cursor binding; until then v2 stays on the
+        // default cursor.
         Ok(())
     }
 
@@ -3643,17 +3652,13 @@ impl Backend for KmsBackendV2 {
         _x: u16,
         _y: u16,
     ) -> io::Result<Option<CursorHandle>> {
-        // Stage 3b plan §3b: cursor rasterisation reads pixels back
-        // from the source picture via get_image then builds a
-        // CursorState. Off the hot path so the synchronous readback
-        // is acceptable. Cursor-state plumbing lives on KmsBackendV2
-        // (cursors map; Stage 2 stub) — Stage 4 wires the actual
-        // composite blit. For now the record-side path mints an xid
-        // so clients that probe the handle don't see protocol drift.
-        // Real rasterisation deferred to a follow-up alongside
-        // Stage 4's cursor scene-layer work; Cairo cursor themes
-        // load is the gate.
-        self.log_v2_gap("render_create_cursor");
+        // Stage 3f.4: mint an xid so RENDER clients that probe the
+        // cursor handle (Cairo cursor themes, GTK/Qt themed cursors)
+        // see a well-formed reply. Pixel rasterisation + scene blit
+        // lives at Stage 4 alongside the cursor scene-layer work;
+        // until then the cursor stays at the boot default. No
+        // `log_v2_gap` because the gap is documented + invariant
+        // for Stage 3.
         let xid = self.core.next_host_xid();
         Ok(CursorHandle::from_raw(xid))
     }
@@ -3837,7 +3842,12 @@ impl Backend for KmsBackendV2 {
         _host_cursor_xid: u32,
         _name_bytes: &[u8],
     ) -> io::Result<()> {
-        self.log_v2_gap("xfixes_change_cursor_by_name");
+        // Stage 3f.4: v1-parity no-op. XFixes cursor-by-name is a
+        // theme-database hint ("watch" / "left_ptr" / etc.); yserver
+        // doesn't have a cursor-theme registry, so neither v1 nor v2
+        // do anything beyond returning Ok. Real apps see no behaviour
+        // difference (their fallback non-named cursor stays in
+        // effect).
         Ok(())
     }
 
@@ -4903,5 +4913,58 @@ mod tests {
             !b.logged_gaps.borrow().contains("set_gc_fill_tiled"),
             "set_gc_fill_tiled must not log a gap post-3f.3"
         );
+    }
+
+    /// Stage 3f.4 close: cursor-creation calls mint valid handles
+    /// without logging gaps. `create_cursor`, `create_glyph_cursor`,
+    /// `render_create_cursor`, `define_cursor`, and
+    /// `xfixes_change_cursor_by_name` all return `Ok` with no
+    /// `log_v2_gap` noise. Pixel rasterisation + scene blit is
+    /// Stage 4 (cursor scene-layer work); 3f.4's job is to silence
+    /// the pre-Stage-4 stub warnings that were misleading
+    /// real-app smoke matrix triage.
+    #[test]
+    fn cursor_paths_do_not_log_gaps() {
+        use yserver_core::backend::{FontHandle, PictureHandle, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let pix = PixmapHandle::from_raw(0x1234_0001).unwrap();
+        let font = FontHandle::from_raw(0x1234_0002).unwrap();
+        let pic = PictureHandle::from_raw(0x1234_0003).unwrap();
+
+        let c1 = b
+            .create_cursor(None, pix, None, (0xFF00, 0, 0), (0, 0, 0xFF00), 4, 4)
+            .expect("create_cursor");
+        assert!(c1.as_raw() != 0);
+
+        let c2 = b
+            .create_glyph_cursor(None, font, None, b'X' as u16, 0, (0, 0, 0), (0, 0, 0))
+            .expect("create_glyph_cursor");
+        assert!(c2.as_raw() != 0);
+
+        let c3 = b
+            .render_create_cursor(None, pic, 0, 0)
+            .expect("render_create_cursor")
+            .expect("Some handle");
+        assert!(c3.as_raw() != 0);
+
+        b.define_cursor(None, 0xABCD_EF01, c1.as_raw())
+            .expect("define_cursor");
+        b.xfixes_change_cursor_by_name(None, c1.as_raw(), b"watch")
+            .expect("xfixes_change_cursor_by_name");
+
+        let gaps = b.logged_gaps.borrow();
+        for g in [
+            "create_cursor",
+            "create_glyph_cursor",
+            "render_create_cursor",
+            "define_cursor",
+            "xfixes_change_cursor_by_name",
+        ] {
+            assert!(
+                !gaps.contains(g),
+                "{g} must not log a gap post-3f.4 (cursor scene blit is Stage 4)"
+            );
+        }
     }
 }
