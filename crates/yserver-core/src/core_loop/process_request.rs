@@ -703,15 +703,31 @@ fn maybe_activate_child_under_redirected_parent(
 /// must land on a freshly-allocated backing matching the new
 /// geometry. L2 plan B.6d.
 ///
-/// Sequence when the window is redirected:
+/// Sequence when the window is redirected (release-then-allocate
+/// order is load-bearing — see below):
 ///   1. Snapshot the existing backing handle.
-///   2. Allocate a new backing at the new (width, height, depth).
-///   3. Repoint `Window.redirected_backing` at the new backing.
-///   4. Release the old backing's reason-1 hold via
+///   2. Release the old backing's reason-1 hold via
 ///      `release_redirected_backing`. If `composite_named_pixmaps`
 ///      aliases still reference it, refcount stays > 0 and the
 ///      backing survives — its content is frozen at pre-resize.
-///      If no aliases hold it, the backing is freed.
+///      If no aliases hold it, the backing is freed. This also
+///      clears the backend's `host_window_to_backing[W]` slot so the
+///      next allocate doesn't short-circuit on the now-stale entry.
+///   3. Allocate a new backing at the new (width, height, depth).
+///      With the slot cleared in step 2, the backend's idempotent
+///      lookup misses and we actually get fresh storage sized to
+///      `new_width × new_height`.
+///   4. Repoint `Window.redirected_backing` at the new backing.
+///
+/// Release-then-allocate order is mandatory because the backend's
+/// `allocate_redirected_backing` is idempotent on
+/// `host_window_to_backing[W]`: an allocate-then-release pass would
+/// return the EXISTING backing handle (ignoring `new_width` /
+/// `new_height`), and the subsequent release would then destroy the
+/// very pixmap we just decided to keep. Hardware smoke caught this
+/// when marco resized a 25-tall mate-panel to 28 tall: the next
+/// `NameWindowPixmap` returned `NotFound` because the backing had
+/// been freed under it.
 ///
 /// `composite_named_pixmaps` is **not** touched here — the aliases
 /// remain valid X protocol resources, pointing at the old (frozen)
@@ -742,9 +758,28 @@ fn rotate_redirected_backing_on_resize(
     let Some(host_window) = host_window else {
         return;
     };
-    // Allocate the new backing before swapping; if allocation fails
-    // we leave the old backing in place so paint keeps landing
-    // somewhere defined.
+
+    // Release the old backing FIRST so the backend's
+    // `host_window_to_backing[W]` slot is clear before the allocate
+    // below — otherwise allocate's idempotent short-circuit would
+    // hand back the about-to-be-released handle and we'd free the
+    // very pixmap we just chose to keep. Composite spec lets the
+    // backing survive (alias-frozen) if `NameWindowPixmap` references
+    // still hold it via the alias registry.
+    if let Err(err) = backend.release_redirected_backing(origin, old_backing) {
+        log::warn!(
+            "rotate_redirected_backing_on_resize: release_redirected_backing(0x{:x}) failed: {err}",
+            old_backing.as_raw()
+        );
+        // Don't bail — try the allocate anyway. Worst case the
+        // allocate also fails and we just leave the window unrouted;
+        // better than leaving the OLD backing pointing somewhere
+        // stale.
+    }
+
+    // Now allocate fresh at the new size. With the slot cleared by
+    // the release above, the idempotent short-circuit misses and we
+    // get a backing actually sized to `new_width × new_height`.
     let new_backing = match backend.allocate_redirected_backing(
         origin,
         host_window,
@@ -759,6 +794,12 @@ fn rotate_redirected_backing_on_resize(
                  allocate failed: {err}",
                 window.0
             );
+            // Clear redirected_backing on the resource since we no
+            // longer have a valid backing — the old one was just
+            // released and the new allocate failed.
+            if let Some(w) = state.resources.window_mut(window) {
+                w.redirected_backing = None;
+            }
             return;
         }
     };
@@ -769,12 +810,6 @@ fn rotate_redirected_backing_on_resize(
             height: new_height,
             depth,
         });
-    }
-    if let Err(err) = backend.release_redirected_backing(origin, old_backing) {
-        log::warn!(
-            "rotate_redirected_backing_on_resize: release_redirected_backing(0x{:x}) failed: {err}",
-            old_backing.as_raw()
-        );
     }
 }
 
@@ -12265,5 +12300,112 @@ mod tests {
             "non-final release must keep host_xid wired — \
              storage is still alive on the backend",
         );
+    }
+
+    // ---------------- rotate_redirected_backing_on_resize ----------------
+    //
+    // Marco-with-compositing resizes the top mate-panel from 25 → 28 px
+    // tall after `RedirectSubwindows(root, Manual)`. The subsequent
+    // `NameWindowPixmap(panel)` must succeed against fresh storage at
+    // the new size. Pre-fix v2 returned `NotFound` because the rotate
+    // path allocated-then-released against an idempotent
+    // `host_window_to_backing[W]` cache and freed the very pixmap it
+    // had just chosen to keep. This test pins release-then-allocate
+    // ORDER — flipping it back would regress the hardware smoke bug.
+    #[test]
+    fn rotate_redirected_backing_on_resize_releases_old_then_allocates_new() {
+        use crate::backend::recording::RecordedCall;
+
+        const WINDOW_XID: u32 = 0x0010_0001;
+        const HOST_XID: u32 = 0x0040_0001;
+        const OLD_BACKING: u32 = 0x0050_0001;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        // Install a top-level child of root, then prime it with a
+        // pretend-existing redirected backing (the state we'd be in
+        // after `RedirectSubwindows` + activation but before the
+        // resize). 100x50 → resize target 100x75.
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 32,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+            w.redirected_backing = Some(crate::resources::RedirectedBacking {
+                host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(OLD_BACKING),
+                width: 100,
+                height: 50,
+                depth: 32,
+            });
+        }
+
+        rotate_redirected_backing_on_resize(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(WINDOW_XID),
+            100,
+            75,
+        );
+
+        let calls = backend.calls();
+        // Release must come FIRST so the backend's idempotent
+        // `host_window_to_backing[W]` lookup misses on the
+        // subsequent allocate.
+        assert!(
+            calls.len() >= 2,
+            "expected 2 backend calls (release, allocate); got {calls:?}",
+        );
+        assert_eq!(
+            calls[0],
+            RecordedCall::ReleaseRedirectedBacking(OLD_BACKING),
+            "step 1 must be ReleaseRedirectedBacking on the OLD backing — \
+             release-then-allocate is load-bearing (see fn doc-comment)",
+        );
+        assert_eq!(
+            calls[1],
+            RecordedCall::AllocateRedirectedBacking {
+                host_window: HOST_XID,
+                width: 100,
+                height: 75,
+                depth: 32,
+            },
+            "step 2 must be AllocateRedirectedBacking at the NEW size",
+        );
+
+        // Window resource now points at the freshly-allocated backing
+        // (RecordingBackend hands back fresh handles per allocate).
+        let backing = state
+            .resources
+            .window(ResourceId(WINDOW_XID))
+            .and_then(|w| w.redirected_backing)
+            .expect("redirected_backing repointed after rotate");
+        assert_ne!(
+            backing.host_pixmap.as_raw(),
+            OLD_BACKING,
+            "redirected_backing must point at the NEW pixmap, not the old one",
+        );
+        assert_eq!(backing.width, 100);
+        assert_eq!(backing.height, 75);
+        assert_eq!(backing.depth, 32);
     }
 }

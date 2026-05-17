@@ -89,6 +89,12 @@ pub enum RecordedCall {
     CloseFont(u32),
     Ping,
     ReleaseRedirectedBacking(u32),
+    AllocateRedirectedBacking {
+        host_window: u32,
+        width: u16,
+        height: u16,
+        depth: u8,
+    },
     SetWindowSceneParticipation {
         host_window: u32,
         participating: bool,
@@ -361,6 +367,24 @@ impl Backend for RecordingBackend {
     fn unregister_host_window(&mut self, host_xid: u32) {
         self.xid_map.remove(&host_xid);
         self.record(RecordedCall::UnregisterHostWindow(host_xid));
+    }
+
+    fn allocate_redirected_backing(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_window: WindowHandle,
+        width: u16,
+        height: u16,
+        depth: u8,
+    ) -> io::Result<PixmapHandle> {
+        let xid = self.allocate_handle();
+        self.record(RecordedCall::AllocateRedirectedBacking {
+            host_window: host_window.as_raw(),
+            width,
+            height,
+            depth,
+        });
+        Ok(PixmapHandle::from_raw_panicking(xid))
     }
 
     fn release_redirected_backing(
