@@ -921,36 +921,45 @@ fn build_scene(
         && let Some(drawable) = store.get(id)
         && drawable.scene_participating
         && matches!(drawable.kind, DrawableKind::Root)
-        && drawable.storage.image_view != vk::ImageView::null()
     {
-        #[allow(clippy::cast_precision_loss)]
-        let dst_origin = [-(layout_x0 as f32), -(layout_y0 as f32)];
-        #[allow(clippy::cast_precision_loss)]
-        let dst_size = [
-            drawable.storage.extent.width as f32,
-            drawable.storage.extent.height as f32,
-        ];
-        draws.push(CompositeDraw {
-            image_view: drawable.storage.image_view,
-            dst_origin,
-            dst_size,
-            src_origin: [0.0, 0.0],
-            src_size: [1.0, 1.0],
-            alpha_passthrough: false,
-        });
-        sampled_ids.push(id);
-        if let Some(snap) = store.peek_presentation_damage(id) {
-            for r in snap.region.rects() {
-                add_projected_damage(
-                    &mut projected,
-                    *r,
-                    -layout_x0,
-                    -layout_y0,
-                    layout_w,
-                    layout_h,
-                );
+        // Stage 4c.3 — route source-storage through `redirected_target`.
+        // For an Automatic-mode redirected drawable, the scene must
+        // blit FROM the backing B (not the drawable's own storage).
+        // Geometry stays driven by the host drawable; only the
+        // sampled storage handle reroutes.
+        let source_id = store.redirected_target(id).unwrap_or(id);
+        if let Some(source) = store.get(source_id)
+            && source.storage.image_view != vk::ImageView::null()
+        {
+            #[allow(clippy::cast_precision_loss)]
+            let dst_origin = [-(layout_x0 as f32), -(layout_y0 as f32)];
+            #[allow(clippy::cast_precision_loss)]
+            let dst_size = [
+                drawable.storage.extent.width as f32,
+                drawable.storage.extent.height as f32,
+            ];
+            draws.push(CompositeDraw {
+                image_view: source.storage.image_view,
+                dst_origin,
+                dst_size,
+                src_origin: [0.0, 0.0],
+                src_size: [1.0, 1.0],
+                alpha_passthrough: false,
+            });
+            sampled_ids.push(source_id);
+            if let Some(snap) = store.peek_presentation_damage(source_id) {
+                for r in snap.region.rects() {
+                    add_projected_damage(
+                        &mut projected,
+                        *r,
+                        -layout_x0,
+                        -layout_y0,
+                        layout_w,
+                        layout_h,
+                    );
+                }
+                snapshots.push(snap);
             }
-            snapshots.push(snap);
         }
     }
     for &top_xid in &core.top_level_order {
@@ -1100,37 +1109,48 @@ fn emit_window_subtree(
         && let Some(drawable) = store.get(id)
         && drawable.scene_participating
         && matches!(drawable.kind, DrawableKind::Window)
-        && drawable.storage.image_view != vk::ImageView::null()
     {
-        let image_view = drawable.storage.image_view;
-        // Project onto output-local coords.
-        let dx = abs_x - layout_x0;
-        let dy = abs_y - layout_y0;
-        let win_w = i32::from(geom.width);
-        let win_h = i32::from(geom.height);
-        // Trivial reject only if the window doesn't intersect the
-        // output at all.
-        let intersects = !(dx + win_w <= 0
-            || dy + win_h <= 0
-            || dx >= i32::try_from(layout_w).unwrap_or(i32::MAX)
-            || dy >= i32::try_from(layout_h).unwrap_or(i32::MAX));
-        if intersects {
-            draws.push(CompositeDraw {
-                image_view,
-                #[allow(clippy::cast_precision_loss)]
-                dst_origin: [dx as f32, dy as f32],
-                #[allow(clippy::cast_precision_loss)]
-                dst_size: [win_w as f32, win_h as f32],
-                src_origin: [0.0, 0.0],
-                src_size: [1.0, 1.0],
-                alpha_passthrough: false,
-            });
-            sampled_ids.push(id);
-            if let Some(snap) = store.peek_presentation_damage(id) {
-                for r in snap.region.rects() {
-                    add_projected_damage(projected, *r, dx, dy, layout_w, layout_h);
+        // Stage 4c.3 — route source-storage through `redirected_target`.
+        // Automatic-mode redirected W blits FROM B; W's geometry
+        // (dst_origin, dst_size, intersect test) stays driven by W's
+        // own state in `windows_v2`. Only the sampled storage handle
+        // reroutes. Manual-mode W's are filtered out before this
+        // path (scene_participating=false), so the indirection only
+        // fires for Automatic.
+        let source_id = store.redirected_target(id).unwrap_or(id);
+        if let Some(source) = store.get(source_id)
+            && source.storage.image_view != vk::ImageView::null()
+        {
+            let image_view = source.storage.image_view;
+            // Project onto output-local coords.
+            let dx = abs_x - layout_x0;
+            let dy = abs_y - layout_y0;
+            let win_w = i32::from(geom.width);
+            let win_h = i32::from(geom.height);
+            // Trivial reject only if the window doesn't intersect the
+            // output at all.
+            let intersects = !(dx + win_w <= 0
+                || dy + win_h <= 0
+                || dx >= i32::try_from(layout_w).unwrap_or(i32::MAX)
+                || dy >= i32::try_from(layout_h).unwrap_or(i32::MAX));
+            if intersects {
+                draws.push(CompositeDraw {
+                    image_view,
+                    #[allow(clippy::cast_precision_loss)]
+                    dst_origin: [dx as f32, dy as f32],
+                    #[allow(clippy::cast_precision_loss)]
+                    dst_size: [win_w as f32, win_h as f32],
+                    src_origin: [0.0, 0.0],
+                    src_size: [1.0, 1.0],
+                    alpha_passthrough: false,
+                });
+                sampled_ids.push(source_id);
+                if let Some(snap) = store.peek_presentation_damage(source_id) {
+                    for r in snap.region.rects() {
+                        add_projected_damage(projected, *r, dx, dy, layout_w, layout_h);
+                    }
+                    snapshots.push(snap);
                 }
-                snapshots.push(snap);
             }
         }
     }
@@ -2069,6 +2089,100 @@ mod tests {
         assert!(
             cursor_draw.alpha_passthrough,
             "cursor must blend (sprite has transparent border)"
+        );
+    }
+
+    /// Stage 4c.3 — when a window W has `redirected_target = Some(B)`,
+    /// the scene entry for W blits FROM B's storage (its `image_view`),
+    /// not from W's own storage. W's geometry (`dst_origin`, `dst_size`)
+    /// stays driven by `windows_v2[W]`. `sampled_ids` carries B_id (not
+    /// W_id) so damage/fence accounting follows the source the scene
+    /// actually read from.
+    #[test]
+    fn build_scene_uses_redirected_target_storage_when_set() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        // Window W @ (50, 60), 200×100 — emits at output coords
+        // (50, 60) since the test output layout origin is (0, 0).
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x100,
+            50,
+            60,
+            200,
+            100,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x100);
+
+        // Allocate a separate backing pixmap B with its OWN sentinel
+        // image_view, distinct from W's. B is allocated with
+        // `scene_participating=false` (Pixmap default) — that's fine
+        // for the build-scene path since the resolution looks up
+        // storage directly; only the peek for B's damage needs the
+        // flag, which we toggle below to verify the snapshot path
+        // keys off `source_id`.
+        let mut b_storage = super::super::store::Storage::for_tests_null(
+            extent(200, 100),
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let b_view: vk::ImageView = ash::vk::Handle::from_raw(0xB000_BEEF);
+        b_storage.image_view = b_view;
+        let b_id = store
+            .allocate(0xB001, DrawableKind::Pixmap, 32, true, b_storage)
+            .expect("alloc backing stub");
+
+        // Confirm W and B have distinct image_views.
+        let w_id = store.lookup(0x100).expect("w_id present");
+        let w_view = store.get(w_id).expect("w drawable").storage.image_view;
+        assert_ne!(
+            w_view, b_view,
+            "fixture sanity: W and B must have distinct sentinel views"
+        );
+
+        // Wire the redirect route: W's source-storage now resolves
+        // through B.
+        store.set_redirected_target(w_id, Some(b_id));
+
+        let built = build_scene(&core, &mut store, &windows_v2, 0, &platform, None, None);
+        let scene = &built.scene;
+        assert_eq!(
+            scene.draws.len(),
+            1,
+            "expected one draw entry for W (geometry unchanged by redirect)"
+        );
+        let w_draw = &scene.draws[0];
+
+        // Geometry still W's.
+        assert_eq!(
+            w_draw.dst_origin,
+            [50.0, 60.0],
+            "redirected W's on-screen rect must remain W's geometry"
+        );
+        assert_eq!(
+            w_draw.dst_size,
+            [200.0, 100.0],
+            "redirected W's on-screen size must remain W's geometry"
+        );
+
+        // Storage handle reroutes to B.
+        assert_eq!(
+            w_draw.image_view, b_view,
+            "redirected W must sample FROM B's image_view, not W's"
+        );
+
+        // `sampled_ids` parallels `draws`; the entry for W must
+        // carry B_id (the source the scene actually read from) so
+        // damage/fence accounting follows the right drawable.
+        assert_eq!(built.sampled_ids.len(), 1);
+        assert_eq!(
+            built.sampled_ids[0], b_id,
+            "sampled_ids must carry source_id (B_id) for damage / fence keying"
         );
     }
 }
