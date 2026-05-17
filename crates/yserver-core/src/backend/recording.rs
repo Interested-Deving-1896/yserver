@@ -99,6 +99,10 @@ pub enum RecordedCall {
         host_window: u32,
         participating: bool,
     },
+    SetBackingSceneParticipation {
+        host_pixmap: u32,
+        participating: bool,
+    },
 }
 
 /// Test double for `Backend`. Auto-allocates host xids from a private
@@ -404,6 +408,19 @@ impl Backend for RecordingBackend {
     ) -> io::Result<()> {
         self.record(RecordedCall::SetWindowSceneParticipation {
             host_window: host_window.as_raw(),
+            participating,
+        });
+        Ok(())
+    }
+
+    fn set_backing_scene_participation(
+        &mut self,
+        _origin: Option<OriginContext>,
+        backing: PixmapHandle,
+        participating: bool,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::SetBackingSceneParticipation {
+            host_pixmap: backing.as_raw(),
             participating,
         });
         Ok(())

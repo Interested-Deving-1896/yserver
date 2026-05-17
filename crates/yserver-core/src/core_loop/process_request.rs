@@ -498,12 +498,23 @@ fn resolve_host_subwindow_visual_to_state(
 /// fixed MATE; v2 (`KmsBackendV2`) overrides to `true` and the
 /// full allocate + participation-flip path runs.
 ///
-/// `mode` drives the scene-participation flip after a successful
-/// allocate: Manual → window participating=false (the external
-/// compositor drives presentation), Automatic → window
-/// participating=true AND backing participating=true (paint
-/// resolves through the backing and the scene walk picks it up
-/// via W's `redirected_target` indirection in 4c).
+/// `mode` drives the window-side flip after a successful allocate:
+/// Manual → window participating=false (the external compositor
+/// drives presentation; Stage 4d.8b leaves the window in the scene
+/// even in Manual under the pragmatic floor — that flip is owned
+/// by the v2 setter, not this site), Automatic → window
+/// participating=true (paint resolves through the backing and the
+/// scene walk picks it up via W's `redirected_target` indirection
+/// in 4c).
+///
+/// Stage 4d.8c: the backing-side participation flag is set to
+/// `true` in BOTH modes. The scene reads from B via the
+/// `redirected_target` indirection regardless of mode, so B's
+/// paint damage must always be tracked. The store's `damage(id,
+/// rect)` is a no-op when `scene_participating` is false; under
+/// 4d.8b's Manual floor (W stays in the scene, reads from B) that
+/// silently dropped repaint signals and produced the
+/// "windows-appear-on-hover" flicker fixed here.
 fn activate_redirect_backing_for(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -561,9 +572,19 @@ fn activate_redirect_backing_for(
                     window.0
                 );
             }
-            if matches!(mode, crate::server::CompositeRedirectMode::Automatic)
-                && let Err(err) = backend.set_backing_scene_participation(origin, host_pixmap, true)
-            {
+            // Stage 4d.8c — backing is scene-participating in BOTH
+            // modes. Automatic: spec-correct (the scene samples B
+            // as the source for W via the 4c.3 `redirected_target`
+            // indirection). Manual under 4d.8b's pragmatic floor:
+            // W stays in the scene and the scene reads from B, so
+            // B's paint damage must be tracked. Without
+            // participating=true the `DrawableStore::damage()`
+            // call is a no-op (it gates on the flag), and the
+            // scene's `peek_presentation_damage(B)` returns empty
+            // — repaints never fire and the redirected window
+            // shows stale content until cursor movement or
+            // another scene-structure event forces a redraw.
+            if let Err(err) = backend.set_backing_scene_participation(origin, host_pixmap, true) {
                 log::warn!(
                     "set_backing_scene_participation(0x{:x}, true) failed: {err}",
                     host_pixmap.as_raw()
@@ -627,7 +648,13 @@ fn flip_redirect_target_mode(
         return;
     };
     let window_participating = matches!(new_mode, crate::server::CompositeRedirectMode::Automatic);
-    let backing_participating = window_participating;
+    // Stage 4d.8c — backing stays scene-participating regardless
+    // of mode (matches the activation-side rationale: the scene
+    // reads B via `redirected_target` in both modes, so B's paint
+    // damage must always be tracked). A redundant `(B, true)` on
+    // a same-flag flip is cheap — the v2 setter early-exits when
+    // the flag is unchanged.
+    let backing_participating = true;
     if let Err(err) =
         backend.set_window_scene_participation(origin, host_window, window_participating)
     {
@@ -12407,5 +12434,152 @@ mod tests {
         assert_eq!(backing.width, 100);
         assert_eq!(backing.height, 75);
         assert_eq!(backing.depth, 32);
+    }
+
+    // ---------------- activate_redirect_backing_for participation flips ----------------
+    //
+    // Stage 4d.8c: the backing-side `set_backing_scene_participation`
+    // call must fire with `true` in BOTH Automatic and Manual modes.
+    // Pre-fix it was Automatic-only, so Manual-redirect paint by the
+    // client never marked B's drawable as scene-participating;
+    // `DrawableStore::damage()` early-returned on the flag and the
+    // scene's `peek_presentation_damage(B)` came back empty, producing
+    // the windows-appear-on-hover flicker on the rendering-model-v2
+    // branch.
+    fn install_window_for_activation_test(state: &mut ServerState, xid: u32, host: u32) {
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(xid),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let w = state
+            .resources
+            .window_mut(ResourceId(xid))
+            .expect("window installed");
+        w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(host));
+    }
+
+    #[test]
+    fn manual_redirect_marks_backing_scene_participating() {
+        use crate::backend::recording::RecordedCall;
+
+        const WINDOW_XID: u32 = 0x0011_0001;
+        const HOST_XID: u32 = 0x0041_0001;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        install_window_for_activation_test(&mut state, WINDOW_XID, HOST_XID);
+
+        activate_redirect_backing_for(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(WINDOW_XID),
+            crate::server::CompositeRedirectMode::Manual,
+        );
+
+        let calls = backend.calls();
+        // Capture the host_pixmap that was just allocated; the
+        // backing-side participation call must reference the same xid.
+        let allocated_pixmap = state
+            .resources
+            .window(ResourceId(WINDOW_XID))
+            .and_then(|w| w.redirected_backing)
+            .map(|b| b.host_pixmap.as_raw())
+            .expect("redirected_backing recorded on the window");
+
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::SetBackingSceneParticipation {
+                    host_pixmap,
+                    participating: true,
+                } if *host_pixmap == allocated_pixmap
+            )),
+            "Manual-mode activation MUST mark backing scene-participating=true \
+             (Stage 4d.8c). calls={calls:#?}",
+        );
+        // Window-side under Manual stays participating=false (the
+        // window-side flip semantics are unchanged by 4d.8c; the v2
+        // backend's `set_window_scene_participation` is the one that
+        // implements the 4d.8b "Manual keeps participating=true"
+        // pragmatic floor — the protocol handler still passes
+        // `participating=false` for Manual).
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::SetWindowSceneParticipation {
+                    host_window,
+                    participating: false,
+                } if *host_window == HOST_XID
+            )),
+            "Manual-mode activation passes window-side participating=false \
+             from the handler; the v2 backend owns the 4d.8b floor. \
+             calls={calls:#?}",
+        );
+    }
+
+    #[test]
+    fn automatic_redirect_marks_backing_scene_participating() {
+        use crate::backend::recording::RecordedCall;
+
+        const WINDOW_XID: u32 = 0x0012_0001;
+        const HOST_XID: u32 = 0x0042_0001;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        install_window_for_activation_test(&mut state, WINDOW_XID, HOST_XID);
+
+        activate_redirect_backing_for(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(WINDOW_XID),
+            crate::server::CompositeRedirectMode::Automatic,
+        );
+
+        let calls = backend.calls();
+        let allocated_pixmap = state
+            .resources
+            .window(ResourceId(WINDOW_XID))
+            .and_then(|w| w.redirected_backing)
+            .map(|b| b.host_pixmap.as_raw())
+            .expect("redirected_backing recorded on the window");
+
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::SetBackingSceneParticipation {
+                    host_pixmap,
+                    participating: true,
+                } if *host_pixmap == allocated_pixmap
+            )),
+            "Automatic-mode activation MUST mark backing scene-participating=true. \
+             calls={calls:#?}",
+        );
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::SetWindowSceneParticipation {
+                    host_window,
+                    participating: true,
+                } if *host_window == HOST_XID
+            )),
+            "Automatic-mode activation MUST mark window scene-participating=true. \
+             calls={calls:#?}",
+        );
     }
 }
