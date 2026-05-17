@@ -552,10 +552,7 @@ impl KmsBackendV2 {
     /// it captures the previous on-screen rect BEFORE flipping
     /// `scene_participating` so it can fire
     /// `mark_scene_structure_damage_rects(&[prev_rect])` for the
-    /// redirect transition. Until 4c.4 wires up the caller, the
-    /// only consumers are this module's tests — hence the
-    /// `dead_code` allow.
-    #[allow(dead_code)]
+    /// redirect transition.
     pub(crate) fn window_absolute_rect(
         &self,
         w_id: crate::kms::v2::store::DrawableId,
@@ -2888,6 +2885,92 @@ impl Backend for KmsBackendV2 {
         true
     }
 
+    /// Stage 4c.4 — flip a window's scene-participation under
+    /// COMPOSITE redirect. Delegates to `DrawableStore::
+    /// set_scene_participating` (which clears unpresented
+    /// presentation damage + bumps the epoch on a true→false
+    /// transition per spec §I5) and fires scene-structure damage
+    /// for the redirect transition.
+    ///
+    /// **Scene-structure damage** — always fires per the plan's
+    /// Cross-cutting §"Concrete scene-structure damage":
+    ///   - `participating=true` (un-redirect / Automatic-activate):
+    ///     rect = W's current screen rect — the scene newly
+    ///     includes W and must paint W's location.
+    ///   - `participating=false` (Manual-activate): rect = W's
+    ///     pre-flip rect — the scene NO LONGER includes W but
+    ///     whatever is underneath must repaint the area where W
+    ///     used to be.
+    ///
+    /// In both branches we capture the rect BEFORE the flip
+    /// (pre-flip and post-flip geometry coincide because the
+    /// participation flip itself doesn't move W); the only
+    /// difference is semantic. When `window_absolute_rect`
+    /// returns `None` (root or untracked geometry), fall back to
+    /// the coarse `mark_scene_structure_dirty` — correctness-
+    /// preserving, just wider than needed.
+    fn set_window_scene_participation(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_window: WindowHandle,
+        participating: bool,
+    ) -> io::Result<()> {
+        let Some(w_id) = self.store.lookup(host_window.as_raw()) else {
+            log::debug!(
+                "v2 set_window_scene_participation(0x{:x}, {participating}): \
+                 window not in store",
+                host_window.as_raw(),
+            );
+            return Ok(());
+        };
+        // Capture rect BEFORE the flip — on participating=false
+        // (Manual activation) the pre-flip rect is what the scene
+        // needs to repaint over; on participating=true the pre-
+        // and post-flip rects coincide (no geometry move on this
+        // path) so either reading is fine, and pre-flip keeps the
+        // two branches symmetric.
+        let pre_flip_rect = self.window_absolute_rect(w_id);
+
+        self.store.set_scene_participating(w_id, participating);
+
+        if let Some(rect) = pre_flip_rect {
+            self.scene.mark_scene_structure_damage_rects(&[rect]);
+        } else {
+            // No tracked geometry (root or untracked) — coarse
+            // marker is correctness-preserving.
+            self.scene.mark_scene_structure_dirty();
+        }
+        Ok(())
+    }
+
+    /// Stage 4c.4 — flip a backing's scene-participation under
+    /// COMPOSITE redirect. Used by Automatic mode so paint that
+    /// resolves through the backing accumulates presentation
+    /// damage on B (which the scene walk picks up via W's
+    /// `redirected_target` indirection in 4c's `build_scene`
+    /// patch). No scene-structure damage from this call — the
+    /// geometric damage of a mode-flip is the W-side call's
+    /// responsibility (the blit-source identity flip is
+    /// geometrically on W; backings have no on-screen geometry
+    /// of their own).
+    fn set_backing_scene_participation(
+        &mut self,
+        _origin: Option<OriginContext>,
+        backing: PixmapHandle,
+        participating: bool,
+    ) -> io::Result<()> {
+        let Some(b_id) = self.store.lookup(backing.as_raw()) else {
+            log::debug!(
+                "v2 set_backing_scene_participation(0x{:x}, {participating}): \
+                 backing not in store",
+                backing.as_raw(),
+            );
+            return Ok(());
+        };
+        self.store.set_scene_participating(b_id, participating);
+        Ok(())
+    }
+
     /// Stage 4b: real `name_window_pixmap`. Mirrors v1
     /// (`kms/backend.rs:9523-9544`) — lookup `host_window_to_backing`,
     /// incref the alias registry, return the SAME handle.
@@ -3000,9 +3083,11 @@ impl Backend for KmsBackendV2 {
     /// is the alias-handle, not a separate redirect), but the
     /// loop is cheap and matches the plan's defensive contract.
     ///
-    /// B-side `scene_participating` flip lives in 4c's
-    /// `set_backing_scene_participation`; this method stays
-    /// agnostic to participation.
+    /// Stage 4c.4 round-3 finding: drop B's `scene_participating`
+    /// flag internally so the protocol handler (RedirectWindow
+    /// unredirect / destroy path) doesn't need a separate
+    /// `set_backing_scene_participation(false)` call. The trait
+    /// docstring is the canonical statement of this contract.
     fn release_redirected_backing(
         &mut self,
         origin: Option<OriginContext>,
@@ -3038,6 +3123,13 @@ impl Backend for KmsBackendV2 {
                     self.store.set_redirected_target(w_id, None);
                 }
             }
+            // Stage 4c.4 round-3 finding: drop B's scene_participating
+            // flag here so the protocol handler doesn't need a
+            // separate `set_backing_scene_participation(false)`
+            // call. No-op when the flag is already false (the
+            // store's `set_scene_participating` short-circuits
+            // the damage-clear branch when `was == v`).
+            self.store.set_scene_participating(b_id, false);
         }
         if self.core.alias_registry.decref(backing) {
             self.free_pixmap(origin, raw)?;
@@ -7872,5 +7964,142 @@ mod tests {
         assert!(!b.windows_v2.contains_key(&0xDEAD));
         assert_ne!(b.core.window_id, 0xDEAD);
         assert_eq!(b.window_absolute_rect(w_id), None);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Stage 4c.4 — set_window_scene_participation /
+    // set_backing_scene_participation
+    // ────────────────────────────────────────────────────────────────
+
+    /// `participating=false` on a window with pending presentation
+    /// damage must delegate to `DrawableStore::set_scene_participating`
+    /// — that store method clears the damage and bumps the epoch.
+    /// This verifies the v2 backend actually wires the call (rather
+    /// than e.g. silently returning Ok).
+    #[test]
+    fn set_window_scene_participation_false_clears_window_damage() {
+        use yserver_core::backend::WindowHandle;
+        let mut b = KmsBackendV2::for_tests();
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        // Seed presentation damage so the store actually has work
+        // to clear when participation flips off.
+        b.store.damage(
+            w_id,
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D::default(),
+                extent: ash::vk::Extent2D {
+                    width: 4,
+                    height: 4,
+                },
+            },
+        );
+        assert_eq!(
+            b.store.get(w_id).unwrap().presentation_damage.rects().len(),
+            1,
+        );
+        let epoch_before = b.store.get(w_id).unwrap().presentation_damage_epoch;
+
+        let handle = WindowHandle::from_raw(0x100).expect("WindowHandle");
+        b.set_window_scene_participation(None, handle, false)
+            .expect("set_window_scene_participation");
+
+        let d = b.store.get(w_id).expect("drawable still alive");
+        assert!(
+            d.presentation_damage.is_empty(),
+            "presentation_damage must clear on participating=false transition: {:?}",
+            d.presentation_damage.rects(),
+        );
+        assert!(
+            d.presentation_damage_epoch > epoch_before,
+            "epoch must bump on participating=false transition (before={epoch_before}, after={})",
+            d.presentation_damage_epoch,
+        );
+        assert!(
+            !d.scene_participating,
+            "scene_participating flag must be cleared",
+        );
+    }
+
+    /// `set_window_scene_participation` must fire scene-structure
+    /// damage for the redirect transition. On the stub-mode scene
+    /// (`for_tests` fixture has `inner: None`), we can only observe
+    /// the `scene_structure_dirty` bit — the per-output rect
+    /// dispatch is covered in `scene::tests::
+    /// dispatch_clip_rects_lands_per_output_clipped` (4c.1 follow-up).
+    /// This test pins the contract that the backend CALLS the rect
+    /// setter (or the coarse fallback) rather than leaving the
+    /// scene-structure state untouched.
+    #[test]
+    fn set_window_scene_participation_fires_scene_structure_damage_rect() {
+        use yserver_core::backend::WindowHandle;
+        let mut b = KmsBackendV2::for_tests();
+        let _w_id = seed_window(&mut b, 0x100, None, 50, 60);
+        // Sanity: pre-flip rect lookup is non-None (Test 2 requires
+        // the rect path, not the coarse fallback path).
+        let pre_flip = b
+            .window_absolute_rect(b.store.lookup(0x100).unwrap())
+            .expect("pre-flip rect known");
+        assert_eq!(pre_flip.offset.x, 50);
+        assert_eq!(pre_flip.offset.y, 60);
+
+        // Start with the dirty bit cleared so the assertion proves
+        // THIS call set it (not some setup side effect).
+        b.scene.scene_structure_dirty = false;
+
+        let handle = WindowHandle::from_raw(0x100).expect("WindowHandle");
+        b.set_window_scene_participation(None, handle, false)
+            .expect("set_window_scene_participation");
+
+        assert!(
+            b.scene.scene_structure_dirty,
+            "scene_structure_dirty must be set after a participation flip",
+        );
+    }
+
+    /// `set_backing_scene_participation` flips the backing's
+    /// `scene_participating` flag via the store but must NOT fire
+    /// scene-structure damage — geometric damage is the W-side
+    /// call's responsibility (backings have no on-screen geometry
+    /// of their own).
+    #[test]
+    fn set_backing_scene_participation_flips_flag_no_damage() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        use yserver_core::backend::PixmapHandle;
+        let mut b = KmsBackendV2::for_tests();
+        let b_id = b
+            .store
+            .allocate(
+                0x2000,
+                DrawableKind::Pixmap,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 64,
+                        height: 64,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("pixmap allocate");
+        // Pixmaps start with scene_participating=false (per
+        // `DrawableStore::allocate`'s `scene_participating` arg).
+        assert!(!b.store.get(b_id).unwrap().scene_participating);
+        // Capture the prior dirty bit (whatever setup left it at).
+        // The assertion below is "no CHANGE", not "is false".
+        let dirty_before = b.scene.scene_structure_dirty;
+
+        let handle = PixmapHandle::from_raw(0x2000).expect("PixmapHandle");
+        b.set_backing_scene_participation(None, handle, true)
+            .expect("set_backing_scene_participation");
+
+        assert!(
+            b.store.get(b_id).unwrap().scene_participating,
+            "backing scene_participating must flip to true",
+        );
+        assert_eq!(
+            b.scene.scene_structure_dirty, dirty_before,
+            "set_backing_scene_participation must NOT fire scene-structure damage",
+        );
     }
 }
