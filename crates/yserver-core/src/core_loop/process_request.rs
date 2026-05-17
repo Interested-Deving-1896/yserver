@@ -511,21 +511,21 @@ fn activate_redirect_backing_for(
     window: ResourceId,
     mode: crate::server::CompositeRedirectMode,
 ) {
-    // TODO(4b.8): same-owner mode-flip. If `redirected_backing` is
-    // already populated, the new record is a mode-flip on an
-    // existing redirect — should NOT reallocate (Xorg's
-    // compCheckRedirect at compositeproto.txt:80 preserves the
-    // backing across mode change). Today we early-return so the
-    // backing + alias refcount survive; the participation flip for
-    // the new mode is still missing until 4b.8 wires it.
+    // Mode-flip on an existing redirect is routed through
+    // `flip_redirect_target_mode` upstream — don't reallocate
+    // here (Xorg preserves the backing per
+    // `xserver/composite/compwindow.c:172` +
+    // `compositeproto.txt:80`). If the caller reaches us with a
+    // populated `redirected_backing` it's a same-mode idempotent
+    // call (or a stale handoff — log + skip rather than crash).
     if state
         .resources
         .window(window)
         .is_some_and(|w| w.redirected_backing.is_some())
     {
         log::debug!(
-            "activate_redirect_backing_for(0x{:x}): backing already present; \
-             mode-flip (4b.8) not yet implemented — leaving record alone",
+            "activate_redirect_backing_for(0x{:x}): backing already present (same-mode \
+             idempotent); skipping reallocation",
             window.0
         );
         return;
@@ -577,6 +577,124 @@ fn activate_redirect_backing_for(
             );
         }
     }
+}
+
+/// Stage 4b.8: same-owner mode-flip handler. When a client
+/// re-issues `Redirect{Window,Subwindows}(W, new_mode)` while it
+/// already owns a record at the same key with a different mode,
+/// Xorg's `compCheckRedirect`
+/// (`xserver/composite/compwindow.c:172`) preserves the backing
+/// pixmap and every `NameWindowPixmap` alias; only `redirectDraw`
+/// flips. Composite spec line 80: "old named pixmaps remain
+/// allocated until FreePixmap."
+///
+/// In v2 the equivalent is: keep `Window.redirected_backing` +
+/// `KmsCore.alias_registry` + `KmsCore.host_window_to_backing` +
+/// `Drawable.redirected_target` untouched; only fire the
+/// participation-flip pair for the new mode.
+///
+/// **No re-seed** per the plan's codex-round-6 decision: the
+/// backing's current content is whatever the compositor has been
+/// reading from (Automatic) or the still-frozen pre-redirect snapshot
+/// (Manual just-flipped-from-Automatic). Running `copy_area(W, B)`
+/// would replace that with W's storage which under Manual is empty —
+/// strictly worse than the existing backing contents.
+fn flip_redirect_target_mode(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    target: ResourceId,
+    new_mode: crate::server::CompositeRedirectMode,
+) {
+    let snapshot = state.resources.window(target).map(|w| {
+        (
+            w.host_xid,
+            w.redirected_backing.as_ref().map(|b| b.host_pixmap),
+        )
+    });
+    let Some((Some(host_window), Some(backing))) = snapshot else {
+        // No existing backing → fall back to a fresh activation.
+        // This shouldn't normally fire (the caller gates on
+        // `prev.mode != new_mode` which implies a prior record
+        // existed, and any prior record under
+        // `supports_redirect_activation()` allocated a backing),
+        // but stay defensive.
+        log::debug!(
+            "flip_redirect_target_mode(0x{:x}): no existing backing; falling back to allocate",
+            target.0
+        );
+        activate_redirect_backing_for(state, backend, origin, target, new_mode);
+        return;
+    };
+    let window_participating = matches!(new_mode, crate::server::CompositeRedirectMode::Automatic);
+    let backing_participating = window_participating;
+    if let Err(err) =
+        backend.set_window_scene_participation(origin, host_window, window_participating)
+    {
+        log::warn!(
+            "flip_redirect_target_mode(0x{:x}, {window_participating}): \
+             set_window_scene_participation failed: {err}",
+            target.0
+        );
+    }
+    if let Err(err) =
+        backend.set_backing_scene_participation(origin, backing, backing_participating)
+    {
+        log::warn!(
+            "flip_redirect_target_mode(0x{:x}, {backing_participating}): \
+             set_backing_scene_participation failed: {err}",
+            target.0
+        );
+    }
+}
+
+/// Stage 4b.7: post-hook for `handle_map_window` /
+/// `handle_map_subwindows`. When a child window is mapped under a
+/// parent that has `RedirectSubwindows(mode)` recorded, the child
+/// inherits the redirect and needs its own backing — per Composite
+/// spec ("redirected hierarchy pixels are available whenever it is
+/// viewable", `compositeproto.txt:44-48`) and Xorg's compositional
+/// realize at `xserver/composite/compwindow.c:267`.
+///
+/// Must be called AFTER `backend.map_subwindow`. The v2 backend's
+/// `map_subwindow` unconditionally sets `scene_participating = true`
+/// (it doesn't know about the parent's redirect record). Running
+/// activation AFTER lets `set_window_scene_participation(W, false)`
+/// (Manual mode) win over `map_subwindow`'s blind flip — the
+/// codex-round-6 ordering decision.
+///
+/// Gated on `backend.supports_redirect_activation()`; no-op on v1
+/// and the host-X11 test backends.
+fn maybe_activate_child_under_redirected_parent(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    child: ResourceId,
+) {
+    if !backend.supports_redirect_activation() {
+        return;
+    }
+    let Some(parent) = state.resources.window(child).map(|w| w.parent) else {
+        return;
+    };
+    // Already redirected? `activate_redirect_backing_for` is
+    // idempotent on this case (the v2 backend's
+    // `allocate_redirected_backing` returns the existing handle
+    // unchanged), but we skip up front to avoid the wasted call.
+    let already_redirected = state
+        .resources
+        .window(child)
+        .is_some_and(|w| w.redirected_backing.is_some());
+    if already_redirected {
+        return;
+    }
+    // Look up `(parent, subwindows = true)` in
+    // `composite_redirects`. The single-window `RedirectWindow(parent)`
+    // doesn't auto-redirect children; only `RedirectSubwindows` does.
+    let Some(record) = state.composite_redirects.get(&(parent, true)).copied() else {
+        return;
+    };
+    activate_redirect_backing_for(state, backend, origin, child, record.mode);
 }
 
 /// Resize-time bookkeeping for COMPOSITE-redirected windows. Per
@@ -2691,7 +2809,8 @@ fn handle_composite_request(
                     }
                 };
                 let key = (ResourceId(window), subwindows);
-                if let Some(existing) = state.composite_redirects.get(&key)
+                let prev = state.composite_redirects.get(&key).copied();
+                if let Some(existing) = prev
                     && existing.owner != client_id
                 {
                     return emit_x11_error_with_minor(
@@ -2718,29 +2837,31 @@ fn handle_composite_request(
                 // v2 returns `true` and the helper allocates + flips
                 // participation.
                 if backend.supports_redirect_activation() {
-                    if subwindows {
+                    // Stage 4b.8: same-owner mode-flip is preserved
+                    // across the flip per Xorg's compCheckRedirect
+                    // (`xserver/composite/compwindow.c:172` +
+                    // `compositeproto.txt:80`). Backing pixmap +
+                    // NameWindowPixmap aliases survive; only the
+                    // window's + backing's `scene_participating`
+                    // flags flip. No re-seed (B's content is
+                    // preserved as-is — re-running the seed-copy
+                    // would clobber the compositor's in-flight
+                    // paint per the plan's codex-round-6 decision).
+                    let mode_flip = matches!(prev, Some(p) if p.mode != mode);
+                    let targets: Vec<ResourceId> = if subwindows {
                         // Snapshot children to a Vec — the helper takes
                         // `&mut state`, so the borrow on `state.resources`
                         // from `children(..)` can't be held across calls.
-                        let kids: Vec<ResourceId> =
-                            state.resources.children(ResourceId(window)).to_vec();
-                        for child in kids {
-                            activate_redirect_backing_for(state, backend, origin, child, mode);
-                        }
-                        // TODO(4b.7): on later `MapWindow` of a child
-                        // under a subtree-redirected parent, the new
-                        // child needs activation too. Add a post-hook
-                        // in the MapWindow handler that checks
-                        // `composite_redirects` for `(parent, true)`
-                        // and calls `activate_redirect_backing_for`.
+                        state.resources.children(ResourceId(window)).to_vec()
                     } else {
-                        activate_redirect_backing_for(
-                            state,
-                            backend,
-                            origin,
-                            ResourceId(window),
-                            mode,
-                        );
+                        vec![ResourceId(window)]
+                    };
+                    for target in targets {
+                        if mode_flip {
+                            flip_redirect_target_mode(state, backend, origin, target, mode);
+                        } else {
+                            activate_redirect_backing_for(state, backend, origin, target, mode);
+                        }
                     }
                 }
             }
@@ -7970,6 +8091,17 @@ fn handle_map_window(
         .map(|w| (w.parent, w.override_redirect));
     if let Some(xid) = host_xid {
         let _ = backend.map_subwindow(origin, xid.as_raw());
+        // Stage 4b.7: if the window's parent has a
+        // `RedirectSubwindows(mode)` record, the newly-mapped child
+        // needs its own backing (per Composite spec: "redirected
+        // hierarchy pixels are available whenever it is viewable",
+        // and Xorg activates on realize at `compwindow.c:267`).
+        // AFTER `map_subwindow` per the plan's codex-round-6
+        // ordering fix — `map_subwindow` blindly flips
+        // `scene_participating = true`, so the Manual
+        // participation flip inside `activate_redirect_backing_for`
+        // (sets it back to false) must land last.
+        maybe_activate_child_under_redirected_parent(state, backend, origin, window);
     }
 
     let wants_focus = {
@@ -8041,6 +8173,10 @@ fn handle_map_subwindows(
             .is_some_and(|w| w.override_redirect);
         if let Some(xid) = host_xid {
             let _ = backend.map_subwindow(origin, xid.as_raw());
+            // Stage 4b.7: same post-hook as `handle_map_window`.
+            // Activation MUST run AFTER `map_subwindow` per the
+            // plan's round-6 ordering fix.
+            maybe_activate_child_under_redirected_parent(state, backend, origin, child);
         }
         let wants_focus = {
             let mask = state
