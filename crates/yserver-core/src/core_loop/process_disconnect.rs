@@ -197,8 +197,20 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         .filter(|(_, rec)| rec.owner == client_id)
         .map(|((win, sub), _)| (*win, *sub))
         .collect();
-    for (window, _subwindows) in &owned_redirects {
-        teardown_redirect_for_window(state, backend, *window);
+    // Stage 4b: symmetric to the COMPOSITE `UnredirectSubwindows`
+    // dispatch arm in `process_request.rs` — a subtree entry tears
+    // down each *child*, not the parent itself (the parent's own
+    // `redirected_backing` belongs to a separate `(parent, false)`
+    // entry, if any).
+    for (window, subwindows) in &owned_redirects {
+        if *subwindows {
+            let kids: Vec<ResourceId> = state.resources.children(*window).to_vec();
+            for child in kids {
+                teardown_redirect_for_window(state, backend, child);
+            }
+        } else {
+            teardown_redirect_for_window(state, backend, *window);
+        }
     }
     state
         .composite_redirects

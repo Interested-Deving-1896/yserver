@@ -491,17 +491,45 @@ fn resolve_host_subwindow_visual_to_state(
 /// `host_drawable_target` will simply fall back to the window's
 /// own host XID until a future event populates the backing.
 ///
-/// Currently uncalled — Composite redirect registration was decoupled
-/// from backing activation (see the REDIRECT_WINDOW handler comment)
-/// because no compositor sampling path exists yet. Kept for revival
-/// when the backing-as-source path lands.
-#[allow(dead_code)]
+/// Stage 4b: wired into the COMPOSITE `RedirectWindow` /
+/// `RedirectSubwindows` dispatch, gated on
+/// `Backend::supports_redirect_activation()`. v1 (`KmsBackend`)
+/// returns `false`, preserving the post-`3751c11` revert that
+/// fixed MATE; v2 (`KmsBackendV2`) overrides to `true` and the
+/// full allocate + participation-flip path runs.
+///
+/// `mode` drives the scene-participation flip after a successful
+/// allocate: Manual → window participating=false (the external
+/// compositor drives presentation), Automatic → window
+/// participating=true AND backing participating=true (paint
+/// resolves through the backing and the scene walk picks it up
+/// via W's `redirected_target` indirection in 4c).
 fn activate_redirect_backing_for(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     origin: Option<OriginContext>,
     window: ResourceId,
+    mode: crate::server::CompositeRedirectMode,
 ) {
+    // TODO(4b.8): same-owner mode-flip. If `redirected_backing` is
+    // already populated, the new record is a mode-flip on an
+    // existing redirect — should NOT reallocate (Xorg's
+    // compCheckRedirect at compositeproto.txt:80 preserves the
+    // backing across mode change). Today we early-return so the
+    // backing + alias refcount survive; the participation flip for
+    // the new mode is still missing until 4b.8 wires it.
+    if state
+        .resources
+        .window(window)
+        .is_some_and(|w| w.redirected_backing.is_some())
+    {
+        log::debug!(
+            "activate_redirect_backing_for(0x{:x}): backing already present; \
+             mode-flip (4b.8) not yet implemented — leaving record alone",
+            window.0
+        );
+        return;
+    }
     let snapshot = state
         .resources
         .window(window)
@@ -518,6 +546,28 @@ fn activate_redirect_backing_for(
                     height: w_height,
                     depth: w_depth,
                 });
+            }
+            // Scene-participation flip. Spec §285+360 names
+            // redirect-state change as a scene-structure damage
+            // source; the v2 impl of these setters fires that
+            // damage internally so the protocol handler just
+            // makes the calls.
+            let participating = matches!(mode, crate::server::CompositeRedirectMode::Automatic);
+            if let Err(err) =
+                backend.set_window_scene_participation(origin, host_window, participating)
+            {
+                log::warn!(
+                    "set_window_scene_participation(0x{:x}, {participating}) failed: {err}",
+                    window.0
+                );
+            }
+            if matches!(mode, crate::server::CompositeRedirectMode::Automatic)
+                && let Err(err) = backend.set_backing_scene_participation(origin, host_pixmap, true)
+            {
+                log::warn!(
+                    "set_backing_scene_participation(0x{:x}, true) failed: {err}",
+                    host_pixmap.as_raw()
+                );
             }
         }
         Err(err) => {
@@ -2661,12 +2711,38 @@ fn handle_composite_request(
                         owner: client_id,
                     },
                 );
-                // We deliberately do NOT call activate_redirect_backing_for.
-                // A previous fix (`92a2a83`, reverted at `3751c11`) tried
-                // it and broke MATE rendering — paint got diverted to a
-                // backing pixmap that no compositor was reading from. The
-                // backing-as-source path is unimplemented; until it lands,
-                // the redirect record alone is what consumers check.
+                // Stage 4b: backing activation + scene-participation
+                // flip, gated on `Backend::supports_redirect_activation()`.
+                // v1 returns `false` (keeping the post-`3751c11`
+                // MATE-fix shape: record only, no backing routing);
+                // v2 returns `true` and the helper allocates + flips
+                // participation.
+                if backend.supports_redirect_activation() {
+                    if subwindows {
+                        // Snapshot children to a Vec — the helper takes
+                        // `&mut state`, so the borrow on `state.resources`
+                        // from `children(..)` can't be held across calls.
+                        let kids: Vec<ResourceId> =
+                            state.resources.children(ResourceId(window)).to_vec();
+                        for child in kids {
+                            activate_redirect_backing_for(state, backend, origin, child, mode);
+                        }
+                        // TODO(4b.7): on later `MapWindow` of a child
+                        // under a subtree-redirected parent, the new
+                        // child needs activation too. Add a post-hook
+                        // in the MapWindow handler that checks
+                        // `composite_redirects` for `(parent, true)`
+                        // and calls `activate_redirect_backing_for`.
+                    } else {
+                        activate_redirect_backing_for(
+                            state,
+                            backend,
+                            origin,
+                            ResourceId(window),
+                            mode,
+                        );
+                    }
+                }
             }
         }
         x11composite::UNREDIRECT_WINDOW | x11composite::UNREDIRECT_SUBWINDOWS => {
@@ -2675,15 +2751,46 @@ fn handle_composite_request(
                 state
                     .composite_redirects
                     .remove(&(ResourceId(window), subwindows));
-                // L2 plan B.6c: release the backing's reason-1 hold
-                // for the single-window case. Subtree redirects walk
-                // their subtree in B.6b — same teardown helper.
-                if !subwindows {
+                // L2 plan B.6c + Stage 4b: release each affected
+                // backing's reason-1 hold. Single-window: just the
+                // named window. Subtree: walk children of the
+                // parent symmetric to the RedirectSubwindows arm
+                // above. Backing-side participation drop happens
+                // inside `release_redirected_backing` per the
+                // Stage-4 round-3 finding; the window-side
+                // participation restore happens below, gated on
+                // `supports_redirect_activation()`.
+                let targets: Vec<ResourceId> = if subwindows {
+                    state.resources.children(ResourceId(window)).to_vec()
+                } else {
+                    vec![ResourceId(window)]
+                };
+                for target in &targets {
                     crate::core_loop::process_disconnect::teardown_redirect_for_window(
-                        state,
-                        backend,
-                        ResourceId(window),
+                        state, backend, *target,
                     );
+                }
+                if backend.supports_redirect_activation() {
+                    // Restore window scene-participation to the
+                    // window's `mapped` state. Spec §285+360 —
+                    // redirect-state change as scene-structure
+                    // damage source; the v2 setter fires that
+                    // damage internally.
+                    for target in &targets {
+                        let snap = state
+                            .resources
+                            .window(*target)
+                            .map(|w| (w.host_xid, w.map_state != MapState::Unmapped));
+                        if let Some((Some(host), participating)) = snap
+                            && let Err(err) =
+                                backend.set_window_scene_participation(origin, host, participating)
+                        {
+                            log::warn!(
+                                "unredirect: set_window_scene_participation(0x{:x}, {participating}) failed: {err}",
+                                target.0
+                            );
+                        }
+                    }
                 }
             }
         }
