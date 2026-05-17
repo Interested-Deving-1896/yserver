@@ -1463,19 +1463,88 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
 
     No protocol-visible change yet — 4b lights up the protocol
     surface.
-  - [ ] **Stage 4b — real `allocate_redirected_backing` /
+  - [x] **Stage 4b — real `allocate_redirected_backing` /
     `release_redirected_backing` / `name_window_pixmap` +
-    protocol activation.** Replaces the Err-stubs at
-    `v2/backend.rs:2472-2513`; re-enables the
-    `process_request.rs` Composite-redirect activation path
-    gated on a new `Backend::supports_redirect_activation`
-    trait method so v1 stays on pre-Stage-4 behaviour.
-    Per-hierarchy seed-copy before `set_redirected_target`
-    flips routing; alias-registry-aware `free_pixmap`. New
-    `Backend::set_window_scene_participation` +
-    `set_backing_scene_participation` methods land here too
-    but only as Manual-mode no-ops on the W side; 4c wires
-    the full mode-aware participation.
+    protocol activation, landed 2026-05-17.**
+    - **4b.1** (`3873a8f`): `Backend::supports_redirect_activation`
+      capability gate (default `false`; v2 overrides to `true`);
+      `set_window_scene_participation` + `set_backing_scene_
+      participation` trait methods with default-`Ok(())`
+      no-ops (v2 impls are 4c scope — the trait surface is here
+      so 4b.6 can call them).
+    - **4b.2-4b.4** (same commit): v2 real bodies for
+      `name_window_pixmap` (`io::ErrorKind::NotFound` on the
+      unredirected path per v1), `release_redirected_backing`
+      (clears `host_window_to_backing` + `store.set_redirected_
+      target(None)` for every routed window + `alias_registry.
+      decref` → `free_pixmap` on refcount=0), real
+      `allocate_redirected_backing` (idempotent on same-W
+      re-call; seeds B from W via `engine.copy_area` BEFORE
+      `set_redirected_target` flips routing per the plan's
+      Cross-cutting §"Initial backing content"), alias-
+      registry-aware `free_pixmap` (decref-then-decref-store
+      gate so `FreePixmap(alias_xid)` doesn't drop the storage
+      while a Reason-1 redirect hold remains).
+    - **4b.5** (`ce64766`): descendant seed-copy. `seed_backing_
+      from_window` DFS-walks `windows_v2` for descendants of W
+      and `engine.copy_area`s each at its absolute position
+      relative to W. Per Xorg `composite/compalloc.c:556` and
+      the plan's Cross-cutting §"Per-hierarchy redirect".
+    - **4b.6** (`8abb03c`): wire `activate_redirect_backing_for`
+      into the COMPOSITE handlers in `process_request.rs`
+      (gated on `supports_redirect_activation()`).
+      `RedirectSubwindows(W, mode)` snapshots
+      `state.resources.children(W)` and activates each child;
+      `UnredirectSubwindows(W)` symmetric. Window-side
+      `set_window_scene_participation` flip drives Manual=false
+      / Automatic=true per the plan's `activate_one` helper;
+      backing-side flip fires only on Automatic. Disconnect
+      path mirrors the subtree-vs-single-window walk.
+    - **4b.7** (`79f44ba`): MapWindow / MapSubwindows post-hook
+      `maybe_activate_child_under_redirected_parent`. A child
+      mapped under a `RedirectSubwindows`-redirected parent
+      inherits the parent's mode; activation fires AFTER
+      `backend.map_subwindow` per the plan's codex-round-6
+      ordering fix so Manual `set_window_scene_participation
+      (W, false)` lands last over `map_subwindow`'s blind
+      `true` flip.
+    - **4b.8** (same commit): same-owner mode-flip handler
+      `flip_redirect_target_mode`. Diffs `prev.mode != new_mode`
+      in the dispatcher; routes mode-flip to a path that
+      preserves backing + aliases per Xorg's
+      `compCheckRedirect` (`compwindow.c:172`) and Composite
+      spec line 80, only firing the new mode's participation
+      pair. No re-seed per codex-round-6 explicit decision.
+
+    Tests landed: v2_allocate_redirected_backing_seeds_refcount_
+    and_map, _is_idempotent, _survives_named_alias,
+    v2_name_window_pixmap_returns_existing_backing,
+    _without_redirect_errors_not_found,
+    v2_release_redirected_backing_drops_storage_when_no_aliases,
+    _survives_named_alias, v2_redirect_seed_copies_window_
+    content, _copies_descendants. 262 yserver lib + 22 ignored
+    v2 Vk + 26 v2_acceptance + 297 yserver-core lib all green;
+    clippy clean.
+
+    **Tests deferred to 4b.9 / 4c batch**: yserver-core has no
+    Composite-handler test scaffolding today; the plan's
+    remaining Vk-backed tests (`v2_mode_flip_preserves_backing_
+    and_aliases`, `_map_window_after_redirect_subwindows_keeps_
+    manual_participation`, `_map_subwindows_redirects_each_
+    child`, `_name_window_pixmap_on_unviewable_returns_bad_match`,
+    `_existing_alias_survives_window_unmap`,
+    `_automatic_redirect_backing_is_scene_participating`)
+    need either (a) a `RecordingBackend`-driven
+    `handle_composite_request` test harness, or (b) v2's
+    real impls of `set_window_scene_participation` +
+    `set_backing_scene_participation` (4c scope). Both share
+    the same scaffolding, so the batch lands at 4c open.
+
+    No hardware smoke yet for Stage 4b in isolation — the
+    real-app gate (mate + marco-with-compositing rendering
+    correctly on bee + fuji) lands at 4c close, once
+    SceneCompositor mode-aware participation actually drives
+    the scene walk through the backing.
   - [ ] **Stage 4c — SceneCompositor I4 + Automatic-mode
     storage routing.** `build_scene` resolves each entry's
     source-storage through `redirected_target` so Automatic-W
