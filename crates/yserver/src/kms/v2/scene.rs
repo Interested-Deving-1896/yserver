@@ -2092,14 +2092,23 @@ mod tests {
         );
     }
 
-    /// Stage 4c.3 — when a window W has `redirected_target = Some(B)`,
-    /// the scene entry for W blits FROM B's storage (its `image_view`),
-    /// not from W's own storage. W's geometry (`dst_origin`, `dst_size`)
-    /// stays driven by `windows_v2[W]`. `sampled_ids` carries B_id (not
-    /// W_id) so damage/fence accounting follows the source the scene
-    /// actually read from.
+    /// Stage 4c.3 / 4c.5 — Automatic-mode invariant.
+    ///
+    /// When a window W has `redirected_target = Some(B)` AND
+    /// `scene_participating == true` (Automatic redirect), the scene
+    /// entry for W blits FROM B's storage (its `image_view`), not
+    /// from W's own storage. W's geometry (`dst_origin`, `dst_size`)
+    /// stays driven by `windows_v2[W]`. `sampled_ids` carries B_id
+    /// (not W_id) so damage/fence accounting follows the source the
+    /// scene actually read from. B is also marked
+    /// `scene_participating=true` per Stage 4c's Automatic-mode
+    /// pairing (the protocol handler issues
+    /// `set_backing_scene_participation(true)` alongside W's flip).
+    ///
+    /// 4c.5 rename: framed around the Automatic-mode invariant per
+    /// task 4c.5 self-review — the assertion shape already matches.
     #[test]
-    fn build_scene_uses_redirected_target_storage_when_set() {
+    fn build_scene_automatic_redirect_keeps_window_via_backing_storage() {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
@@ -2145,6 +2154,20 @@ mod tests {
             "fixture sanity: W and B must have distinct sentinel views"
         );
 
+        // Fixture sanity (4c.5 Automatic-mode invariant): W stays
+        // scene_participating=true under Automatic redirect; the
+        // backing also flips to scene_participating=true (the
+        // protocol-side pairing). `alloc_stub_window(mapped=true)`
+        // and the `allocate(..., true, _)` above wire both flags.
+        assert!(
+            store.get(w_id).unwrap().scene_participating,
+            "Automatic redirect: W must stay scene_participating=true",
+        );
+        assert!(
+            store.get(b_id).unwrap().scene_participating,
+            "Automatic redirect: B must be scene_participating=true",
+        );
+
         // Wire the redirect route: W's source-storage now resolves
         // through B.
         store.set_redirected_target(w_id, Some(b_id));
@@ -2183,6 +2206,109 @@ mod tests {
         assert_eq!(
             built.sampled_ids[0], b_id,
             "sampled_ids must carry source_id (B_id) for damage / fence keying"
+        );
+    }
+
+    /// Stage 4c.5 — Manual-mode invariant.
+    ///
+    /// `build_scene`'s `scene_participating` filter (scene.rs:1110 and
+    /// :922) drops any drawable with `scene_participating == false`
+    /// from the per-output draw list. Manual-redirected windows carry
+    /// `scene_participating=false` (the protocol handler issues
+    /// `set_window_scene_participation(W, false)` on Manual activation)
+    /// so they MUST NOT appear in `scene.draws` nor in
+    /// `built.sampled_ids`. Plain unredirected/Automatic windows
+    /// stay participating and continue to emit.
+    ///
+    /// Setup: two top-level windows W1 + W2, both mapped and same
+    /// geometry shape (so the filter is the only thing distinguishing
+    /// them). W1 stays `scene_participating=true`; W2 is flipped to
+    /// `false` post-allocation via `set_scene_participating` to
+    /// mimic the Manual-redirect activation path. The build must
+    /// emit one draw (W1) and zero entries for W2.
+    #[test]
+    fn build_scene_skips_manual_redirected_window() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        // W1 @ (10, 20), 50×40 — Automatic / unredirected
+        // (scene_participating=true via `alloc_stub_window`'s
+        // `mapped` arg, which the helper forwards as the
+        // `scene_participating` flag in `store.allocate`).
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x111,
+            10,
+            20,
+            50,
+            40,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x111);
+
+        // W2 @ (100, 200), 60×30 — geometry that doesn't overlap
+        // W1 so a stray draw entry would be unambiguous.
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x222,
+            100,
+            200,
+            60,
+            30,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x222);
+
+        // Flip W2 off the scene (Manual-redirect activation). Use
+        // the store's setter directly — the backend method does
+        // more bookkeeping (damage clear + scene-structure damage
+        // rect) than this no-Vk scene-walk test needs.
+        let w2_id = store.lookup(0x222).expect("w2 lookup");
+        store.set_scene_participating(w2_id, false);
+        let w1_id = store.lookup(0x111).expect("w1 lookup");
+        assert!(
+            store.get(w1_id).unwrap().scene_participating,
+            "fixture sanity: W1 stays scene_participating=true",
+        );
+        assert!(
+            !store.get(w2_id).unwrap().scene_participating,
+            "fixture sanity: W2 must be scene_participating=false",
+        );
+
+        let built = build_scene(&core, &mut store, &windows_v2, 0, &platform, None, None);
+        let scene = &built.scene;
+
+        // Only W1's draw entry must be present.
+        assert_eq!(
+            scene.draws.len(),
+            1,
+            "Manual-redirected W2 must be filtered from scene.draws (saw {} entries: {:?})",
+            scene.draws.len(),
+            scene.draws,
+        );
+        let w1_draw = &scene.draws[0];
+        assert_eq!(
+            w1_draw.dst_origin,
+            [10.0, 20.0],
+            "the surviving draw must be W1 (origin (10,20)), NOT W2 (origin (100,200))",
+        );
+        assert_eq!(
+            w1_draw.dst_size,
+            [50.0, 40.0],
+            "the surviving draw must be W1 (50×40), NOT W2 (60×30)",
+        );
+
+        // sampled_ids mirrors draws — must carry W1's id only.
+        assert_eq!(built.sampled_ids.len(), 1);
+        assert_eq!(
+            built.sampled_ids[0], w1_id,
+            "sampled_ids must reference W1; W2 was filtered before push",
         );
     }
 }

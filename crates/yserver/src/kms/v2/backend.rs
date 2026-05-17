@@ -319,6 +319,24 @@ impl KmsBackendV2 {
             .map(|h| h.as_raw())
     }
 
+    /// Stage 4c.5 — test-only probe for a drawable's presentation
+    /// damage. Returns `true` iff the drawable exists, has
+    /// `scene_participating=true` (the `peek_presentation_damage`
+    /// gate), AND has a non-empty damage region. Used by the
+    /// `v2_automatic_redirect_backing_is_scene_participating`
+    /// integration test to assert the Automatic-mode pairing
+    /// actually accumulates scene damage on the backing.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_peek_presentation_damage_nonempty(&self, xid: u32) -> bool {
+        let Some(id) = self.store.lookup(xid) else {
+            return false;
+        };
+        self.store
+            .peek_presentation_damage(id)
+            .is_some_and(|snap| !snap.region.is_empty())
+    }
+
     /// Stage 4a — test-only knob to install a COMPOSITE redirect
     /// route directly via the store, bypassing 4b's protocol
     /// surface (`allocate_redirected_backing` / `name_window_pixmap`
@@ -8100,6 +8118,119 @@ mod tests {
         assert_eq!(
             b.scene.scene_structure_dirty, dirty_before,
             "set_backing_scene_participation must NOT fire scene-structure damage",
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Stage 4c.5 — Manual-redirect lifecycle through the Backend
+    // surface (deferred from 4b.9 / Stage 4c plan §"Tests Vk-backed").
+    //
+    // These exercise the no-Vk pathway: `allocate_redirected_backing`
+    // skips the store-side wiring when no Vk is attached (the
+    // `create_pixmap` fallback doesn't seed a store entry for the
+    // backing — see backend.rs:3214 `create_pixmap_no_vk`), but the
+    // `alias_registry.insert` + `host_window_to_backing.insert` still
+    // fire. That's enough for the participation-flip assertions to
+    // observe `scene_structure_dirty`.
+    //
+    // The per-output rect dispatch goes through scene.rs:412's
+    // stub-mode guard — `dispatch_clip_rects_lands_per_output_clipped`
+    // covers that branch directly.
+    // ────────────────────────────────────────────────────────────────
+
+    /// Simulate `RedirectWindow(W, Manual)`: allocate the backing,
+    /// then flip W to `scene_participating=false`. The participation
+    /// flip MUST fire scene-structure damage so the next composite
+    /// repaints the region W used to occupy (under Manual mode the
+    /// scene drops W; whatever's underneath must redraw).
+    #[test]
+    fn manual_redirect_path_marks_scene_structure_damage() {
+        use yserver_core::backend::WindowHandle;
+        let mut b = KmsBackendV2::for_tests();
+        let _w_id = seed_window(&mut b, 0x100, None, 30, 40);
+        let w = WindowHandle::from_raw(0x100).expect("WindowHandle");
+
+        // Step 1: allocate the backing. On no-Vk the store-side
+        // wiring is skipped (logged as a warn) but the alias-registry
+        // + host_window_to_backing entries install. That's enough
+        // for the protocol-side state machine; scene-structure
+        // damage comes from the next call.
+        let _backing = b
+            .allocate_redirected_backing(None, w, 100, 100, 32)
+            .expect("allocate_redirected_backing");
+
+        // Clear the dirty bit so the post-flip assertion proves
+        // the participation call set it, not the allocation above.
+        b.scene.scene_structure_dirty = false;
+
+        // Step 2: flip W to non-participating (Manual activation).
+        b.set_window_scene_participation(None, w, false)
+            .expect("set_window_scene_participation(false)");
+
+        assert!(
+            b.scene.scene_structure_dirty,
+            "Manual-redirect participation flip (W→false) must fire \
+             scene-structure damage so the region W used to occupy \
+             gets repainted by whatever's underneath",
+        );
+    }
+
+    /// Full Manual-redirect lifecycle: activate (Manual), then
+    /// un-redirect. Both transitions must fire scene-structure
+    /// damage. Clear the dirty bit between the two flips so the
+    /// final assertion proves the SECOND call set it independently.
+    #[test]
+    fn unredirect_restores_participation_and_marks_damage() {
+        use yserver_core::backend::WindowHandle;
+        let mut b = KmsBackendV2::for_tests();
+        let _w_id = seed_window(&mut b, 0x100, None, 30, 40);
+        let w = WindowHandle::from_raw(0x100).expect("WindowHandle");
+
+        // Manual activation: allocate + flip W off-scene.
+        let backing = b
+            .allocate_redirected_backing(None, w, 100, 100, 32)
+            .expect("allocate_redirected_backing");
+        b.set_window_scene_participation(None, w, false)
+            .expect("set_window_scene_participation(false)");
+        assert!(
+            b.scene.scene_structure_dirty,
+            "fixture sanity: Manual activation already fires scene-structure damage \
+             (covered by manual_redirect_path_marks_scene_structure_damage)",
+        );
+
+        // Clear so the post-un-redirect assertion is sharp.
+        b.scene.scene_structure_dirty = false;
+
+        // Un-redirect: drop the backing hold and flip W back on-scene.
+        b.release_redirected_backing(None, backing)
+            .expect("release_redirected_backing");
+        // `release_redirected_backing` doesn't touch W's scene flag;
+        // un-redirect-to-mapped is the W-side caller's responsibility.
+        b.set_window_scene_participation(None, w, true)
+            .expect("set_window_scene_participation(true)");
+
+        assert!(
+            b.scene.scene_structure_dirty,
+            "Un-redirect participation flip (W→true) must ALSO fire \
+             scene-structure damage so W's region gets composited \
+             back into the scene from W's own storage",
+        );
+
+        // Sanity: W is back to participating; the backing's
+        // alias-registry entry is gone (release dropped Reason-1
+        // and there were no aliases).
+        let w_id = b.store.lookup(0x100).expect("w still in store");
+        assert!(
+            b.store.get(w_id).unwrap().scene_participating,
+            "W must end in scene_participating=true after un-redirect",
+        );
+        assert!(
+            b.test_alias_registry_get(backing.as_raw()).is_none(),
+            "backing alias-registry entry must be cleared after release_redirected_backing",
+        );
+        assert!(
+            b.test_host_window_to_backing(0x100).is_none(),
+            "host_window_to_backing must be cleared after release",
         );
     }
 }

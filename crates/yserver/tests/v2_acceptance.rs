@@ -1930,3 +1930,245 @@ fn v2_release_redirected_backing_survives_named_alias() {
         "alias FreePixmap drops the last hold",
     );
 }
+
+// ───── Stage 4c.5 — Vk-backed participation + mode-flip oracles ────
+//
+// Test #5 (`v2_redirected_paint_lands_in_backing`) from the task spec
+// is already covered by `v2_set_redirected_target_routes_fill_to_backing`
+// above — that test pre-fills B blue, installs the redirect, paints
+// green through W's xid, and asserts B reads green. Skipped here to
+// keep the suite mean (single-purpose oracles).
+
+/// Stage 4c.5 — Automatic-mode redirect: paint through W's xid lands
+/// in B (per 4a's `resolve_paint_target`) AND accumulates presentation
+/// damage on B (since B's `scene_participating=true`). The scene
+/// walk's `peek_presentation_damage` (scene.rs:1148 via 4c.3's
+/// `source_id` indirection) is what picks up that damage; the
+/// participation flag on B is the gate (`peek` returns None when
+/// `!scene_participating`).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_automatic_redirect_backing_is_scene_participating() {
+    use yserver_core::backend::{PixmapHandle, WindowHandle};
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Use a depth-32 pixmap as W (the redirect surface). `for_tests`
+    // doesn't drive a real CreateWindow flow; v2's
+    // `allocate_redirected_backing` accepts any drawable xid in the
+    // store (the `name_window_pixmap_returns_existing_backing` test
+    // above uses the same shape).
+    let w_xid = b.create_pixmap(None, 32, 8, 8).expect("W").as_raw();
+    let w = WindowHandle::from_raw(w_xid).expect("WindowHandle");
+    let backing = b
+        .allocate_redirected_backing(None, w, 8, 8, 32)
+        .expect("allocate backing");
+    let bxid = backing.as_raw();
+    let bk_handle = PixmapHandle::from_raw(bxid).expect("PixmapHandle");
+
+    // Automatic-mode protocol pairing: W AND B both flip to
+    // scene_participating=true.
+    b.set_window_scene_participation(None, w, true)
+        .expect("set_window_scene_participation(true)");
+    b.set_backing_scene_participation(None, bk_handle, true)
+        .expect("set_backing_scene_participation(true)");
+
+    // Per-store assertion: B's scene_participating flipped on.
+    // Reach into the doc-hidden test helpers via the public store
+    // surface — `get_by_xid` is `pub(crate)`, so use the
+    // presentation-damage probe below as the contract check.
+    // First confirm the flag flipped by checking that
+    // peek_presentation_damage doesn't `None` out (it would on
+    // !scene_participating, even after we paint).
+
+    // Paint green via W's xid. Per 4a's `resolve_paint_target` this
+    // lands in B; per 3f's damage accounting that fires
+    // `store.damage` on B's drawable, which (with B
+    // scene_participating=true) accumulates as presentation damage.
+    b.fill_rectangle(None, w_xid, 0xFF00FF00, 1, 2, 3, 4)
+        .expect("redirected fill via W");
+
+    // GetImage on B confirms the paint landed there (sanity — the
+    // damage assertion below relies on the paint actually hitting).
+    let img = b
+        .get_image(None, bxid, 2, 0, 0, 8, 8, !0)
+        .expect("get_image B")
+        .expect("Some B bytes");
+    let pixel = |x: usize, y: usize| -> [u8; 4] {
+        let off = (y * 8 + x) * 4;
+        [img[off], img[off + 1], img[off + 2], img[off + 3]]
+    };
+    assert_eq!(
+        pixel(1, 2),
+        [0x00, 0xFF, 0x00, 0xFF],
+        "B at (1,2) — top-left of the redirected fill — must be green",
+    );
+
+    // The key oracle: presentation damage accumulated on B (because
+    // B is scene_participating=true). A pre-4c backing with the
+    // default scene_participating=false would have produced a
+    // damage record that `peek_presentation_damage` returns as None
+    // (see store.rs:670 — the gate is the `scene_participating`
+    // flag). `test_peek_presentation_damage_nonempty` rolls both
+    // checks into one bool to keep this oracle terse.
+    assert!(
+        b.test_peek_presentation_damage_nonempty(bxid),
+        "B must have peekable, non-empty presentation damage from the redirected fill \
+         (false ⇒ either scene_participating=false or region empty at paint time)",
+    );
+}
+
+/// Stage 4c.5 — mode-flip preserves the backing and any
+/// `NameWindowPixmap` aliases. Per Stage 4 plan §"Cross-cutting:
+/// Mode-flip semantics", `RedirectWindow(W, Mode)` issued a second
+/// time on an already-redirected W must reuse the existing backing
+/// (no destroy + recreate) so client aliases stay valid and content
+/// is preserved. This test exercises the at-this-layer simulation:
+///
+/// - alloc backing for W
+/// - name_window_pixmap(W) → alias bumps refcount to 2
+/// - paint a sentinel into B
+/// - simulate a Manual→Automatic mode flip by toggling participation
+///   (Automatic-mode protocol pairing)
+/// - assert: backing's xid unchanged, alias refcount unchanged, B's
+///   sentinel content preserved
+///
+/// Note (per task spec): the protocol-handler `flip_redirect_target_mode`
+/// path in `yserver-core/src/core_loop/process_request.rs` isn't
+/// drivable from `tests/v2_acceptance.rs` without protocol scaffolding
+/// (see TODO comments below). The participation-toggle dance covers
+/// the same backend-trait invariants the protocol handler exercises.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_mode_flip_preserves_backing_and_aliases() {
+    use yserver_core::backend::{PixmapHandle, WindowHandle};
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let w_xid = b.create_pixmap(None, 32, 8, 8).expect("W").as_raw();
+    let w = WindowHandle::from_raw(w_xid).expect("WindowHandle");
+
+    // Initial Manual-mode setup: allocate backing, flip W off-scene.
+    let backing = b
+        .allocate_redirected_backing(None, w, 8, 8, 32)
+        .expect("allocate backing");
+    let bxid_pre_flip = backing.as_raw();
+    b.set_window_scene_participation(None, w, false)
+        .expect("Manual activation (W→false)");
+
+    // Create a NameWindowPixmap alias — refcount goes 1 → 2.
+    let alias = b.name_window_pixmap(None, w).expect("name_window_pixmap");
+    assert_eq!(
+        alias.as_raw(),
+        bxid_pre_flip,
+        "alias xid must equal the backing xid (Reason-2 incref on the same handle)",
+    );
+    let entry_before = b
+        .test_alias_registry_get(bxid_pre_flip)
+        .expect("alias_registry entry present");
+    assert_eq!(
+        entry_before.refcount, 2,
+        "post-alias refcount = Reason-1 (1) + Reason-2 (1) = 2",
+    );
+
+    // Paint a sentinel into B before the flip — magenta at (0,0).
+    b.fill_rectangle(None, bxid_pre_flip, 0xFFFF00FF, 0, 0, 8, 8)
+        .expect("sentinel paint into B");
+    let img_pre = b
+        .get_image(None, bxid_pre_flip, 2, 0, 0, 8, 8, !0)
+        .expect("get_image pre-flip")
+        .expect("Some bytes pre-flip");
+    let pre_pixel: [u8; 4] = [img_pre[0], img_pre[1], img_pre[2], img_pre[3]];
+    assert_eq!(
+        pre_pixel,
+        [0xFF, 0x00, 0xFF, 0xFF],
+        "fixture sanity: B's (0,0) must read the sentinel magenta pre-flip",
+    );
+
+    // Mode flip: Manual → Automatic. The protocol handler's
+    // `flip_redirect_target_mode` ultimately calls
+    // `set_window_scene_participation(W, true)` +
+    // `set_backing_scene_participation(B, true)`.
+    let bk_handle = PixmapHandle::from_raw(bxid_pre_flip).expect("PixmapHandle");
+    b.set_window_scene_participation(None, w, true)
+        .expect("Automatic activation (W→true)");
+    b.set_backing_scene_participation(None, bk_handle, true)
+        .expect("Automatic activation (B→true)");
+
+    // Backing xid unchanged.
+    let bxid_post = b
+        .test_host_window_to_backing(w_xid)
+        .expect("host_window_to_backing still maps W → B");
+    assert_eq!(
+        bxid_post, bxid_pre_flip,
+        "mode flip must NOT recreate the backing (xid must be stable)",
+    );
+
+    // Alias refcount unchanged (still Reason-1 + Reason-2).
+    let entry_after = b
+        .test_alias_registry_get(bxid_pre_flip)
+        .expect("alias_registry entry still present post-flip");
+    assert_eq!(
+        entry_after.refcount, entry_before.refcount,
+        "alias refcount must be preserved across mode flip \
+         (pre={}, post={})",
+        entry_before.refcount, entry_after.refcount,
+    );
+
+    // Content preserved — B's (0,0) still magenta.
+    let img_post = b
+        .get_image(None, bxid_pre_flip, 2, 0, 0, 8, 8, !0)
+        .expect("get_image post-flip")
+        .expect("Some bytes post-flip");
+    let post_pixel: [u8; 4] = [img_post[0], img_post[1], img_post[2], img_post[3]];
+    assert_eq!(
+        post_pixel, pre_pixel,
+        "B's content must be preserved across mode flip \
+         (pre={pre_pixel:?}, post={post_pixel:?})",
+    );
+}
+
+// ───── Stage 4c.5 — deferred protocol-level tests ───────────────────
+//
+// The Stage 4b.9 / 4c plan also lists these protocol-level invariants
+// that require driving the X11 wire bytes through
+// `yserver-core::core_loop::process_request::handle_composite_request`.
+// yserver-core has no test scaffolding for that path today, and
+// building it is its own substage's worth of work. The hardware-smoke
+// gate at 4c.6 is the actual coverage for these invariants until the
+// scaffolding lands.
+//
+// TODO(4c.7 or post-4c): needs `handle_composite_request` test scaffolding
+// - v2_map_window_after_redirect_subwindows_keeps_manual_participation
+//     RedirectSubwindows(parent, Manual) → MapWindow(child) — child's
+//     participation must stay Manual (off-scene); the post-map hook
+//     must not flip it back on.
+//
+// TODO(4c.7 or post-4c): needs `handle_composite_request` test scaffolding
+// - v2_map_subwindows_redirects_each_child
+//     RedirectSubwindows(parent, Manual) → MapSubwindows(parent) —
+//     every child gets its own `allocate_redirected_backing` call
+//     via the per-child redirect hook.
+//
+// TODO(4c.7 or post-4c): needs `handle_composite_request` test scaffolding
+// - v2_name_window_pixmap_on_unviewable_returns_bad_match
+//     NameWindowPixmap(W) on an unmapped (unviewable) window must
+//     return `BadMatch` per the X11 COMPOSITE spec, not silently
+//     succeed with an alias to whatever backing exists.
+//
+// TODO(4c.7 or post-4c): needs `handle_composite_request` test scaffolding
+// - v2_existing_alias_survives_window_unmap
+//     A held NameWindowPixmap alias must keep the backing alive past
+//     a subsequent UnmapWindow(W) (no race that drops the storage
+//     when the redirect map clears).
