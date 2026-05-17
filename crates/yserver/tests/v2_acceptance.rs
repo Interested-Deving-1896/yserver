@@ -2191,17 +2191,6 @@ fn v2_mode_flip_preserves_backing_and_aliases() {
 /// `put_image` against the COW xid — confirms (a) the xid resolves,
 /// (b) the storage is `scene_participating`, and (c) the paint
 /// accumulated presentation damage that a scene tick would consume.
-///
-/// Stage 4d.8d note: this test asserts the **storage-level**
-/// contract — paint lands on COW storage and round-trips via
-/// GetImage, damage accumulates. That contract is unchanged by
-/// 4d.8d. What 4d.8d does change is **scanout visibility**: under
-/// the pragmatic compositor floor, `build_scene` skips the COW
-/// draw entirely (see `COW_VISIBLE_IN_SCENE` in `scene.rs`), so
-/// the painted bytes here would NOT appear on the actual scanout.
-/// The PresentPixmap-to-COW-via-CopyArea path stays live (storage
-/// receives paint), which is exactly what this test exercises —
-/// hence the test still passes under 4d.8d.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_cow_paint_appears_on_scanout() {

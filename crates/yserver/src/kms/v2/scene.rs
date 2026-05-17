@@ -1045,31 +1045,7 @@ fn build_scene(
     // force-opaque. Skip the entry cleanly when the storage
     // isn't ready (null image_view from a stub fixture, or COW
     // was unregistered between tick frames).
-    //
-    // Stage 4d.8d — COW draw skipped in the scene compose.
-    //
-    // Compositing WMs (marco, xfwm4 with compositing) PresentPixmap
-    // their offscreen pixmap full-screen onto COW. That offscreen is
-    // authored under xRGB intent — alpha bytes are "X padding", not
-    // real alpha — but v2 has no PictFormat tracking and copies the
-    // alpha bytes byte-for-byte. Drawing COW with alpha_passthrough=
-    // true (the spec-correct alpha-aware compose) then produces a
-    // COW layer with alpha=1 everywhere, which covers every window
-    // the scene drew underneath. v2's pragmatic floor (4d.8b/c)
-    // keeps redirected windows in the scene + tracks paint damage
-    // on backings, so apps render correctly from their backings.
-    // Marco's compositor effects (shadows, decoration paints) become
-    // invisible — matches v1's effective compositor floor where
-    // COW PresentPixmap was a no-op altogether.
-    //
-    // Re-enable when PictFormat-aware sampling lands (Stage 4e or a
-    // future spec-compliant compositor substrate). The COW storage,
-    // scene registration, and PresentPixmap-to-COW-via-CopyArea path
-    // all stay live so re-enabling is a one-line flip here.
-    const COW_VISIBLE_IN_SCENE: bool = false;
-
-    if COW_VISIBLE_IN_SCENE
-        && let Some(cow_id) = cow
+    if let Some(cow_id) = cow
         && let Some(drawable) = store.get(cow_id)
         && drawable.scene_participating
         && drawable.storage.image_view != vk::ImageView::null()
@@ -2600,22 +2576,13 @@ mod tests {
         );
     }
 
-    /// Stage 4d.8d — `build_scene` must NOT emit a draw for the
-    /// Composite Overlay Window. v2 has no PictFormat tracking, so
-    /// alpha bytes in compositor-authored COW content (xRGB intent,
-    /// alpha-byte = padding) propagate to the scene compose and
-    /// cover everything beneath. The pragmatic floor: COW storage
-    /// still exists, paint still lands on it (PresentPixmap-to-COW
-    /// path stays live), but the scene compose skips the COW layer
-    /// — apps render correctly from their own backings (4d.8b/c),
-    /// at the cost of marco/xfwm4 compositor effects being invisible
-    /// (matches v1's effective floor). Re-enable via the
-    /// `COW_VISIBLE_IN_SCENE` const in `build_scene` once
-    /// PictFormat-aware sampling lands.
-    ///
-    /// Synthetic topology: two top-levels + a registered COW; the
-    /// COW must NOT appear in `scene.draws`. The COW's id must NOT
-    /// appear in `sampled_ids` either.
+    /// Stage 4d — `build_scene` appends the Composite Overlay
+    /// Window draw entry ABOVE all top-levels but BELOW the
+    /// cursor (Stage 4 plan §4d scene layering items 3 + 4).
+    /// Synthetic topology: two top-levels + a registered COW;
+    /// the COW entry MUST be the last non-cursor draw in
+    /// `scene.draws`. `alpha_passthrough=true` so the
+    /// compositor's premul-alpha output blends correctly.
     #[test]
     fn build_scene_appends_cow_above_top_levels() {
         let mut core = KmsCore::for_tests();
@@ -2674,43 +2641,63 @@ mod tests {
         );
         let scene = &built.scene;
 
-        // Stage 4d.8d: COW is registered but the scene compose must
-        // skip it. Expect: top-level 0x100, top-level 0x101 — two
-        // entries total (no cursor, no COW).
+        // Expect: top-level 0x100, top-level 0x101, COW. Three
+        // entries total (no cursor in this fixture).
         assert_eq!(
             scene.draws.len(),
-            2,
-            "Stage 4d.8d: expected 2 top-levels (no COW draw), got {} draws: {:?}",
+            3,
+            "expected 2 top-levels + COW, got {} draws: {:?}",
             scene.draws.len(),
             scene.draws,
         );
 
-        // Neither top-level should be screen-sized (which would
-        // indicate the COW slipped in). The stub windows are 100×80
-        // and 120×90 respectively.
-        for (i, d) in scene.draws.iter().enumerate() {
-            assert_ne!(
-                d.dst_size,
-                [800.0, 600.0],
-                "Stage 4d.8d: draw[{i}] must be a top-level, not a screen-extent COW",
-            );
-        }
-
-        // sampled_ids must NOT contain cow_id under 4d.8d.
+        // COW must be the LAST entry (top of z, since cursor is
+        // None). dst_size matches the COW storage extent
+        // (800×600). alpha_passthrough must be true.
+        let cow_draw = scene.draws.last().expect("COW draw present");
+        assert_eq!(
+            cow_draw.dst_size,
+            [800.0, 600.0],
+            "COW draw must carry the screen-extent storage size",
+        );
         assert!(
-            !built.sampled_ids.contains(&cow_id),
-            "Stage 4d.8d: sampled_ids must not reference COW id \
-             (COW is skipped in the scene compose); got {:?}",
-            built.sampled_ids,
+            cow_draw.alpha_passthrough,
+            "COW must blend (compositors paint premul-alpha output)",
+        );
+        // Output layout origin is (0, 0) in the test fixture, so
+        // dst_origin is (0, 0).
+        assert_eq!(
+            cow_draw.dst_origin,
+            [0.0, 0.0],
+            "COW dst_origin must be (0, 0) absolute after output projection",
+        );
+
+        // Both top-levels must come BEFORE the COW entry. Confirm
+        // by checking the first two draws are window-sized, NOT
+        // screen-sized.
+        assert_ne!(
+            scene.draws[0].dst_size,
+            [800.0, 600.0],
+            "first draw must be a top-level, not the COW",
+        );
+        assert_ne!(
+            scene.draws[1].dst_size,
+            [800.0, 600.0],
+            "second draw must be a top-level, not the COW",
+        );
+
+        // sampled_ids must carry cow_id last.
+        assert_eq!(
+            *built.sampled_ids.last().expect("sampled_ids non-empty"),
+            cow_id,
+            "sampled_ids must reference COW id at the top of z",
         );
     }
 
-    /// Stage 4d.8d — when a cursor IS registered alongside the COW,
-    /// the COW is still skipped in the scene compose. The cursor
-    /// remains the top-of-z draw; the top-level is the only other
-    /// draw. The COW's id must NOT appear in `sampled_ids`. See the
-    /// `build_scene_appends_cow_above_top_levels` docstring above
-    /// for the why.
+    /// Stage 4d — when a cursor IS registered alongside the COW,
+    /// the COW must appear BELOW the cursor (Stage 4 plan §4d
+    /// layering item 4: COW is below cursor). Layering oracle:
+    /// the cursor draw is last; the COW draw is second-to-last.
     #[test]
     fn build_scene_cow_is_below_cursor() {
         let mut core = KmsCore::for_tests();
@@ -2772,33 +2759,25 @@ mod tests {
         );
         let scene = &built.scene;
 
-        // Stage 4d.8d: COW skipped in compose. Expect: top-level,
-        // cursor — 2 draws, in that order (no COW between them).
+        // Expect: top-level, COW, cursor — 3 draws, in that order.
         assert_eq!(
             scene.draws.len(),
-            2,
-            "Stage 4d.8d: expected top-level + cursor = 2 draws (no COW), got {}: {:?}",
+            3,
+            "expected top-level + COW + cursor = 3 draws, got {}: {:?}",
             scene.draws.len(),
             scene.draws,
         );
-        // Last draw = cursor (16×16) — still top-of-z.
+        // Last draw = cursor (16×16).
         assert_eq!(
             scene.draws.last().expect("cursor").dst_size,
             [16.0, 16.0],
             "cursor must be the top-of-z draw",
         );
-        // First draw = top-level (400×300), NOT screen-extent COW.
+        // Second-to-last = COW (800×600).
         assert_eq!(
-            scene.draws[0].dst_size,
-            [400.0, 300.0],
-            "Stage 4d.8d: first draw must be the top-level (not a screen-extent COW)",
-        );
-        // COW id must NOT appear in sampled_ids under 4d.8d.
-        assert!(
-            !built.sampled_ids.contains(&cow_id),
-            "Stage 4d.8d: sampled_ids must not reference COW id \
-             (COW is skipped in the scene compose); got {:?}",
-            built.sampled_ids,
+            scene.draws[scene.draws.len() - 2].dst_size,
+            [800.0, 600.0],
+            "COW must be directly below cursor",
         );
     }
 }
