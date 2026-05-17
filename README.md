@@ -31,10 +31,11 @@ Window Maker work; fvwm3 boots but its core-font menu rendering has
 a known gap (see [`docs/known-issues.md`](docs/known-issues.md)).
 
 See [`docs/test-status.md`](docs/test-status.md) for the latest xts5
-+ rendercheck pass numbers, [`docs/status.md`](docs/status.md) for
-per-phase progress, [`docs/known-issues.md`](docs/known-issues.md)
-for current gaps, and [`docs/xts-baseline.md`](docs/xts-baseline.md)
-for the run-by-run xts working log.
+
+- rendercheck pass numbers, [`docs/status.md`](docs/status.md) for
+  per-phase progress, [`docs/known-issues.md`](docs/known-issues.md)
+  for current gaps, and [`docs/xts-baseline.md`](docs/xts-baseline.md)
+  for the run-by-run xts working log.
 
 ## Layout
 
@@ -145,12 +146,20 @@ vng prerequisites on the host:
   for other distros).
 - `qemu-desktop` or `qemu-full` (the minimal `qemu-base` lacks
   virtio-gpu and display backends — symptom: `'virtio-gpu-pci' is
-  not a valid device model name`).
+not a valid device model name`).
 - `--disable-microvm` is on by default in the recipes — vng's
   default microvm machine has no PCI bus and therefore no DRM
   device.
 
 ## Development
+
+### Dependencies
+
+#### Ubuntu
+
+```sh
+sudo apt install libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libfontconfig-dev
+```
 
 Before committing:
 
@@ -172,10 +181,11 @@ just xts-ynest scenario=Xlib3
 
 The recipe boots release `ynest` on `:99`, runs the chosen scenario
 via [`tools/xts-run.sh`](tools/xts-run.sh) (which wraps `xts/check.sh`
-+ `xts-report`), and tears down `ynest` on exit. Results land in
-`/home/jos/Projects/xts/results/<timestamp>/summary` — a
-`CASES TESTS PASS UNSUP UNTST NOTIU WARN FIP FAIL UNRES UNIN ABORT`
-table per scenario. Latest pass numbers per scenario live in
-[`docs/test-status.md`](docs/test-status.md);
-[`docs/xts-baseline.md`](docs/xts-baseline.md) is the run-by-run
-working log with debugging notes and dominant failure-mode buckets.
+
+- `xts-report`), and tears down `ynest` on exit. Results land in
+  `/home/jos/Projects/xts/results/<timestamp>/summary` — a
+  `CASES TESTS PASS UNSUP UNTST NOTIU WARN FIP FAIL UNRES UNIN ABORT`
+  table per scenario. Latest pass numbers per scenario live in
+  [`docs/test-status.md`](docs/test-status.md);
+  [`docs/xts-baseline.md`](docs/xts-baseline.md) is the run-by-run
+  working log with debugging notes and dominant failure-mode buckets.
