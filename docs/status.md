@@ -1888,10 +1888,135 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     Render::Composite correctness). Probably a separate
     Stage 4e or its own follow-on after 4d closes pragmatically.
 
-    ### Known follow-ups (post-4d-close-pragmatic)
+    ### Stage 4d.8 pragmatic-floor attempt — TRIED AND REVERTED 2026-05-17
 
-    - Stage 4d.8 — Manual-mode keeps scene_participating=true
-      (implementation pending).
+    Implemented as five sub-commits (b5d6287, 60db57c, 2283a11,
+    d2003d3) over a single evening. **Reverted (`8f0274c`,
+    `8065a6f`, `d46db4e`, `9ab8973`) after hardware-smoke showed
+    the cumulative effect made BOTH comp and non-comp WORSE than
+    the pre-4d.8 baseline.**
+
+    - **4d.8a**: `default_window_init_color(32) = (0,0,0,1)`
+      (opaque-black instead of transparent).
+    - **4d.8b**: `set_window_scene_participation(false)` (Manual
+      mode) became a no-op — Manual-redirected windows stayed
+      in the scene walk, sampling from B via 4c.3's
+      `redirected_target` indirection.
+    - **4d.8c**: `activate_redirect_backing_for` set the backing
+      `scene_participating=true` in BOTH modes (not just
+      Automatic) so paint damage on B got tracked.
+    - **4d.8d**: skipped the COW draw in `build_scene` because
+      marco/xfwm4 PresentPixmap full-screen onto COW with
+      alpha=1 everywhere → COW covered all scene-drawn windows.
+    - **4d.8e**: `emit_window_subtree` skipped descendant
+      recursion under a redirected ancestor (rationale:
+      ancestor's B has the subtree via cascade paint per X11
+      Composite spec).
+
+    Symptom progression after each landing:
+    - After 4d.8b: trace confirmed Manual windows stayed in
+      scene with source_id != store_id (route indirection
+      working), but visually the comp-mode result was identical
+      to before — marco's COW still covered everything opaquely
+      because xRGB-intent alpha bytes from marco's offscreen
+      propagated to COW (no PictFormat tracking).
+    - After 4d.8c: damage on B was tracked. Cursor movement
+      revealed window content (proving damage→repaint chain
+      worked), but flicker + "windows disappearing on
+      hover-over-menu" + "layer switching when calendar opens"
+      indicated COW was unconditionally covering scene draws.
+    - After 4d.8d: COW draw skipped. Full panel + some of
+      Control Center visible. But CC's main content area was
+      transparent — wallpaper-through. Hypothesis (4d.8e):
+      double-emit of redirected parent + child where child's
+      empty own-storage covered parent's cascade-painted B.
+    - After 4d.8e: static scanout looked good (Caja file
+      manager rendered fully with sidebar + toolbar + items).
+      Dynamic correctness BROKEN: windows + bits appearing /
+      disappearing during use, "slow as molasses", flicker.
+      Both comp and non-comp affected.
+
+    **Honest retrospective.** The 4d.8 stack chased visual
+    symptoms with progressively desperate, non-evidence-based
+    fixes. Each one moved a static-frame visible state forward
+    but introduced second-order issues in damage/repaint timing.
+    By 4d.8e the dynamic experience was worse than v1's
+    "ignore the compositor" floor on both comp AND non-comp
+    paths. Reverted to restore the d8bcd92 checkpoint state
+    (post-4d.7 alpha_passthrough flip, pre-4d.8 pragmatic
+    floor). Even at that revert point, non-comp dynamic
+    correctness is reported as "bits appear/disappear, slow"
+    — suggesting the underlying damage/repaint/perf issue
+    predates 4d.8 entirely and was masked when only static
+    smoke was being inspected.
+
+    **What 4d.8 taught us (negative results worth recording)**:
+    - Keeping Manual-redirected windows in the scene without
+      proper PictFormat tracking interacts badly with COW.
+    - COW pixel-as-ARGB without xRGB intent makes
+      compositor-paint-to-COW unconditionally cover the scene.
+    - Damage tracking on backings WORKS (4d.8c verified) but
+      doesn't fix the visual end-to-end without correct alpha
+      semantics.
+    - Skipping descendant emission of redirected windows is
+      structurally correct per X11 Composite spec, but the
+      cascade-via-parent's-B model requires that the scene's
+      single draw of the parent's B reflects all paint to that
+      subtree — which depends on every paint correctly resolving
+      to B via `resolve_paint_target`. Any escape path
+      (e.g., a non-redirected child with its own paint that
+      should also show) needs separate handling.
+
+    **What this means for Stage 4d close**:
+
+    Stage 4d is **NOT closeable as pragmatic floor**. The 4d.8
+    attempt failed; reverting got us back to a static-rendering
+    baseline but dynamic correctness is broken across the
+    board (even non-comp). The next investigation needs to be
+    rigorous, instrumented, evidence-based — not the symptom-
+    chase pattern that produced the 4d.8 stack. The systematic-
+    debugging skill applies: dump backing storage on SIGUSR1,
+    log every paint route resolution, count repaint frequency
+    + damage region totals, profile compose-CB record/submit
+    overhead. Without that data the next fixes will repeat the
+    desperate pattern.
+
+    ### Open investigation items for the next session
+
+    - **Why non-comp non-static behavior is also bad**
+      (flicker, slow, missing bits). The pre-4d.8 state was
+      claimed at ~95% v1 parity based on a single static
+      scanout sample; that claim was wrong. Need to identify
+      what dynamic correctness regression exists between
+      d8bcd92 (or earlier) and v1.
+    - **Damage tracking correctness in steady state.**
+      Suspect: store's `peek_presentation_damage` /
+      `ack_presentation_damage` epoch logic, buffer-age
+      `pick_repaint_region` clipping, or per-output
+      `scene_structure_damage` accumulation between frames.
+    - **Performance**: scene tick cost in v2 may have grown
+      from cumulative storage allocations, retire queues,
+      descriptor-pool ring pressure. Profile vs. v1.
+    - **PictFormat / xRGB-vs-ARGB picture intent tracking**
+      to properly support compositor-WM sessions in a future
+      stage (4e).
+    - **CursorFlicker / trail under compositing** (was a
+      separate item).
+    - **KmsCore.pictures disconnect cleanup** (Task 4, still
+      open).
+
+    ### Tasks fully tackled this session
+
+    Stage 4d.1 (`3ed630c`), 4d.2 (`589aa87`), 4d.3 DRI3 backfill
+    (`9414096`), 4d.4 disconnect-recovery participation
+    (`6b63173`), 4d.5 rotate-redirected-backing order
+    (`cd22f47`), 4d.6 depth-24 force opaque source (`d20f279`),
+    4d.7 alpha_passthrough=true for windows (`f3e9276`). These
+    are all kept; only the 4d.8 stack was reverted.
+
+    The Justfile defaults now include
+    `yserver::kms::v2::scene=trace` in the recipe log defaults
+    for ongoing diagnosis (`f3cd9cd`).
     - **Task 4 — KmsCore.pictures disconnect cleanup**.
       Stale Picture records from disconnected clients
       (mate-session-check) persist in v2's `KmsCore.pictures`,
