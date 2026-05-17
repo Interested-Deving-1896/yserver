@@ -1161,9 +1161,12 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       `Backend::poly_segment`, asserts `telemetry.lifetime
       .paint_submits` delta is 1 and `queue_submit2` delta is
       1). 249 lib + 23 ignored v2 Vk + 16 v2_acceptance tests
-      green under lavapipe (3 pre-existing failures unrelated
-      to 3f.15: see "Open follow-up from 2026-05-17 smoke"
-      below); clippy clean. Hardware smoke (fvwm3 drag,
+      green under lavapipe; clippy clean. (The 3f.15 close run
+      surfaced 3 pre-existing Vk-test flakes — 2 gradient
+      pixel mismatches + 1 SIGSEGV in
+      `set_container_background_pixmap` — all triaged + fixed
+      in the same window; see entries below.) Hardware smoke
+      (fvwm3 drag,
       caja-on-mate) deferred to 3f.5.
 
   ### Shared-Vk and v2-storage fixes landed 2026-05-16/17
@@ -1278,27 +1281,35 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       with the xeyes-shrink bug (rapid configure_subwindow on
       panel applet activity) or be its own scene-damage issue.
       Worth capturing a focused trace+log when picked up.
-    - [ ] **Lavapipe-only Vk test flakes** (surfaced during
-      3f.15 close, reproduce on the 3f.14 baseline — *not* a
-      3f.15 regression). Hardware-smoke on RADV / Intel is the
-      gate of record; these are diagnosis owed for the
-      lavapipe-only CI loop:
+    - [x] **Three Vk-test flakes triaged + fixed 2026-05-17**
+      (surfaced during the 3f.15 close run; all were pre-
+      existing on the 3f.14 baseline, not 3f.15 regressions):
       1. `render_composite_linear_gradient_horizontal_two_stop`
-         — reads `BGRA=(0,0,0,255)` instead of the colored
-         ramp at the right edge. 3f.13 commit message
-         explicitly notes "Fuji hw-smoke confirmed gradient
-         rendering by user 2026-05-16," so the live wire path
-         works; failure likely sits in lavapipe's gradient-
-         sampler corner.
-      2. `render_composite_radial_gradient_centred` — rim
-         pixel reads black instead of near-white. Same
-         3f.13 LUT path; same lavapipe-vs-real-HW shape.
-      3. `v2_set_container_background_pixmap_tiles_across_root`
-         — SIGSEGV in the test binary (3f.14 tile path).
-         Hard crash, not a pixel-mismatch; this one needs
-         a real triage pass (binding lifetime? `Repeat::Normal`
-         sampler under lavapipe?) since it affects the rest
-         of the acceptance run by aborting the binary.
+         + `render_composite_radial_gradient_centred` — both
+         tests passed `pos: i32::MAX` for the second stop.
+         `Stop::pos` is documented as X11 16.16 fixed-point in
+         [0, 1], so 1.0 = `0x10000`. `sample_stops` builds
+         `target = t * 65536` and lerps in `[lo.pos, hi.pos]`;
+         with `hi.pos = i32::MAX` the lerp's `local =
+         (target - lo.pos) / (hi.pos - lo.pos)` ≈ 0 at every
+         LUT index, so every output pixel read the first stop
+         (black). Hardware-smoke worked because real clients
+         send proper 16.16 positions. Fix: change `i32::MAX`
+         → `0x10000` in both tests.
+      2. `v2_set_container_background_pixmap_tiles_across_root`
+         — SIGSEGV. `for_tests_with_vk` called `for_tests`
+         first, which ran `init_root_storage` with no Vk
+         attached and stamped a `for_tests_null` stub
+         (`vk::ImageView::null()`) into the store. The
+         second `init_root_storage` after Vk attach
+         short-circuited on the existing xid mapping, leaving
+         the null-view root in place. `render_composite`
+         then bound the null view as a color attachment →
+         segfault inside the descriptor-set bind. Fix:
+         extract `for_tests_seed` (no root init), have
+         `for_tests_with_vk` call seed-only, attach Vk +
+         engine, then `init_root_storage`. `for_tests` still
+         does the immediate init for the no-Vk path.
 
     - [ ] **3f.5 — acceptance.** rendercheck parity, real-app
       smoke matrix (xterm / xclock / xeyes / gedit / MATE /

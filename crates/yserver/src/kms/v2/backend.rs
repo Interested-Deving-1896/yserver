@@ -246,7 +246,16 @@ impl KmsBackendV2 {
     #[doc(hidden)]
     pub fn for_tests_with_vk() -> Result<Self, io::Error> {
         use std::sync::Arc;
-        let mut base = Self::for_tests();
+        // Build the test seed WITHOUT the root drawable. If
+        // `for_tests()` were used, `init_root_storage` would have
+        // run with no Vk attached and stamped a `for_tests_null`
+        // stub (vk::ImageView::null()) into the store. The second
+        // `init_root_storage` call below would then short-circuit
+        // on the existing xid and we'd be left with a null-view
+        // root — any `render_composite` against it (e.g.
+        // `set_container_background_pixmap`) segfaults inside the
+        // descriptor-set bind.
+        let mut base = Self::for_tests_seed();
         let vk = crate::kms::vk::device::VkContext::new()
             .map_err(|e| io::Error::other(format!("v2 for_tests_with_vk: VkContext: {e:?}")))?;
         let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)).map_err(|e| {
@@ -272,7 +281,16 @@ impl KmsBackendV2 {
     #[doc(hidden)]
     #[must_use]
     pub fn for_tests() -> Self {
-        let mut b = Self {
+        let mut b = Self::for_tests_seed();
+        b.init_root_storage();
+        b
+    }
+
+    /// Construct the test fixture **without** initialising root
+    /// storage. Used by `for_tests_with_vk` so root allocation
+    /// happens after the Vk context is attached.
+    fn for_tests_seed() -> Self {
+        Self {
             core: KmsCore::for_tests(),
             platform: PlatformBackend::for_tests(),
             logged_gaps: RefCell::new(HashSet::new()),
@@ -281,9 +299,7 @@ impl KmsBackendV2 {
             scene: SceneCompositor::stub(),
             windows_v2: WindowsV2Map::new(),
             telemetry: Telemetry::new(),
-        };
-        b.init_root_storage();
-        b
+        }
     }
 
     fn init_root_storage(&mut self) {

@@ -5781,8 +5781,13 @@ mod tests {
                         b: 0,
                         a: 0xFFFF,
                     },
+                    // 16.16 fixed-point: 1.0 = 0x10000. Using i32::MAX
+                    // here would put the second stop far past t=1.0,
+                    // so `sample_stops` would lerp `(target - 0) /
+                    // i32::MAX ≈ 0` and every LUT pixel would read
+                    // the first stop (black).
                     Stop {
-                        pos: i32::MAX,
+                        pos: 0x10000,
                         r: 0xFFFF,
                         g: 0xFFFF,
                         b: 0xFFFF,
@@ -5896,8 +5901,10 @@ mod tests {
                         b: 0,
                         a: 0xFFFF,
                     },
+                    // 16.16 fixed-point: 1.0 = 0x10000. See linear-
+                    // gradient test above for why i32::MAX is wrong.
                     Stop {
-                        pos: i32::MAX,
+                        pos: 0x10000,
                         r: 0xFFFF,
                         g: 0xFFFF,
                         b: 0xFFFF,
