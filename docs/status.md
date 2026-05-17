@@ -1392,10 +1392,103 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
   (Intel KBL or fuji minimum, RDNA2 / bee for the strictest
   driver coverage) needs to gate stage close, not be
   reserved for the final acceptance pass.
-- [ ] **Stage 4 — re-enable COMPOSITE + COW.** Manual-redirect
+- [~] **Stage 4 — re-enable COMPOSITE + COW.** Manual-redirect
   backing routing, NameWindowPixmap, scene treats COW as
   always-on-top entry. xfce drop-shadow renders correctly. picom
   composites and updates per Damage event.
+
+  Plan: `docs/superpowers/plans/2026-05-17-stage-4.md` (8 codex
+  review rounds; ready for impl 2026-05-17). Four substages:
+  4a (`set_redirected_target` + paint resolver) → 4b
+  (real `allocate_redirected_backing` / `name_window_pixmap` +
+  protocol activation) → 4c (`SceneCompositor` mode-aware
+  participation + Automatic-mode storage routing) → 4d (COW as
+  first-class scene entry).
+
+  - [x] **Stage 4a — `set_redirected_target` + paint resolver
+    landed 2026-05-17 (`e2df0dd`).** Storage-side
+    `DrawableStore::set_redirected_target(window_id,
+    Some(backing_id))` plus `KmsBackendV2::resolve_paint_target(
+    host_xid) -> Option<PaintTarget { id, offset }>` walking
+    `windows_v2.parent` upward, accumulating descendant (x, y)
+    offsets, stopping at the nearest redirected ancestor.
+    Pre-loop short-circuit for non-`windows_v2` xids (pixmaps +
+    root) checks the leaf's own `redirected_target` so
+    `RedirectWindow(root, …)` routes correctly. `parent == None`
+    arm (the production representation `create_subwindow`
+    produces when host_parent is root_xid) steps up to root
+    explicitly before the fall-through — codex round-7 finding
+    caught pre-commit via TDD: the original test used the non-
+    production `parent = Some(root_xid)` shape and missed the
+    bug.
+
+    ~22 paint sites swapped to `resolve_paint_target`:
+    `fill_solid_rects`, `fill_rects_honoring_fill_state`,
+    `try_tiled_fill` (all refactored to take `PaintTarget`);
+    `fill_rectangle`, `poly_fill_*`, `poly_line/segment/
+    rectangle/arc/point`; `copy_area` (dst only — src stays
+    unresolved per spec); `put_image`, `get_image` (per plan
+    Risk 1 — GetImage(W) under redirect reads B);
+    `image_text*`, `poly_text*` (via `render_text_chars_v2` +
+    `fill_text_background`); `render_composite`,
+    `render_fill_rectangles`, `render_composite_glyphs`,
+    `render_trapezoids`, `render_triangles_op` (dst-via-picture
+    through refactored `resolve_dst_picture_for_render` —
+    signature now `(&core, host_pic) -> Option<(u32, clip)>`,
+    each caller resolves through `resolve_paint_target`
+    afterwards); `set_container_background_pixel` / `_pixmap`.
+
+    Trap / triangle redirect offset folded into the 16.16
+    fixed-point `x_off` / `y_off` shift BEFORE bbox computation
+    so the bbox is in backing coords. Per-rect picture clips
+    shifted via `shift_dst_picture_clip`. `try_tiled_fill`
+    shifts dst_x/dst_y but NOT src_x/src_y (which is
+    `r.x - tile_ox`, a difference invariant under translation).
+
+    Deliberately NOT swapped:
+    `change_subwindow_attributes` (just stores into
+    `windows_v2`); `allocate_window_storage` initial fill
+    (happens before any redirect could be settable);
+    `configure_subwindow` resize bg fill (resize allocates fresh
+    storage; redirect can't be on a fresh drawable per the 4b
+    lifecycle).
+
+    Tests: 4 store unit tests + 9 resolver unit tests + 2
+    Vk-backed acceptance tests (`v2_set_redirected_target_
+    routes_fill_to_backing`, `v2_set_redirected_target_
+    descendant_fill_lands_at_offset`) driving through the
+    Backend trait via a new doc-hidden `test_set_redirected_
+    target` helper. 262 lib + 22 ignored v2 Vk + 18 v2_
+    acceptance tests green under lavapipe; clippy clean.
+
+    No protocol-visible change yet — 4b lights up the protocol
+    surface.
+  - [ ] **Stage 4b — real `allocate_redirected_backing` /
+    `release_redirected_backing` / `name_window_pixmap` +
+    protocol activation.** Replaces the Err-stubs at
+    `v2/backend.rs:2472-2513`; re-enables the
+    `process_request.rs` Composite-redirect activation path
+    gated on a new `Backend::supports_redirect_activation`
+    trait method so v1 stays on pre-Stage-4 behaviour.
+    Per-hierarchy seed-copy before `set_redirected_target`
+    flips routing; alias-registry-aware `free_pixmap`. New
+    `Backend::set_window_scene_participation` +
+    `set_backing_scene_participation` methods land here too
+    but only as Manual-mode no-ops on the W side; 4c wires
+    the full mode-aware participation.
+  - [ ] **Stage 4c — SceneCompositor I4 + Automatic-mode
+    storage routing.** `build_scene` resolves each entry's
+    source-storage through `redirected_target` so Automatic-W
+    blits from B. Mode-flip handler preserves backing +
+    aliases (no re-seed). First compositor-WM hardware-smoke
+    gate: mate-session + marco-with-compositing on bee + fuji.
+  - [ ] **Stage 4d — Composite Overlay Window as first-class
+    scene entry.** `cow_refcount: u32` in `KmsCore` (metadata
+    only — no `DrawableId` per the spec's `KmsCore` scope
+    rule); `cow_id: Option<DrawableId>` on `KmsBackendV2`.
+    `build_scene` appends COW above top-levels, below the
+    cursor. Hardware-smoke gate: full xfce4 session with
+    xfwm4-with-compositing on bee + fuji.
 - [ ] **Stage 5 (optional) — advanced perf strategies.**
   Strategy plug-ins on the existing components: damage-strategy
   selection per frame, HW cursor return, direct scanout, HW
