@@ -1545,3 +1545,225 @@ fn v2_set_redirected_target_descendant_fill_lands_at_offset() {
         "B at (8,8) must stay black — past the redirected rect's bottom-right",
     );
 }
+
+// ───── Stage 4b — allocate_redirected_backing / name_window_pixmap /
+// ───── release_redirected_backing
+//
+// Each test drives the Backend-trait surface for the COMPOSITE
+// redirect lifecycle. v1's reference impls live in
+// `crates/yserver/src/kms/backend.rs:9523-9607`; v2 mirrors the
+// shape via `KmsCore.alias_registry` + `KmsCore.host_window_to_backing`
+// (already in tree as shared state).
+
+/// Plan §4b: `allocate_redirected_backing(W, w, h, depth)` allocates
+/// a fresh backing pixmap, seeds `alias_registry` with refcount=1,
+/// and maps `host_window_to_backing[W] = B`. The returned
+/// `PixmapHandle` is what `name_window_pixmap(W)` returns on every
+/// subsequent call (with incremented refcount).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_allocate_redirected_backing_seeds_refcount_and_map() {
+    use yserver_core::backend::WindowHandle;
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    // Allocate a pixmap to act as the "window" — v2 doesn't care
+    // about W being a real Window-kind drawable for the activation
+    // path; what matters is the xid resolves in the store so the
+    // `set_redirected_target` step succeeds. (In 4c real-app paths
+    // W is a top-level Window-kind drawable; the seed-copy path
+    // tested separately in `v2_redirect_seed_copies_window_content`
+    // exercises that shape.)
+    let w_xid = b.create_pixmap(None, 32, 16, 16).expect("W").as_raw();
+    let w_handle = WindowHandle::from_raw(w_xid).expect("WindowHandle");
+
+    let backing = b
+        .allocate_redirected_backing(None, w_handle, 16, 16, 32)
+        .expect("allocate_redirected_backing must succeed in v2");
+    let raw = backing.as_raw();
+    assert_ne!(raw, 0, "backing handle is non-zero");
+    assert_ne!(
+        raw, w_xid,
+        "backing xid distinct from window xid (fresh pixmap)",
+    );
+
+    // Inspect the shared state via the read-only test helper.
+    let entry = b
+        .test_alias_registry_get(raw)
+        .expect("alias_registry must have a Reason-1 hold");
+    assert_eq!(entry.refcount, 1, "Reason-1 seed → refcount = 1");
+    assert_eq!(entry.width, 16);
+    assert_eq!(entry.height, 16);
+    assert_eq!(entry.depth, 32);
+
+    let mapped = b
+        .test_host_window_to_backing(w_xid)
+        .expect("host_window_to_backing must point at the backing");
+    assert_eq!(mapped, raw, "map points at the backing xid");
+}
+
+/// Plan §4b: a second `allocate_redirected_backing(W, …)` for an
+/// already-redirected W returns the SAME handle with NO refcount
+/// bump (it's the redirect-activation hold, not an alias). v1
+/// idempotency path at `kms/backend.rs:9581-9588`.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_allocate_redirected_backing_is_idempotent() {
+    use yserver_core::backend::WindowHandle;
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let w_xid = b.create_pixmap(None, 32, 8, 8).expect("W").as_raw();
+    let w = WindowHandle::from_raw(w_xid).unwrap();
+    let first = b.allocate_redirected_backing(None, w, 8, 8, 32).unwrap();
+    let second = b.allocate_redirected_backing(None, w, 8, 8, 32).unwrap();
+    assert_eq!(
+        first.as_raw(),
+        second.as_raw(),
+        "idempotent allocation returns the same handle",
+    );
+    let entry = b.test_alias_registry_get(first.as_raw()).unwrap();
+    assert_eq!(
+        entry.refcount, 1,
+        "no incref on the idempotent path — Reason-1 is single-instance",
+    );
+}
+
+/// Plan §4b: `name_window_pixmap(W)` after activation returns the
+/// existing backing and increments refcount (Reason-2 alias hold).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_name_window_pixmap_returns_existing_backing() {
+    use yserver_core::backend::WindowHandle;
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let w_xid = b.create_pixmap(None, 32, 8, 8).expect("W").as_raw();
+    let w = WindowHandle::from_raw(w_xid).unwrap();
+    let backing = b.allocate_redirected_backing(None, w, 8, 8, 32).unwrap();
+    let aliased = b.name_window_pixmap(None, w).unwrap();
+    assert_eq!(
+        aliased.as_raw(),
+        backing.as_raw(),
+        "alias handle equals backing handle (same xid on every call)",
+    );
+    let entry = b.test_alias_registry_get(backing.as_raw()).unwrap();
+    assert_eq!(
+        entry.refcount, 2,
+        "alias bumps refcount to 2 (Reason-1 + Reason-2)",
+    );
+}
+
+/// Plan §4b: `name_window_pixmap(W)` against an un-redirected W
+/// returns `NotFound` (X11 protocol error → BadWindow upstream).
+/// v1 uses `io::ErrorKind::NotFound` at `kms/backend.rs:9534`.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_name_window_pixmap_without_redirect_errors_not_found() {
+    use yserver_core::backend::WindowHandle;
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let w_xid = b.create_pixmap(None, 32, 8, 8).expect("W").as_raw();
+    let w = WindowHandle::from_raw(w_xid).unwrap();
+    let err = b
+        .name_window_pixmap(None, w)
+        .expect_err("name without redirect must error");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::NotFound,
+        "v1-parity: NotFound (got {err:?})",
+    );
+}
+
+/// Plan §4b: `release_redirected_backing` decrefs the Reason-1
+/// hold; with no aliases held, the backing storage is destroyed.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_release_redirected_backing_drops_storage_when_no_aliases() {
+    use yserver_core::backend::WindowHandle;
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let w_xid = b.create_pixmap(None, 32, 8, 8).expect("W").as_raw();
+    let w = WindowHandle::from_raw(w_xid).unwrap();
+    let backing = b.allocate_redirected_backing(None, w, 8, 8, 32).unwrap();
+    let bxid = backing.as_raw();
+
+    b.release_redirected_backing(None, backing).unwrap();
+
+    assert!(
+        b.test_alias_registry_get(bxid).is_none(),
+        "alias_registry entry removed (refcount → 0)",
+    );
+    assert!(
+        b.test_host_window_to_backing(w_xid).is_none(),
+        "host_window_to_backing entry cleared",
+    );
+}
+
+/// Plan §4b: a `NameWindowPixmap` alias keeps the backing alive
+/// past `release_redirected_backing` — the alias's FreePixmap
+/// is what eventually drops the storage.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_release_redirected_backing_survives_named_alias() {
+    use yserver_core::backend::WindowHandle;
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let w_xid = b.create_pixmap(None, 32, 8, 8).expect("W").as_raw();
+    let w = WindowHandle::from_raw(w_xid).unwrap();
+    let backing = b.allocate_redirected_backing(None, w, 8, 8, 32).unwrap();
+    let bxid = backing.as_raw();
+    let alias = b.name_window_pixmap(None, w).unwrap();
+    assert_eq!(alias.as_raw(), bxid, "alias is the backing xid");
+
+    // Drop Reason 1. Reason 2 (alias) keeps it alive.
+    b.release_redirected_backing(None, backing).unwrap();
+    let entry = b
+        .test_alias_registry_get(bxid)
+        .expect("alias still holds the backing");
+    assert_eq!(entry.refcount, 1, "Reason-1 dropped, Reason-2 remains");
+    assert!(
+        b.test_host_window_to_backing(w_xid).is_none(),
+        "redirect map cleared — only the alias refers to the backing now",
+    );
+
+    // FreePixmap on the alias must drop the storage.
+    b.free_pixmap(None, alias.as_raw()).unwrap();
+    assert!(
+        b.test_alias_registry_get(bxid).is_none(),
+        "alias FreePixmap drops the last hold",
+    );
+}

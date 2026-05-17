@@ -293,6 +293,32 @@ impl KmsBackendV2 {
         Ok(base)
     }
 
+    /// Stage 4b — test-only read of the alias registry. Returns
+    /// a copy of the entry if the backing xid is tracked; the
+    /// `pub(crate)` `KmsCore.alias_registry` is otherwise unreachable
+    /// from the `tests/` integration crate.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_alias_registry_get(
+        &self,
+        backing_xid: u32,
+    ) -> Option<crate::kms::core::AliasEntry> {
+        let handle = yserver_core::backend::PixmapHandle::from_raw(backing_xid)?;
+        self.core.alias_registry.get(handle).copied()
+    }
+
+    /// Stage 4b — test-only read of the host_window_to_backing
+    /// map. Returns the backing xid registered against
+    /// `window_xid`, or `None` when the window isn't redirected.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_host_window_to_backing(&self, window_xid: u32) -> Option<u32> {
+        self.core
+            .host_window_to_backing
+            .get(&window_xid)
+            .map(|h| h.as_raw())
+    }
+
     /// Stage 4a — test-only knob to install a COMPOSITE redirect
     /// route directly via the store, bypassing 4b's protocol
     /// surface (`allocate_redirected_backing` / `name_window_pixmap`
@@ -2691,46 +2717,193 @@ impl Backend for KmsBackendV2 {
         self.core.xid_map.remove(&host_xid);
     }
 
+    /// Stage 4b: opt v2 into the full COMPOSITE-redirect
+    /// activation path. The `process_request.rs` Composite
+    /// handler gates its `activate_redirect_backing_for` call
+    /// on this flag so v1 (which returns the default `false`)
+    /// stays on the pre-Stage-4 "redirect record only" shape
+    /// that the `92a2a83 → 3751c11` revert established.
+    fn supports_redirect_activation(&self) -> bool {
+        true
+    }
+
+    /// Stage 4b: real `name_window_pixmap`. Mirrors v1
+    /// (`kms/backend.rs:9523-9544`) — lookup `host_window_to_backing`,
+    /// incref the alias registry, return the SAME handle.
+    /// Returns `NotFound` if the window isn't redirected
+    /// (`allocate_redirected_backing` was never called for it).
     fn name_window_pixmap(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_window: WindowHandle,
+        host_window: WindowHandle,
     ) -> io::Result<PixmapHandle> {
-        self.log_v2_gap("name_window_pixmap");
-        Err(io::Error::other(
-            "v2: name_window_pixmap not yet implemented",
-        ))
+        let backing = self
+            .core
+            .host_window_to_backing
+            .get(&host_window.as_raw())
+            .copied()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "v2 name_window_pixmap: window is not redirected (no backing)",
+                )
+            })?;
+        self.core.alias_registry.incref(backing);
+        Ok(backing)
     }
 
+    /// Stage 4b: real `allocate_redirected_backing`. Mirrors v1
+    /// (`kms/backend.rs:9568-9607`) with one v2-specific addition:
+    /// after allocating the backing and registering it in
+    /// `alias_registry` + `host_window_to_backing`, also flip
+    /// `store.set_redirected_target(W_id, Some(B_id))` so v2's
+    /// `resolve_paint_target` routes future paint to the backing.
+    ///
+    /// **Seed-copy ordering** per the plan's Cross-cutting
+    /// §"Initial backing content" decision: the W→B copy fires
+    /// BEFORE `set_redirected_target` flips routing, so the copy
+    /// reads from W's own storage (not B's). Descendant seed-copy
+    /// (per-hierarchy walk) is substage 4b.5 — not implemented
+    /// here; only W itself is seeded for now.
     fn allocate_redirected_backing(
         &mut self,
-        _origin: Option<OriginContext>,
-        _host_window: WindowHandle,
-        _width: u16,
-        _height: u16,
-        _depth: u8,
+        origin: Option<OriginContext>,
+        host_window: WindowHandle,
+        width: u16,
+        height: u16,
+        depth: u8,
     ) -> io::Result<PixmapHandle> {
-        // Stage 1b stub: no DrawableStore yet to allocate against.
-        // Spec § "C-stubs special case": this is the deliberate
-        // no-op cited in the plan — refcount lifecycle stays
-        // consistent because the v1 path (alias_registry.insert)
-        // never runs in v2.
-        self.log_v2_gap("allocate_redirected_backing");
-        Err(io::Error::other(
-            "v2: allocate_redirected_backing not yet implemented",
-        ))
+        // Idempotent — second `RedirectWindow` for the same W
+        // returns the existing backing with no refcount bump
+        // (the Reason-1 hold is single-instance per
+        // §"Single refcount, two reasons").
+        if let Some(existing) = self
+            .core
+            .host_window_to_backing
+            .get(&host_window.as_raw())
+            .copied()
+        {
+            return Ok(existing);
+        }
+        let w_xid = host_window.as_raw();
+
+        // Allocate a fresh backing via the existing
+        // `create_pixmap` path (3f.10 pool + 3f.14 zero-fill).
+        let backing = self.create_pixmap(origin, depth, width, height)?;
+        let backing_xid = backing.as_raw();
+
+        // Seed-copy: W → B, BEFORE the route flip. Both ids are
+        // raw `DrawableId`s so the copy does NOT consult
+        // `resolve_paint_target` (which would B→B no-op once the
+        // route flip lands below). W must already exist in the
+        // store; if not, that's a protocol error upstream — log
+        // and skip the seed but keep going so the redirect
+        // record still installs.
+        if let (Some(w_id), Some(b_id)) = (self.store.lookup(w_xid), self.store.lookup(backing_xid))
+        {
+            let w_extent = self
+                .store
+                .get(w_id)
+                .map(|d| d.storage.extent)
+                .unwrap_or(ash::vk::Extent2D::default());
+            if w_extent.width != 0 && w_extent.height != 0 {
+                let src_rect = ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D::default(),
+                    extent: w_extent,
+                };
+                if let Err(e) = self.engine.copy_area(
+                    &mut self.store,
+                    &mut self.platform,
+                    w_id,
+                    b_id,
+                    src_rect,
+                    ash::vk::Offset2D::default(),
+                ) {
+                    log::warn!(
+                        "v2 allocate_redirected_backing(0x{w_xid:x}): seed copy_area failed: {e:?}",
+                    );
+                } else {
+                    self.telemetry.record_paint_submit();
+                }
+            }
+            // Now flip routing — after this, paint against W
+            // resolves to B via `resolve_paint_target`.
+            self.store.set_redirected_target(w_id, Some(b_id));
+        } else {
+            log::warn!(
+                "v2 allocate_redirected_backing(0x{w_xid:x}): window or backing not in store \
+                 (seed + route flip skipped)",
+            );
+        }
+
+        // Register Reason-1 hold + redirect map. Identical to v1.
+        self.core.alias_registry.insert(
+            backing,
+            crate::kms::core::AliasEntry {
+                refcount: 1,
+                width,
+                height,
+                depth,
+            },
+        );
+        self.core.host_window_to_backing.insert(w_xid, backing);
+        Ok(backing)
     }
 
+    /// Stage 4b: real `release_redirected_backing`. Mirrors v1
+    /// (`kms/backend.rs:9547-9566`) — clear the
+    /// `host_window_to_backing` entry, drop the Reason-1 hold,
+    /// free pixmap on refcount=0.
+    ///
+    /// v2-specific addition: when the redirect map clears, also
+    /// drop `store.set_redirected_target` for every window that
+    /// was routed through this backing. Multiple windows can
+    /// alias the same backing only via NameWindowPixmap (which
+    /// is the alias-handle, not a separate redirect), but the
+    /// loop is cheap and matches the plan's defensive contract.
+    ///
+    /// B-side `scene_participating` flip lives in 4c's
+    /// `set_backing_scene_participation`; this method stays
+    /// agnostic to participation.
     fn release_redirected_backing(
         &mut self,
-        _origin: Option<OriginContext>,
-        _backing: PixmapHandle,
+        origin: Option<OriginContext>,
+        backing: PixmapHandle,
     ) -> io::Result<()> {
-        // See `allocate_redirected_backing` — paired no-op. If
-        // `alias_registry.decref` somehow returned `true` (it can't
-        // in v2 since insert never runs), the caller would be told
-        // "no storage to free" via this Ok return.
-        self.log_v2_gap("release_redirected_backing");
+        let raw = backing.as_raw();
+        // Drop the W→B map entry. v1 uses `retain` because the
+        // map is keyed by W_xid (not B_xid); same shape here.
+        self.core
+            .host_window_to_backing
+            .retain(|_, h| h.as_raw() != raw);
+        // Clear the store-side route on every window that pointed
+        // at this backing's DrawableId. Reverse-scan over `entries`
+        // would need an iter accessor we don't have; iterate the
+        // map keys we just retained against and clear each.
+        // (In practice the map is empty after `retain` above —
+        // but a future multi-window-per-backing model would still
+        // be correct.)
+        if let Some(b_id) = self.store.lookup(raw) {
+            let routed_windows: Vec<u32> = self
+                .windows_v2
+                .keys()
+                .copied()
+                .filter(|xid| {
+                    self.store
+                        .lookup(*xid)
+                        .and_then(|id| self.store.redirected_target(id))
+                        == Some(b_id)
+                })
+                .collect();
+            for w_xid in routed_windows {
+                if let Some(w_id) = self.store.lookup(w_xid) {
+                    self.store.set_redirected_target(w_id, None);
+                }
+            }
+        }
+        if self.core.alias_registry.decref(backing) {
+            self.free_pixmap(origin, raw)?;
+        }
         Ok(())
     }
 
@@ -2818,6 +2991,31 @@ impl Backend for KmsBackendV2 {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        // Stage 4b: alias-registry-aware free path. When `host_xid`
+        // names a COMPOSITE-redirect backing (via NameWindowPixmap
+        // alias or the Reason-1 redirect hold), decref the registry
+        // first; only drop the storage when refcount hits zero.
+        // Otherwise (an ordinary pixmap) fall through to the
+        // straight `store.decref` path.
+        //
+        // v1's `free_pixmap` (`kms/backend.rs:9637-9650`) does NOT
+        // consult the registry — it gets away with this because
+        // compositors typically call FreePixmap(alias) after
+        // UnredirectWindow, so the registry has already been
+        // torn down by `release_redirected_backing`. The protocol
+        // doesn't guarantee that ordering though, and v2 gates
+        // here so an early FreePixmap on a still-held alias
+        // doesn't drop the backing while a redirect still uses it.
+        if let Some(handle) = yserver_core::backend::PixmapHandle::from_raw(host_xid)
+            && self.core.alias_registry.get(handle).is_some()
+        {
+            if self.core.alias_registry.decref(handle)
+                && let Some(id) = self.store.lookup(host_xid)
+            {
+                self.store.decref(&mut self.platform, id);
+            }
+            return Ok(());
+        }
         if let Some(id) = self.store.lookup(host_xid) {
             self.store.decref(&mut self.platform, id);
         }

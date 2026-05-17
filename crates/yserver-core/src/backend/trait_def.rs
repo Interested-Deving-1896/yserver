@@ -405,6 +405,72 @@ pub trait Backend: Send {
         Ok(())
     }
 
+    /// Stage 4b — capability flag: returns `true` when the backend
+    /// implements the full COMPOSITE-redirect activation path
+    /// (`allocate_redirected_backing` + `release_redirected_backing` +
+    /// `name_window_pixmap` + the scene-participation flips). The
+    /// `process_request.rs` Composite handlers gate the activation
+    /// path on this so v1 (still on the pre-Stage-4 "redirect record
+    /// but no backing routing" shape) doesn't regress on MATE the
+    /// way commit `92a2a83` did before being reverted at `3751c11`.
+    ///
+    /// Default `false` covers v1 + the host-X11 test backends.
+    /// v2 (`KmsBackendV2`) overrides to `true`.
+    fn supports_redirect_activation(&self) -> bool {
+        false
+    }
+
+    /// Stage 4b — flip a window's scene-participation under
+    /// COMPOSITE redirect. Manual mode: `participating = false`
+    /// removes the window from the scene walk so the external
+    /// compositor (reading via `NameWindowPixmap`) drives the
+    /// on-screen presentation; the I5 transactional rule on
+    /// `set_scene_participating` clears unpresented presentation
+    /// damage + bumps the epoch. Automatic mode: stays `true`.
+    /// On unredirect, restored to the window's `mapped` state.
+    ///
+    /// Default no-op for backends without scene-state (v1's
+    /// per-window-mirror model has no equivalent flip; the test
+    /// `RecordingBackend` keeps the default too).
+    ///
+    /// # Errors
+    /// Propagates backend-internal failures on the participation
+    /// flip path (no path errors today, but reserved).
+    fn set_window_scene_participation(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_window: WindowHandle,
+        participating: bool,
+    ) -> io::Result<()> {
+        let _ = (origin, host_window, participating);
+        Ok(())
+    }
+
+    /// Stage 4b — flip a backing's scene-participation under
+    /// COMPOSITE redirect. Used by Automatic mode so paint that
+    /// resolves through the backing accumulates presentation
+    /// damage on B (which the scene walk picks up via W's
+    /// `redirected_target` indirection in 4c's `build_scene`
+    /// patch). Manual backings stay `false`; only Automatic
+    /// activations call this with `true`. On unredirect /
+    /// destroy, `release_redirected_backing` drops the flag
+    /// internally so the protocol handler doesn't need to fire
+    /// a separate `false` call.
+    ///
+    /// Default no-op as for `set_window_scene_participation`.
+    ///
+    /// # Errors
+    /// Same shape as `set_window_scene_participation`.
+    fn set_backing_scene_participation(
+        &mut self,
+        origin: Option<OriginContext>,
+        backing: PixmapHandle,
+        participating: bool,
+    ) -> io::Result<()> {
+        let _ = (origin, backing, participating);
+        Ok(())
+    }
+
     // ──────────────────────────────────────────────────────────────
     // Resources (pixmap, font, cursor)
     // ──────────────────────────────────────────────────────────────
