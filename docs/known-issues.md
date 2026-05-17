@@ -141,6 +141,22 @@ from.
 
 ## Drawing / rendering artifacts
 
+- [ ] **Stage 4c follow-up: `src_size = [1, 1]` after redirected W
+      resizes past B's extent.** `build_scene`'s redirect-aware
+      indirection (Stage 4c.3, commit `b9a9f3a`) emits
+      `CompositeDraw.src_size = [1.0, 1.0]` (normalized UV "sample
+      whole texture") for the W entry. When W is Automatic-redirected
+      to backing B and W later RESIZES past B's extent, the scene
+      stretches B onto W's new larger `dst_size` instead of leaving
+      the now-uncovered region undefined. Conversely on W-shrink the
+      scene samples a B-region larger than W now is, with the same
+      undefined result. Either: (a) resize B in lockstep with W (per
+      Composite spec NameWindowPixmap aliases freeze at pre-resize
+      content so this is delicate), or (b) clamp `src_size` to the
+      W/B extent ratio. Plan §4c didn't pin a behaviour; revisit
+      before the 4c hardware smoke gate (mate + marco) or risk
+      stretched window content on resize.
+
 - [ ] **xeyes resize-DOWN artefact on v2 + mate + marco
       (2026-05-17, open).** Continuous-drag-shrink leaves xeyes
       with eye geometry sized for a *wider* window than what's
