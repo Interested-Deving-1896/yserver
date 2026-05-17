@@ -566,6 +566,18 @@ yserver-mate-hw log="debug,yserver::kms::v2::scene=trace":
         echo "yserver log: yserver-hw.log";\
         echo "mate log:    mate.log"'
 
+yserver-cinnamon-hw log="debug,yserver::kms::v2::scene=trace":
+    cargo build --bin yserver
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-cinnamon.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session cinnamon-session > cinnamon.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null'
+
 # xfce on yserver with x11trace recording the full X11 wire
 # protocol between clients and yserver. xfce-session connects to
 # the fake display `:8`; x11trace tunnels everything to yserver
