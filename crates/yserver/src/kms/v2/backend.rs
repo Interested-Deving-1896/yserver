@@ -77,6 +77,7 @@ pub(crate) struct WindowGeometryV2 {
     pub(crate) depth: u8,
     pub(crate) mapped: bool,
     pub(crate) parent: Option<u32>,
+    pub(crate) stack_rank: u64,
     pub(crate) bg_pixel: Option<u32>,
     pub(crate) bg_pixmap: Option<u32>,
 }
@@ -144,6 +145,11 @@ pub struct KmsBackendV2 {
     /// `map_subwindow` / `unmap_subwindow` /
     /// `destroy_subwindow`.
     pub(crate) windows_v2: WindowsV2Map,
+    /// Monotonic allocator for per-parent sibling ordering. V2 scene
+    /// assembly still stores windows in a flat map, so child z-order
+    /// needs an explicit stable rank instead of relying on HashMap
+    /// iteration order.
+    next_window_stack_rank: u64,
     /// Stage 4d: `DrawableId` of the Composite Overlay Window
     /// storage, allocated lazily on the first `GetOverlayWindow`
     /// and dropped on the final `ReleaseOverlayWindow`. `None`
@@ -168,6 +174,114 @@ pub struct KmsBackendV2 {
 }
 
 impl KmsBackendV2 {
+    fn alloc_window_stack_rank(&mut self) -> u64 {
+        let rank = self.next_window_stack_rank;
+        self.next_window_stack_rank = self.next_window_stack_rank.saturating_add(1);
+        rank
+    }
+
+    fn clear_window_area_with_background(
+        &mut self,
+        host_xid: u32,
+        background_pixel: u32,
+        background_pixmap_host_xid: Option<u32>,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        use crate::kms::{v2::engine::ResolvedSource, vk::ops::render::CompositeRect};
+
+        self.clear_clip_rectangles(None)?;
+        let Some(dst_target) = self.resolve_paint_target(host_xid) else {
+            return Ok(());
+        };
+        if let Some(bg_host_xid) = background_pixmap_host_xid
+            && let Some(src) = self.store.lookup(bg_host_xid)
+        {
+            if src == dst_target.id {
+                return Ok(());
+            }
+            if self.store.get(src).map(|d| d.storage.format)
+                == Some(ash::vk::Format::B8G8R8A8_UNORM)
+            {
+                let rects = [CompositeRect {
+                    src_x: i32::from(x),
+                    src_y: i32::from(y),
+                    mask_x: 0,
+                    mask_y: 0,
+                    dst_x: dst_target.offset.0 + i32::from(x),
+                    dst_y: dst_target.offset.1 + i32::from(y),
+                    width: u32::from(width),
+                    height: u32::from(height),
+                }];
+                const OP_SRC: u8 = 1;
+                match self.engine.render_composite(
+                    &mut self.store,
+                    &mut self.platform,
+                    OP_SRC,
+                    ResolvedSource::Drawable(src),
+                    ResolvedSource::None,
+                    dst_target.id,
+                    &rects,
+                    None,
+                    Repeat::Normal,
+                    Repeat::None,
+                    None,
+                    None,
+                    false,
+                ) {
+                    Ok(s) if s.recorded_draws > 0 => {
+                        self.telemetry.record_paint_submit();
+                        return Ok(());
+                    }
+                    Ok(_) => return Ok(()),
+                    Err(e) => {
+                        log::warn!(
+                            "v2 clear_window_area_with_background: tiled bg_pixmap clear failed \
+                             for 0x{host_xid:x}: {e:?}"
+                        );
+                    }
+                }
+            }
+        }
+        self.fill_rectangle(None, host_xid, background_pixel, x, y, width, height)
+    }
+
+    fn restack_subwindow(&mut self, host_xid: u32, stack_mode: u8, sibling: Option<u32>) {
+        let Some(current) = self.windows_v2.get(&host_xid).copied() else {
+            return;
+        };
+        let parent = current.parent;
+        let mut siblings: Vec<(u32, u64)> = self
+            .windows_v2
+            .iter()
+            .filter_map(|(xid, geom)| (geom.parent == parent).then_some((*xid, geom.stack_rank)))
+            .collect();
+        siblings.sort_by_key(|(_, rank)| *rank);
+        let Some(pos) = siblings.iter().position(|(xid, _)| *xid == host_xid) else {
+            return;
+        };
+        let entry = siblings.remove(pos);
+        let sibling_pos = sibling.and_then(|sib| siblings.iter().position(|(xid, _)| *xid == sib));
+        match stack_mode {
+            0 | 2 | 4 => match sibling_pos {
+                Some(sp) => siblings.insert(sp + 1, entry),
+                None => siblings.push(entry),
+            },
+            1 | 3 => match sibling_pos {
+                Some(sp) => siblings.insert(sp, entry),
+                None => siblings.insert(0, entry),
+            },
+            _ => siblings.push(entry),
+        }
+        for (rank, (xid, _)) in siblings.into_iter().enumerate() {
+            if let Some(geom) = self.windows_v2.get_mut(&xid) {
+                geom.stack_rank = u64::try_from(rank).unwrap_or(u64::MAX);
+            }
+        }
+    }
+
     /// Real-DRM-real-Vk constructor. Per Stage 2a, the platform
     /// layer (DRM device, output layouts, libinput, VkContext,
     /// ops command pool, fence pool, per-output scanout pools)
@@ -214,6 +328,7 @@ impl KmsBackendV2 {
             engine,
             scene,
             windows_v2: WindowsV2Map::new(),
+            next_window_stack_rank: 1,
             telemetry: Telemetry::new(),
             cow_id: None,
             dri3_xshmfences: HashMap::new(),
@@ -411,6 +526,7 @@ impl KmsBackendV2 {
             engine: RenderEngine::stub(),
             scene: SceneCompositor::stub(),
             windows_v2: WindowsV2Map::new(),
+            next_window_stack_rank: 1,
             telemetry: Telemetry::new(),
             cow_id: None,
             dri3_xshmfences: HashMap::new(),
@@ -657,7 +773,7 @@ impl KmsBackendV2 {
             .store
             .get(w_id)
             .map(|d| d.storage.extent)
-            .unwrap_or(ash::vk::Extent2D::default());
+            .unwrap_or_default();
         if w_extent.width != 0 && w_extent.height != 0 {
             let src_rect = ash::vk::Rect2D {
                 offset: ash::vk::Offset2D::default(),
@@ -679,25 +795,36 @@ impl KmsBackendV2 {
             }
         }
 
-        // 2. Walk descendants. Collect to a Vec first to release
-        // the borrow on `windows_v2` before we call into the
-        // engine (which takes `&mut self.store`).
+        // 2. Walk descendants in sibling stack order. Collect to a
+        // Vec first to release the borrow on `windows_v2` before we
+        // call into the engine (which takes `&mut self.store`).
         //
         // Each Vec entry is (descendant_xid, descendant_x_in_W,
-        // descendant_y_in_W). The walk is a manual stack-driven
-        // DFS over `windows_v2.parent` — we can't recurse on
-        // `&mut self` easily because the inner `engine.copy_area`
-        // call also takes `&mut self.store` / `&mut self.platform`.
+        // descendant_y_in_W). The walk is a manual stack-driven DFS
+        // over `windows_v2.parent`. Children are visited in ascending
+        // `stack_rank` so the seed-copy reproduces the same bottom→top
+        // overwrite order the scene uses for overlapping siblings.
         let mut to_seed: Vec<(u32, i32, i32)> = Vec::new();
         let mut frontier: Vec<(u32, i32, i32)> = vec![(w_xid, 0, 0)];
         while let Some((parent_xid, parent_dx, parent_dy)) = frontier.pop() {
-            for (xid, geom) in &self.windows_v2 {
-                if geom.parent == Some(parent_xid) {
-                    let abs_x = parent_dx + i32::from(geom.x);
-                    let abs_y = parent_dy + i32::from(geom.y);
-                    to_seed.push((*xid, abs_x, abs_y));
-                    frontier.push((*xid, abs_x, abs_y));
-                }
+            let mut children: Vec<(u32, u64, i32, i32)> = self
+                .windows_v2
+                .iter()
+                .filter_map(|(xid, geom)| {
+                    (geom.parent == Some(parent_xid)).then_some((
+                        *xid,
+                        geom.stack_rank,
+                        parent_dx + i32::from(geom.x),
+                        parent_dy + i32::from(geom.y),
+                    ))
+                })
+                .collect();
+            children.sort_by_key(|(_, rank, _, _)| *rank);
+            for (xid, _, abs_x, abs_y) in &children {
+                to_seed.push((*xid, *abs_x, *abs_y));
+            }
+            for (xid, _, abs_x, abs_y) in children.into_iter().rev() {
+                frontier.push((xid, abs_x, abs_y));
             }
         }
         for (desc_xid, abs_x, abs_y) in to_seed {
@@ -708,7 +835,7 @@ impl KmsBackendV2 {
                 .store
                 .get(desc_id)
                 .map(|d| d.storage.extent)
-                .unwrap_or(ash::vk::Extent2D::default());
+                .unwrap_or_default();
             if desc_extent.width == 0 || desc_extent.height == 0 {
                 continue;
             }
@@ -1615,6 +1742,7 @@ impl KmsBackendV2 {
         if self.windows_v2.contains_key(&host_xid) {
             return;
         }
+        let stack_rank = self.alloc_window_stack_rank();
         let mut storage_allocated = false;
         match self
             .platform
@@ -1655,6 +1783,7 @@ impl KmsBackendV2 {
                 depth,
                 mapped: false,
                 parent,
+                stack_rank,
                 bg_pixel,
                 bg_pixmap: None,
             },
@@ -2368,12 +2497,15 @@ fn default_cursor_sprite_bgra() -> Vec<u8> {
     bytes
 }
 
-fn depth_for_visual(visual: HostSubwindowVisual) -> u8 {
+/// Resolve the drawable depth for a new subwindow. `CopyFromParent`
+/// inherits the parent window's depth; only the root / untracked
+/// fallback defaults to 24.
+fn depth_for_visual(visual: HostSubwindowVisual, parent_depth: Option<u8>) -> u8 {
     match visual {
-        HostSubwindowVisual::CopyFromParent => 32,
+        HostSubwindowVisual::CopyFromParent => parent_depth.unwrap_or(24),
         HostSubwindowVisual::Explicit { depth, .. } => {
             if depth == 0 {
-                32
+                parent_depth.unwrap_or(24)
             } else {
                 depth
             }
@@ -2578,8 +2710,13 @@ impl Backend for KmsBackendV2 {
         background_pixmap: Option<u32>,
     ) -> io::Result<WindowHandle> {
         let xid = self.core.next_host_xid();
-        let depth = depth_for_visual(visual);
         let parent_xid = host_parent.as_raw();
+        let parent_depth = if parent_xid == self.core.window_id {
+            Some(24)
+        } else {
+            self.windows_v2.get(&parent_xid).map(|g| g.depth)
+        };
+        let depth = depth_for_visual(visual, parent_depth);
         // Stage 3f.6: record the parent xid so `build_scene` can
         // recurse the tree. `bg_pixel` is passed into
         // `allocate_window_storage`, which paints it into the fresh
@@ -2680,6 +2817,7 @@ impl Backend for KmsBackendV2 {
         let depth = geom.depth;
         let scene_participating = geom.mapped;
         let bg_pixel = geom.bg_pixel;
+        let bg_pixmap = geom.bg_pixmap;
         if size_changed && let Some(old_id) = self.store.lookup(host_xid) {
             // Replace window storage. Stage 2d doesn't preserve
             // content across resize — clients are expected to
@@ -2716,34 +2854,50 @@ impl Backend for KmsBackendV2 {
                             "v2 configure_subwindow: store.allocate failed for xid {host_xid:#x}: {e:?}",
                         );
                     } else if let Some(id) = self.store.lookup(host_xid) {
-                        // Stage 3f.6 + 3f.14: clear the fresh
-                        // storage so resize doesn't leave pool-
-                        // returner content (or Vk-undefined bytes)
-                        // visible until the client's next repaint.
-                        // Bg_pixel-set: paint that colour;
-                        // otherwise depth-appropriate safe default
-                        // (matches `allocate_window_storage`).
-                        let color = bg_pixel.map_or_else(
-                            || default_window_init_color(depth),
-                            decode_x11_pixel_bgra,
-                        );
-                        let rect = ash::vk::Rect2D {
-                            offset: ash::vk::Offset2D::default(),
-                            extent: ash::vk::Extent2D {
-                                width: u32::from(new_w),
-                                height: u32::from(new_h),
-                            },
-                        };
-                        if let Err(e) = self.engine.fill_rect(
-                            &mut self.store,
-                            &mut self.platform,
-                            id,
-                            rect,
-                            color,
-                        ) {
-                            log::debug!(
-                                "v2 configure_subwindow: storage init fill failed for xid {host_xid:#x}: {e:?}"
+                        if let Some(bg_pixmap_host_xid) = bg_pixmap {
+                            if let Err(e) = self.clear_window_area_with_background(
+                                host_xid,
+                                bg_pixel.unwrap_or(0),
+                                Some(bg_pixmap_host_xid),
+                                0,
+                                0,
+                                new_w,
+                                new_h,
+                            ) {
+                                log::debug!(
+                                    "v2 configure_subwindow: bg_pixmap resize init failed for xid {host_xid:#x}: {e:?}"
+                                );
+                            }
+                        } else {
+                            // Stage 3f.6 + 3f.14: clear the fresh
+                            // storage so resize doesn't leave pool-
+                            // returner content (or Vk-undefined bytes)
+                            // visible until the client's next repaint.
+                            // Bg_pixel-set: paint that colour;
+                            // otherwise depth-appropriate safe default
+                            // (matches `allocate_window_storage`).
+                            let color = bg_pixel.map_or_else(
+                                || default_window_init_color(depth),
+                                decode_x11_pixel_bgra,
                             );
+                            let rect = ash::vk::Rect2D {
+                                offset: ash::vk::Offset2D::default(),
+                                extent: ash::vk::Extent2D {
+                                    width: u32::from(new_w),
+                                    height: u32::from(new_h),
+                                },
+                            };
+                            if let Err(e) = self.engine.fill_rect(
+                                &mut self.store,
+                                &mut self.platform,
+                                id,
+                                rect,
+                                color,
+                            ) {
+                                log::debug!(
+                                    "v2 configure_subwindow: storage init fill failed for xid {host_xid:#x}: {e:?}"
+                                );
+                            }
                         }
                     }
                 }
@@ -2754,17 +2908,12 @@ impl Backend for KmsBackendV2 {
                 }
             }
         }
-        // Stage 3f.11: honour `stack_mode` for top-level windows.
-        // marco lowers caja-desktop via `ConfigureWindow stack_mode=
-        // Below` so the wallpaper-and-icons window stays beneath
-        // every other top-level; without this, the most-recently-
-        // registered top-level ends up on top in `top_level_order`,
-        // and caja-desktop occludes mate-panel + every floating
-        // window. Subwindow stack order is not yet tracked (post-
-        // 3f.11 polish — `build_scene` recurse uses HashMap iter
-        // order for siblings under the same parent).
         if let Some(stack_mode) = config.stack_mode {
-            self.restack_top_level(host_xid, stack_mode, config.sibling);
+            if self.core.top_level_order.contains(&host_xid) {
+                self.restack_top_level(host_xid, stack_mode, config.sibling);
+            } else {
+                self.restack_subwindow(host_xid, stack_mode, config.sibling);
+            }
         }
         self.scene.mark_scene_structure_dirty();
         Ok(())
@@ -2801,10 +2950,12 @@ impl Backend for KmsBackendV2 {
         } else {
             Some(host_parent)
         };
+        let new_rank = self.alloc_window_stack_rank();
         if let Some(geom) = self.windows_v2.get_mut(&host_xid) {
             geom.x = x;
             geom.y = y;
             geom.parent = parent;
+            geom.stack_rank = new_rank;
         }
         // Reconcile top_level_order:
         // - parent == None  → window is now (or stays) a top-level
@@ -2842,16 +2993,35 @@ impl Backend for KmsBackendV2 {
         let Some(geom) = self.windows_v2.get_mut(&host_xid) else {
             return Ok(());
         };
+        let mut repaint_bg = false;
         let mut idx = 0;
         if value_mask & 0x01 != 0 && idx < values.len() {
             // CWBackPixmap. 0 = None / inherit-from-parent.
             let v = values[idx];
             geom.bg_pixmap = if v == 0 { None } else { Some(v) };
             idx += 1;
+            repaint_bg = true;
         }
         if value_mask & 0x02 != 0 && idx < values.len() {
             // CWBackPixel — opaque ARGB-or-XRGB pixel value.
             geom.bg_pixel = Some(values[idx]);
+            repaint_bg = true;
+        }
+        if repaint_bg {
+            let _ = geom;
+            let Some(geom) = self.windows_v2.get(&host_xid).copied() else {
+                return Ok(());
+            };
+            let bg_pixel = geom.bg_pixel.unwrap_or(0);
+            self.clear_window_area_with_background(
+                host_xid,
+                bg_pixel,
+                geom.bg_pixmap,
+                0,
+                0,
+                geom.width.max(1),
+                geom.height.max(1),
+            )?;
         }
         Ok(())
     }
@@ -2888,7 +3058,7 @@ impl Backend for KmsBackendV2 {
         if !self.windows_v2.contains_key(&host_xid) {
             // Top-level: parent = None (root), no bg_pixel known yet
             // (set later via change_subwindow_attributes).
-            self.allocate_window_storage(host_xid, 0, 0, 1, 1, 32, None, None);
+            self.allocate_window_storage(host_xid, 0, 0, 1, 1, 24, None, None);
         }
         if !self.core.top_level_order.contains(&host_xid) {
             self.core.top_level_order.push(host_xid);
@@ -3057,8 +3227,9 @@ impl Backend for KmsBackendV2 {
     /// §"Initial backing content" decision: the W→B copy fires
     /// BEFORE `set_redirected_target` flips routing, so the copy
     /// reads from W's own storage (not B's). Descendant seed-copy
-    /// (per-hierarchy walk) is substage 4b.5 — not implemented
-    /// here; only W itself is seeded for now.
+    /// follows the same one-shot walk, in stable sibling z-order,
+    /// so overlapping frame/decor children seed into the backing in
+    /// the same order they would appear on screen.
     fn allocate_redirected_backing(
         &mut self,
         origin: Option<OriginContext>,
@@ -4062,6 +4233,28 @@ impl Backend for KmsBackendV2 {
                 Ok(None)
             }
         }
+    }
+
+    fn clear_area(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+        background_pixel: u32,
+        background_pixmap_host_xid: Option<u32>,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        self.clear_window_area_with_background(
+            host_xid,
+            background_pixel,
+            background_pixmap_host_xid,
+            x,
+            y,
+            width,
+            height,
+        )
     }
 
     fn poly_line(
@@ -6275,24 +6468,87 @@ impl Backend for KmsBackendV2 {
     fn list_fonts_proxy(
         &mut self,
         _origin: Option<OriginContext>,
-        _max_names: u16,
-        _pattern: &str,
+        max_names: u16,
+        pattern: &str,
     ) -> io::Result<Vec<u8>> {
-        self.log_v2_gap("list_fonts_proxy");
-        // Minimal valid empty-list reply: 32-byte header, zero names.
-        let mut reply = vec![0u8; 32];
+        let cap = usize::from(max_names);
+        let names: Vec<&str> = self
+            .core
+            .font_loader
+            .catalog
+            .iter()
+            .map(String::as_str)
+            .filter(|name| xlfd_pattern_matches(pattern, name))
+            .take(cap)
+            .collect();
+
+        let mut name_data: Vec<u8> = Vec::new();
+        for name in &names {
+            name_data.push(u8::try_from(name.len()).unwrap_or(u8::MAX));
+            name_data.extend_from_slice(name.as_bytes());
+        }
+        let pad = (4 - (name_data.len() % 4)) % 4;
+        name_data.resize(name_data.len() + pad, 0);
+
+        let extra_words = u32::try_from(name_data.len() / 4).unwrap_or(0);
+        let mut reply = vec![0u8; 32 + name_data.len()];
         reply[0] = 1;
+        reply[4..8].copy_from_slice(&extra_words.to_le_bytes());
+        reply[8..10].copy_from_slice(&u16::try_from(names.len()).unwrap_or(u16::MAX).to_le_bytes());
+        reply[32..].copy_from_slice(&name_data);
         Ok(reply)
     }
 
     fn list_fonts_with_info_proxy(
         &mut self,
         _origin: Option<OriginContext>,
-        _max_names: u16,
-        _pattern: &str,
+        max_names: u16,
+        pattern: &str,
     ) -> io::Result<Vec<Vec<u8>>> {
-        self.log_v2_gap("list_fonts_with_info_proxy");
-        Ok(Vec::new())
+        let cap = usize::from(max_names);
+        let matched: Vec<String> = self
+            .core
+            .font_loader
+            .catalog
+            .iter()
+            .filter(|name| xlfd_pattern_matches(pattern, name))
+            .take(cap)
+            .cloned()
+            .collect();
+
+        let mut entries: Vec<(String, FontMetrics)> = Vec::with_capacity(matched.len());
+        for name in matched {
+            match self.core.font_loader.open_font(&name) {
+                Ok((_face, metrics, _cache)) => entries.push((name, metrics)),
+                Err(err) => {
+                    log::debug!("v2 ListFontsWithInfo: skipping {name:?} — open_font: {err}");
+                }
+            }
+        }
+
+        let total = entries.len();
+        let mut replies: Vec<Vec<u8>> = Vec::with_capacity(total + 1);
+        for (idx, (name, metrics)) in entries.iter().enumerate() {
+            let remaining = u32::try_from(total - idx - 1).unwrap_or(0);
+            let mut buf = Vec::new();
+            yserver_protocol::x11::write_list_fonts_with_info_reply(
+                &mut buf,
+                yserver_protocol::x11::ClientByteOrder::LittleEndian,
+                yserver_protocol::x11::SequenceNumber(0),
+                metrics,
+                name,
+                remaining,
+            )?;
+            replies.push(buf);
+        }
+        let mut term = Vec::new();
+        yserver_protocol::x11::write_list_fonts_with_info_terminator(
+            &mut term,
+            yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            yserver_protocol::x11::SequenceNumber(0),
+        )?;
+        replies.push(term);
+        Ok(replies)
     }
 
     fn get_atom_name(
@@ -6359,6 +6615,38 @@ impl Backend for KmsBackendV2 {
         ];
         Ok((4, data))
     }
+}
+
+/// XLFD glob match per X11 ListFonts semantics: `*` matches zero or more
+/// characters (including `-`), `?` matches exactly one. Comparison is
+/// ASCII case-insensitive because clients legitimately mix case.
+fn xlfd_pattern_matches(pattern: &str, name: &str) -> bool {
+    let pat = pattern.as_bytes();
+    let s = name.as_bytes();
+    let mut pi = 0usize;
+    let mut si = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_si: usize = 0;
+    while si < s.len() {
+        if pi < pat.len() && (pat[pi] == b'?' || pat[pi].eq_ignore_ascii_case(&s[si])) {
+            pi += 1;
+            si += 1;
+        } else if pi < pat.len() && pat[pi] == b'*' {
+            star_pi = Some(pi);
+            star_si = si;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pat.len()
 }
 
 #[cfg(test)]
@@ -6433,6 +6721,28 @@ mod tests {
         // way KmsCore::new does); verify the accessor works and
         // returns an actual map reference.
         assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn v2_list_fonts_proxy_returns_catalog_matches() {
+        let mut b = KmsBackendV2::for_tests();
+        let expected = u16::try_from(b.core.font_loader.catalog.len().min(8)).unwrap_or(u16::MAX);
+        let reply = b.list_fonts_proxy(None, 8, "*").expect("list_fonts");
+        assert_eq!(reply[0], 1);
+        let count = u16::from_le_bytes([reply[8], reply[9]]);
+        assert_eq!(count, expected);
+    }
+
+    #[test]
+    fn v2_list_fonts_with_info_proxy_emits_terminator() {
+        let mut b = KmsBackendV2::for_tests();
+        let replies = b
+            .list_fonts_with_info_proxy(None, 4, "*")
+            .expect("list_fonts_with_info");
+        assert!(!replies.is_empty(), "terminator reply must be present");
+        let terminator = replies.last().expect("terminator");
+        assert_eq!(terminator[0], 1);
+        assert_eq!(terminator[1], 0);
     }
 
     /// Telemetry: counter sites fire at the Backend trait
@@ -7472,6 +7782,7 @@ mod tests {
                 depth: 32,
                 mapped: false,
                 parent: None,
+                stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
             },
@@ -7632,6 +7943,7 @@ mod tests {
                 depth: 32,
                 mapped: true,
                 parent: None,
+                stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
             },
@@ -7646,6 +7958,7 @@ mod tests {
                 depth: 32,
                 mapped: true,
                 parent: None,
+                stack_rank: 1,
                 bg_pixel: None,
                 bg_pixmap: None,
             },
@@ -7732,7 +8045,48 @@ mod tests {
         assert_eq!(geom.y, 20);
         assert_eq!(geom.width, 100);
         assert_eq!(geom.height, 50);
+        assert_eq!(
+            geom.depth, 24,
+            "root/untracked CopyFromParent inherits root depth"
+        );
         assert!(!geom.mapped, "mapped is set later via map_subwindow");
+    }
+
+    #[test]
+    fn copy_from_parent_child_inherits_argb_parent_depth() {
+        use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+
+        let mut b = KmsBackendV2::for_tests();
+        b.windows_v2.insert(
+            0x2000,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 40,
+                depth: 32,
+                mapped: true,
+                parent: None,
+                stack_rank: 0,
+                bg_pixel: None,
+                bg_pixmap: None,
+            },
+        );
+        let child = b
+            .create_subwindow(
+                None,
+                WindowHandle::from_raw(0x2000).unwrap(),
+                1,
+                2,
+                30,
+                20,
+                0,
+                HostSubwindowVisual::CopyFromParent,
+                None,
+                None,
+            )
+            .expect("create_subwindow");
+        assert_eq!(b.windows_v2[&child.as_raw()].depth, 32);
     }
 
     /// Stage 3f.11: reparenting a top-level window INTO another
@@ -7758,6 +8112,7 @@ mod tests {
                 depth: 32,
                 mapped: true,
                 parent: None,
+                stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
             },
@@ -7772,6 +8127,7 @@ mod tests {
                 depth: 32,
                 mapped: true,
                 parent: None,
+                stack_rank: 1,
                 bg_pixel: None,
                 bg_pixmap: None,
             },
@@ -7822,16 +8178,43 @@ mod tests {
         assert_eq!(b.core.top_level_order, vec![0x2000, 0x3000, 0x1000]);
     }
 
-    /// Stage 3f.11: subwindow restack (xid not in
-    /// `top_level_order`) is currently a no-op — sibling stack
-    /// ordering for children isn't tracked yet.
+    /// Stage 3f.11 follow-up: subwindow restack updates sibling order
+    /// within a shared parent instead of relying on HashMap iteration.
     #[test]
-    fn restack_subwindow_is_noop() {
+    fn restack_subwindow_updates_sibling_order() {
         let mut b = KmsBackendV2::for_tests();
-        b.core.top_level_order = vec![0x1000, 0x2000];
-        // 0xCAFE isn't in top_level_order → no-op.
-        b.restack_top_level(0xCAFE, 1, None);
-        assert_eq!(b.core.top_level_order, vec![0x1000, 0x2000]);
+        b.windows_v2.insert(
+            0xCAFE,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+                depth: 32,
+                mapped: true,
+                parent: Some(0xBEEF),
+                stack_rank: 0,
+                bg_pixel: None,
+                bg_pixmap: None,
+            },
+        );
+        b.windows_v2.insert(
+            0xD00D,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+                depth: 32,
+                mapped: true,
+                parent: Some(0xBEEF),
+                stack_rank: 1,
+                bg_pixel: None,
+                bg_pixmap: None,
+            },
+        );
+        b.restack_subwindow(0xD00D, 1, Some(0xCAFE));
+        assert!(b.windows_v2[&0xD00D].stack_rank < b.windows_v2[&0xCAFE].stack_rank);
     }
 
     /// Stage 3f.11: reparenting back to root re-adds to
@@ -7852,6 +8235,7 @@ mod tests {
                 depth: 32,
                 mapped: true,
                 parent: None,
+                stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
             },
@@ -7866,6 +8250,7 @@ mod tests {
                 depth: 32,
                 mapped: true,
                 parent: Some(0xC0FFEE),
+                stack_rank: 1,
                 bg_pixel: None,
                 bg_pixmap: None,
             },
@@ -7911,6 +8296,7 @@ mod tests {
                 depth: 32,
                 mapped: true,
                 parent,
+                stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
             },

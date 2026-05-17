@@ -733,6 +733,26 @@ pub trait Backend: Send {
         plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>>;
 
+    #[allow(clippy::too_many_arguments)]
+    fn clear_area(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_xid: u32,
+        background_pixel: u32,
+        background_pixmap_host_xid: Option<u32>,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        self.clear_clip_rectangles(origin)?;
+        if let Some(bg_host_xid) = background_pixmap_host_xid {
+            self.copy_area(origin, bg_host_xid, host_xid, x, y, x, y, width, height)
+        } else {
+            self.fill_rectangle(origin, host_xid, background_pixel, x, y, width, height)
+        }
+    }
+
     /// Read a depth-1 pixmap's pixels as a tightly packed `(width,
     /// height, bytes)` triple where each byte is non-zero for set
     /// pixels and zero for clear. Used by SHAPE `Mask` to convert a

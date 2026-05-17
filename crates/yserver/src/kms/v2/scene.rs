@@ -57,7 +57,10 @@
     reason = "SceneCompositor primitives are consumed across Stages 2d–2e"
 )]
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::{Arc, OnceLock},
+};
 
 use ash::vk;
 
@@ -911,6 +914,46 @@ fn all_zero(c: [f32; 4]) -> bool {
     c[0] == 0.0 && c[1] == 0.0 && c[2] == 0.0 && c[3] == 0.0
 }
 
+fn debug_scene_walk_xids() -> &'static HashSet<u32> {
+    static XIDS: OnceLock<HashSet<u32>> = OnceLock::new();
+    XIDS.get_or_init(|| {
+        std::env::var("YSERVER_V2_SCENE_WALK_XIDS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .filter_map(|part| {
+                        let token = part.trim();
+                        if token.is_empty() {
+                            return None;
+                        }
+                        let hex = token
+                            .strip_prefix("0x")
+                            .or_else(|| token.strip_prefix("0X"))
+                            .unwrap_or(token);
+                        u32::from_str_radix(hex, 16)
+                            .ok()
+                            .or_else(|| token.parse::<u32>().ok())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+fn debug_scene_walk_all() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("YSERVER_V2_SCENE_WALK_ALL").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+        )
+    })
+}
+
+fn scene_walk_debug_enabled_for(host_xid: u32) -> bool {
+    debug_scene_walk_all() || debug_scene_walk_xids().contains(&host_xid)
+}
+
 /// Walk window tree, build the per-output scene + collect damage
 /// snapshots.
 ///
@@ -1196,6 +1239,7 @@ fn emit_window_subtree(
     sampled_ids: &mut Vec<super::store::DrawableId>,
     projected: &mut RegionSet,
 ) {
+    let debug_focus = scene_walk_debug_enabled_for(host_xid);
     // Stage 4 diagnostic: trace-level scene-walk decision per window.
     // Enable with `RUST_LOG=yserver::kms::v2::scene=trace`. The
     // top-level and descendant paths share this function so the
@@ -1204,6 +1248,9 @@ fn emit_window_subtree(
     // yserver-hw.log to extract just these lines.
     let Some(geom) = windows_v2.get(&host_xid) else {
         log::trace!("v2 scene_walk xid={host_xid:#x}: SKIP reason=geom_not_in_windows_v2");
+        if debug_focus {
+            log::debug!("v2 scene_walk xid={host_xid:#x}: SKIP reason=geom_not_in_windows_v2");
+        }
         return;
     };
     if !geom.mapped {
@@ -1218,6 +1265,18 @@ fn emit_window_subtree(
             depth = geom.depth,
             parent = geom.parent,
         );
+        if debug_focus {
+            log::debug!(
+                "v2 scene_walk xid={host_xid:#x}: SKIP reason=geom_unmapped \
+                 geom=({x},{y} {w}x{h}) depth={depth} parent={parent:?}",
+                x = geom.x,
+                y = geom.y,
+                w = geom.width,
+                h = geom.height,
+                depth = geom.depth,
+                parent = geom.parent,
+            );
+        }
         return;
     }
     let abs_x = parent_abs_x + i32::from(geom.x);
@@ -1236,6 +1295,17 @@ fn emit_window_subtree(
             h = geom.height,
             depth = geom.depth,
         );
+        if debug_focus {
+            log::debug!(
+                "v2 scene_walk xid={host_xid:#x}: SKIP reason=no_store_lookup \
+                 geom=({x},{y} {w}x{h}) mapped=true depth={depth}",
+                x = geom.x,
+                y = geom.y,
+                w = geom.width,
+                h = geom.height,
+                depth = geom.depth,
+            );
+        }
     }
     if let Some(id) = lookup_id {
         // Pull diagnostic fields up front (cheap copies) so we can
@@ -1309,6 +1379,22 @@ fn emit_window_subtree(
                     dew = d_extent.width,
                     deh = d_extent.height,
                 );
+                if debug_focus {
+                    log::debug!(
+                        "v2 scene_walk xid={host_xid:#x}: SKIP reason={reason} \
+                         geom=({gx},{gy} {gw}x{gh}) mapped=true \
+                         store_id={d_id:?} kind={d_kind:?} depth={d_depth} \
+                         refcount={d_refcount} scene_participating={d_part} \
+                         storage_extent={dew}x{deh} image_view_null={d_view_null} \
+                         source_id={source_id:?} source_view_null={source_view_null}",
+                        gx = geom.x,
+                        gy = geom.y,
+                        gw = geom.width,
+                        gh = geom.height,
+                        dew = d_extent.width,
+                        deh = d_extent.height,
+                    );
+                }
             } else {
                 log::trace!(
                     "v2 scene_walk xid={host_xid:#x}: WILL_EMIT \
@@ -1325,6 +1411,23 @@ fn emit_window_subtree(
                     dew = d_extent.width,
                     deh = d_extent.height,
                 );
+                if debug_focus {
+                    log::debug!(
+                        "v2 scene_walk xid={host_xid:#x}: WILL_EMIT \
+                         geom=({gx},{gy} {gw}x{gh}) abs=({abs_x},{abs_y}) \
+                         output=({dx},{dy} {win_w}x{win_h}) \
+                         store_id={d_id:?} kind={d_kind:?} depth={d_depth} \
+                         refcount={d_refcount} scene_participating={d_part} \
+                         storage_extent={dew}x{deh} image_view_null={d_view_null} \
+                         source_id={source_id:?}",
+                        gx = geom.x,
+                        gy = geom.y,
+                        gw = geom.width,
+                        gh = geom.height,
+                        dew = d_extent.width,
+                        deh = d_extent.height,
+                    );
+                }
             }
 
             if d_part
@@ -1375,23 +1478,33 @@ fn emit_window_subtree(
                 h = geom.height,
                 depth = geom.depth,
             );
+            if debug_focus {
+                log::debug!(
+                    "v2 scene_walk xid={host_xid:#x}: SKIP reason=store_get_returned_none \
+                     store_id={lookup_id:?} geom=({x},{y} {w}x{h}) mapped=true depth={depth}",
+                    x = geom.x,
+                    y = geom.y,
+                    w = geom.width,
+                    h = geom.height,
+                    depth = geom.depth,
+                );
+            }
         }
     }
 
-    // Recurse into mapped descendants. Sibling z-order is HashMap
-    // iteration order (see fn-level comment) — proper stack tracking
-    // is post-3f.6.
-    let children: Vec<u32> = windows_v2
+    // Recurse into mapped descendants in stable sibling stack order.
+    let mut children: Vec<(u32, u64)> = windows_v2
         .iter()
         .filter_map(|(xid, g)| {
             if g.parent == Some(host_xid) {
-                Some(*xid)
+                Some((*xid, g.stack_rank))
             } else {
                 None
             }
         })
         .collect();
-    for child_xid in children {
+    children.sort_by_key(|(_, rank)| *rank);
+    for (child_xid, _) in children {
         emit_window_subtree(
             child_xid,
             abs_x,
@@ -2137,6 +2250,7 @@ mod tests {
                 depth: 32,
                 mapped,
                 parent,
+                stack_rank: 0,
                 bg_pixel: None,
                 bg_pixmap: None,
             },

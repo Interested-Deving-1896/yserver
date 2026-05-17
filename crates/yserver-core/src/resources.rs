@@ -1262,6 +1262,36 @@ impl ResourceTable {
             .map(|h| h.as_raw())
     }
 
+    /// Resolve the effective background by following `ParentRelative`
+    /// links upward until a concrete pixel or pixmap is found.
+    pub fn window_resolved_background(
+        &self,
+        window_id: ResourceId,
+    ) -> Option<ResolvedWindowBackground> {
+        self.window_resolved_background_inner(window_id, &mut Vec::new())
+    }
+
+    fn window_resolved_background_inner(
+        &self,
+        window_id: ResourceId,
+        seen: &mut Vec<ResourceId>,
+    ) -> Option<ResolvedWindowBackground> {
+        if seen.contains(&window_id) {
+            return None;
+        }
+        seen.push(window_id);
+
+        let window = self.windows.get(&window_id.0)?;
+        if matches!(window.background_pixmap, Some(bg) if bg.0 == 1) {
+            return self.window_resolved_background_inner(window.parent, seen);
+        }
+
+        Some(ResolvedWindowBackground {
+            background_pixel: window.background_pixel,
+            background_pixmap_host_xid: window.background_pixmap_host_xid,
+        })
+    }
+
     /// Returns true if any window currently uses `host_xid` as its background.
     /// Used by FreePixmap to skip releasing host pixmaps still owned by a window.
     pub fn host_xid_referenced_by_window_bg(&self, host_xid: crate::backend::PixmapHandle) -> bool {
@@ -2218,6 +2248,14 @@ pub struct Window {
     pub redirected_backing: Option<RedirectedBacking>,
 }
 
+/// Resolved background attributes for a window after following
+/// any `ParentRelative` links up the ancestry chain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedWindowBackground {
+    pub background_pixel: u32,
+    pub background_pixmap_host_xid: Option<crate::backend::PixmapHandle>,
+}
+
 /// Off-screen mirror backing a redirected window. `host_pixmap` is
 /// the backend pixmap handle (the X11 resource layer treats it as
 /// a synthetic pixmap drawable for paint-time routing). Width /
@@ -2522,6 +2560,43 @@ mod tests {
     fn fresh_window_has_no_redirected_backing() {
         let placeholder = Window::placeholder(ResourceId(0x100_0042));
         assert!(placeholder.redirected_backing.is_none());
+    }
+
+    #[test]
+    fn resolved_background_follows_parent_relative_links() {
+        let mut table = ResourceTable::new();
+        make_window(&mut table, 0x200001);
+        make_child(&mut table, 0x200002, 0x200001, 0, 0);
+
+        {
+            let parent = table.windows.get_mut(&0x200001).unwrap();
+            parent.background_pixel = 0x00aa_bbcc;
+            parent.background_pixmap = None;
+            parent.background_pixmap_host_xid = None;
+        }
+        {
+            let child = table.windows.get_mut(&0x200002).unwrap();
+            child.background_pixmap = Some(ResourceId(1));
+            child.background_pixmap_host_xid = None;
+        }
+
+        let resolved = table
+            .window_resolved_background(ResourceId(0x200002))
+            .expect("resolved background");
+        assert_eq!(resolved.background_pixel, 0x00aa_bbcc);
+        assert_eq!(resolved.background_pixmap_host_xid, None);
+
+        let parent_host = crate::backend::PixmapHandle::from_raw_for_test(0xdead_beef);
+        {
+            let parent = table.windows.get_mut(&0x200001).unwrap();
+            parent.background_pixmap = Some(ResourceId(0x200010));
+            parent.background_pixmap_host_xid = Some(parent_host);
+        }
+        let resolved = table
+            .window_resolved_background(ResourceId(0x200002))
+            .expect("resolved background");
+        assert_eq!(resolved.background_pixel, 0x00aa_bbcc);
+        assert_eq!(resolved.background_pixmap_host_xid, Some(parent_host));
     }
 
     #[test]

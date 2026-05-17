@@ -584,6 +584,22 @@ impl Backend for HostX11Backend {
         })
     }
 
+    fn clear_area(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_xid: u32,
+        _background_pixel: u32,
+        _background_pixmap_host_xid: Option<u32>,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        self.with_active_origin(origin, |this| {
+            HostX11Backend::clear_area(this, host_xid, x, y, width, height, false)
+        })
+    }
+
     fn poly_line(
         &mut self,
         origin: Option<OriginContext>,

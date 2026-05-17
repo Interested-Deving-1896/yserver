@@ -6741,10 +6741,18 @@ fn handle_create_window(
             state.resources.window(parent).and_then(|w| w.host_xid)
         };
         let local = state.resources.window(window_id);
-        let host_bg_pixel = local.map(|w| w.background_pixel);
-        let host_bg_pixmap = local
-            .and_then(|w| w.background_pixmap_host_xid)
-            .map(|h| h.as_raw());
+        let resolved_bg = state.resources.window_resolved_background(window_id);
+        let host_bg_pixel = resolved_bg
+            .map(|bg| bg.background_pixel)
+            .or_else(|| local.map(|w| w.background_pixel));
+        let host_bg_pixmap = resolved_bg
+            .and_then(|bg| bg.background_pixmap_host_xid)
+            .map(|h| h.as_raw())
+            .or_else(|| {
+                local
+                    .and_then(|w| w.background_pixmap_host_xid)
+                    .map(|h| h.as_raw())
+            });
         let allocated = host_parent.and_then(|host_parent| {
             match backend.create_subwindow(
                 origin,
@@ -6900,19 +6908,18 @@ fn handle_change_window_attributes(
         .is_some_and(|w| w.map_state == MapState::Viewable);
 
     if target_window == ROOT_WINDOW {
-        let root_bg_host_xid = if request.background_pixmap.is_some() {
-            state
-                .resources
-                .window_background_pixmap_host_xid(ROOT_WINDOW)
-        } else {
-            None
-        };
+        let root_bg = state.resources.window_resolved_background(ROOT_WINDOW);
+        let root_bg_host_xid = root_bg.and_then(|bg| bg.background_pixmap_host_xid);
         debug!(
             "client {} CWA(root) bg_pixmap={:?} bg_pixel={:?} root_bg_host_xid={:?}",
             client_id.0, request.background_pixmap, request.background_pixel, root_bg_host_xid,
         );
         if request.background_pixmap.is_some() {
-            let _ = backend.set_container_background_pixmap(origin, root_bg_host_xid.unwrap_or(0));
+            if let Some(host_bg) = root_bg_host_xid {
+                let _ = backend.set_container_background_pixmap(origin, host_bg.as_raw());
+            } else if let Some(bg_pixel) = root_bg.map(|bg| bg.background_pixel) {
+                let _ = backend.set_container_background_pixel(origin, bg_pixel);
+            }
         } else if let Some(pixel) = request.background_pixel {
             let _ = backend.set_container_background_pixel(origin, pixel);
         }
@@ -6929,23 +6936,23 @@ fn handle_change_window_attributes(
             .resources
             .window(target_window)
             .and_then(|w| w.host_xid);
-        let bg_pixel = state
-            .resources
-            .window(target_window)
-            .map(|w| w.background_pixel);
-        let bg_pixmap_host_xid = state
-            .resources
-            .window(target_window)
-            .and_then(|w| w.background_pixmap_host_xid);
+        let resolved_bg = state.resources.window_resolved_background(target_window);
         if let Some(host_xid) = host_xid {
             let mut value_mask: u32 = 0;
             let mut values: Vec<u32> = Vec::with_capacity(1);
             if request.background_pixmap.is_some() {
-                value_mask |= 1 << 0;
-                values.push(bg_pixmap_host_xid.map(|h| h.as_raw()).unwrap_or(0));
+                if let Some(bg_pixmap_host_xid) =
+                    resolved_bg.and_then(|bg| bg.background_pixmap_host_xid)
+                {
+                    value_mask |= 1 << 0;
+                    values.push(bg_pixmap_host_xid.as_raw());
+                } else {
+                    value_mask |= 1 << 1;
+                    values.push(resolved_bg.map(|bg| bg.background_pixel).unwrap_or(0));
+                }
             } else if request.background_pixel.is_some() {
                 value_mask |= 1 << 1;
-                values.push(bg_pixel.unwrap_or(0));
+                values.push(resolved_bg.map(|bg| bg.background_pixel).unwrap_or(0));
             }
             let _ =
                 backend.change_subwindow_attributes(origin, host_xid.as_raw(), value_mask, &values);
@@ -9267,41 +9274,29 @@ fn handle_clear_area(
         let extents = state
             .resources
             .window(request.window)
-            .map(|w| (w.background_pixel, w.width, w.height));
-        let bg_pixmap_host = state
-            .resources
-            .window_background_pixmap_host_xid(request.window);
+            .map(|w| (w.width, w.height));
+        let resolved_bg = state.resources.window_resolved_background(request.window);
         let target = state.resources.host_drawable_target(request.window);
-        if let Some((background_pixel, w_width, w_height)) = extents
+        if let Some((w_width, w_height)) = extents
             && let Some(target) = target
         {
             let width = clear_extent(request.width, request.x, w_width);
             let height = clear_extent(request.height, request.y, w_height);
             if width != 0 && height != 0 {
-                backend.clear_clip_rectangles(origin)?;
-                if let Some(bg_host_xid) = bg_pixmap_host {
-                    backend.copy_area(
-                        origin,
-                        bg_host_xid,
-                        target.host_xid(),
-                        request.x,
-                        request.y,
-                        request.x,
-                        request.y,
-                        width,
-                        height,
-                    )?;
-                } else {
-                    backend.fill_rectangle(
-                        origin,
-                        target.host_xid(),
-                        background_pixel,
-                        request.x,
-                        request.y,
-                        width,
-                        height,
-                    )?;
-                }
+                let bg_pixel = resolved_bg.map(|bg| bg.background_pixel).unwrap_or(0);
+                let bg_pixmap_host = resolved_bg
+                    .and_then(|bg| bg.background_pixmap_host_xid)
+                    .map(|h| h.as_raw());
+                backend.clear_area(
+                    origin,
+                    target.host_xid(),
+                    bg_pixel,
+                    bg_pixmap_host,
+                    request.x,
+                    request.y,
+                    width,
+                    height,
+                )?;
                 let _dropped = accumulate_damage_to_state(
                     state,
                     request.window,

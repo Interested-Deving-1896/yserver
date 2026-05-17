@@ -1227,6 +1227,159 @@ fn v2_set_container_background_pixmap_tiles_across_root() {
     }
 }
 
+/// `ClearArea` on a window with `bg_pixmap` must tile the pixmap
+/// relative to the window origin, not issue a one-shot copy from the
+/// same `(x, y)` source offset. fvwm3 frame/panel clears rely on this.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_clear_area_with_bg_pixmap_tiles_window_background() {
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let tile = b.create_pixmap(None, 32, 2, 2).expect("tile");
+    b.fill_rectangle(None, tile.as_raw(), 0xFFFF_0000, 0, 0, 2, 2)
+        .expect("tile red");
+
+    let root = WindowHandle::from_raw(1).expect("root");
+    let window = b
+        .create_subwindow(
+            None,
+            root,
+            0,
+            0,
+            8,
+            8,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("window");
+    let xid = window.as_raw();
+
+    b.fill_rectangle(None, xid, 0xFF00_00FF, 0, 0, 8, 8)
+        .expect("window blue");
+    b.clear_area(None, xid, 0, Some(tile.as_raw()), 3, 3, 4, 4)
+        .expect("clear_area bg_pixmap");
+
+    let out = b
+        .get_image(None, xid, 2, 0, 0, 8, 8, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+    let pixel = |x: usize, y: usize| -> [u8; 4] {
+        let off = (y * 8 + x) * 4;
+        [out[off], out[off + 1], out[off + 2], out[off + 3]]
+    };
+
+    assert_eq!(
+        pixel(0, 0),
+        [0xFF, 0x00, 0x00, 0xFF],
+        "outside clear stays blue"
+    );
+    assert_eq!(
+        pixel(3, 3),
+        [0x00, 0x00, 0xFF, 0xFF],
+        "clear origin tiles red"
+    );
+    assert_eq!(
+        pixel(4, 3),
+        [0x00, 0x00, 0xFF, 0xFF],
+        "tile repeats horizontally inside clear"
+    );
+    assert_eq!(
+        pixel(6, 6),
+        [0x00, 0x00, 0xFF, 0xFF],
+        "tile repeats over the whole cleared region"
+    );
+    assert_eq!(
+        pixel(7, 7),
+        [0xFF, 0x00, 0x00, 0xFF],
+        "outside clear stays blue at bottom-right"
+    );
+}
+
+/// Resizing a window that has a `bg_pixmap` must seed the fresh
+/// storage from that pixmap, not from `bg_pixel`/default fill only.
+/// The right-side fvwm panel exercises exactly this path when its
+/// child window is resized from a small initial geometry to a tall
+/// column.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_resize_with_bg_pixmap_reseeds_new_storage_from_background_pixmap() {
+    use yserver_core::{
+        backend::WindowHandle,
+        host_x11::{HostSubwindowConfig, HostSubwindowVisual},
+    };
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let tile = b.create_pixmap(None, 32, 2, 2).expect("tile");
+    b.fill_rectangle(None, tile.as_raw(), 0xFFFF_0000, 0, 0, 2, 2)
+        .expect("tile red");
+
+    let root = WindowHandle::from_raw(1).expect("root");
+    let window = b
+        .create_subwindow(
+            None,
+            root,
+            0,
+            0,
+            8,
+            8,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            Some(tile.as_raw()),
+        )
+        .expect("window");
+    let xid = window.as_raw();
+
+    b.fill_rectangle(None, xid, 0xFF00_00FF, 0, 0, 8, 8)
+        .expect("window blue");
+    b.configure_subwindow(
+        None,
+        xid,
+        HostSubwindowConfig {
+            width: Some(32),
+            height: Some(32),
+            ..HostSubwindowConfig::default()
+        },
+    )
+    .expect("resize");
+
+    let out = b
+        .get_image(None, xid, 2, 20, 20, 1, 1, !0)
+        .expect("get_image")
+        .expect("Some");
+    assert_eq!(out.len(), 4, "single BGRA8 pixel");
+    assert_eq!(
+        &out[0..4],
+        &[0x00, 0x00, 0xFF, 0xFF],
+        "freshly grown storage must come from tiled bg_pixmap, not default white/black fill",
+    );
+}
+
 /// Stage 3f.14 acceptance: a fresh window storage allocated with
 /// `bg_pixel == None` (no `CWBackPixel` attribute) reads back as a
 /// depth-appropriate safe-default colour, **not** whatever bytes
@@ -1887,6 +2040,144 @@ fn v2_redirect_seed_copies_descendants() {
         pixel(11, 4),
         [0x00, 0x00, 0xFF, 0xFF],
         "(11, 4) just past C's right edge — W's red",
+    );
+}
+
+/// Redirect seed-copy must respect sibling stack order for
+/// overlapping descendants. WM frame pieces are frequently sibling
+/// subwindows under one parent; if the seed walk uses HashMap order,
+/// the overlap area in the backing becomes nondeterministic.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_redirect_seed_respects_overlapping_sibling_stack_order() {
+    use yserver_core::{
+        backend::WindowHandle,
+        host_x11::{HostSubwindowConfig, HostSubwindowVisual},
+    };
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let root = WindowHandle::from_raw(1).expect("root");
+    let w_handle = b
+        .create_subwindow(
+            None,
+            root,
+            0,
+            0,
+            16,
+            16,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("create W");
+    let a_handle = b
+        .create_subwindow(
+            None,
+            w_handle,
+            2,
+            2,
+            8,
+            8,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("create A");
+    let b_handle = b
+        .create_subwindow(
+            None,
+            w_handle,
+            4,
+            4,
+            8,
+            8,
+            0,
+            HostSubwindowVisual::Explicit {
+                depth: 32,
+                visual_xid: 0,
+                colormap_xid: 0,
+            },
+            None,
+            None,
+        )
+        .expect("create B");
+
+    let w_xid = w_handle.as_raw();
+    let a_xid = a_handle.as_raw();
+    let b_xid = b_handle.as_raw();
+
+    b.fill_rectangle(None, w_xid, 0xFFFF0000, 0, 0, 16, 16)
+        .expect("seed W red");
+    b.fill_rectangle(None, a_xid, 0xFF0000FF, 0, 0, 8, 8)
+        .expect("seed A blue");
+    b.fill_rectangle(None, b_xid, 0xFF00FF00, 0, 0, 8, 8)
+        .expect("seed B green");
+
+    // Put B above A before redirect; the overlap at (4..10, 4..10)
+    // must therefore read green in the seeded backing.
+    b.configure_subwindow(
+        None,
+        b_xid,
+        HostSubwindowConfig {
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            border_width: None,
+            sibling: Some(a_xid),
+            stack_mode: Some(0),
+        },
+    )
+    .expect("restack B above A");
+
+    let backing = b
+        .allocate_redirected_backing(None, w_handle, 16, 16, 32)
+        .expect("allocate must succeed");
+    let img = b
+        .get_image(None, backing.as_raw(), 2, 0, 0, 16, 16, !0)
+        .expect("get_image")
+        .expect("Some bytes");
+    let pixel = |x: usize, y: usize| -> [u8; 4] {
+        let off = (y * 16 + x) * 4;
+        [img[off], img[off + 1], img[off + 2], img[off + 3]]
+    };
+
+    assert_eq!(
+        pixel(1, 1),
+        [0x00, 0x00, 0xFF, 0xFF],
+        "outside children → parent red",
+    );
+    assert_eq!(
+        pixel(3, 3),
+        [0xFF, 0x00, 0x00, 0xFF],
+        "inside A-only region → A blue",
+    );
+    assert_eq!(
+        pixel(11, 11),
+        [0x00, 0xFF, 0x00, 0xFF],
+        "inside B-only region → B green",
+    );
+    assert_eq!(
+        pixel(5, 5),
+        [0x00, 0xFF, 0x00, 0xFF],
+        "overlap must follow sibling stack order: B above A → green",
     );
 }
 

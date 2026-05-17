@@ -1114,6 +1114,29 @@ impl HostX11Backend {
         self.stream.flush()
     }
 
+    pub fn clear_area(
+        &mut self,
+        host_xid: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        exposures: bool,
+    ) -> io::Result<()> {
+        self.advance_sequence();
+        let mut clear = Vec::with_capacity(16);
+        clear.push(61);
+        clear.push(u8::from(exposures));
+        write_u16(&mut clear, 4);
+        write_u32(&mut clear, host_xid);
+        write_i16(&mut clear, x);
+        write_i16(&mut clear, y);
+        write_u16(&mut clear, width);
+        write_u16(&mut clear, height);
+        self.stream.write_all(&clear)?;
+        self.stream.flush()
+    }
+
     pub fn map_subwindow(&mut self, host_xid: u32) -> io::Result<()> {
         self.advance_sequence();
         let mut out = Vec::new();
