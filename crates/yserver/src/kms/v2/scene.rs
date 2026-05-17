@@ -393,6 +393,35 @@ impl SceneCompositor {
         }
     }
 
+    /// Stage 4c.1 — rect-precise scene-structure damage where the
+    /// caller doesn't know which output(s) a screen-/output-coord
+    /// rect intersects. Each input rect is intersected against every
+    /// output's extent and (if non-empty) added to that output's
+    /// `scene_structure_damage`. Mirrors the singular
+    /// `mark_scene_structure_damage_rect` setter but applies to all
+    /// outputs with output-extent clipping, the dual of
+    /// `add_projected_damage` (output-coord input rather than
+    /// storage-local projection).
+    ///
+    /// In the Stage-4 single-output deployment, output origin is
+    /// (0, 0) so "screen-coord" and "output-local-coord" coincide;
+    /// this clip is just "drop the bits that fall off the right /
+    /// bottom edge".
+    pub(crate) fn mark_scene_structure_damage_rects(&mut self, rects: &[vk::Rect2D]) {
+        self.scene_structure_dirty = true;
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        for o in &mut inner.outputs {
+            let ext = o.output_extent;
+            for r in rects {
+                if let Some(clipped) = clip_rect_to_output_extent(*r, ext) {
+                    o.scene_structure_damage.add(clipped);
+                }
+            }
+        }
+    }
+
     /// Drain in-flight compose work before tear-down. Best-effort
     /// — `device_wait_idle` is the safe fallback the platform
     /// uses anyway. Releases descriptor-pool slots so the
@@ -1139,6 +1168,42 @@ fn emit_window_subtree(
     }
 }
 
+/// Stage 4c.1 — intersect a rect (in output-local coords) with the
+/// output's extent. Returns `None` if the intersection is empty
+/// (rect lies fully outside, or input has zero width/height).
+///
+/// This is the output-local counterpart to `add_projected_damage`'s
+/// clipping math: same rectangle-intersection arithmetic, but the
+/// projection (the `+dx`/`+dy` translation that maps storage-local
+/// coords into output coords) is omitted because the caller already
+/// works in output coords.
+fn clip_rect_to_output_extent(rect: vk::Rect2D, ext: vk::Extent2D) -> Option<vk::Rect2D> {
+    let max_x = i32::try_from(ext.width).unwrap_or(i32::MAX);
+    let max_y = i32::try_from(ext.height).unwrap_or(i32::MAX);
+    let x0 = rect.offset.x.max(0);
+    let y0 = rect.offset.y.max(0);
+    let x1 = rect
+        .offset
+        .x
+        .saturating_add_unsigned(rect.extent.width)
+        .min(max_x);
+    let y1 = rect
+        .offset
+        .y
+        .saturating_add_unsigned(rect.extent.height)
+        .min(max_y);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(vk::Rect2D {
+        offset: vk::Offset2D { x: x0, y: y0 },
+        extent: vk::Extent2D {
+            width: u32::try_from(x1 - x0).unwrap_or(0),
+            height: u32::try_from(y1 - y0).unwrap_or(0),
+        },
+    })
+}
+
 fn add_projected_damage(
     projected: &mut RegionSet,
     src: vk::Rect2D,
@@ -1503,6 +1568,62 @@ mod tests {
         assert!(scene.scene_structure_dirty);
         scene.mark_scene_structure_dirty();
         assert!(scene.scene_structure_dirty);
+    }
+
+    /// Stage 4c.1 — the plural setter sets `scene_structure_dirty`
+    /// even on the stub-mode compositor (mirrors the singular
+    /// setter's early-return shape).
+    #[test]
+    fn mark_scene_structure_damage_rects_sets_dirty_on_stub() {
+        let mut scene = SceneCompositor::stub();
+        scene.scene_structure_dirty = false;
+        scene.mark_scene_structure_damage_rects(&[rect(0, 0, 10, 10)]);
+        assert!(scene.scene_structure_dirty);
+    }
+
+    /// Stage 4c.1 — the helper clips a rect to the output's extent
+    /// (offset assumed (0,0) — output-local coords). Wholly inside
+    /// → identity. Partially overlapping → clipped intersection.
+    /// Fully outside or zero-area → `None`.
+    #[test]
+    fn clip_rect_to_output_extent_handles_all_cases() {
+        let ext = extent(800, 600);
+
+        // Wholly inside — identity.
+        assert_eq!(
+            clip_rect_to_output_extent(rect(10, 20, 100, 50), ext),
+            Some(rect(10, 20, 100, 50)),
+        );
+
+        // Right edge spills — clip width.
+        assert_eq!(
+            clip_rect_to_output_extent(rect(700, 0, 200, 50), ext),
+            Some(rect(700, 0, 100, 50)),
+        );
+
+        // Bottom edge spills — clip height.
+        assert_eq!(
+            clip_rect_to_output_extent(rect(0, 500, 50, 200), ext),
+            Some(rect(0, 500, 50, 100)),
+        );
+
+        // Negative offset — clamp to 0, clip width.
+        assert_eq!(
+            clip_rect_to_output_extent(rect(-30, -20, 100, 80), ext),
+            Some(rect(0, 0, 70, 60)),
+        );
+
+        // Wholly to the right — None.
+        assert_eq!(clip_rect_to_output_extent(rect(900, 0, 50, 50), ext), None);
+
+        // Wholly below — None.
+        assert_eq!(clip_rect_to_output_extent(rect(0, 700, 50, 50), ext), None);
+
+        // Zero-width — None.
+        assert_eq!(clip_rect_to_output_extent(rect(10, 10, 0, 50), ext), None);
+
+        // Zero-height — None.
+        assert_eq!(clip_rect_to_output_extent(rect(10, 10, 50, 0), ext), None);
     }
 
     fn rect(x: i32, y: i32, w: u32, h: u32) -> vk::Rect2D {
