@@ -42,3 +42,8 @@ bee-*.data.old
 
 # Flamegraphs / per-run perf artifacts (binary-ish SVGs, large)
 bee-*.svg
+
+# Scanout PPM dumps from yserver SIGUSR1 / hardware smoke (large,
+# regenerable, not source-of-truth)
+yserver-*-scanout-*.ppm
+*.ppm
