@@ -3187,9 +3187,16 @@ impl Backend for KmsBackendV2 {
     /// rather than recycled GPU garbage. The fill is best-effort
     /// — on the stub fixture (no Vk) `engine.fill_rect` errors;
     /// log + continue (storage already exists at xid level).
+    ///
+    /// The zero-fill itself is NOT damage-tracked: the first
+    /// compositor `put_image`/paint provides the presentation
+    /// damage `build_scene` will pick up, and `register_cow`
+    /// below already marks `scene_structure_dirty` so the next
+    /// tick composites the COW layer (with a fresh clear)
+    /// regardless of whether per-drawable damage is empty.
     fn get_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
         if self.cow_id.is_some() {
-            self.core.cow_refcount = self.core.cow_refcount.saturating_add(1);
+            self.core.cow_refcount += 1;
             return Ok(());
         }
         let fb_w = self.platform.fb_w.max(1);
@@ -8487,6 +8494,35 @@ mod tests {
         // fresh, refcount climbs from 0 → 1.
         b.get_overlay_window(None)
             .expect("re-get after final release");
+        assert_eq!(b.core.cow_refcount, 1);
+        assert!(b.cow_id.is_some());
+    }
+
+    /// Stage 4d defensive branch: a `ReleaseOverlayWindow` with
+    /// no preceding `GetOverlayWindow` (compositor crash + restart
+    /// midway through a hand-off, double-release on the same
+    /// client, etc.) must be a clean no-op. `core.cow_refcount`
+    /// stays 0 (no underflow), `cow_id` stays `None`, and the
+    /// scene's COW entry stays unregistered.
+    #[test]
+    fn cow_release_without_prior_get_is_noop() {
+        let mut b = KmsBackendV2::for_tests();
+        assert_eq!(b.core.cow_refcount, 0);
+        assert!(b.cow_id.is_none());
+
+        b.release_overlay_window(None).expect("noop release");
+
+        assert_eq!(
+            b.core.cow_refcount, 0,
+            "unmatched release must NOT underflow refcount",
+        );
+        assert!(
+            b.cow_id.is_none(),
+            "unmatched release must NOT spuriously set cow_id",
+        );
+        // Subsequent get_overlay_window still works (defensive
+        // branch hasn't poisoned any state).
+        b.get_overlay_window(None).expect("get after noop release");
         assert_eq!(b.core.cow_refcount, 1);
         assert!(b.cow_id.is_some());
     }

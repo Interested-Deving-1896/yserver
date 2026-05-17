@@ -2178,15 +2178,15 @@ fn v2_mode_flip_preserves_backing_and_aliases() {
 /// storage with presentation damage accumulated. This is the load-
 /// bearing v2 path for compositing WMs (marco-compositing,
 /// xfwm4-compositing): pre-4d the COW xid resolved to nothing in
-/// the store, so every render_composite against it gap-logged and
-/// dropped paint.
+/// the store, so every `render_composite` against it gap-logged
+/// and dropped paint.
 ///
 /// Oracle shape: scanout dump integration is heavyweight (needs
 /// `dump_scanout` wiring that test fixtures don't have); per the
 /// stage brief, the acceptable surrogate is
 /// `test_peek_presentation_damage_nonempty(0x103)` after a
 /// `put_image` against the COW xid — confirms (a) the xid resolves,
-/// (b) the storage is scene_participating, and (c) the paint
+/// (b) the storage is `scene_participating`, and (c) the paint
 /// accumulated presentation damage that a scene tick would consume.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
