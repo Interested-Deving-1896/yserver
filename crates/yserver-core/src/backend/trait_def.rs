@@ -447,23 +447,15 @@ pub trait Backend: Send {
     }
 
     /// Stage 4b — flip a backing's scene-participation under
-    /// COMPOSITE redirect. Used so paint that resolves through
-    /// the backing accumulates presentation damage on B, which
-    /// the scene walk picks up via W's `redirected_target`
-    /// indirection in 4c's `build_scene` patch.
-    ///
-    /// Stage 4d.8c: callers (`activate_redirect_backing_for` and
-    /// `flip_redirect_target_mode` in `process_request.rs`)
-    /// invoke this with `true` in BOTH Automatic and Manual
-    /// modes. Manual was previously skipped, but under 4d.8b's
-    /// pragmatic floor W stays scene-participating in Manual and
-    /// the scene reads from B via `redirected_target`, so B's
-    /// paint damage must be tracked in both modes — otherwise the
-    /// drawable store's `damage()` early-returns and repaints
-    /// never fire. On unredirect / destroy,
-    /// `release_redirected_backing` drops the flag internally so
-    /// the protocol handler doesn't need to fire a separate
-    /// `false` call.
+    /// COMPOSITE redirect. Used by Automatic mode so paint that
+    /// resolves through the backing accumulates presentation
+    /// damage on B (which the scene walk picks up via W's
+    /// `redirected_target` indirection in 4c's `build_scene`
+    /// patch). Manual backings stay `false`; only Automatic
+    /// activations call this with `true`. On unredirect /
+    /// destroy, `release_redirected_backing` drops the flag
+    /// internally so the protocol handler doesn't need to fire
+    /// a separate `false` call.
     ///
     /// Default no-op as for `set_window_scene_participation`.
     ///
