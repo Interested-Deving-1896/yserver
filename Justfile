@@ -538,13 +538,13 @@ yserver-wmaker-xterm-hw log="debug":
 yserver-picom-hw client="xclock":
     tools/picom-yserver.sh {{client}}
 
-yserver-xfce-hw log="debug,yserver::kms::v2::scene=trace":
+yserver-xfce-hw log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::store=trace":
     cargo build --bin yserver
     bash -c '\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-xfce.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 YSERVER_V2_SCENE_WALK_ALL=1\
             XDG_SESSION_TYPE=x11 \
             dbus-run-session xfce4-session --display :7 > xfce.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
@@ -688,6 +688,29 @@ mate-xephyr-trace screen="5120x1440":
         echo "Xephyr log: mate-xephyr.log";\
         echo "x11trace:   mate-xorg.xtrace";\
         echo "mate log:   mate-xorg.log"'
+
+xfce-xephyr-trace screen="1920x1080":
+    rm -f xfce-xorg.xtrace xfce-xephyr.log xfce-xorg.log
+    bash -c 'set -e;\
+        if [[ -z "${DISPLAY:-}" ]]; then echo "need a host DISPLAY (XWayland under GNOME provides one)" >&2; exit 1; fi;\
+        if ! command -v Xephyr >/dev/null; then echo "Xephyr not installed (pacman -S xorg-server-xephyr)" >&2; exit 1; fi;\
+        if ! command -v x11trace >/dev/null; then echo "x11trace not installed (pacman -S xtrace)" >&2; exit 1; fi;\
+        echo "outer DISPLAY=$DISPLAY  nested=:18  traced=:19";\
+        Xephyr -screen {{screen}} -title "xfce-xorg-trace" :18 > xfce-xephyr.log 2>&1 &\
+        xephyr_pid=$!;\
+        trap "kill -TERM $xephyr_pid 2>/dev/null; wait $xephyr_pid 2>/dev/null" EXIT;\
+        for _ in $(seq 1 50); do [[ -S /tmp/.X11-unix/X18 ]] && break; sleep 0.1; done;\
+        if [[ ! -S /tmp/.X11-unix/X18 ]]; then echo "Xephyr :18 never came up; see xfce-xephyr.log" >&2; tail -20 xfce-xephyr.log >&2; exit 2; fi;\
+        x11trace -d :18 -D :19 -n -o xfce-xorg.xtrace &\
+        xtrace_pid=$!;\
+        trap "kill -TERM $xtrace_pid $xephyr_pid 2>/dev/null; wait $xephyr_pid 2>/dev/null" EXIT;\
+        sleep 1;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:19 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session xfce4-session --display=:19 > xfce-xorg.log 2>&1;\
+        echo "Xephyr log: xfce-xephyr.log";\
+        echo "x11trace:   xfce-xorg.xtrace";\
+        echo "xfce log:   xfce-xorg.log"'
 
 # Release-mode mate with logging turned down to `warn`. Use this to
 # test whether pointer lag under hover is dominated by env_logger /
