@@ -2650,3 +2650,89 @@ fn v2_render_composite_depth24_src_samples_opaque_alpha() {
         }
     }
 }
+
+/// Scene-path α-leak fix — sibling to
+/// `v2_render_composite_depth24_src_samples_opaque_alpha` above,
+/// covering the scene compositor side instead of the engine RENDER
+/// side.
+///
+/// Bug: `Storage::image_view` is created with IDENTITY component
+/// swizzle (required by VUID-VkFramebufferCreateInfo-pAttachments-00891
+/// because the same view doubles as a colour attachment). The
+/// engine's RENDER path avoids the depth-24 α-leak by sampling via
+/// a separate cached view with `BgraNoAlpha` swizzle
+/// (`engine::ensure_drawable_view`), but the scene compositor binds
+/// `storage.image_view` directly in every `CompositeDraw`
+/// (`scene::build_scene` four sites — root, window subtree, COW,
+/// cursor). With `alpha_passthrough=true` on window draws, the
+/// shader samples raw padding bytes as α; for a depth-24 BGRA8
+/// drawable that has been filled with α-byte = 0 in storage (any
+/// `put_image` of `0x00RRGGBB` wire bytes, the depth-24 default),
+/// the scene blends with α=0 and the layer below shows through —
+/// matching the `mate-with-compositing wallpaper bleeds through
+/// COW` and `bits appear/disappear` symptoms.
+///
+/// Fix: `Storage` carries a second view `sample_view` built with
+/// format-aware swizzle (α=ONE for depth-24 BGRA8). Scene draws
+/// bind `sample_view`. This test only proves the field exists,
+/// differs from `image_view` for a depth-24 drawable, and is a
+/// real (non-null) `vk::ImageView`. End-to-end pixel-level scene
+/// verification needs scanout-dump test scaffolding the v2
+/// acceptance harness does not yet have — but the swizzle helper
+/// itself is the load-bearing piece and is also covered by
+/// engine-side composite tests.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_storage_depth24_has_distinct_sample_view() {
+    use ash::vk;
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Depth-24 pixmap — the case where the BgraNoAlpha swizzle
+    // (α=ONE) must differ from the identity attachment view.
+    let pix24 = b.create_pixmap(None, 24, 4, 4).expect("create d24");
+    let views24 = b
+        .test_storage_views(pix24.as_raw())
+        .expect("d24 storage resolves");
+    assert_ne!(
+        views24.0,
+        vk::ImageView::null(),
+        "d24 image_view must be non-null",
+    );
+    assert_ne!(
+        views24.1,
+        vk::ImageView::null(),
+        "d24 sample_view must be non-null after the scene-α fix \
+         (pre-fix: sample_view field did not exist, scene bound \
+         image_view directly with identity swizzle, depth-24 \
+         padding α leaked)",
+    );
+    assert_ne!(
+        views24.0, views24.1,
+        "d24 sample_view must be a different VkImageView than \
+         image_view (different ComponentMapping — α=ONE vs \
+         IDENTITY). Same handle would mean either the fix \
+         wasn't applied or the format-aware swizzle defaulted \
+         to identity for BGRA8/depth-24.",
+    );
+
+    // Depth-32 pixmap — sample_view's swizzle is also identity
+    // (real α passes through), so the *swizzle* is the same as
+    // image_view, but they must still be distinct VkImageView
+    // handles (the attachment view must keep IDENTITY swizzle
+    // unconditionally per VUID 00891, and the sample_view is
+    // owned/destroyed separately by Storage). Asserting non-null
+    // proves the plumbing is wired for depth-32 too.
+    let pix32 = b.create_pixmap(None, 32, 4, 4).expect("create d32");
+    let views32 = b
+        .test_storage_views(pix32.as_raw())
+        .expect("d32 storage resolves");
+    assert_ne!(views32.0, vk::ImageView::null());
+    assert_ne!(views32.1, vk::ImageView::null());
+}

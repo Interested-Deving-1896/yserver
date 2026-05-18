@@ -1021,7 +1021,11 @@ fn build_scene(
                 drawable.storage.extent.height as f32,
             ];
             draws.push(CompositeDraw {
-                image_view: source.storage.image_view,
+                // Root scene draw — sample-side view carries the
+                // format/depth-aware swizzle (depth-24 → α=ONE).
+                // See `Storage::sample_view` for why scene draws
+                // MUST NOT bind `image_view` directly.
+                image_view: source.storage.sample_view,
                 dst_origin,
                 dst_size,
                 src_origin: [0.0, 0.0],
@@ -1100,7 +1104,15 @@ fn build_scene(
             drawable.storage.extent.width as f32,
             drawable.storage.extent.height as f32,
         ];
-        let image_view = drawable.storage.image_view;
+        // COW scene draw — bind the sample-side view so the
+        // compositor's xRGB-intent paint sees α=ONE through the
+        // shader (depth-24 BGRA8 padding bytes get force-opaque
+        // by the swizzle). Pre-fix the IDENTITY view leaked
+        // padding-α into the scene; with `alpha_passthrough=true`
+        // that blended the layer below through COW, matching the
+        // "wallpaper bleeds through marco/xfwm4 composited frame"
+        // hardware-smoke symptom.
+        let image_view = drawable.storage.sample_view;
         draws.push(CompositeDraw {
             image_view,
             dst_origin,
@@ -1179,7 +1191,9 @@ fn build_scene(
         let visible = !(dx + cw <= 0 || dy + ch <= 0 || dx >= layout_w_i || dy >= layout_h_i);
         if visible {
             draws.push(CompositeDraw {
-                image_view: drawable.storage.image_view,
+                // Cursor sprite — sample-side view so the
+                // sprite's depth-32 ARGB α passes through cleanly.
+                image_view: drawable.storage.sample_view,
                 #[allow(clippy::cast_precision_loss)]
                 dst_origin: [dx as f32, dy as f32],
                 #[allow(clippy::cast_precision_loss)]
@@ -1436,7 +1450,22 @@ fn emit_window_subtree(
                 && source.storage.image_view != vk::ImageView::null()
                 && intersects
             {
-                let image_view = source.storage.image_view;
+                // Window scene draw — bind the sample-side view
+                // (format/depth-aware swizzle) instead of the
+                // raw IDENTITY-swizzle attachment view. This is
+                // the load-bearing fix for the "depth-24 windows
+                // / COW α leak" bug: the BgraNoAlpha swizzle
+                // forced α=ONE for depth-24 used to live ONLY in
+                // the engine's RENDER view-cache, never on the
+                // scene path. Combined with `alpha_passthrough=true`
+                // below, the prior IDENTITY view leaked the
+                // BGRA8 padding byte (typically 0) into the
+                // shader's `src.a`, blending depth-24 windows
+                // with α=0 — invisible against root, which
+                // matched the post-4d.7 mate-with-compositing
+                // and xfce-with-compositing hardware-smoke
+                // failure shape.
+                let image_view = source.storage.sample_view;
                 draws.push(CompositeDraw {
                     image_view,
                     #[allow(clippy::cast_precision_loss)]
@@ -1455,9 +1484,9 @@ fn emit_window_subtree(
                     // turned transparent areas into opaque black, hiding
                     // mate-panel applets, control-center sidebar text,
                     // system-tray icons, and tooltips. Depth-24 sources
-                    // stay correct because their BgraNoAlpha image-view
-                    // swizzle pins alpha=ONE at view-bind time, so this
-                    // pipeline sees alpha=1 from them regardless.
+                    // pass through `sample_view`'s α=ONE swizzle so the
+                    // shader sees α=1 from them regardless of the BGRA8
+                    // padding byte — that's the scene-α fix above.
                     alpha_passthrough: true,
                 });
                 sampled_ids.push(source_id);
@@ -2236,7 +2265,13 @@ mod tests {
         // SAFETY: Vk handle types are opaque u64s; constructing a
         // sentinel doesn't touch the driver. The `is_test_stub`
         // flag on Storage means Drop won't try to destroy these.
-        storage.image_view = ash::vk::Handle::from_raw(u64::from(xid) | 0xFF00_0000);
+        // Stamp both views to the same sentinel so build_scene's
+        // sample-side bind (`storage.sample_view`) sees the same
+        // handle the legacy tests asserted against — these stubs
+        // don't exercise α swizzle, just storage-routing.
+        let sentinel: ash::vk::ImageView = ash::vk::Handle::from_raw(u64::from(xid) | 0xFF00_0000);
+        storage.image_view = sentinel;
+        storage.sample_view = sentinel;
         store
             .allocate(xid, DrawableKind::Window, 32, mapped, storage)
             .expect("stub allocate");
@@ -2412,8 +2447,10 @@ mod tests {
         );
         // SAFETY: opaque u64 Vk handle for the cursor's view; the
         // stub Storage's `is_test_stub` flag means Drop won't free
-        // it.
-        storage.image_view = ash::vk::Handle::from_raw(0xCAFE_BABE);
+        // it. Stamp both views so scene binds the sample-side.
+        let cur_sentinel: ash::vk::ImageView = ash::vk::Handle::from_raw(0xCAFE_BABE);
+        storage.image_view = cur_sentinel;
+        storage.sample_view = cur_sentinel;
         let cursor_id = store
             .allocate(0xCAFE_0001, DrawableKind::Pixmap, 32, false, storage)
             .expect("alloc cursor stub");
@@ -2499,6 +2536,10 @@ mod tests {
         );
         let b_view: vk::ImageView = ash::vk::Handle::from_raw(0xB000_BEEF);
         b_storage.image_view = b_view;
+        // Stub both views to the same sentinel — see
+        // `alloc_stub_window` for rationale; tests verify
+        // routing, not swizzle semantics.
+        b_storage.sample_view = b_view;
         let b_id = store
             .allocate(0xB001, DrawableKind::Pixmap, 32, true, b_storage)
             .expect("alloc backing stub");
@@ -2559,10 +2600,15 @@ mod tests {
             "redirected W's on-screen size must remain W's geometry"
         );
 
-        // Storage handle reroutes to B.
+        // Storage handle reroutes to B. The stub fixture stamps
+        // both `image_view` and `sample_view` to the same sentinel,
+        // so this also implicitly verifies the scene-α fix is
+        // binding the sample-side view (no separate handle to
+        // distinguish in the stub world — production builds them
+        // distinct via `PlatformBackend::build_sample_view`).
         assert_eq!(
             w_draw.image_view, b_view,
-            "redirected W must sample FROM B's image_view, not W's"
+            "redirected W must sample FROM B's view, not W's"
         );
 
         // `sampled_ids` parallels `draws`; the entry for W must
@@ -2735,7 +2781,9 @@ mod tests {
             extent(800, 600),
             vk::Format::B8G8R8A8_UNORM,
         );
-        cow_storage.image_view = ash::vk::Handle::from_raw(0xC0_C0_C0_C0);
+        let cow_sentinel: ash::vk::ImageView = ash::vk::Handle::from_raw(0xC0_C0_C0_C0);
+        cow_storage.image_view = cow_sentinel;
+        cow_storage.sample_view = cow_sentinel;
         let cow_id = store
             .allocate(0x103, DrawableKind::Window, 24, true, cow_storage)
             .expect("alloc COW stub");
@@ -2835,7 +2883,9 @@ mod tests {
             extent(800, 600),
             vk::Format::B8G8R8A8_UNORM,
         );
-        cow_storage.image_view = ash::vk::Handle::from_raw(0xC0_C0_C0_C0);
+        let cow_sentinel: ash::vk::ImageView = ash::vk::Handle::from_raw(0xC0_C0_C0_C0);
+        cow_storage.image_view = cow_sentinel;
+        cow_storage.sample_view = cow_sentinel;
         let cow_id = store
             .allocate(0x103, DrawableKind::Window, 24, true, cow_storage)
             .expect("alloc COW stub");
@@ -2845,7 +2895,9 @@ mod tests {
             extent(16, 16),
             vk::Format::B8G8R8A8_UNORM,
         );
-        cursor_storage.image_view = ash::vk::Handle::from_raw(0xCAFE_BABE);
+        let cur2_sentinel: ash::vk::ImageView = ash::vk::Handle::from_raw(0xCAFE_BABE);
+        cursor_storage.image_view = cur2_sentinel;
+        cursor_storage.sample_view = cur2_sentinel;
         let cursor_id = store
             .allocate(0xCAFE_0002, DrawableKind::Pixmap, 32, false, cursor_storage)
             .expect("alloc cursor stub");

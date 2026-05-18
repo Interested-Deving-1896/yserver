@@ -501,6 +501,20 @@ impl KmsBackendV2 {
             .is_some_and(|snap| !snap.region.is_empty())
     }
 
+    /// Scene-α fix — test-only read of the per-storage Vk views
+    /// keyed by host xid. Returns `(image_view, sample_view)` —
+    /// the attachment-side IDENTITY view and the format-aware
+    /// sampling view, respectively. Used by
+    /// `v2_storage_depth24_has_distinct_sample_view` to gate the
+    /// scene-side α-leak fix at the construction layer.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_storage_views(&self, xid: u32) -> Option<(ash::vk::ImageView, ash::vk::ImageView)> {
+        let id = self.store.lookup(xid)?;
+        let drawable = self.store.get(id)?;
+        Some((drawable.storage.image_view, drawable.storage.sample_view))
+    }
+
     /// Stage 4a — test-only knob to install a COMPOSITE redirect
     /// route directly via the store, bypassing 4b's protocol
     /// surface (`allocate_redirected_backing` / `name_window_pixmap`
@@ -6260,7 +6274,7 @@ impl Backend for KmsBackendV2 {
             }
         };
         let drawable = crate::kms::vk::dri3::import_dmabuf(
-            vk,
+            vk.clone(),
             fd,
             u32::from(width),
             u32::from(height),
@@ -6272,7 +6286,20 @@ impl Backend for KmsBackendV2 {
             }],
         )
         .map_err(|e| io::Error::other(format!("DRI3 import_dmabuf: {e:?}")))?;
-        let storage = Storage::from_imported_drawable_image(drawable);
+        // Build a sample-side view over the imported VkImage. The
+        // DRI3 path's own `vk_image_view` (kept as `image_view` on
+        // the resulting Storage) is IDENTITY-swizzle and serves as
+        // the attachment view; the sample-side view applies the
+        // format/depth-aware swizzle the scene compositor relies on
+        // (depth-24 BGRA8 → α=ONE).
+        let sample_view = crate::kms::v2::platform::PlatformBackend::build_sample_view(
+            &vk,
+            drawable.vk_image,
+            drawable.format,
+            depth,
+        )
+        .map_err(|e| io::Error::other(format!("DRI3 import build_sample_view: {e:?}")))?;
+        let storage = Storage::from_imported_drawable_image(drawable, sample_view, depth);
         let host_xid = self.core.next_host_xid();
         self.store
             .allocate(host_xid, DrawableKind::Pixmap, depth, false, storage)

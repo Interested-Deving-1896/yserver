@@ -72,9 +72,31 @@ pub(crate) enum DrawableKind {
 pub(crate) struct Storage {
     pub(crate) image: vk::Image,
     pub(crate) memory: vk::DeviceMemory,
+    /// IDENTITY-swizzle view. Used as a colour attachment
+    /// (VUID-VkFramebufferCreateInfo-pAttachments-00891 requires
+    /// IDENTITY on attachment views) and as the default sample
+    /// source inside the engine's view cache for cases where the
+    /// format-aware swizzle would be IDENTITY anyway. The scene
+    /// compositor MUST NOT bind this view as a sampler input — see
+    /// `sample_view`.
     pub(crate) image_view: vk::ImageView,
+    /// Format-and-depth-aware view used by the scene compositor for
+    /// sampling. For BGRA8 storage of an X11 depth-24 drawable the
+    /// swizzle pins `α=ONE`, matching the X11 RENDER `PictFormat`
+    /// `alpha_mask=0` invariant (depth-24 / xRGB samples must read
+    /// α=1.0). For BGRA8 depth-32 the swizzle is identity. For R8
+    /// storage the swizzle reads as alpha-only (R→a, rest=0). Always
+    /// a distinct `VkImageView` from `image_view`; both views alias
+    /// the same `image` so paint writes through `image_view` are
+    /// readable through `sample_view`.
+    pub(crate) sample_view: vk::ImageView,
     pub(crate) extent: vk::Extent2D,
     pub(crate) format: vk::Format,
+    /// X11 drawable depth (1/8/24/32). Recorded so `Storage::destroy`
+    /// can reason about format/depth-specific cleanup and so test
+    /// helpers can introspect without re-deriving from format alone
+    /// (BGRA8 covers both 24 and 32).
+    pub(crate) depth: u8,
     /// Current layout tracked outside the Vk driver — see
     /// [`Drawable::record_layout_transition`] for the central
     /// mutation point. Single source of truth for what the
@@ -89,7 +111,9 @@ pub(crate) struct Storage {
     /// skips its own destroy path in this case; the inner
     /// `DrawableImage`'s own `Drop` releases the handles + the
     /// imported dma-buf fd. Pool-return is also skipped because
-    /// imported memory isn't pool-eligible.
+    /// imported memory isn't pool-eligible. `sample_view` is still
+    /// owned by `Storage` (we build it fresh against the borrowed
+    /// image) and is destroyed explicitly in `Storage::destroy`.
     pub(crate) imported_drawable: Option<crate::kms::vk::target::DrawableImage>,
 }
 
@@ -102,15 +126,19 @@ impl Storage {
         image: vk::Image,
         memory: vk::DeviceMemory,
         image_view: vk::ImageView,
+        sample_view: vk::ImageView,
         extent: vk::Extent2D,
         format: vk::Format,
+        depth: u8,
     ) -> Self {
         Self {
             image,
             memory,
             image_view,
+            sample_view,
             extent,
             format,
+            depth,
             current_layout: vk::ImageLayout::UNDEFINED,
             is_test_stub: false,
             imported_drawable: None,
@@ -126,6 +154,8 @@ impl Storage {
     /// first paint barrier). Used by `dri3_import_pixmap`.
     pub(crate) fn from_imported_drawable_image(
         drawable: crate::kms::vk::target::DrawableImage,
+        sample_view: vk::ImageView,
+        depth: u8,
     ) -> Self {
         let image = drawable.vk_image;
         let image_view = drawable.vk_image_view;
@@ -136,8 +166,10 @@ impl Storage {
             image,
             memory,
             image_view,
+            sample_view,
             extent,
             format,
+            depth,
             current_layout: vk::ImageLayout::UNDEFINED,
             is_test_stub: false,
             imported_drawable: Some(drawable),
@@ -150,15 +182,19 @@ impl Storage {
     /// ops transition from the right source state.
     pub(crate) fn from_pooled(
         pooled: crate::kms::vk::pixmap_pool::PooledPixmapImage,
+        sample_view: vk::ImageView,
         extent: vk::Extent2D,
         format: vk::Format,
+        depth: u8,
     ) -> Self {
         Self {
             image: pooled.image,
             memory: pooled.memory,
             image_view: pooled.view,
+            sample_view,
             extent,
             format,
+            depth,
             current_layout: pooled.current_layout,
             is_test_stub: false,
             imported_drawable: None,
@@ -170,10 +206,19 @@ impl Storage {
     /// logic without needing a live VkContext.
     #[doc(hidden)]
     pub(crate) fn for_tests_null(extent: vk::Extent2D, format: vk::Format) -> Self {
+        // Match the production depth→format pairing so tests that
+        // inspect `Storage::depth` see a sensible default — but
+        // never build real Vk views (this is the null-stub path).
+        let depth = match format {
+            vk::Format::R8_UNORM => 8,
+            _ => 32,
+        };
         Self {
             image: vk::Image::null(),
             memory: vk::DeviceMemory::null(),
             image_view: vk::ImageView::null(),
+            sample_view: vk::ImageView::null(),
+            depth,
             extent,
             format,
             current_layout: vk::ImageLayout::UNDEFINED,
@@ -196,10 +241,17 @@ impl Storage {
             return;
         }
         // DRI3-imported storage: the DrawableImage owns its own Vk
-        // handles + dma-buf fd; its Drop releases everything. Skip
-        // the normal destroy path so we don't double-free the
-        // borrowed image/view/memory aliased above.
+        // handles + dma-buf fd; its Drop releases the
+        // image/view/memory borrowed below. But `sample_view` was
+        // built by us against the borrowed image — we own it and
+        // must destroy it explicitly before the inner Drop fires.
         if self.imported_drawable.is_some() {
+            if let Some(vk) = platform.vk.as_ref()
+                && self.sample_view != vk::ImageView::null()
+            {
+                unsafe { vk.device.destroy_image_view(self.sample_view, None) };
+            }
+            self.sample_view = vk::ImageView::null();
             // Null out the aliasing handles before the inner Drop
             // runs to avoid any chance of pool-return or other
             // observers seeing live handles after the underlying
@@ -221,6 +273,15 @@ impl Storage {
             );
             return;
         };
+        // Destroy sample_view first. It's always owned by Storage
+        // (the pool stores only the attachment-side view) and its
+        // swizzle is depth-specific, so we never recycle it — a
+        // pool-take rebuilds a fresh sample_view for whatever depth
+        // the new allocation requests.
+        if self.sample_view != vk::ImageView::null() {
+            unsafe { vk.device.destroy_image_view(self.sample_view, None) };
+            self.sample_view = vk::ImageView::null();
+        }
         // Pool-return path: only attempt for non-null handles and
         // when the platform has a pool wired (production path).
         if self.image != vk::Image::null()
@@ -1222,7 +1283,8 @@ mod tests {
             height: 64,
         };
         let format = ash::vk::Format::B8G8R8A8_UNORM;
-        let s = Storage::from_pooled(pooled, extent, format);
+        let sample_view: ash::vk::ImageView = ash::vk::Handle::from_raw(0x1000_0004);
+        let s = Storage::from_pooled(pooled, sample_view, extent, format, 32);
         assert_eq!(s.extent.width, 32);
         assert_eq!(s.extent.height, 64);
         assert_eq!(s.format, format);

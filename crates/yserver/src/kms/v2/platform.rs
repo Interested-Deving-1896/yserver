@@ -627,6 +627,83 @@ impl PlatformBackend {
 
     // ── Storage allocation (Stage 2c) ───────────────────────────
 
+    /// Sample-side view swizzle for a (format, depth) pair. The
+    /// attachment-side view kept by `Storage::image_view` always
+    /// uses IDENTITY (VUID-VkFramebufferCreateInfo-pAttachments-00891
+    /// requires that for color attachments). The sample-side view
+    /// kept by `Storage::sample_view` carries the format-aware
+    /// swizzle so the scene compositor + engine sampling paths see
+    /// X11-correct alpha semantics:
+    ///
+    /// - `(R8_UNORM, _)` → `a=R, rgb=ZERO` — R8 storage sampled as
+    ///   an alpha mask (glyphs, RENDER mask scratch, depth-1 / 8
+    ///   bitmaps). RGB channels intentionally zeroed so the
+    ///   composite shader's `src * coverage` reads zero RGB and
+    ///   the dst keeps its own colour.
+    /// - `(B8G8R8A8_UNORM, depth == 24)` → `a=ONE` — depth-24
+    ///   pixmaps (`PictFormat.alpha_mask = 0` per X11 RENDER spec)
+    ///   must read α = 1.0 regardless of the BGRA8 padding byte.
+    ///   Otherwise the scene's `alpha_passthrough=true` window
+    ///   draws blend with undefined α and the layer below leaks
+    ///   through.
+    /// - everything else → IDENTITY (depth-32 ARGB passes α
+    ///   through; unknown formats default-safe).
+    ///
+    /// Mirrors `engine::swizzle_class_for` (the engine's RENDER
+    /// view-cache classifier) — the engine cache stays for the
+    /// cases where the sampler config also differs; this helper
+    /// owns the storage-side view that the scene compositor
+    /// binds directly.
+    pub(crate) fn sample_view_components(format: vk::Format, depth: u8) -> vk::ComponentMapping {
+        match (format, depth) {
+            (vk::Format::R8_UNORM, _) => vk::ComponentMapping {
+                r: vk::ComponentSwizzle::ZERO,
+                g: vk::ComponentSwizzle::ZERO,
+                b: vk::ComponentSwizzle::ZERO,
+                a: vk::ComponentSwizzle::R,
+            },
+            (vk::Format::B8G8R8A8_UNORM, 24) => vk::ComponentMapping {
+                r: vk::ComponentSwizzle::IDENTITY,
+                g: vk::ComponentSwizzle::IDENTITY,
+                b: vk::ComponentSwizzle::IDENTITY,
+                a: vk::ComponentSwizzle::ONE,
+            },
+            _ => vk::ComponentMapping {
+                r: vk::ComponentSwizzle::IDENTITY,
+                g: vk::ComponentSwizzle::IDENTITY,
+                b: vk::ComponentSwizzle::IDENTITY,
+                a: vk::ComponentSwizzle::IDENTITY,
+            },
+        }
+    }
+
+    /// Build a fresh sample-side `vk::ImageView` over `image` with
+    /// the format/depth-aware swizzle from
+    /// [`Self::sample_view_components`]. Used by the fresh-alloc
+    /// path, the pool-take path (where the pool only stores the
+    /// attachment view), and the DRI3 import path (where the
+    /// imported DrawableImage carries an identity-swizzle view we
+    /// can't reuse for scene sampling).
+    pub(crate) fn build_sample_view(
+        vk: &crate::kms::vk::device::VkContext,
+        image: vk::Image,
+        format: vk::Format,
+        depth: u8,
+    ) -> Result<vk::ImageView, vk::Result> {
+        let info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .components(Self::sample_view_components(format, depth))
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            );
+        unsafe { vk.device.create_image_view(&info, None) }
+    }
+
     /// Map an X11 drawable depth to its v2 storage format. Mirrors
     /// `DrawableImage::format_for_pixmap_depth` (v1) so the two
     /// don't drift.
@@ -683,7 +760,35 @@ impl PlatformBackend {
                 format,
             };
             if let Some(pooled) = pool.try_take(key) {
-                return Ok(Storage::from_pooled(pooled, extent, format));
+                // The pool stores only the attachment-side
+                // (IDENTITY) view; the sample-side view is
+                // depth-specific (a recycled depth-32 BGRA8
+                // image can serve a fresh depth-24 request and
+                // vice versa, since the pool key is format only),
+                // so always build a fresh sample_view for the
+                // current request's depth. View creation is cheap;
+                // pooling the image + memory is where the win is.
+                let pooled_image = pooled.image;
+                let sample_view = match Self::build_sample_view(vk, pooled_image, format, depth) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Couldn't build a sample_view: return the
+                        // pooled triple back to the pool and fall
+                        // through to fresh allocate (which also
+                        // tries to build a sample_view and may also
+                        // fail — but the diagnostic path is
+                        // uniform that way).
+                        let _ = pool.try_return(key, pooled);
+                        return Err(e);
+                    }
+                };
+                return Ok(Storage::from_pooled(
+                    pooled,
+                    sample_view,
+                    extent,
+                    format,
+                    depth,
+                ));
             }
         }
 
@@ -766,8 +871,33 @@ impl PlatformBackend {
             }
         };
 
+        // Sample-side view with format/depth-aware swizzle. The
+        // scene compositor and the engine view-cache fall back to
+        // this view for sampling instead of `view` (IDENTITY) so
+        // depth-24 BGRA8 storage reads α=ONE per X11 PictFormat
+        // semantics. Built unconditionally — for depth-32 the
+        // swizzle is identity, but a distinct VkImageView keeps
+        // Storage's ownership story uniform.
+        let sample_view = match Self::build_sample_view(vk, image, format, depth) {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe {
+                    vk.device.destroy_image_view(view, None);
+                    vk.device.free_memory(memory, None);
+                    vk.device.destroy_image(image, None);
+                }
+                return Err(e);
+            }
+        };
+
         Ok(Storage::new_server_owned(
-            image, memory, view, extent, format,
+            image,
+            memory,
+            view,
+            sample_view,
+            extent,
+            format,
+            depth,
         ))
     }
 
