@@ -645,6 +645,50 @@ yserver-mate-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2:
         echo "x11trace:    mate.xtrace";\
         echo "mate log:    mate.log"'
 
+# MATE inside Xephyr (nested Xorg-family server), with x11trace
+# recording marco's wire stream to/from Xephyr. The Xorg-side
+# counterpart to `yserver-mate-hw-trace`: same workload, same
+# tracer, but server is Xephyr (kdrive/ephyr, shares dix with
+# Xorg) instead of yserver. Compare `mate-xorg.xtrace` against
+# `mate.xtrace` to find the divergent server reply/event that
+# makes marco's compositor logic take a different branch.
+#
+# Layout:
+#   - Xephyr on :18 — outer X server for the nested session.
+#   - x11trace tunnels :18 → :19, dumping wire to mate-xorg.xtrace.
+#   - mate-session connects to :19 (sees x11trace as its server).
+#
+# Works under GNOME-Wayland: Xephyr opens as a regular window
+# managed by mutter; mate-session inside is fully isolated from
+# the host session (its own dbus via dbus-run-session). Focus the
+# Xephyr window to send input. Ctrl-Shift releases pointer grab
+# if Xephyr captures it.
+#
+# Defaults to 5120x1440 to match the yserver hardware-scanout
+# scenario so CC's drag distances and geometry are comparable.
+mate-xephyr-trace screen="5120x1440":
+    rm -f mate-xorg.xtrace mate-xephyr.log mate-xorg.log
+    bash -c 'set -e;\
+        if [[ -z "${DISPLAY:-}" ]]; then echo "need a host DISPLAY (XWayland under GNOME provides one)" >&2; exit 1; fi;\
+        if ! command -v Xephyr >/dev/null; then echo "Xephyr not installed (pacman -S xorg-server-xephyr)" >&2; exit 1; fi;\
+        if ! command -v x11trace >/dev/null; then echo "x11trace not installed (pacman -S xtrace)" >&2; exit 1; fi;\
+        echo "outer DISPLAY=$DISPLAY  nested=:18  traced=:19";\
+        Xephyr -screen {{screen}} -title "mate-xorg-trace" :18 > mate-xephyr.log 2>&1 &\
+        xephyr_pid=$!;\
+        trap "kill -TERM $xephyr_pid 2>/dev/null; wait $xephyr_pid 2>/dev/null" EXIT;\
+        for _ in $(seq 1 50); do [[ -S /tmp/.X11-unix/X18 ]] && break; sleep 0.1; done;\
+        if [[ ! -S /tmp/.X11-unix/X18 ]]; then echo "Xephyr :18 never came up; see mate-xephyr.log" >&2; tail -20 mate-xephyr.log >&2; exit 2; fi;\
+        x11trace -d :18 -D :19 -n -o mate-xorg.xtrace &\
+        xtrace_pid=$!;\
+        trap "kill -TERM $xtrace_pid $xephyr_pid 2>/dev/null; wait $xephyr_pid 2>/dev/null" EXIT;\
+        sleep 1;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:19 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session mate-session --display :19 > mate-xorg.log 2>&1;\
+        echo "Xephyr log: mate-xephyr.log";\
+        echo "x11trace:   mate-xorg.xtrace";\
+        echo "mate log:   mate-xorg.log"'
+
 # Release-mode mate with logging turned down to `warn`. Use this to
 # test whether pointer lag under hover is dominated by env_logger /
 # stderr formatting cost (observed at ~5% of CPU under debug+debug

@@ -7160,6 +7160,35 @@ fn handle_configure_window(
                 geometry.height,
             );
         }
+        // X11 Composite + DAMAGE interaction: configuring a redirected
+        // window (move / resize / border / stack-order) changes its
+        // screen-space presentation. The pixel content of the
+        // redirected backing doesn't change, but the compositor MUST
+        // recomposite the moved-from + moved-to regions. Xorg
+        // signals this by emitting a `DamageNotify` on the window
+        // for the full window-local extent at the new geometry
+        // (xserver/composite/compwindow.c). Measured divergence on a
+        // mate-with-compositing drag: Xephyr emitted 776 DamageNotify
+        // events to marco over the run; yserver emitted 0. Without
+        // these events marco's compositor never marked the moved
+        // window dirty, its SetPictureClipRectangles excluded the
+        // window's region, and composites against the redirected
+        // backing no-op'd — producing the "CC disappears on drag /
+        // muddy bands on caja-redraw" symptom.
+        //
+        // Apply to the window itself. `accumulate_damage_full_to_state`
+        // walks the ancestor chain so any compositor subscribed
+        // higher in the tree also gets a translated rect. Only fires
+        // when a damage object exists on the drawable (the helper
+        // filters on `damage_object.drawable == this`), so cost is
+        // zero for unredirected/uncomposited windows.
+        if state
+            .resources
+            .window(window_id)
+            .is_some_and(|w| w.redirected_backing.is_some())
+        {
+            let _dropped = accumulate_damage_full_to_state(state, window_id);
+        }
         let grew = old_size.is_some_and(|(ow, oh)| geometry.width > ow || geometry.height > oh);
         if grew {
             let _dropped =
@@ -12727,6 +12756,164 @@ mod tests {
             &vec![repair_rect],
             "Subtract must treat the repair region as read-only input; \
              pre-fix this overwrote it with the damage rects"
+        );
+    }
+
+    /// X11 Composite + DAMAGE interaction: a configure that changes a
+    /// redirected window's screen-space presentation must emit a
+    /// `DamageNotify` to the compositor's damage subscription on that
+    /// window. Xorg behaviour (compositor.c) — without this event,
+    /// marco/picom/etc. never mark the moved window dirty and their
+    /// SetPictureClipRectangles excludes the window's region, so
+    /// composites against the redirected backing no-op or partially
+    /// blend, producing the "CC disappears on drag / muddy bands on
+    /// caja-redraw" symptom we measured against a Xephyr (Xorg-family)
+    /// reference run: yserver emitted 0 DamageNotify events to marco;
+    /// Xephyr emitted 776.
+    ///
+    /// Reproduce minimally: install marco client, create a top-level
+    /// window with a damage object owned by marco, set the window
+    /// `redirected_backing` (Manual-redirect activated state), then
+    /// send a move-only ConfigureWindow. Read marco's socket and
+    /// look for the DamageNotify event (event opcode 94 = DAMAGE
+    /// first_event + 0).
+    #[test]
+    fn configure_window_on_redirected_window_emits_damage_to_subscriber() {
+        use crate::{
+            resources::{ROOT_WINDOW, RedirectedBacking},
+            server::DamageObject,
+        };
+        use std::io::Read;
+        use yserver_protocol::x11::CreateWindowRequest;
+        const MARCO: u32 = 14;
+        const FRAME_XID: u32 = 0x0010_0001;
+        const DAMAGE_XID: u32 = 0x0010_0002;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_client(&mut state, MARCO);
+
+        // Frame W under root.
+        state.resources.create_window(
+            ClientId(MARCO),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(FRAME_XID),
+                parent: ROOT_WINDOW,
+                x: 100,
+                y: 100,
+                width: 997,
+                height: 652,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(FRAME_XID));
+        // Mark the frame as redirected (Manual-redirect activated
+        // state). `host_pixmap` value is opaque to the damage path.
+        if let Some(w) = state.resources.window_mut(ResourceId(FRAME_XID)) {
+            w.host_xid = crate::backend::WindowHandle::from_raw(0xDEAD_BEEF);
+            w.redirected_backing = Some(RedirectedBacking {
+                host_pixmap: crate::backend::PixmapHandle::from_raw(0xC0DE).unwrap(),
+                width: 997,
+                height: 652,
+                depth: 24,
+            });
+        }
+        // Damage subscription on the frame, owned by marco, NonEmpty
+        // level (0x03) so any change fires.
+        state.damage_objects.insert(
+            DAMAGE_XID,
+            DamageObject {
+                owner: ClientId(MARCO),
+                drawable: ResourceId(FRAME_XID),
+                level: 3,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+            },
+        );
+
+        // ConfigureWindow body: window(4) + value_mask(2) + pad(2) +
+        // x(4 as i16) + y(4 as i16). value_mask = 0x03 = CWX | CWY.
+        // Move from (100, 100) to (250, 300).
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&FRAME_XID.to_le_bytes());
+        body.extend_from_slice(&0x0003u16.to_le_bytes()); // value_mask
+        body.extend_from_slice(&[0u8; 2]); // pad
+        body.extend_from_slice(&250i32.to_le_bytes()); // x
+        body.extend_from_slice(&300i32.to_le_bytes()); // y
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(MARCO),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 12, // ConfigureWindow
+                data: 0,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        // Drain marco's socket. Look for a DamageNotify event:
+        // event_code = DAMAGE_FIRST_EVENT (94) + 0 = 94.
+        peer.set_nonblocking(true).unwrap();
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        let damage_evt: [u8; 32] = all
+            .chunks_exact(32)
+            .find(|evt| evt[0] == 94)
+            .map(|s| {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(s);
+                a
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "ConfigureWindow on a redirected window must emit DamageNotify \
+                     (event code 94) to the compositor's damage subscriber. \
+                     Pre-fix yserver emits 0 DamageNotify events vs Xephyr's 776, \
+                     which leaves marco's compositor unable to mark the moved \
+                     window dirty. Got {} bytes; first 32: {:02x?}",
+                    all.len(),
+                    &all.get(..32.min(all.len())).unwrap_or(&[]),
+                )
+            });
+        // Per X11 DAMAGE proto: DamageNotify.geometry encodes the
+        // damaged drawable's CURRENT root-relative position + extent
+        // (Xorg damageext.c fills from pDrawable->{x,y,width,height};
+        // for windows, x/y are root-relative). marco/picom etc. use
+        // this to map the damage region into screen space. yserver's
+        // encoder historically hardcoded {x: 0, y: 0, w, h}, leaving
+        // marco mapping the damage to the wrong screen rect after
+        // every move — visible as "top-left bits stay rendered"
+        // after dragging (marco recomposites at the OLD position
+        // because the geometry origin points back to (0,0)).
+        //
+        // Wire layout: offsets 24..32 hold geometry as
+        // (x i16, y i16, w u16, h u16) little-endian. The window
+        // was configured to (250, 300) above.
+        let geom_x = i16::from_le_bytes([damage_evt[24], damage_evt[25]]);
+        let geom_y = i16::from_le_bytes([damage_evt[26], damage_evt[27]]);
+        let geom_w = u16::from_le_bytes([damage_evt[28], damage_evt[29]]);
+        let geom_h = u16::from_le_bytes([damage_evt[30], damage_evt[31]]);
+        assert_eq!(
+            (geom_x, geom_y, geom_w, geom_h),
+            (250, 300, 997, 652),
+            "DamageNotify.geometry must encode the window's CURRENT \
+             root-relative position + extent; pre-fix this hardcodes \
+             (0, 0, w, h) and breaks marco's screen-rect mapping",
         );
     }
 }

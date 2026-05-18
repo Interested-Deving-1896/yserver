@@ -201,15 +201,28 @@ fn accumulate_at_level(
         height: rect_i16.height,
     };
 
-    // Per-level geometry — the bounding box reported alongside the
-    // damage rect. For ancestor matches this is the ANCESTOR's
-    // extent (in its own coord space), matching the X11 spec
-    // requirement that DamageNotify.geometry describes the damaged
-    // drawable's full extent, not the originating leaf's.
+    // Per-level geometry — the damaged drawable's CURRENT geometry
+    // in its parent's coordinate space (X11 DAMAGE proto + Xorg
+    // damageext.c: fills from pDrawable->{x, y, width, height};
+    // window drawables carry root-relative x/y, pixmaps are
+    // always (0, 0)). marco/picom/etc. use this geometry to map
+    // the damage rect back into screen space — if x/y stay
+    // hardcoded at (0, 0), the compositor recomposites at the
+    // wrong screen position after every move, observable as
+    // "top-left bits of CC stay rendered" after dragging.
     let geom_full = drawable_full_rect(state, level_drawable);
+    let (geom_x, geom_y) = if state.resources.window(level_drawable).is_some() {
+        let (ax, ay) = state.resources.window_absolute_position(level_drawable);
+        (
+            i16::try_from(ax).unwrap_or(i16::MAX),
+            i16::try_from(ay).unwrap_or(i16::MAX),
+        )
+    } else {
+        (0, 0)
+    };
     let geom_rect = x11damage::Rectangle {
-        x: 0,
-        y: 0,
+        x: geom_x,
+        y: geom_y,
         width: geom_full.width,
         height: geom_full.height,
     };
