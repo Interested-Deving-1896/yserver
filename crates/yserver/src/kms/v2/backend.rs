@@ -3893,10 +3893,11 @@ impl Backend for KmsBackendV2 {
     /// First `GetOverlayWindow` allocates screen-extent depth-24
     /// storage at xid `COMPOSITE_OVERLAY_WINDOW` (0x103), stores
     /// the resulting `DrawableId` on `self.cow_id`, sets the
-    /// matching protocol refcount on `core.cow_refcount = 1`, and
-    /// registers the entry with `SceneCompositor::register_cow`
-    /// so `build_scene` lays it above top-levels + below the
-    /// cursor.
+    /// matching protocol refcount on `core.cow_refcount = 1`.
+    /// The drawable stays off the normal scene path; xfwm4 paints
+    /// its composited desktop into its own child window, so adding
+    /// the COW as a topmost scene layer would cover the real output
+    /// with a stale black surface.
     ///
     /// Subsequent calls (compositor restart, multi-client
     /// scenarios) just bump `core.cow_refcount` and return Ok
@@ -3910,13 +3911,6 @@ impl Backend for KmsBackendV2 {
     /// rather than recycled GPU garbage. The fill is best-effort
     /// — on the stub fixture (no Vk) `engine.fill_rect` errors;
     /// log + continue (storage already exists at xid level).
-    ///
-    /// The zero-fill itself is NOT damage-tracked: the first
-    /// compositor `put_image`/paint provides the presentation
-    /// damage `build_scene` will pick up, and `register_cow`
-    /// below already marks `scene_structure_dirty` so the next
-    /// tick composites the COW layer (with a fresh clear)
-    /// regardless of whether per-drawable damage is empty.
     fn get_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
         if self.cow_id.is_some() {
             self.core.cow_refcount += 1;
@@ -3974,17 +3968,16 @@ impl Backend for KmsBackendV2 {
         }
         self.cow_id = Some(id);
         self.core.cow_refcount = 1;
-        self.scene.register_cow(id);
         Ok(())
     }
 
     /// Stage 4d — Composite Overlay Window release.
     ///
-    /// Decrements `core.cow_refcount`; on the final release
-    /// unregisters the scene entry, decrefs the store storage,
-    /// and clears `self.cow_id`. `DrawableStore::decref` removes
-    /// the xid mapping (immediately on synchronous-destroy,
-    /// deferred on `PendingFence`) so the next `GetOverlayWindow`
+    /// Decrements `core.cow_refcount`; on the final release it
+    /// decrefs the store storage and clears `self.cow_id`.
+    /// `DrawableStore::decref` removes the xid mapping
+    /// (immediately on synchronous-destroy, deferred on
+    /// `PendingFence`) so the next `GetOverlayWindow`
     /// reallocates fresh storage at the same xid.
     ///
     /// Defensive against unmatched releases (refcount=0 → Ok(false)
@@ -4001,7 +3994,6 @@ impl Backend for KmsBackendV2 {
         }
         self.core.cow_refcount -= 1;
         if self.core.cow_refcount == 0 {
-            self.scene.unregister_cow();
             if let Some(id) = self.cow_id.take() {
                 self.store.decref(&mut self.platform, id);
             }

@@ -1662,26 +1662,30 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     no-op for v1 / ynest / RecordingBackend; v2 overrides).
     Backend impl: first `get_overlay_window` allocates a
     screen-extent depth-24 BGRA8 drawable as
-    `DrawableKind::Window` with `scene_participating=true`,
-    zero-fills via `engine.fill_rect`, registers with the
-    scene, sets `cow_id` + refcount=1. Subsequent calls bump
-    refcount only. `release_overlay_window` decrements; on
-    zero unregisters the scene entry + decrefs storage + clears
-    `cow_id`. Defensive guard against unmatched release (no
-    underflow). `process_request.rs` GET / RELEASE arms now
-    call the backend hooks; log + continue on Err so the
-    protocol reply still goes out.
+    `DrawableKind::Window`, zero-fills it via
+    `engine.fill_rect`, sets `cow_id` + refcount=1, and keeps
+    it off the normal scene path. xfwm4 presents into its own
+    child compositor window, so a topmost scene-layer COW can
+    cover the real output with a stale black surface.
+    Subsequent calls bump refcount only.
+    `release_overlay_window` decrements; on zero it clears
+    `cow_id` and decrefs storage. Defensive guard against
+    unmatched release (no underflow). `process_request.rs` GET
+    / RELEASE arms now call the backend hooks; log + continue
+    on Err so the protocol reply still goes out.
 
-    `SceneCompositor` grows `cow: Option<DrawableId>` on the
-    inner state with `register_cow` / `unregister_cow` setters
-    (both bump `scene_structure_dirty`). `build_scene` appends
-    a `CompositeDraw` for COW **between** the top-level loop
-    and the cursor block — position projects through
-    `layout_x0/y0` like root storage, extent from COW
-    storage's image, `alpha_passthrough=true` so compositor-
-    written alpha actually blends. Damage peek + project mirror
-    the root path; COW id pushes onto `sampled_ids` so
-    retirement covers it.
+    Early smoke showed xfwm4's compositor paints into a child
+    window under the overlay, so the first pass of the COW was
+    not kept as a visible scene entry. The overlay drawable now
+    stays backend-owned storage only; there is no top-level COW
+    draw in `build_scene`, which avoids covering xfwm4's real
+    output with the zero-filled overlay surface.
+
+    Manual-redirected parents still prune their descendants, but
+    if they have a redirected backing the scene emits that backing
+    instead of skipping the parent outright. That keeps compositor-
+    owned desktop/window surfaces visible without leaking child
+    windows separately.
 
     7 tests: `cow_get_overlay_first_call_allocates_storage`,
     `_second_call_refcounts`, `cow_release_decrements_refcount`,

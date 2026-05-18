@@ -238,14 +238,11 @@ struct SceneCompositorInner {
     /// moves). Updated to the current cursor position every time
     /// build_scene emits a cursor draw entry.
     cursor_prev_pos: Option<(i32, i32)>,
-    /// Stage 4d: Composite Overlay Window scene entry. `Some`
-    /// once `KmsBackendV2::get_overlay_window` has allocated the
-    /// COW storage and registered it here; `None` until then or
-    /// after the final `release_overlay_window`. Appended by
-    /// `build_scene` ABOVE all top-levels but BELOW the cursor
-    /// per the Stage 4 plan §4d layering items 3 + 4. Stub
-    /// fixture (no Vk) leaves this `None` — `register_cow` is a
-    /// no-op when `inner` is `None`.
+    /// Stage 4d: Composite Overlay Window scene entry. Retained
+    /// for the stage 4d layering tests; the live backend no
+    /// longer drives it in the current XFCE fix. Stub fixture
+    /// (no Vk) leaves this `None` — `register_cow` is a no-op
+    /// when `inner` is `None`.
     cow: Option<super::store::DrawableId>,
 }
 
@@ -354,12 +351,12 @@ impl SceneCompositor {
     }
 
     /// Stage 4d — register the Composite Overlay Window scene
-    /// entry. Called by `KmsBackendV2::get_overlay_window` after
-    /// allocating screen-extent storage for the COW xid. The
-    /// scene appends a draw entry for this id ABOVE top-levels +
-    /// BELOW the cursor on every subsequent `build_scene`.
-    /// Marks scene structure dirty so the next tick picks up the
-    /// new layer. No-op on the stub fixture (no Vk).
+    /// entry. Retained for the stage 4d layering tests; the live
+    /// backend no longer calls this because xfwm4 paints into a
+    /// child compositor window and a topmost COW obscures the
+    /// actual output. Marks scene structure dirty so the next
+    /// tick picks up the new layer. No-op on the stub fixture
+    /// (no Vk).
     pub(crate) fn register_cow(&mut self, id: super::store::DrawableId) {
         if let Some(inner) = self.inner.as_mut() {
             inner.cow = Some(id);
@@ -368,11 +365,11 @@ impl SceneCompositor {
     }
 
     /// Stage 4d — clear the Composite Overlay Window scene
-    /// entry. Called by `KmsBackendV2::release_overlay_window`
-    /// when the COW refcount falls to zero. Subsequent
-    /// `build_scene` calls omit the COW layer; the storage drop
-    /// itself is handled by the backend's `store.decref`. No-op
-    /// on the stub fixture.
+    /// entry. Retained for the stage 4d layering tests; the live
+    /// backend no longer calls this. Subsequent `build_scene`
+    /// calls omit the COW layer; the storage drop itself is
+    /// handled by the backend's `store.decref`. No-op on the
+    /// stub fixture.
     pub(crate) fn unregister_cow(&mut self) {
         if let Some(inner) = self.inner.as_mut() {
             inner.cow = None;
@@ -1360,14 +1357,17 @@ fn emit_window_subtree(
             // Stage 4c.3 — route source-storage through `redirected_target`.
             // Automatic-mode redirected W blits FROM B; W's geometry
             // (dst_origin, dst_size, intersect test) stays driven by W's
-            // own state in `windows_v2`. Only the sampled storage handle
-            // reroutes. Manual-mode W's are filtered out before this
-            // path (scene_participating=false), so the indirection only
-            // fires for Automatic.
+            // own state in `windows_v2`. Manual-redirected W's still
+            // prune their descendants, but if they have a redirected
+            // backing the scene draws that backing instead of skipping
+            // the parent outright. That keeps the compositor-owned
+            // desktop/window surface visible while preserving the
+            // subtree boundary.
             let source_id = store.redirected_target(id).unwrap_or(id);
             let source_view_null = store
                 .get(source_id)
                 .is_none_or(|s| s.storage.image_view == vk::ImageView::null());
+            let uses_redirected_source = source_id != id;
 
             // Project onto output-local coords (computed once here so
             // both the SKIP=no_intersect and WILL_EMIT trace lines can
@@ -1387,7 +1387,7 @@ fn emit_window_subtree(
             if !d_part {
                 prune_subtree = true;
             }
-            let skip_reason: Option<&'static str> = if !d_part {
+            let skip_reason: Option<&'static str> = if !d_part && !uses_redirected_source {
                 Some("scene_participating=false")
             } else if !matches!(d_kind, DrawableKind::Window) {
                 Some("kind!=Window")
@@ -1465,11 +1465,11 @@ fn emit_window_subtree(
                 }
             }
 
-            if d_part
-                && matches!(d_kind, DrawableKind::Window)
+            if matches!(d_kind, DrawableKind::Window)
                 && let Some(source) = store.get(source_id)
                 && source.storage.image_view != vk::ImageView::null()
                 && intersects
+                && (d_part || uses_redirected_source)
             {
                 // Window scene draw — bind the sample-side view
                 // (format/depth-aware swizzle) instead of the
@@ -2882,6 +2882,112 @@ mod tests {
         // sampled_ids mirrors draws — must not reference child.
         let bystander_id = store.lookup(0x222).expect("bystander lookup");
         assert_eq!(built.sampled_ids, vec![bystander_id]);
+    }
+
+    /// Stage 4d follow-up — a Manual-redirected parent with a
+    /// redirected backing must still emit that backing, while its
+    /// descendants remain pruned.
+    #[test]
+    fn build_scene_emits_manual_redirected_parent_backing() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x111,
+            100,
+            200,
+            200,
+            150,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x111);
+        let w_frame_id = store.lookup(0x111).expect("frame lookup");
+
+        let mut backing = super::super::store::Storage::for_tests_null(
+            extent(200, 150),
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let backing_view: vk::ImageView = ash::vk::Handle::from_raw(0xBEEF_CAFE);
+        backing.image_view = backing_view;
+        backing.sample_view = backing_view;
+        let backing_id = store
+            .allocate(0xB002, DrawableKind::Pixmap, 32, true, backing)
+            .expect("alloc redirected backing");
+        store.set_redirected_target(w_frame_id, Some(backing_id));
+        store.set_scene_participating(w_frame_id, false);
+        assert!(
+            store.get(backing_id).unwrap().scene_participating,
+            "fixture sanity: redirected backing stays scene_participating=true",
+        );
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x112,
+            11,
+            41,
+            100,
+            80,
+            Some(0x111),
+            true,
+        );
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x222,
+            500,
+            500,
+            60,
+            30,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x222);
+
+        let child_id = store.lookup(0x112).expect("child lookup");
+        assert!(
+            store.get(child_id).unwrap().scene_participating,
+            "fixture sanity: child stays scene_participating=true",
+        );
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows_v2,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+        );
+        let scene = &built.scene;
+
+        assert_eq!(
+            scene.draws.len(),
+            2,
+            "expected redirected parent backing + bystander; got {:?}",
+            scene.draws,
+        );
+        assert_eq!(scene.draws[0].dst_origin, [100.0, 200.0]);
+        assert_eq!(scene.draws[0].dst_size, [200.0, 150.0]);
+        assert_eq!(
+            scene.draws[0].image_view, backing_view,
+            "manual-redirected parent must sample from its redirected backing",
+        );
+        assert_eq!(scene.draws[1].dst_origin, [500.0, 500.0]);
+
+        assert_eq!(built.sampled_ids.len(), 2);
+        assert_eq!(built.sampled_ids[0], backing_id);
+        assert_eq!(
+            built.sampled_ids[1],
+            store.lookup(0x222).expect("bystander lookup")
+        );
     }
 
     /// Stage 4d — `build_scene` appends the Composite Overlay
