@@ -47,3 +47,4 @@ bee-*.svg
 # regenerable, not source-of-truth)
 yserver-*-scanout-*.ppm
 *.ppm
+*.xtrace
