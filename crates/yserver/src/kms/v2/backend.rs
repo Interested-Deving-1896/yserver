@@ -717,7 +717,42 @@ impl KmsBackendV2 {
                 },
                 hot_x: i16::try_from(record.hot_x).unwrap_or(i16::MAX),
                 hot_y: i16::try_from(record.hot_y).unwrap_or(i16::MAX),
+                record_version: record.version,
+                bgra_bytes: Some(std::sync::Arc::new(record.bgra_bytes.clone())),
             });
+
+        // Stage 5 Phase D — steady-state HW sprite-change. When the
+        // plane is fully bound, the scene won't re-tick (v2's
+        // empty-damage fast path at scene.rs:840), so a record
+        // swap would starve the upload waiting for a compose
+        // event. Push the bytes synchronously through the scene's
+        // queueing path; if any output is transitioning, the
+        // bytes land in the deferred slot until the wait set
+        // drains.
+        if matches!(
+            self.scene.cursor_mode(),
+            crate::kms::v2::scene::CursorPlaneMode::Hw
+                | crate::kms::v2::scene::CursorPlaneMode::Mixed
+        ) && record.width <= 64
+            && record.height <= 64
+        {
+            let bytes = std::sync::Arc::new(record.bgra_bytes.clone());
+            #[allow(clippy::cast_possible_truncation)]
+            let cx = self.core.cursor_x as i32;
+            #[allow(clippy::cast_possible_truncation)]
+            let cy = self.core.cursor_y as i32;
+            self.scene.queue_steady_state_cursor_upload(
+                &mut self.platform,
+                record.version,
+                record.width,
+                record.height,
+                bytes,
+                record.hot_x,
+                record.hot_y,
+                cx,
+                cy,
+            );
+        }
         // The scene blit ordering: register_cursor already marks
         // scene_structure_dirty so the next tick repaints; no extra
         // wake needed.
@@ -1326,7 +1361,7 @@ impl KmsBackendV2 {
         // each subsystem's book-keeping reclaims its handles
         // against the still-live pool.
         self.engine.drain_all(&self.platform);
-        self.scene.drain_all(&self.platform);
+        self.scene.drain_all(&mut self.platform);
         self.platform.disable_output()
     }
 
@@ -1604,7 +1639,32 @@ impl KmsBackendV2 {
         if new_x != self.core.cursor_x || new_y != self.core.cursor_y {
             self.core.cursor_x = new_x;
             self.core.cursor_y = new_y;
-            self.scene.wake_for_damage();
+            // Stage 5 Phase D — pointer fast path. When the plane
+            // is fully bound on every output AND no transition is
+            // pending, route motion directly through
+            // `cursor_plane_move` — one ioctl per visible CRTC, no
+            // GPU work, no compose cadence. The Mixed state (any
+            // output still has a Sw→Hw or Hw→Sw transition
+            // pending) falls back to the scene-wake path so the
+            // SW cursor doesn't desync from the eventual plane
+            // bind. The core thread owns DRM state, so this is
+            // not a thread-safety question — the ioctl is
+            // synchronous from the same thread that owns scene
+            // state.
+            if matches!(
+                self.scene.cursor_mode(),
+                crate::kms::v2::scene::CursorPlaneMode::Hw
+            ) {
+                #[allow(clippy::cast_possible_truncation)]
+                let cx = new_x as i32;
+                #[allow(clippy::cast_possible_truncation)]
+                let cy = new_y as i32;
+                if let Err(e) = self.platform.cursor_plane_move(cx, cy) {
+                    log::debug!("v2 cursor fast path: move failed: {e}");
+                }
+            } else {
+                self.scene.wake_for_damage();
+            }
         }
         self.dispatch_motion_event(server_state);
     }
