@@ -334,6 +334,14 @@ pub(crate) struct SceneCompositor {
     /// construction time so the gate is consistent across all
     /// `build_scene` calls.
     hw_cursor_strategy_enabled: bool,
+    /// Stage 4d — Composite Overlay Window scene entry. Lazily set
+    /// by `register_cow` on the first client paint into COW (the
+    /// xfwm4 case allocates COW but never paints into it, so
+    /// registering eagerly would cover the scene with the depth-24
+    /// force-opaque initial fill). Lives on the outer struct (not
+    /// `inner`) so the stub fixture can also track registration
+    /// state in unit tests that don't bring up a live scanout pool.
+    cow: Option<super::store::DrawableId>,
 }
 
 /// Stage 5 Phase H — env gate for the HW cursor strategy. Default
@@ -381,12 +389,6 @@ struct SceneCompositorInner {
     /// is just a default-arrow fallback so hardware smoke has
     /// visible pointer feedback.
     cursor: Option<CursorEntry>,
-    /// Stage 4d: Composite Overlay Window scene entry. Retained
-    /// for the stage 4d layering tests; the live backend no
-    /// longer drives it in the current XFCE fix. Stub fixture
-    /// (no Vk) leaves this `None` — `register_cow` is a no-op
-    /// when `inner` is `None`.
-    cow: Option<super::store::DrawableId>,
     /// Stage 5 Phase D — deferred upload pending while at least
     /// one output's `wait_set` membership is non-empty. Drained
     /// when the set becomes empty by event (ShowOnRetire /
@@ -501,12 +503,12 @@ impl SceneCompositor {
                 pipeline,
                 outputs,
                 cursor: None,
-                cow: None,
                 deferred_cursor_upload: None,
                 deferred_upload_wait_set: HashSet::new(),
             }),
             scene_structure_dirty: true,
             hw_cursor_strategy_enabled: hw_cursor_strategy_enabled(),
+            cow: None,
         })
     }
 
@@ -529,23 +531,26 @@ impl SceneCompositor {
     /// tick picks up the new layer. No-op on the stub fixture
     /// (no Vk).
     pub(crate) fn register_cow(&mut self, id: super::store::DrawableId) {
-        if let Some(inner) = self.inner.as_mut() {
-            inner.cow = Some(id);
-            self.scene_structure_dirty = true;
-        }
+        self.cow = Some(id);
+        self.scene_structure_dirty = true;
     }
 
     /// Stage 4d — clear the Composite Overlay Window scene
-    /// entry. Retained for the stage 4d layering tests; the live
-    /// backend no longer calls this. Subsequent `build_scene`
-    /// calls omit the COW layer; the storage drop itself is
-    /// handled by the backend's `store.decref`. No-op on the
-    /// stub fixture.
+    /// entry. Subsequent `build_scene` calls omit the COW layer;
+    /// the storage drop itself is handled by the backend's
+    /// `store.decref`. No-op on the stub fixture.
     pub(crate) fn unregister_cow(&mut self) {
-        if let Some(inner) = self.inner.as_mut() {
-            inner.cow = None;
-            self.scene_structure_dirty = true;
-        }
+        self.cow = None;
+        self.scene_structure_dirty = true;
+    }
+
+    /// Whether the Composite Overlay Window is currently registered
+    /// as a scene entry. The backend uses this to lazy-register on
+    /// the first client paint into COW (the xfwm4 case allocates COW
+    /// but never paints into it, so registering on allocation would
+    /// cover the scene with the depth-24 force-opaque initial fill).
+    pub(crate) fn is_cow_registered(&self) -> bool {
+        self.cow.is_some()
     }
 
     /// Test fixture / Stage-1b-era stub. Construct via
@@ -556,6 +561,7 @@ impl SceneCompositor {
             inner: None,
             scene_structure_dirty: false,
             hw_cursor_strategy_enabled: false,
+            cow: None,
         }
     }
 
@@ -785,6 +791,8 @@ impl SceneCompositor {
         windows_v2: &super::backend::WindowsV2Map,
         telemetry: &mut Telemetry,
     ) -> Result<usize, SceneError> {
+        let cow = self.cow;
+        let hw_strategy = self.hw_cursor_strategy_enabled;
         let Some(inner) = self.inner.as_mut() else {
             return Err(SceneError::NoVk);
         };
@@ -793,7 +801,6 @@ impl SceneCompositor {
         }
         let n_outputs = inner.outputs.len();
         let mut composed = 0usize;
-        let hw_strategy = self.hw_cursor_strategy_enabled;
         for output_idx in 0..n_outputs {
             match tick_one_output(
                 inner,
@@ -804,6 +811,7 @@ impl SceneCompositor {
                 windows_v2,
                 telemetry,
                 hw_strategy,
+                cow,
             ) {
                 Ok(true) => composed += 1,
                 Ok(false) => {} // skipped (no BO / empty scene)
@@ -1111,6 +1119,7 @@ fn tick_one_output(
     windows_v2: &super::backend::WindowsV2Map,
     telemetry: &mut Telemetry,
     hw_strategy_enabled: bool,
+    cow: Option<super::store::DrawableId>,
 ) -> Result<bool, SceneError> {
     // 0. **Per-output flip-pending gate.** KMS only allows one
     //    pending atomic commit per CRTC at a time; a second
@@ -1174,7 +1183,7 @@ fn tick_one_output(
         platform,
         inner.cursor.clone(),
         cursor_prev_pos_before,
-        inner.cow,
+        cow,
         hw_can_run,
     );
 

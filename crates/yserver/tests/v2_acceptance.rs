@@ -2330,6 +2330,84 @@ fn v2_cow_paint_appears_on_scanout() {
     );
 }
 
+/// Regression: Present-Pixmap compositors (picom-style, some marco
+/// builds) Redirect→GetOverlayWindow→Present::Pixmap onto COW. The
+/// `Present::Pixmap` handler in the dispatcher resolves to v2's
+/// `copy_area(src=pixmap, dst=COW)`, which lands content in COW
+/// storage. But `build_scene` gates the COW draw on `inner.cow`,
+/// which is set only by `SceneCompositor::register_cow`. Pre-fix,
+/// `register_cow` was defined but no live backend ever called it
+/// (status.md ~1769-1773 — un-wired during a 2026-05-17 xfwm4 fix
+/// because xfwm4's compositor paints into a child window and the
+/// zero-filled COW covers the real output). Net effect: the
+/// compositor's full-screen composited image (including soft
+/// drop shadows) lived in COW storage forever, invisible to the
+/// scanout. User-visible symptom: opaque dark borders where soft
+/// shadows should be.
+///
+/// Trigger semantics: lazy-register on the first paint into COW.
+/// Allocating COW without ever painting (xfwm4 case) leaves the
+/// scene entry off, so the depth-24 force-opaque initial fill does
+/// not cover scene content.
+///
+/// Oracle: `get_overlay_window` → `put_image` against the COW xid →
+/// scene reports the COW is registered. Pre-fix this assertion is
+/// the failing one — every other observable (store lookup, refcount,
+/// presentation damage) is correct because the bug is exclusively
+/// at the scene-registration boundary.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_paint_into_cow_registers_scene_entry() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Allocation alone must NOT register: xfwm4-style compositors
+    // allocate COW but never paint into it; registering eagerly
+    // would force-opaque-cover the entire scene with the initial
+    // zero-fill (depth-24 padding byte → α=1.0 through the
+    // sample-side swizzle).
+    b.get_overlay_window(None).expect("get_overlay_window");
+    assert!(
+        !b.test_scene_cow_registered(),
+        "GetOverlayWindow alone must not register the COW scene entry \
+         — xfwm4 allocates COW but paints into a child window, so an \
+         eager registration would cover the real output with the \
+         depth-24 force-opaque initial fill",
+    );
+
+    // First paint into COW (Present-Pixmap path goes through
+    // `copy_area`; `put_image` is the test-fixture-friendly
+    // equivalent paint vector). After this, the scene MUST see
+    // the COW registered so `build_scene` emits it at the top of z.
+    let cow_xid = 0x103u32;
+    let pixels: Vec<u8> = vec![0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF];
+    b.put_image(None, cow_xid, 24, 2, 1, 0, 0, &pixels)
+        .expect("put_image into COW xid");
+    assert!(
+        b.test_scene_cow_registered(),
+        "after the first client paint into COW, the scene must have \
+         the COW registered as a top-of-z entry — otherwise the \
+         compositor's painted content lives in storage but never \
+         reaches the scanout (the active 'no shadows' bug)",
+    );
+
+    // Final release unregisters the scene entry so a subsequent
+    // GetOverlayWindow round-trip starts cleanly. The scene field
+    // tracks the storage lifetime, not the protocol refcount.
+    b.release_overlay_window(None).expect("release");
+    assert!(
+        !b.test_scene_cow_registered(),
+        "final ReleaseOverlayWindow must unregister the scene entry: \
+         the storage is gone, so a stale registration would point at \
+         a destroyed drawable",
+    );
+}
+
 /// Stage 4d X11 Render `PictFormat` fix — marco-compositing widgets-
 /// invisible repro.
 ///

@@ -8882,6 +8882,17 @@ fn handle_map_window(
         // (sets it back to false) must land last.
         maybe_activate_child_under_redirected_parent(state, backend, origin, window);
         reapply_redirect_mode_after_map(state, backend, origin, window);
+        // Audit #11: Xorg's `miPaintWindow` fires damage on the
+        // window's extent when the window becomes viewable (the
+        // server-background fill is itself a paint, and DAMAGE
+        // hooks every paint). Compositors that subscribe via
+        // `XDamageCreate(window)` rely on that first DamageNotify
+        // to read the freshly-mapped window's pixels into their
+        // own offscreen. Without it, override-redirect popups,
+        // XEMBED tray icons (`nm-applet`), and any other window
+        // that maps and then sits without further paint stay
+        // invisible on COW under a compositor.
+        let _dropped = accumulate_damage_full_to_state(state, window);
     }
 
     let wants_focus = {
@@ -8958,6 +8969,11 @@ fn handle_map_subwindows(
             // plan's round-6 ordering fix.
             maybe_activate_child_under_redirected_parent(state, backend, origin, child);
             reapply_redirect_mode_after_map(state, backend, origin, child);
+            // Audit #11: see `handle_map_window` for the rationale.
+            // Mirror the damage bump so MapSubwindows-driven mass
+            // maps (mate-panel applet realize cascade, GTK
+            // children-on-show) also notify subscribed compositors.
+            let _dropped = accumulate_damage_full_to_state(state, child);
         }
         let wants_focus = {
             let mask = state
@@ -13835,6 +13851,94 @@ mod tests {
                 } if *host_window == HOST_XID
             )),
             "mapping a Manual-redirected window must not leave it scene_participating=true; got {calls:?}",
+        );
+    }
+
+    /// Audit #11 regression — when a window maps, server-background
+    /// paint fills the window's storage but no `DamageNotify` fires
+    /// for the affected region. Compositors that subscribe to
+    /// `XDamageCreate(window)` (marco-with-compositing, picom) miss
+    /// the first frame and the window stays invisible on COW until
+    /// the next paint into it. Symptom: override-redirect popup
+    /// menus, mate-panel system-tray icons (`nm-applet`) don't show
+    /// when a compositor is active and v2 routes the visible output
+    /// through `Present::Pixmap → COW`.
+    ///
+    /// Oracle: a `DamageObject` subscribed to a freshly-created
+    /// window must accumulate damage rects covering the window's
+    /// full extent after `handle_map_window` returns.
+    #[test]
+    fn map_window_emits_damage_on_window_extent() {
+        use crate::server::DamageObject;
+
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0010;
+        const HOST_XID: u32 = 0x0040_0010;
+        const DAMAGE_ID: u32 = 0x0080_0010;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 80,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+        }
+
+        // Compositor subscribes via `XDamageCreate(window)`. Pin the
+        // pre-state explicitly: no rects accumulated yet.
+        state.damage_objects.insert(
+            DAMAGE_ID,
+            DamageObject {
+                owner: ClientId(CLIENT_ID),
+                drawable: ResourceId(WINDOW_XID),
+                level: 0,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+            },
+        );
+
+        let mut body = Vec::with_capacity(4);
+        body.extend_from_slice(&WINDOW_XID.to_le_bytes());
+        handle_map_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_map_window");
+
+        let damage = state
+            .damage_objects
+            .get(&DAMAGE_ID)
+            .expect("damage_object survived map");
+        assert!(
+            !damage.rects.is_empty(),
+            "MapWindow must fire damage on the window's extent so a \
+             subscribed compositor repaints the new region into its \
+             offscreen — pre-fix this is empty and the compositor \
+             never sees the newly-mapped popup / tray icon / window",
         );
     }
 

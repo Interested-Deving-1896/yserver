@@ -857,6 +857,21 @@ impl KmsBackendV2 {
         Some((drawable.storage.image_view, drawable.storage.sample_view))
     }
 
+    /// Test-only read of whether the Composite Overlay Window is
+    /// currently a scene entry. The COW lifecycle splits "store
+    /// allocation" (eager, on `GetOverlayWindow`) from "scene
+    /// registration" (lazy, on first client paint into COW) so a
+    /// compositor that allocates the COW but never paints into it
+    /// (xfwm4 with its child compositor window) does not cover the
+    /// real output with a zero-filled overlay. This accessor lets
+    /// the regression test pin that the lazy registration actually
+    /// fires.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_scene_cow_registered(&self) -> bool {
+        self.scene.is_cow_registered()
+    }
+
     /// Stage 4a — test-only knob to install a COMPOSITE redirect
     /// route directly via the store, bypassing 4b's protocol
     /// surface (`allocate_redirected_backing` / `name_window_pixmap`
@@ -1023,6 +1038,31 @@ impl KmsBackendV2 {
             );
         }
         result
+    }
+
+    /// Lazy COW scene registration. Called from every paint method
+    /// after `resolve_paint_target` succeeds: if the resolved target
+    /// is the Composite Overlay Window storage and the scene has
+    /// not yet registered it, register now.
+    ///
+    /// Why lazy and not eager-on-`get_overlay_window`: xfwm4's
+    /// compositor allocates COW (so `XCompositeGetOverlayWindow`
+    /// returns a real xid) but paints into a child compositor
+    /// window, never into COW. An eager registration would emit
+    /// the zero-filled depth-24 COW as a scene-top force-opaque
+    /// layer (sample-side swizzle forces α=1.0 on depth-24), which
+    /// covers the actual output with solid black. Picom-style
+    /// Present-Pixmap compositors, by contrast, DO paint into COW
+    /// — the first `copy_area` / `put_image` / `render_*` whose dst
+    /// resolves to COW is the signal that the scene entry should
+    /// turn on.
+    pub(crate) fn maybe_register_cow_on_paint(&mut self, target_id: super::store::DrawableId) {
+        if !self.scene.is_cow_registered()
+            && let Some(cow_id) = self.cow_id
+            && cow_id == target_id
+        {
+            self.scene.register_cow(cow_id);
+        }
     }
 
     fn resolve_paint_target_inner(
@@ -4346,6 +4386,12 @@ impl Backend for KmsBackendV2 {
         }
         self.core.cow_refcount -= 1;
         if self.core.cow_refcount == 0 {
+            // Drop the scene entry FIRST so subsequent `build_scene`
+            // calls during a still-in-flight retire window can't
+            // sample a destroyed drawable. `decref` may defer the
+            // storage drop on a `PendingFence`, but the scene must
+            // stop referencing COW from this point regardless.
+            self.scene.unregister_cow();
             if let Some(id) = self.cow_id.take() {
                 self.store.decref(&mut self.platform, id);
             }
@@ -4939,6 +4985,7 @@ impl Backend for KmsBackendV2 {
             self.log_v2_gap("copy_area_unknown_xid");
             return Ok(());
         };
+        self.maybe_register_cow_on_paint(dst_target.id);
         // Diagnostic trace (TEMP — Stage 4d "top-left-only CC" investigation).
         // Pins where each CopyArea lands: src store id, dst's resolved
         // PaintTarget (id + offset), and the wire src/dst coords + size.
@@ -5269,6 +5316,7 @@ impl Backend for KmsBackendV2 {
             self.log_v2_gap("put_image_unknown_xid");
             return Ok(());
         };
+        self.maybe_register_cow_on_paint(target.id);
         // GC clipping is honoured upstream by `clear_clip_rectangles`
         // when the dispatcher zeroes the clip (the MIT-SHM /
         // ImageText callers do this); Stage 2c's engine ignores
@@ -6298,6 +6346,7 @@ impl Backend for KmsBackendV2 {
             );
             return Ok(());
         };
+        self.maybe_register_cow_on_paint(dst_target.id);
         let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
 
         // Audit #2 (2026-05-19) — fold src/mask client clips into
@@ -6544,6 +6593,7 @@ impl Backend for KmsBackendV2 {
             log::debug!("v2 composite_glyphs gap: dst drawable 0x{dst_host_xid:x} not in store");
             return Ok(());
         };
+        self.maybe_register_cow_on_paint(dst_target.id);
         let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
         if !self.core.glyphsets.contains_key(&host_gs) {
             log::debug!("v2 composite_glyphs gap: glyphset 0x{host_gs:x} not registered");
@@ -6822,6 +6872,7 @@ impl Backend for KmsBackendV2 {
             );
             return Ok(());
         };
+        self.maybe_register_cow_on_paint(dst_target.id);
         let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
         let (paint_dx, paint_dy) = dst_target.offset;
 
@@ -6942,6 +6993,7 @@ impl Backend for KmsBackendV2 {
             log::debug!("v2 render_trapezoids gap: dst drawable 0x{dst_host_xid:x} not in store");
             return Ok(());
         };
+        self.maybe_register_cow_on_paint(dst_target.id);
         let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
         let dx = (i32::from(x_off) + dst_target.offset.0) << 16;
         let dy = (i32::from(y_off) + dst_target.offset.1) << 16;
@@ -7114,6 +7166,7 @@ impl Backend for KmsBackendV2 {
             log::debug!("v2 render_triangles gap: dst drawable 0x{dst_host_xid:x} not in store");
             return Ok(());
         };
+        self.maybe_register_cow_on_paint(dst_target.id);
         let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
         let dx = (i32::from(x_off) + dst_target.offset.0) << 16;
         let dy = (i32::from(y_off) + dst_target.offset.1) << 16;
