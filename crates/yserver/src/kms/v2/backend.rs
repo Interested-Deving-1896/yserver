@@ -2904,6 +2904,30 @@ fn resolve_dst_picture_for_render(
     Some((*host_xid, clip.clone()))
 }
 
+/// Audit #2 (2026-05-19) — extract a source / mask picture's
+/// `clientClip` for `render_composite`'s composite-region
+/// computation. The picture's clip rects are stored
+/// pre-shifted by `clip_x` / `clip_y` (see
+/// `render_set_picture_clip_rectangles`), so the returned list
+/// is already in the picture's drawable-local coord space —
+/// `compute_render_composite_clip` translates from there into
+/// dst space via `(xDst - xSrc, yDst - ySrc)`.
+///
+/// Non-Drawable pictures (`SolidFill` / gradients) carry no
+/// `clientClip` and return `None`. `host_pic == 0` (the
+/// "no mask" sentinel `RenderComposite` uses) also returns `None`.
+fn picture_client_clip(core: &KmsCore, host_pic: u32) -> Option<Vec<Rectangle16>> {
+    if host_pic == 0 {
+        return None;
+    }
+    match core.pictures.get(&host_pic)? {
+        PictureRecord::Drawable { clip, .. } => clip.clone(),
+        PictureRecord::SolidFill { .. }
+        | PictureRecord::LinearGradient { .. }
+        | PictureRecord::RadialGradient { .. } => None,
+    }
+}
+
 /// Stage 3f.8: 16×16 BGRA8 default-arrow cursor sprite. Hotspot
 /// at (0, 0). The shape is a filled right-triangle pointing
 /// down-right — sized so the tip falls on the click point and the
@@ -5794,6 +5818,41 @@ impl Backend for KmsBackendV2 {
         };
         let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset);
 
+        // Audit #2 (2026-05-19) — fold src/mask client clips into
+        // the composite-region clip per Xorg's
+        // `miComputeCompositeRegion` (`render/mipict.c:316-389`).
+        // Pre-fix, `resolve_picture_for_render` discarded src/mask
+        // clips entirely, so `SetPictureClipRectangles` on a source
+        // picture (xfwm4/muffin shadow blits) painted over the
+        // whole dst. The translation offset matches Xorg's
+        // `miClipPictureSrc(..., xDst - xSrc, yDst - ySrc)` call
+        // site at `mipict.c:356,370` — the dst already has
+        // `dst_target.offset` applied to `(xDst, yDst)`, so the
+        // translation picks up that offset automatically.
+        let src_clip = picture_client_clip(&self.core, host_src);
+        let mask_clip = if host_mask == 0 {
+            None
+        } else {
+            picture_client_clip(&self.core, host_mask)
+        };
+        let dst_origin_x = i32::from(dst_x) + dst_target.offset.0;
+        let dst_origin_y = i32::from(dst_y) + dst_target.offset.1;
+        let src_translation = (
+            dst_origin_x - i32::from(src_x),
+            dst_origin_y - i32::from(src_y),
+        );
+        let mask_translation = (
+            dst_origin_x - i32::from(mask_x),
+            dst_origin_y - i32::from(mask_y),
+        );
+        let dst_clip = compute_render_composite_clip(
+            dst_clip.as_deref(),
+            src_clip.as_deref(),
+            src_translation,
+            mask_clip.as_deref(),
+            mask_translation,
+        );
+
         let rect = crate::kms::vk::ops::render::CompositeRect {
             src_x: i32::from(src_x),
             src_y: i32::from(src_y),
@@ -7571,6 +7630,116 @@ fn intersect_rect_with_clip(
     out
 }
 
+/// Translate a clip-rect list by `(dx, dy)` (signed). Used to map a
+/// source / mask picture's client clip from the picture's own
+/// drawable space into the destination's drawable space, mirroring
+/// Xorg's `miClipPictureSrc`
+/// (`/home/jos/Projects/xserver/render/mipict.c:267-290`). The Xorg
+/// path translates pPicture->clientClip in-place, intersects, then
+/// translates back; we copy-translate so the picture record stays
+/// untouched.
+///
+/// Out-of-i16 results saturate; X11 fixed-point clips never need
+/// more than 16-bit signed coords on the wire.
+fn translate_clip_rects(rects: &[Rectangle16], dx: i32, dy: i32) -> Vec<Rectangle16> {
+    rects
+        .iter()
+        .map(|r| {
+            let nx = i32::from(r.x).saturating_add(dx);
+            let ny = i32::from(r.y).saturating_add(dy);
+            Rectangle16 {
+                x: i16::try_from(nx).unwrap_or(if nx < 0 { i16::MIN } else { i16::MAX }),
+                y: i16::try_from(ny).unwrap_or(if ny < 0 { i16::MIN } else { i16::MAX }),
+                width: r.width,
+                height: r.height,
+            }
+        })
+        .collect()
+}
+
+/// Intersect two clip-rect lists. Returns the pairwise rectangle
+/// intersections, omitting empties. Both lists are interpreted as
+/// "the clip is the union of these rects" — the resulting list is
+/// `union { a ∩ b : a ∈ a_list, b ∈ b_list }`.
+///
+/// Helper for `compute_render_composite_clip` below.
+fn intersect_clip_lists(a: &[Rectangle16], b: &[Rectangle16]) -> Vec<Rectangle16> {
+    let mut out = Vec::with_capacity(a.len() * b.len());
+    for ra in a {
+        let ax0 = i32::from(ra.x);
+        let ay0 = i32::from(ra.y);
+        let ax1 = ax0.saturating_add(i32::from(ra.width));
+        let ay1 = ay0.saturating_add(i32::from(ra.height));
+        for rb in b {
+            let bx0 = i32::from(rb.x);
+            let by0 = i32::from(rb.y);
+            let bx1 = bx0.saturating_add(i32::from(rb.width));
+            let by1 = by0.saturating_add(i32::from(rb.height));
+            let ix0 = ax0.max(bx0);
+            let iy0 = ay0.max(by0);
+            let ix1 = ax1.min(bx1);
+            let iy1 = ay1.min(by1);
+            if ix0 < ix1 && iy0 < iy1 {
+                out.push(Rectangle16 {
+                    x: i16::try_from(ix0).unwrap_or(i16::MAX),
+                    y: i16::try_from(iy0).unwrap_or(i16::MAX),
+                    width: u16::try_from(ix1 - ix0).unwrap_or(u16::MAX),
+                    height: u16::try_from(iy1 - iy0).unwrap_or(u16::MAX),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Compose the effective composite-region clip for `render_composite`
+/// per X RENDER spec (`miComputeCompositeRegion`,
+/// `/home/jos/Projects/xserver/render/mipict.c:316-389`):
+///
+///   clip = dst_clip ∩ src_clip-translated-to-dst-space ∩ mask_clip-translated-to-dst-space
+///
+/// Each argument may be `None`, which is interpreted as "no clip on
+/// this picture" (paint everywhere). If all three are `None`, the
+/// function returns `None` — the engine then applies its own
+/// full-extent default. If any is `Some`, the result is `Some` and
+/// carries the intersection (possibly empty, which means "paint
+/// nothing" per X RENDER spec — Xorg returns FALSE here and skips
+/// the draw).
+///
+/// `src_translation` and `mask_translation` are `(xDst - xSrc,
+/// yDst - ySrc)` and `(xDst - xMask, yDst - yMask)` respectively
+/// (per Xorg's `miClipPictureSrc` call sites at `mipict.c:356,370`).
+/// `mask_clip` should be `None` when no mask is used.
+///
+/// Pure / no Vulkan; tested below against hand-traced Xorg vectors.
+fn compute_render_composite_clip(
+    dst_clip: Option<&[Rectangle16]>,
+    src_clip: Option<&[Rectangle16]>,
+    src_translation: (i32, i32),
+    mask_clip: Option<&[Rectangle16]>,
+    mask_translation: (i32, i32),
+) -> Option<Vec<Rectangle16>> {
+    let src_in_dst = src_clip.map(|c| translate_clip_rects(c, src_translation.0, src_translation.1));
+    let mask_in_dst =
+        mask_clip.map(|c| translate_clip_rects(c, mask_translation.0, mask_translation.1));
+    // Start with whichever input is Some, then fold the remaining
+    // Some-inputs via intersection. Order doesn't matter — list
+    // intersection is associative & commutative.
+    let mut acc: Option<Vec<Rectangle16>> = None;
+    let mut fold = |next: Option<Vec<Rectangle16>>| {
+        match (acc.take(), next) {
+            (None, None) => {}
+            (None, Some(v)) => acc = Some(v),
+            (Some(a), None) => acc = Some(a),
+            (Some(a), Some(b)) => acc = Some(intersect_clip_lists(&a, &b)),
+        }
+    };
+    fold(dst_clip.map(<[Rectangle16]>::to_vec));
+    fold(src_in_dst);
+    fold(mask_in_dst);
+    acc
+}
+
 fn compute_copy_area_dst_rects(
     dst_rect: ash::vk::Rect2D,
     child_rects: &[ash::vk::Rect2D],
@@ -7640,10 +7809,10 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        KmsBackendV2, PictureRecord, compute_copy_area_dst_rects, intersect_rect_with_clip,
-        resolve_picture_for_render,
+        KmsBackendV2, PictureRecord, compute_copy_area_dst_rects, compute_render_composite_clip,
+        intersect_rect_with_clip, resolve_picture_for_render,
     };
-    use crate::kms::cpu_types::Repeat;
+    use crate::kms::cpu_types::{Rectangle16, Repeat};
     use std::collections::HashMap;
     use yserver_core::backend::Backend;
 
@@ -10801,6 +10970,206 @@ mod tests {
         assert_eq!(got[0].offset.y, 7);
         assert_eq!(got[0].extent.width, 100);
         assert_eq!(got[0].extent.height, 80);
+    }
+
+    // ── compute_render_composite_clip — audit #2 (2026-05-19) ────────
+    //
+    // Mirrors Xorg's `miComputeCompositeRegion`
+    // (`render/mipict.c:316-389`). Per-test vectors hand-traced from
+    // the Xorg algorithm so the expected output is grounded in the
+    // reference, not in my own arithmetic (per
+    // `feedback_test_vectors_must_be_external`).
+
+    /// All three clips `None` → result `None` (engine paints
+    /// everywhere, matching Xorg's "no clientClip" path which
+    /// leaves pRegion unconstrained beyond dst extent).
+    #[test]
+    fn compute_render_composite_clip_all_none_returns_none() {
+        let got = compute_render_composite_clip(None, None, (0, 0), None, (0, 0));
+        assert!(got.is_none());
+    }
+
+    /// Only dst clip set → result is dst clip (no translation).
+    #[test]
+    fn compute_render_composite_clip_only_dst() {
+        let dst = vec![Rectangle16 {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 40,
+        }];
+        let got = compute_render_composite_clip(Some(&dst), None, (0, 0), None, (0, 0));
+        assert_eq!(got.as_deref(), Some(dst.as_slice()));
+    }
+
+    /// Only src clip set, src and dst coincide (xDst==xSrc, yDst==
+    /// ySrc → translation (0,0)) → result is src clip as-is. This
+    /// is the load-bearing case for the audit: xfwm4/muffin set a
+    /// clip on a source picture and pre-fix yserver ignored it.
+    #[test]
+    fn compute_render_composite_clip_src_only_zero_translation() {
+        let src = vec![Rectangle16 {
+            x: 5,
+            y: 5,
+            width: 10,
+            height: 10,
+        }];
+        let got = compute_render_composite_clip(None, Some(&src), (0, 0), None, (0, 0));
+        assert_eq!(got.as_deref(), Some(src.as_slice()));
+    }
+
+    /// Src clip translates to dst space by (xDst - xSrc, yDst -
+    /// ySrc). Per Xorg `mipict.c:356`:
+    /// `miClipPictureSrc(pRegion, pSrc, xDst - xSrc, yDst - ySrc)`.
+    /// Set src clip {0,0 4×4}, composite from src(2,2) to
+    /// dst(10,20), 4×4 — translation is (10-2, 20-2) = (8, 18).
+    /// Expected: src clip translated to {8,18 4×4}.
+    #[test]
+    fn compute_render_composite_clip_translates_src_clip_to_dst_space() {
+        let src = vec![Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        }];
+        let got = compute_render_composite_clip(None, Some(&src), (8, 18), None, (0, 0));
+        assert_eq!(
+            got.as_deref(),
+            Some(
+                &[Rectangle16 {
+                    x: 8,
+                    y: 18,
+                    width: 4,
+                    height: 4,
+                }][..]
+            )
+        );
+    }
+
+    /// Dst clip ∩ src-translated clip when the two overlap on a
+    /// strict sub-rect. dst clip {0,0 100×100}; src clip {0,0 50×50}
+    /// translated by (20, 30) → {20,30 50×50}. Intersection:
+    /// {20,30 50×50} (src translates fully inside dst).
+    #[test]
+    fn compute_render_composite_clip_dst_and_src_intersection() {
+        let dst = vec![Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        }];
+        let src = vec![Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        }];
+        let got = compute_render_composite_clip(Some(&dst), Some(&src), (20, 30), None, (0, 0));
+        assert_eq!(
+            got.as_deref(),
+            Some(
+                &[Rectangle16 {
+                    x: 20,
+                    y: 30,
+                    width: 50,
+                    height: 50,
+                }][..]
+            )
+        );
+    }
+
+    /// Disjoint dst and src-translated clips → empty result (which
+    /// Xorg treats as "paint nothing" — `miComputeCompositeRegion`
+    /// returns FALSE there).
+    #[test]
+    fn compute_render_composite_clip_disjoint_yields_empty() {
+        let dst = vec![Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        }];
+        let src = vec![Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        }];
+        // Translate src by (100, 0) → {100,0 10×10}; disjoint from
+        // dst {0,0 10×10}.
+        let got = compute_render_composite_clip(Some(&dst), Some(&src), (100, 0), None, (0, 0));
+        assert_eq!(got.as_deref(), Some(&[][..]));
+    }
+
+    /// Three-way intersection: dst ∩ src ∩ mask. Use disjoint
+    /// translations that all overlap at one corner. dst {0,0 50×50},
+    /// src {0,0 50×50} translated by (10, 10) → {10,10 50×50},
+    /// mask {0,0 50×50} translated by (20, 20) → {20,20 50×50}.
+    /// Three-way intersection: {20,20 30×30}.
+    #[test]
+    fn compute_render_composite_clip_three_way_intersection() {
+        let dst = vec![Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        }];
+        let src = vec![Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        }];
+        let mask = vec![Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        }];
+        let got =
+            compute_render_composite_clip(Some(&dst), Some(&src), (10, 10), Some(&mask), (20, 20));
+        assert_eq!(
+            got.as_deref(),
+            Some(
+                &[Rectangle16 {
+                    x: 20,
+                    y: 20,
+                    width: 30,
+                    height: 30,
+                }][..]
+            )
+        );
+    }
+
+    /// Multi-rect dst clip ∩ single src clip translated: every
+    /// dst rect intersects with the translated src rect; union of
+    /// intersections is what the engine should emit per-scissor.
+    #[test]
+    fn compute_render_composite_clip_multi_rect_dst_with_single_src() {
+        let dst = vec![
+            Rectangle16 {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            Rectangle16 {
+                x: 20,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+        ];
+        // Src clip {0,0 100×100} translated by (0, 0) → covers
+        // both dst rects. Result: both dst rects survive.
+        let src = vec![Rectangle16 {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        }];
+        let got = compute_render_composite_clip(Some(&dst), Some(&src), (0, 0), None, (0, 0));
+        assert_eq!(got.as_deref(), Some(dst.as_slice()));
     }
 
     /// GC clip intersection: rect partially inside a single clip rect
