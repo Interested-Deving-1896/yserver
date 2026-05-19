@@ -382,49 +382,10 @@ yserver-mate mode="1024x768" log="trace":
             DISPLAY=:7 xterm &\
             wait $yserver_pid'
 
-# Run yserver directly on bare-metal hardware (no vng), capture its log,
-# and bring up fvwm3 + xterm against it. Intended for TTY2 use while
-# another graphical session (GNOME/Xorg) holds the user's main display
-# on a different VT — yserver acquires DRM master on whichever
-# /dev/dri/cardN matches its discovery.
-#
-# Default log level is debug; lower it with `log=info`.
-#
-# Closing xterm terminates the recipe; yserver is then SIGTERMed and
-# the DRM master is released cleanly.
-# Stage 2 v2 hardware smoke. The only DE-style stack mostly DOES
-# NOT work on v2 today because v2 has no RENDER/glyphs/fonts (those
-# are Stage 3) — mate-session, xfce-session, xfwm4 all abort
-# during their early open_font / render_create_picture calls. The
-# minimum smoke that v2 CAN currently produce on real hardware is
-# a screen-fill via `xsetroot -solid`, which only touches
-# set_container_background_pixel + ClearArea — pure Stage 2c/2d
-# path with no Stage 3 dependencies. Expect: screen visibly
-# flashes through the listed colors, telemetry shows
-# composite_submits matched 1:1 by frame_present_count,
-# vk_queue_wait_idle/s=0 holds, zero atomic commit failures
-# (with the bc6718a per-output flip-pending gate in place).
-yserver-v2-xsetroot-hw log="info":
-    cargo build --bin yserver
-    bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
-        YSERVER_RENDER_MODEL=v2 YSERVER_LOOP_TELEMETRY=1 \
-        target/debug/yserver > yserver-hw.log 2>&1 &\
-        yserver_pid=$!;\
-        ( sleep 45; kill -KILL $yserver_pid 2>/dev/null ) &\
-        watchdog_pid=$!;\
-        for i in $(seq 1 30); do [ -S /tmp/.X11-unix/X7 ] && break; sleep 1; done;\
-        sleep 1;\
-        for c in red green blue yellow magenta cyan white black red green blue; do kill -0 $yserver_pid 2>/dev/null || break; timeout 2 xsetroot -display :7 -solid "$c" 2>/dev/null; sleep 1; done;\
-        kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        kill $watchdog_pid 2>/dev/null;\
-        echo "yserver log: yserver-hw.log"'
-
 yserver-fvwm3-xterm-hw log="debug":
     cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}},yserver::kms::v2::scene=debug" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}},yserver::kms::v2::scene=debug" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-fvwm3.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 fvwm3 > fvwm3-hw.log 2>&1 &\
@@ -433,54 +394,20 @@ yserver-fvwm3-xterm-hw log="debug":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
-# No-WM hw smoke: just xterm against yserver. Lets us tell whether
-# fvwm3 specifically is the blocker or whether the compositor / input
-# pipeline itself is broken on hw. Without a WM xterm won't get a
-# frame, but it should still render its own content + the cursor
-# should track the mouse.
-yserver-xterm-only-hw log="debug":
-    cargo build --bin yserver
-    bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
-        yserver_pid=$!;\
-        sleep 2;\
-        DISPLAY=:7 xterm;\
-        kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        echo "yserver log: yserver-hw.log"'
-
-# No-WM hw smoke: just xterm against yserver. Lets us tell whether
-# fvwm3 specifically is the blocker or whether the compositor / input
-# pipeline itself is broken on hw. Without a WM xterm won't get a
-# frame, but it should still render its own content + the cursor
-# should track the mouse.
-yserver-xclock-only-hw log="debug":
-    cargo build --bin yserver
-    bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
-        yserver_pid=$!;\
-        sleep 2;\
-        DISPLAY=:7 xclock -update 1;\
-        kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        echo "yserver log: yserver-hw.log"'
-
 yserver-e16-xterm-hw log="debug":
     cargo build --bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-e16.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 e16 > e16-hw.log 2>&1 &\
         sleep 2;\
         DISPLAY=:7 wezterm;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        echo "yserver log: yserver-hw.log";\
-        echo "e16 log:   e16-hw.log"'
+        wait $yserver_pid 2>/dev/null;'
 
 # e16 + wezterm on yserver with x11trace recording the X11 wire
 # protocol between clients and yserver. e16 connects to the fake
@@ -495,7 +422,7 @@ yserver-e16-xterm-hw-trace log="debug":
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
         export GDK_BACKEND=x11;\
         export XDG_SESSION_TYPE=x11;\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-e16.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -d :7 -D :8 -n -o e16.xtrace &\
@@ -505,24 +432,19 @@ yserver-e16-xterm-hw-trace log="debug":
         sleep 2;\
         DISPLAY=:8 wezterm;\
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        echo "yserver log: yserver-hw.log";\
-        echo "x11trace:    e16.xtrace";\
-        echo "e16 log:     e16-hw.log"'
+        wait $yserver_pid 2>/dev/null;'
 
 yserver-wmaker-xterm-hw log="debug":
     cargo build --bin yserver
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-wmaker.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         DISPLAY=:7 wmaker > wmaker-hw.log 2>&1 &\
         sleep 2;\
         DISPLAY=:7 wezterm;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        echo "yserver log: yserver-hw.log";\
-        echo "wmaker log:   wmaker-hw.log"'
+        wait $yserver_pid 2>/dev/null;'
 
 # Run picom against yserver as a RENDER smoke test. picom v13's
 # `xrender` backend exercises a wider RENDER surface than xfwm4 /
@@ -548,9 +470,7 @@ yserver-xfce-hw log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::store
             XDG_SESSION_TYPE=x11 \
             dbus-run-session xfce4-session --display :7 > xfce.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        echo "yserver log: yserver-hw.log";\
-        echo "xfce log:    xfce.log"'
+        wait $yserver_pid 2>/dev/null'
 
 yserver-mate-hw log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::render=trace,yserver::kms::v2::fill=trace,yserver::kms::v2::store=trace,yserver::kms::v2::paint=trace":
     cargo build --bin yserver
@@ -562,9 +482,7 @@ yserver-mate-hw log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::rende
             XDG_SESSION_TYPE=x11 \
             dbus-run-session mate-session --display :7 > mate.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        echo "yserver log: yserver-hw.log";\
-        echo "mate log:    mate.log"'
+        wait $yserver_pid 2>/dev/null;'
 
 yserver-cinnamon-hw log="debug,yserver::kms::v2::scene=trace":
     cargo build --bin yserver
@@ -590,7 +508,7 @@ yserver-xfce-hw-trace log="debug":
     cargo build --bin yserver
     rm -f xfce.xtrace
     bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-xfce.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -d :7 -D :8 -n -o xfce.xtrace &\
@@ -600,10 +518,7 @@ yserver-xfce-hw-trace log="debug":
             XDG_SESSION_TYPE=x11 \
             dbus-run-session xfce4-session --display :8 > xfce.log 2>&1;\
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        echo "yserver log: yserver-hw.log";\
-        echo "x11trace:    xfce.xtrace";\
-        echo "xfce log:    xfce.log"'
+        wait $yserver_pid 2>/dev/null;'
 
 # Companion recipe: run thunar against the host Xorg through
 # x11trace, dumping the same protocol view to `thunar-xorg.xtrace`.
@@ -642,10 +557,7 @@ yserver-mate-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2:
             XDG_SESSION_TYPE=x11 \
             dbus-run-session mate-session --display :8 > mate.log 2>&1;\
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        echo "yserver log: yserver-hw-mate.log";\
-        echo "x11trace:    mate.xtrace";\
-        echo "mate log:    mate.log"'
+        wait $yserver_pid 2>/dev/null;'
 
 yserver-cinnamon-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::render=trace,yserver::kms::v2::fill=trace,yserver::kms::v2::store=trace,yserver::kms::v2::paint=trace,yserver::diag::configure_notify=debug":
     cargo build --bin yserver
@@ -661,10 +573,7 @@ yserver-cinnamon-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms:
             XDG_SESSION_TYPE=x11 \
             dbus-run-session cinnamon-session > cinnamon.log 2>&1;\
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        echo "yserver log: yserver-hw-cinnamon.log";\
-        echo "x11trace:    cinnamon.xtrace";\
-        echo "cinnamon log:    cinnamon.log"'
+        wait $yserver_pid 2>/dev/null;'
 
 # MATE inside Xephyr (nested Xorg-family server), with x11trace
 # recording marco's wire stream to/from Xephyr. The Xorg-side
@@ -755,9 +664,7 @@ yserver-mate-hw-release log="warn":
             XDG_SESSION_TYPE=x11 \
             dbus-run-session mate-session --display :7 > mate.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        echo "yserver log: yserver-hw.log";\
-        echo "mate log:    mate.log"'
+        wait $yserver_pid 2>/dev/null;'
 
 # Release-mode mate with the core-loop telemetry enabled (see
 # `LoopTelemetry` in `crates/yserver-core/src/core_loop/run.rs`).
@@ -773,36 +680,14 @@ yserver-mate-hw-telemetry log="info":
     RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
     bash -c '\
         YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
-            target/release/yserver > yserver-hw.log 2>&1 &\
+            target/release/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
             XDG_SESSION_TYPE=x11 \
             dbus-run-session mate-session --display :7 > mate.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        echo "yserver log:    yserver-hw.log";\
-        echo "mate log:       mate.log";\
-        echo "";\
-        echo "telemetry lines:";\
-        grep "loop telemetry" yserver-hw.log | tail -10'
-
-# Bare-metal GLX/DRI3 smoke: yserver + glxgears with verbose Mesa logs.
-# Mesa's loader_dri3 prints every probe step + driver load failure so
-# we can pinpoint why "failed to load driver: radeonsi" fires. Pair
-# with the yserver log to correlate Mesa's expectations against the
-# DRI3 / GLX requests we actually see.
-yserver-glxgears-hw log="debug":
-    cargo build --bin yserver
-    bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw.log 2>&1 &\
-        yserver_pid=$!;\
-        sleep 2;\
-        DISPLAY=:7 LIBGL_DEBUG=verbose MESA_DEBUG=1 glxgears > glxgears.log 2>&1;\
-        kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        echo "yserver log:  yserver-hw.log";\
-        echo "glxgears log: glxgears.log"'
+        wait $yserver_pid 2>/dev/null;'
 
 # Run rendercheck (X RENDER smoke suite) against ynest on `display`.
 # `tests` is a comma-separated list. Default budget is 600s/test —
