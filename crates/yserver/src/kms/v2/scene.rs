@@ -144,8 +144,12 @@ pub(crate) enum CursorAssignment {
     },
     /// SW path — sprite drawn into the scanout BO via composite.
     /// `scene.draws` carries the cursor entry; prev + new rect
-    /// added to projected damage.
-    Sw,
+    /// added to projected damage. `pos` is the output-local
+    /// top-left of the cursor draw (`cursor.xy − hot − layout`)
+    /// — propagates into `OutputSceneState.cursor_prev_pos` on
+    /// successful retire so the next tick damages this rect to
+    /// clear the SW trail.
+    Sw { pos: (i32, i32) },
     /// Cursor off-output / unregistered / clipped. SW path damages
     /// the prev rect (if any) so trails clear; nothing is drawn.
     Hidden,
@@ -944,24 +948,31 @@ fn derive_cursor_transition(
             // the screen.
             OutputCursorMode::Hw,
         ),
-        (OutputCursorMode::Hw, CursorAssignment::Sw) => (
+        (OutputCursorMode::Hw, CursorAssignment::Sw { pos }) => (
             Some(CursorTransition::HideOnRetire),
-            None,
-            OutputCursorMode::Sw { prev: None },
+            // Hw → Sw: the SW sprite is drawn at `pos` this frame.
+            // Advance prev so the NEXT frame damages this rect to
+            // clear the trail when the SW cursor moves.
+            Some(Some(pos)),
+            OutputCursorMode::Sw { prev: Some(pos) },
         ),
         (OutputCursorMode::Hw, CursorAssignment::Hidden) => (
             Some(CursorTransition::HideOnRetire),
             None,
             OutputCursorMode::Hidden,
         ),
-        (_, CursorAssignment::Sw) => {
-            // Sw → Sw or Hidden → Sw: no transition; SW prev_pos
-            // tracking is the build_scene-side draw entry's
-            // responsibility. The mode lands as Sw — even from
-            // Hidden, the new frame is drawing the SW sprite, so
-            // the next frame's `derive_cursor_transition` sees
-            // the right "prev".
-            (None, None, OutputCursorMode::Sw { prev: None })
+        (_, CursorAssignment::Sw { pos }) => {
+            // Sw → Sw or Hidden → Sw: no transition; advance the
+            // per-output `cursor_prev_pos` to where the SW sprite
+            // landed this frame so the NEXT frame damages this
+            // rect. The transactional rule (codex v4-pass) means
+            // failed submits do NOT advance — the OLD prev rect
+            // survives and is re-damaged.
+            (
+                None,
+                Some(Some(pos)),
+                OutputCursorMode::Sw { prev: Some(pos) },
+            )
         }
         (_, CursorAssignment::Hidden) => (None, Some(None), OutputCursorMode::Hidden),
         (OutputCursorMode::Hw, CursorAssignment::Hw { .. }) => (None, None, OutputCursorMode::Hw),
@@ -1711,7 +1722,7 @@ fn build_scene(
                 });
                 sampled_ids.push(cur.id);
                 add_cursor_damage(&mut projected, dx, dy);
-                CursorAssignment::Sw
+                CursorAssignment::Sw { pos: (dx, dy) }
             }
         }
     } else {
@@ -2573,8 +2584,10 @@ mod tests {
 
     #[test]
     fn derive_hw_to_sw_queues_hide_on_retire() {
-        let (trans, _prev_pos, mode_after) =
-            derive_cursor_transition(OutputCursorMode::Hw, CursorAssignment::Sw);
+        let (trans, _prev_pos, mode_after) = derive_cursor_transition(
+            OutputCursorMode::Hw,
+            CursorAssignment::Sw { pos: (100, 100) },
+        );
         assert!(matches!(trans, Some(CursorTransition::HideOnRetire)));
         assert!(matches!(mode_after, OutputCursorMode::Sw { .. }));
     }
@@ -2611,13 +2624,17 @@ mod tests {
     /// frame's derivation sees the right "prev".
     #[test]
     fn derive_sw_or_hidden_to_sw_advances_mode_no_transition() {
-        let (trans, _prev_pos, mode_after) =
-            derive_cursor_transition(OutputCursorMode::Sw { prev: None }, CursorAssignment::Sw);
+        let (trans, _prev_pos, mode_after) = derive_cursor_transition(
+            OutputCursorMode::Sw { prev: None },
+            CursorAssignment::Sw { pos: (50, 50) },
+        );
         assert!(trans.is_none());
         assert!(matches!(mode_after, OutputCursorMode::Sw { .. }));
 
-        let (trans, _, mode_after) =
-            derive_cursor_transition(OutputCursorMode::Hidden, CursorAssignment::Sw);
+        let (trans, _, mode_after) = derive_cursor_transition(
+            OutputCursorMode::Hidden,
+            CursorAssignment::Sw { pos: (50, 50) },
+        );
         assert!(trans.is_none());
         assert!(matches!(mode_after, OutputCursorMode::Sw { .. }));
     }
@@ -2638,7 +2655,7 @@ mod tests {
         // env-var test would need a process-scoped fixture.
         let prev = OutputCursorMode::Sw { prev: None };
         // Sw → Sw with HW NOT active — no transition.
-        let (trans, _, _) = derive_cursor_transition(prev, CursorAssignment::Sw);
+        let (trans, _, _) = derive_cursor_transition(prev, CursorAssignment::Sw { pos: (10, 10) });
         assert!(trans.is_none());
     }
 
