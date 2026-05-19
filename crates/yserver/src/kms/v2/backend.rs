@@ -7891,6 +7891,7 @@ mod tests {
                 subwindow_mode,
                 poly_edge,
                 poly_mode,
+                drawable_origin: _,
             } => {
                 assert_eq!(*host_xid, 0x4242_4242);
                 assert!(clip.is_none(), "clip stays None for clip_mask=0");

@@ -157,6 +157,11 @@ pub struct PictureState {
     pub host_picture_xid: crate::backend::PictureHandle,
     pub host_owned_pixmap: Option<crate::backend::PixmapHandle>,
     pub kind: PictureKind,
+    /// For `PictureKind::Drawable` pictures: the client-visible XID of
+    /// the backing window or pixmap. Used by RENDER paint handlers to
+    /// accumulate damage on the right drawable after painting.
+    /// `None` for `Sourceless` pictures (SolidFill / gradient).
+    pub drawable: Option<ResourceId>,
 }
 
 #[derive(Debug)]

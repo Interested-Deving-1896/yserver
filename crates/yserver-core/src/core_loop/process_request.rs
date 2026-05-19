@@ -1158,6 +1158,7 @@ fn handle_render_request(
                         host_picture_xid: host_pic,
                         host_owned_pixmap: None,
                         kind: crate::resources::PictureKind::Drawable,
+                        drawable: Some(req.drawable),
                     },
                 );
             }
@@ -1259,6 +1260,13 @@ fn handle_render_request(
                     origin, req.op, host_src, host_mask, host_dst, req.src_x, req.src_y,
                     req.mask_x, req.mask_y, req.dst_x, req.dst_y, req.width, req.height,
                 );
+                if req.width > 0 && req.height > 0 {
+                    if let Some(dst_drawable) =
+                        state.resources.picture(req.dst).and_then(|p| p.drawable)
+                    {
+                        let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
+                    }
+                }
             }
         }
         10..=13 => {
@@ -1329,6 +1337,9 @@ fn handle_render_request(
                         0,
                         0,
                     );
+                }
+                if let Some(dst_drawable) = state.resources.picture(dst).and_then(|p| p.drawable) {
+                    let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
                 }
             }
         }
@@ -1428,6 +1439,13 @@ fn handle_render_request(
                     origin, minor, req.op, host_src, host_dst, mask_fmt, host_gs, req.src_x,
                     req.src_y, &req.items, 0, 0,
                 );
+                if !req.items.is_empty() {
+                    if let Some(dst_drawable) =
+                        state.resources.picture(req.dst).and_then(|p| p.drawable)
+                    {
+                        let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
+                    }
+                }
             }
         }
         26 => {
@@ -1452,6 +1470,13 @@ fn handle_render_request(
             if let Some(host_dst) = host_dst {
                 let _ = backend
                     .render_fill_rectangles(origin, host_dst, req.op, req.color, &req.rects, 0, 0);
+                if !req.rects.is_empty() {
+                    if let Some(dst_drawable) =
+                        state.resources.picture(req.dst).and_then(|p| p.drawable)
+                    {
+                        let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
+                    }
+                }
             }
         }
         27 => {
@@ -1529,6 +1554,7 @@ fn handle_render_request(
                         host_picture_xid: host_pic,
                         host_owned_pixmap: None,
                         kind: crate::resources::PictureKind::Sourceless,
+                        drawable: None,
                     },
                 );
             }
@@ -1550,6 +1576,7 @@ fn handle_render_request(
                         host_picture_xid: host_pic,
                         host_owned_pixmap: None,
                         kind: crate::resources::PictureKind::Sourceless,
+                        drawable: None,
                     },
                 );
             }
@@ -1571,6 +1598,7 @@ fn handle_render_request(
                         host_picture_xid: host_pic,
                         host_owned_pixmap: None,
                         kind: crate::resources::PictureKind::Sourceless,
+                        drawable: None,
                     },
                 );
             }
@@ -13781,7 +13809,7 @@ mod tests {
         .unwrap();
 
         // Drain marco's socket. Look for a DamageNotify event:
-        // event_code = DAMAGE_FIRST_EVENT (94) + 0 = 94.
+        // event_code = DAMAGE_FIRST_EVENT + 0.
         peer.set_nonblocking(true).unwrap();
         let mut all = Vec::new();
         let mut chunk = [0u8; 4096];
@@ -13794,7 +13822,7 @@ mod tests {
         }
         let damage_evt: [u8; 32] = all
             .chunks_exact(32)
-            .find(|evt| evt[0] == 94)
+            .find(|evt| evt[0] == crate::nested::DAMAGE_FIRST_EVENT)
             .map(|s| {
                 let mut a = [0u8; 32];
                 a.copy_from_slice(s);
@@ -14328,5 +14356,118 @@ mod tests {
         assert_eq!(got[0].y, 0);
         assert_eq!(got[0].width, 100);
         assert_eq!(got[0].height, 80);
+    }
+
+    /// RENDER paint ops must fire DamageNotify to damage subscribers on the
+    /// dst picture's underlying drawable. Before the fix the RENDER path
+    /// called backend.render_composite but never called
+    /// accumulate_damage_full_to_state, so compositors registered with
+    /// XDamageCreate(window=W) received zero DamageNotify events for any
+    /// RENDER traffic — matching "marco emits 0 DamageNotify" from the audit.
+    #[test]
+    fn render_composite_emits_damage_on_dst_drawable() {
+        use crate::{
+            backend::PictureHandle,
+            resources::{PictureKind, PictureState},
+            server::DamageObject,
+        };
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const COMPOSITOR: u32 = 7;
+        const WIN_XID: u32 = 0x0020_0001;
+        const SRC_PIC_XID: u32 = 0x0020_0010;
+        const DST_PIC_XID: u32 = 0x0020_0011;
+        const DAMAGE_XID: u32 = 0x0020_0020;
+        const HOST_SRC: u32 = 0xAA01;
+        const HOST_DST: u32 = 0xAA02;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let _peer = install_client(&mut state, COMPOSITOR);
+
+        state.resources.create_window(
+            ClientId(COMPOSITOR),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WIN_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+
+        // Insert pictures directly — bypass CreatePicture dispatch since
+        // RecordingBackend.render_create_picture returns Ok(None).
+        state.resources.create_picture(
+            ResourceId(SRC_PIC_XID),
+            PictureState {
+                client: ClientId(COMPOSITOR),
+                host_picture_xid: PictureHandle::from_raw_for_test(HOST_SRC),
+                host_owned_pixmap: None,
+                kind: PictureKind::Drawable,
+                drawable: Some(ResourceId(WIN_XID)),
+            },
+        );
+        state.resources.create_picture(
+            ResourceId(DST_PIC_XID),
+            PictureState {
+                client: ClientId(COMPOSITOR),
+                host_picture_xid: PictureHandle::from_raw_for_test(HOST_DST),
+                host_owned_pixmap: None,
+                kind: PictureKind::Drawable,
+                drawable: Some(ResourceId(WIN_XID)),
+            },
+        );
+
+        state.damage_objects.insert(
+            DAMAGE_XID,
+            DamageObject {
+                owner: ClientId(COMPOSITOR),
+                drawable: ResourceId(WIN_XID),
+                level: 3, // NonEmpty
+                rects: Vec::new(),
+                pending_notify_fired: false,
+            },
+        );
+
+        // RENDER Composite body (minor=8, total 32 bytes):
+        // op(1) + pad(3) + src(4) + mask(4) + dst(4) + src_xy(4) +
+        // mask_xy(4) + dst_xy(4) + size(4)
+        let mut body = vec![0u8; 32];
+        body[0] = 3; // PictOpOver
+        body[4..8].copy_from_slice(&SRC_PIC_XID.to_le_bytes());
+        body[8..12].copy_from_slice(&0u32.to_le_bytes()); // no mask
+        body[12..16].copy_from_slice(&DST_PIC_XID.to_le_bytes());
+        body[28..30].copy_from_slice(&100u16.to_le_bytes()); // width
+        body[30..32].copy_from_slice(&80u16.to_le_bytes()); // height
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(COMPOSITOR),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 133, // RENDER major opcode
+                data: 8,     // minor: Composite
+                length_units: u32::try_from(1 + 32 / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        let damage = state.damage_objects.get(&DAMAGE_XID).unwrap();
+        assert!(
+            !damage.rects.is_empty(),
+            "render_composite must call accumulate_damage_full_to_state on the \
+             dst picture's drawable; got 0 rects — the RENDER path is missing \
+             the damage call",
+        );
     }
 }

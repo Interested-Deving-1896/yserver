@@ -914,6 +914,20 @@ pub trait Backend: Send {
         values: &[u8],
     ) -> io::Result<Option<PictureHandle>>;
 
+    /// Store the drawable-space origin for a picture so that window-backed
+    /// pictures can translate external region geometry into picture-local
+    /// coordinates. Default no-op for backends that don't track this.
+    fn set_picture_drawable_origin(&mut self, _host_pic: u32, _origin: (i16, i16)) {}
+
+    /// Return the client-set clip rectangles for a picture (if any).
+    /// Used by `CreateRegionFromPicture`. Default returns `None`.
+    fn picture_client_clip_rects(
+        &mut self,
+        _host_pic: u32,
+    ) -> Option<Option<Vec<xfixes::RegionRect>>> {
+        None
+    }
+
     fn render_change_picture(
         &mut self,
         origin: Option<OriginContext>,

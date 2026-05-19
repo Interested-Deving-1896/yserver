@@ -13,7 +13,7 @@ use yserver_protocol::x11::{ClientId, ResourceId, SequenceNumber, damage as x11d
 
 use crate::{core_loop::fanout::fanout_event_to_clients, server::ServerState};
 
-const DAMAGE_FIRST_EVENT: u8 = 94;
+use crate::nested::DAMAGE_FIRST_EVENT;
 
 /// One DamageNotify worth of identity that has already been
 /// "committed" against `state.damage_objects` (rect pushed, fired

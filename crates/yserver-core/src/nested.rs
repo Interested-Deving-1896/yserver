@@ -35,23 +35,23 @@ const BIG_REQUESTS_FIRST_ERROR: u8 = 0;
 const XKB_MAJOR_OPCODE: u8 = 136;
 
 const XI2_MAJOR_OPCODE: u8 = 137;
-const XI2_FIRST_EVENT: u8 = 90;
+const XI2_FIRST_EVENT: u8 = 66; // matches Xorg: XI1 legacy events 66-82
 const XI2_FIRST_ERROR: u8 = 153;
 
 const XFIXES_MAJOR_OPCODE: u8 = 140;
-const XFIXES_FIRST_EVENT: u8 = 91;
+const XFIXES_FIRST_EVENT: u8 = 87; // matches Xorg: Selection=87, Cursor=88
 const XFIXES_FIRST_ERROR: u8 = 154;
 
 const SHAPE_MAJOR_OPCODE: u8 = 141;
-const SHAPE_FIRST_EVENT: u8 = 92;
+const SHAPE_FIRST_EVENT: u8 = 64; // matches Xorg: ShapeNotify=64
 const SHAPE_FIRST_ERROR: u8 = 155;
 
 const SYNC_MAJOR_OPCODE: u8 = 142;
-const SYNC_FIRST_EVENT: u8 = 93;
+const SYNC_FIRST_EVENT: u8 = 83; // matches Xorg: Counter=83, Alarm=84
 const SYNC_FIRST_ERROR: u8 = 156;
 
 const DAMAGE_MAJOR_OPCODE: u8 = 143;
-const DAMAGE_FIRST_EVENT: u8 = 94;
+pub(crate) const DAMAGE_FIRST_EVENT: u8 = 91; // matches Xorg: DamageNotify=91
 const DAMAGE_FIRST_ERROR: u8 = 157;
 
 const COMPOSITE_MAJOR_OPCODE: u8 = 144;
@@ -59,11 +59,11 @@ const COMPOSITE_FIRST_EVENT: u8 = 0;
 const COMPOSITE_FIRST_ERROR: u8 = 158;
 
 const PRESENT_MAJOR_OPCODE: u8 = 145;
-const PRESENT_FIRST_EVENT: u8 = 95;
+const PRESENT_FIRST_EVENT: u8 = 0; // Present uses XGE, no sequential event codes
 const PRESENT_FIRST_ERROR: u8 = 159;
 
 const MIT_SHM_MAJOR_OPCODE: u8 = 130;
-const MIT_SHM_FIRST_EVENT: u8 = 96;
+const MIT_SHM_FIRST_EVENT: u8 = 65; // matches Xorg: ShmCompletion=65
 const MIT_SHM_FIRST_ERROR: u8 = 160;
 
 const XTEST_MAJOR_OPCODE: u8 = 146;
@@ -71,7 +71,7 @@ const XTEST_MAJOR_OPCODE: u8 = 146;
 pub(crate) const DRI3_MAJOR_OPCODE: u8 = 147;
 
 pub(crate) const GLX_MAJOR_OPCODE: u8 = 148;
-pub(crate) const GLX_FIRST_EVENT: u8 = 97;
+pub(crate) const GLX_FIRST_EVENT: u8 = 95; // matches Xorg: Pbuffer=95, BufferSwap=96
 pub(crate) const GLX_FIRST_ERROR: u8 = 161;
 
 pub(crate) const X_RESOURCE_MAJOR_OPCODE: u8 = 149;
@@ -98,6 +98,9 @@ pub(crate) struct ExtensionMetadata {
     pub(crate) name: &'static str,
     pub(crate) major_opcode: u8,
     pub(crate) first_event: u8,
+    /// Number of sequential event codes reserved starting at first_event.
+    /// 0 for extensions that use XGE or have no events (first_event must be 0).
+    pub(crate) event_count: u8,
     pub(crate) first_error: u8,
     pub(crate) availability: ExtensionAvailability,
     #[allow(dead_code)]
@@ -109,6 +112,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         name: "RANDR",
         major_opcode: RANDR_MAJOR_OPCODE,
         first_event: RANDR_FIRST_EVENT,
+        event_count: 2, // ScreenChangeNotify=0, Notify=1
         first_error: RANDR_FIRST_ERROR,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -117,6 +121,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         name: "RENDER",
         major_opcode: RENDER_MAJOR_OPCODE,
         first_event: RENDER_FIRST_EVENT,
+        event_count: 0,
         first_error: RENDER_FIRST_ERROR,
         availability: ExtensionAvailability::HostRender,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -125,6 +130,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         name: "Generic Event Extension",
         major_opcode: GE_MAJOR_OPCODE,
         first_event: 0,
+        event_count: 0,
         first_error: 0,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -133,6 +139,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         name: "BIG-REQUESTS",
         major_opcode: BIG_REQUESTS_MAJOR_OPCODE,
         first_event: BIG_REQUESTS_FIRST_EVENT,
+        event_count: 0,
         first_error: BIG_REQUESTS_FIRST_ERROR,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -140,7 +147,8 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
     ExtensionMetadata {
         name: "XKEYBOARD",
         major_opcode: XKB_MAJOR_OPCODE,
-        first_event: 0,
+        first_event: 0, // passed through from host via xkb_info()
+        event_count: 0,
         first_error: 0,
         availability: ExtensionAvailability::HostXkb,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -149,6 +157,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         name: "XInputExtension",
         major_opcode: XI2_MAJOR_OPCODE,
         first_event: XI2_FIRST_EVENT,
+        event_count: 17, // XI1 legacy: DeviceValuator..DevicePropertyNotify (66-82)
         first_error: XI2_FIRST_ERROR,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -157,6 +166,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         name: "XFIXES",
         major_opcode: XFIXES_MAJOR_OPCODE,
         first_event: XFIXES_FIRST_EVENT,
+        event_count: 2, // SelectionNotify=0, CursorNotify=1
         first_error: XFIXES_FIRST_ERROR,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -165,6 +175,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         name: "SHAPE",
         major_opcode: SHAPE_MAJOR_OPCODE,
         first_event: SHAPE_FIRST_EVENT,
+        event_count: 1, // ShapeNotify=0
         first_error: SHAPE_FIRST_ERROR,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -173,6 +184,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         name: "SYNC",
         major_opcode: SYNC_MAJOR_OPCODE,
         first_event: SYNC_FIRST_EVENT,
+        event_count: 2, // CounterNotify=0, AlarmNotify=1
         first_error: SYNC_FIRST_ERROR,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -181,6 +193,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         name: "DAMAGE",
         major_opcode: DAMAGE_MAJOR_OPCODE,
         first_event: DAMAGE_FIRST_EVENT,
+        event_count: 1, // Notify=0
         first_error: DAMAGE_FIRST_ERROR,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -189,6 +202,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         name: "Composite",
         major_opcode: COMPOSITE_MAJOR_OPCODE,
         first_event: COMPOSITE_FIRST_EVENT,
+        event_count: 0,
         first_error: COMPOSITE_FIRST_ERROR,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -197,6 +211,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         name: "Present",
         major_opcode: PRESENT_MAJOR_OPCODE,
         first_event: PRESENT_FIRST_EVENT,
+        event_count: 0, // Present uses XGE, not sequential event codes
         first_error: PRESENT_FIRST_ERROR,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -205,6 +220,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         name: "MIT-SHM",
         major_opcode: MIT_SHM_MAJOR_OPCODE,
         first_event: MIT_SHM_FIRST_EVENT,
+        event_count: 1, // ShmCompletion=0
         first_error: MIT_SHM_FIRST_ERROR,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -213,6 +229,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         name: "XTEST",
         major_opcode: XTEST_MAJOR_OPCODE,
         first_event: 0,
+        event_count: 0,
         first_error: 0,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -221,6 +238,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         name: "DRI3",
         major_opcode: DRI3_MAJOR_OPCODE,
         first_event: 0,
+        event_count: 0,
         first_error: 0,
         availability: ExtensionAvailability::Dri3,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -229,6 +247,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         name: "GLX",
         major_opcode: GLX_MAJOR_OPCODE,
         first_event: GLX_FIRST_EVENT,
+        event_count: 2, // PbufferClobber=0, BufferSwapComplete=1
         first_error: GLX_FIRST_ERROR,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -237,6 +256,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         name: "X-Resource",
         major_opcode: X_RESOURCE_MAJOR_OPCODE,
         first_event: 0,
+        event_count: 0,
         first_error: 0,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
@@ -863,26 +883,46 @@ mod tests {
     }
 
     #[test]
-    fn extension_registry_non_zero_bases_are_unique() {
-        let non_zero_event_bases = EXTENSIONS
+    fn extension_registry_event_ranges_do_not_overlap() {
+        // Collect all (first_event, last_event_inclusive, name) for extensions
+        // that have event_count > 0. Sort by first_event and verify each range
+        // ends before the next one starts.
+        let mut ranges: Vec<(u8, u8, &str)> = EXTENSIONS
             .iter()
-            .map(|ext| ext.first_event)
-            .filter(|base| *base != 0)
-            .collect::<Vec<_>>();
-        let mut sorted = non_zero_event_bases.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), non_zero_event_bases.len());
+            .filter(|ext| ext.event_count > 0 && ext.first_event > 0)
+            .map(|ext| {
+                (
+                    ext.first_event,
+                    ext.first_event + ext.event_count - 1,
+                    ext.name,
+                )
+            })
+            .collect();
+        ranges.sort_by_key(|(base, _, _)| *base);
+        for pair in ranges.windows(2) {
+            let (_, end_a, name_a) = pair[0];
+            let (start_b, _, name_b) = pair[1];
+            assert!(
+                end_a < start_b,
+                "Extension event range collision: {name_a} ends at {end_a}, \
+                 {name_b} starts at {start_b}"
+            );
+        }
 
-        let non_zero_error_bases = EXTENSIONS
+        // Error bases must also be unique.
+        let non_zero_error_bases: Vec<u8> = EXTENSIONS
             .iter()
             .map(|ext| ext.first_error)
             .filter(|base| *base != 0)
-            .collect::<Vec<_>>();
+            .collect();
         let mut sorted = non_zero_error_bases.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), non_zero_error_bases.len());
+        assert_eq!(
+            sorted.len(),
+            non_zero_error_bases.len(),
+            "error base collision"
+        );
     }
 
     mod render {
