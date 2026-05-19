@@ -344,6 +344,75 @@ pub fn encode_get_cursor_image_empty_reply(
     out
 }
 
+/// Per X11 XFIXES GetCursorImageReply (Xorg `xfixes/cursor.c:381-413`):
+/// 32-byte header containing position/dims/hotspot/serial followed by
+/// `width × height` × 4-byte pixels in **premultiplied ARGB32** (host
+/// byte order, but the wire is always 32-bit native — we encode
+/// big-endian to match the protocol for big-endian clients).
+///
+/// `bgra_straight` is the cursor image in straight-alpha BGRA8 (the
+/// canonical [`CursorRecord`](../../../yserver/src/kms/v2/cursor.rs)
+/// representation in v2). This routine premultiplies and flips byte
+/// order to produce the ARGB the X11 wire expects.
+///
+/// Length encoding: reply `length` field counts 4-byte words after
+/// the 32-byte fixed header.
+#[must_use]
+pub fn encode_get_cursor_image_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    xhot: u16,
+    yhot: u16,
+    cursor_serial: u32,
+    bgra_straight: &[u8],
+) -> Vec<u8> {
+    let pixel_count = usize::from(width) * usize::from(height);
+    let payload_bytes = pixel_count * 4;
+    debug_assert_eq!(bgra_straight.len(), payload_bytes);
+    #[allow(clippy::cast_possible_truncation)]
+    let length = pixel_count as u32;
+    let mut out = fixed_reply(byte_order, sequence, length);
+    write_i16(byte_order, &mut out, x);
+    write_i16(byte_order, &mut out, y);
+    write_u16(byte_order, &mut out, width);
+    write_u16(byte_order, &mut out, height);
+    write_u16(byte_order, &mut out, xhot);
+    write_u16(byte_order, &mut out, yhot);
+    write_u32(byte_order, &mut out, cursor_serial);
+    out.extend_from_slice(&[0u8; 8]);
+    debug_assert_eq!(out.len(), 32);
+    // Premultiply + byte-order conversion. Source is straight BGRA
+    // (B, G, R, A); X11 wire wants ARGB packed as a 32-bit native
+    // word — encode as four bytes in big- or little-endian per the
+    // client's byte order so the reader interpretation as `u32 ARGB`
+    // matches its endianness.
+    for px in bgra_straight.chunks_exact(4) {
+        let b = px[0];
+        let g = px[1];
+        let r = px[2];
+        let a = px[3];
+        // Straight → premultiplied alpha. Each channel × (a / 255),
+        // rounded to nearest. Xorg uses bit-shift premul which is
+        // equivalent for u8.
+        let pm = |c: u8| -> u8 {
+            let prod = u16::from(c) * u16::from(a) + 127;
+            ((prod + (prod >> 8)) >> 8) as u8
+        };
+        let pr = pm(r);
+        let pg = pm(g);
+        let pb = pm(b);
+        let argb: u32 =
+            (u32::from(a) << 24) | (u32::from(pr) << 16) | (u32::from(pg) << 8) | u32::from(pb);
+        write_u32(byte_order, &mut out, argb);
+    }
+    debug_assert_eq!(out.len(), 32 + payload_bytes);
+    out
+}
+
 #[must_use]
 pub fn encode_fetch_region_reply(
     byte_order: ClientByteOrder,
@@ -372,6 +441,67 @@ pub fn encode_fetch_region_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stage 5 unblock — `GetCursorImage` real reply carries the
+    /// cursor pixels with premultiplied ARGB (host-native u32 per
+    /// pixel) after the 32-byte header. Tests on a 1×1 fully-opaque
+    /// red sprite at (10, 20) with hotspot (1, 2) and serial 99.
+    #[test]
+    fn get_cursor_image_reply_encodes_premul_argb() {
+        // 1×1 sprite, opaque red. Straight BGRA: B=0, G=0, R=0xFF,
+        // A=0xFF. Premultiplied = same (α=1.0). Wire ARGB =
+        // 0xFFFF0000.
+        let bgra = [0u8, 0, 0xFF, 0xFF];
+        let reply = encode_get_cursor_image_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(3),
+            10,
+            20,
+            1,
+            1,
+            1,
+            2,
+            99,
+            &bgra,
+        );
+        assert_eq!(reply.len(), 32 + 4, "header + 1 pixel");
+        // length field = 1 word.
+        assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 1);
+        // x, y, w, h, xhot, yhot.
+        assert_eq!(i16::from_le_bytes([reply[8], reply[9]]), 10);
+        assert_eq!(i16::from_le_bytes([reply[10], reply[11]]), 20);
+        assert_eq!(u16::from_le_bytes([reply[12], reply[13]]), 1);
+        assert_eq!(u16::from_le_bytes([reply[14], reply[15]]), 1);
+        assert_eq!(u16::from_le_bytes([reply[16], reply[17]]), 1);
+        assert_eq!(u16::from_le_bytes([reply[18], reply[19]]), 2);
+        assert_eq!(u32::from_le_bytes(reply[20..24].try_into().unwrap()), 99);
+        // Pixel 0 — premul ARGB(0xFFFF0000). On LE wire: 00 00 FF FF.
+        assert_eq!(&reply[32..36], &[0x00, 0x00, 0xFF, 0xFF]);
+    }
+
+    /// Half-alpha sprite — straight BGRA(0, 0, 255, 128) premultiplies
+    /// to ARGB(128, 128, 0, 0) on the wire (red × α/255 ≈ 128).
+    #[test]
+    fn get_cursor_image_reply_premultiplies_alpha() {
+        let bgra = [0u8, 0, 0xFF, 0x80];
+        let reply = encode_get_cursor_image_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0),
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            1,
+            &bgra,
+        );
+        // ARGB packed LE: B, G, R, A. R = 0xFF * 0x80 / 255 ≈ 0x80.
+        assert_eq!(reply[32], 0x00); // B premul
+        assert_eq!(reply[33], 0x00); // G premul
+        assert_eq!(reply[34], 0x80); // R premul (within ±1 ULP)
+        assert_eq!(reply[35], 0x80); // A untouched
+    }
 
     #[test]
     fn query_version_reply_shape() {

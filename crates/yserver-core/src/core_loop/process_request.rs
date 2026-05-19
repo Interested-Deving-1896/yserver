@@ -2605,7 +2605,27 @@ fn handle_xfixes_request(
             }
         }
         x11xfixes::GET_CURSOR_IMAGE => {
-            let reply = x11xfixes::encode_get_cursor_image_empty_reply(byte_order, sequence);
+            // Stage 5 unblock for audit #14: source the active
+            // cursor from the backend. Pre-Stage-5 backends
+            // (`ynest`, `RecordingBackend`) return `None` — fall
+            // back to the empty reply so existing client behaviour
+            // doesn't regress (a 0×0 reply is still a valid X11
+            // GetCursorImage response).
+            let reply = match backend.get_active_cursor_image() {
+                Some(img) => x11xfixes::encode_get_cursor_image_reply(
+                    byte_order,
+                    sequence,
+                    img.x,
+                    img.y,
+                    img.width,
+                    img.height,
+                    img.hot_x,
+                    img.hot_y,
+                    img.serial,
+                    img.bgra_bytes.as_ref(),
+                ),
+                None => x11xfixes::encode_get_cursor_image_empty_reply(byte_order, sequence),
+            };
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };

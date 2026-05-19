@@ -46,6 +46,26 @@ pub enum BackendFdKind {
 /// without depending on the host module.
 pub use crate::host_x11::HostSocketStatus;
 
+/// Stage 5 unblock for protocol-audit item #14 — snapshot of the
+/// active on-screen cursor returned by `Backend::get_active_cursor_image`.
+/// `bgra_bytes` is straight-alpha BGRA8 (the canonical
+/// `CursorRecord` representation); the XFIXES `GetCursorImage`
+/// encoder premultiplies + byte-swaps at the wire boundary.
+#[derive(Debug, Clone)]
+pub struct ActiveCursorImage {
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    pub x: i16,
+    pub y: i16,
+    /// Monotonically-increasing serial — XFIXES clients compare
+    /// this against the previous reply's serial to detect cursor
+    /// changes. Backed by `Arc<CursorRecord>.version` in v2.
+    pub serial: u32,
+    pub bgra_bytes: std::sync::Arc<Vec<u8>>,
+}
+
 /// Present capability surface. Phase 4.2 design §4. Per-window
 /// because Present's `QueryCapabilities` is per-window in the wire
 /// protocol; in single-output single-GPU configurations the same
@@ -1253,6 +1273,18 @@ pub trait Backend: Send {
         host_cursor_xid: u32,
         name_bytes: &[u8],
     ) -> io::Result<()>;
+
+    /// Stage 5 unblock — XFIXES `GetCursorImage` data source for the
+    /// active on-screen cursor. Returns the straight-alpha BGRA
+    /// pixels + dimensions + hotspot + monotonic serial of the
+    /// currently-effective cursor, plus the pointer position. `None`
+    /// when no cursor is registered (test fixtures, pre-init).
+    ///
+    /// Default returns `None` — pre-Stage-5 backends (`ynest`,
+    /// `RecordingBackend`) don't track per-cursor records.
+    fn get_active_cursor_image(&self) -> Option<ActiveCursorImage> {
+        None
+    }
 
     fn set_shape_rectangles(
         &mut self,

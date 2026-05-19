@@ -184,19 +184,25 @@ the focused client is between Subtracts.
 
 picom (uses DeltaRegion) misses incremental damage between two Subtracts → smearing.
 
-### 14. ⏸ `SelectCursorInput` never emits `XFixesCursorNotify`; `GetCursorImage` returns 0×0
-**Severity: Bug** — **Parked pending hw-cursor work**
-- yserver: `process_request.rs:2569-2578` (storage only); `xfixes.rs:329-345` (empty reply)
+### 14. ⏳ `SelectCursorInput` never emits `XFixesCursorNotify`; `GetCursorImage` returns real data
+**Severity: Bug** — `GetCursorImage` unblocked 2026-05-19; `XFixesCursorNotify` event emission still TODO
+- yserver: `process_request.rs:2607-2632` (real reply path now sources from
+  `Backend::get_active_cursor_image`); `xfixes.rs:347-410`
+  (`encode_get_cursor_image_reply` premultiplies straight BGRA → wire ARGB)
 - Xorg: `xfixes/cursor.c:360-413`
 
-Screencast, magnifier, accessibility tools see no cursor. Cursor-follow features broken.
-`xfixes_change_cursor_by_name` also a documented no-op in v2 backend.
+**Status (2026-05-19, post Stage 5a-c):** `GetCursorImage` now returns the
+currently-effective cursor's pixels + position + hotspot + monotonic serial,
+sourced from `KmsBackendV2.cursor_records[effective_cursor_xid]` (v2) — the
+records landed in Stage 5 Phase A. Pre-Stage-5 backends (`ynest`,
+`RecordingBackend`) keep the empty-reply fallback (`get_active_cursor_image`
+default is `None`). Screencast/magnifier readers see the correct cursor image.
 
-**Status (2026-05-19):** intentionally deferred — will be implemented when the
-hardware cursor pipeline is re-introduced. The XFixes cursor surface (image,
-position, name) is shaped to read from the active cursor sprite, so wiring it
-in isolation against the current always-default-arrow stub adds bookkeeping
-without behavioral gain.
+**Remaining**: `XFixesCursorNotify` event emission when the effective cursor
+changes — backend → core event routing not wired yet; mask storage at
+`process_request.rs:2597-2606` is in place, the emit-side is the gap. Likely
+~30 LoC once a `Backend::pop_pending_xfixes_events` (or similar) shape is
+agreed.
 
 ### 15. `ExpandRegion` (XFIXES 3.0, minor 28) stubbed
 **Severity: Stub**
@@ -294,7 +300,12 @@ xfwm4/picom pixel-precise shadow shapes break; SetWindowShape with bitmap clears
 - DAMAGE: `DamageNoteCritical`; `DamageAdd` origin translation; `DamageQueryVersion`
   dispatch gate; all Poly*/FillPoly/PolyText over-damage by full drawable (correct but
   wasteful)
-- RENDER `render_create_cursor` allocates xid but never rasterises (themed cursors)
+- ~~RENDER `render_create_cursor` allocates xid but never rasterises (themed cursors)~~
+  — **Done 2026-05-19** (Stage 5 Phase A `feat(stage-5a)`). v2 now reads the
+  Picture's BGRA pixmap via `engine.get_image` and stores it as a
+  `CursorRecord`; `define_cursor` swaps the scene's `CursorEntry` to a
+  freshly-rasterised sprite. Themed cursors (Cairo / GTK / Qt) work
+  end-to-end.
 
 ---
 

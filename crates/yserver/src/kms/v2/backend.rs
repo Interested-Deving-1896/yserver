@@ -7839,6 +7839,32 @@ impl Backend for KmsBackendV2 {
         Ok(reply)
     }
 
+    fn get_active_cursor_image(&self) -> Option<yserver_core::backend::ActiveCursorImage> {
+        // Stage 5 — unblock protocol-audit #14 (`GetCursorImage`
+        // returns 0×0). Source the bytes from the
+        // currently-effective `Arc<CursorRecord>` and stamp the
+        // current root-space pointer position.
+        let xid = self.effective_cursor_xid?;
+        let record = self.cursor_records.get(&xid)?;
+        #[allow(clippy::cast_possible_truncation)]
+        let x = self.core.cursor_x as i16;
+        #[allow(clippy::cast_possible_truncation)]
+        let y = self.core.cursor_y as i16;
+        Some(yserver_core::backend::ActiveCursorImage {
+            width: record.width,
+            height: record.height,
+            hot_x: record.hot_x,
+            hot_y: record.hot_y,
+            x,
+            y,
+            // XFIXES serial is u32; CursorRecord.version is u64
+            // server-wide monotonic. Saturate; in practice we'll
+            // never roll over a u32 of cursor changes in a session.
+            serial: u32::try_from(record.version).unwrap_or(u32::MAX),
+            bgra_bytes: std::sync::Arc::new(record.bgra_bytes.clone()),
+        })
+    }
+
     fn xfixes_change_cursor_by_name(
         &mut self,
         _origin: Option<OriginContext>,
