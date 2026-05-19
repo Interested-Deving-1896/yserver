@@ -113,7 +113,7 @@ pub fn selection_owner_target_id(
     state: &ServerState,
     selection: yserver_protocol::x11::AtomId,
 ) -> Option<(ResourceId, ClientId)> {
-    let owner_window = *state.selections.get(&selection)?;
+    let owner_window = state.selections.get(&selection)?.0;
     let owner_client = state.resources.window_owner(owner_window)?;
     let target = client_target_id(state, owner_client)?;
     Some((owner_window, target))

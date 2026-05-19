@@ -10978,11 +10978,11 @@ fn handle_set_selection_owner(
     };
 
     let old = selection_owner_target_id(state, selection);
-    let old_window = state.selections.get(&selection).copied();
+    let old_window = state.selections.get(&selection).map(|(w, _)| *w);
     if window.0 == 0 {
         state.selections.remove(&selection);
     } else {
-        state.selections.insert(selection, window);
+        state.selections.insert(selection, (window, time_val));
     }
     let send_clear =
         old_window.is_some() && old_window != (if window.0 == 0 { None } else { Some(window) });
@@ -11046,23 +11046,45 @@ fn drop_selections_owned_by_windows(
     owned_windows: &[ResourceId],
     subtype: u8,
 ) {
-    let to_drop: Vec<AtomId> = state
+    // Capture (selection, prior_last_time_changed) BEFORE clearing so
+    // the notify can carry the prior `selection_timestamp` — Xorg's
+    // `DeleteWindowFromAnySelections` / `DeleteClientFromAnySelections`
+    // (`dix/selection.c:131-138, 145-153`) fire the callback BEFORE
+    // mutating `pSel->window`/`pSel->client`, and the callback at
+    // `xfixes/select.c:89` reads `selection->lastTimeChanged`.
+    let to_drop: Vec<(AtomId, u32)> = state
         .selections
         .iter()
-        .filter_map(|(sel, owner)| {
+        .filter_map(|(sel, (owner, last_time_changed))| {
             if owned_windows.contains(owner) {
-                Some(*sel)
+                Some((*sel, *last_time_changed))
             } else {
                 None
             }
         })
         .collect();
-    for sel in to_drop {
-        state.selections.remove(&sel);
-        // owner=0 (None) reflects the cleared ownership per the
-        // X11 spec for destroy/close notifies.
-        fanout_xfixes_selection_notify(state, sel, subtype, 0, 0, 0);
+    if to_drop.is_empty() {
+        return;
     }
+    let now = current_server_time_ms(state);
+    for (sel, prior_last_time_changed) in to_drop {
+        // owner=0 (None) — see Xorg `xfixes/select.c:85-86`:
+        // destroy/close subtypes always carry owner=None.
+        fanout_xfixes_selection_notify(state, sel, subtype, 0, now, prior_last_time_changed);
+        state.selections.remove(&sel);
+    }
+}
+
+/// X11 `currentTime.milliseconds` equivalent: monotonic ms since
+/// server start. Surfaces on the wire as the `timestamp` field of
+/// `XFixesSelectionNotify` events for destroy/close subtypes (Xorg
+/// `xfixes/select.c:88`). Clamped to a minimum of 1 — X11 timestamp
+/// 0 has dedicated semantics (`CurrentTime`, "server picks") so an
+/// event payload must never emit it as a real moment.
+fn current_server_time_ms(state: &ServerState) -> u32 {
+    let ms = state.start_instant.elapsed().as_millis();
+    let trunc = u32::try_from(ms & u128::from(u32::MAX)).unwrap_or(u32::MAX);
+    trunc.max(1)
 }
 
 /// Audit #9 — client-disconnect cleanup: find every window the
@@ -11078,7 +11100,7 @@ pub(crate) fn fanout_xfixes_selection_client_close_for_client(
     let client_windows: Vec<ResourceId> = state
         .selections
         .values()
-        .copied()
+        .map(|(win, _)| *win)
         .filter(|win| state.resources.window_owner(*win) == Some(cid))
         .collect();
     if client_windows.is_empty() {
@@ -12161,7 +12183,7 @@ fn handle_get_selection_owner(
         state
             .selections
             .get(&selection)
-            .copied()
+            .map(|(w, _)| *w)
             .unwrap_or(ResourceId(0))
     } else {
         ResourceId(0)
@@ -14252,7 +14274,7 @@ mod tests {
         // PRIMARY currently owned by OWNER_WIN.
         state
             .selections
-            .insert(AtomId(PRIMARY), ResourceId(OWNER_WIN));
+            .insert(AtomId(PRIMARY), (ResourceId(OWNER_WIN), 0));
 
         // Subscriber registered with WindowDestroy bit.
         state.xfixes_selection_masks.insert(
@@ -14369,7 +14391,7 @@ mod tests {
         );
         state
             .selections
-            .insert(AtomId(PRIMARY), ResourceId(OWNER_WIN));
+            .insert(AtomId(PRIMARY), (ResourceId(OWNER_WIN), 0));
         state.xfixes_selection_masks.insert(
             (SUBSCRIBER_ID, ResourceId(SUBSCRIBER_WIN), AtomId(PRIMARY)),
             x11xfixes::SELECTION_MASK_CLIENT_CLOSE,
@@ -14426,6 +14448,197 @@ mod tests {
             u32::from_le_bytes([evt[12], evt[13], evt[14], evt[15]]),
             PRIMARY,
             "selection field",
+        );
+    }
+
+    /// Audit #9 (code-review follow-up): the destroy/close path
+    /// must emit the notify BEFORE clearing the selection (matching
+    /// Xorg's `DeleteWindowFromAnySelections` order at
+    /// `dix/selection.c:131-138`) so the wire payload carries the
+    /// stored `selection_timestamp` — `selection->lastTimeChanged`
+    /// in Xorg's `xfixes/select.c:89`. yserver tracks
+    /// `lastTimeChanged` as the second element of the
+    /// `state.selections` tuple, stamped by SetSelectionOwner with
+    /// the request's `time` arg.
+    #[test]
+    fn destroy_window_owning_selection_carries_prior_last_time_changed_in_selection_timestamp() {
+        use std::io::Read;
+        use yserver_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
+        const SUBSCRIBER_ID: u32 = 15;
+        const OWNER_ID: u32 = 16;
+        const SUBSCRIBER_WIN: u32 = 0x00f0_0001;
+        const OWNER_WIN: u32 = 0x0100_0001;
+        const PRIMARY: u32 = 1;
+        const SET_OWNER_TIME: u32 = 0x0a0b_0c0d;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, SUBSCRIBER_ID);
+        let _ = install_client(&mut state, OWNER_ID);
+
+        state.resources.create_window(
+            ClientId(OWNER_ID),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(OWNER_WIN),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.xfixes_selection_masks.insert(
+            (SUBSCRIBER_ID, ResourceId(SUBSCRIBER_WIN), AtomId(PRIMARY)),
+            x11xfixes::SELECTION_MASK_WINDOW_DESTROY,
+        );
+
+        // SetSelectionOwner first so lastTimeChanged is recorded.
+        let mut set_body = Vec::with_capacity(12);
+        set_body.extend_from_slice(&OWNER_WIN.to_le_bytes());
+        set_body.extend_from_slice(&PRIMARY.to_le_bytes());
+        set_body.extend_from_slice(&SET_OWNER_TIME.to_le_bytes());
+        handle_set_selection_owner(&mut state, ClientId(OWNER_ID), SequenceNumber(1), &set_body)
+            .expect("handle_set_selection_owner");
+        // Drain the subscriber's socket to discard the SetOwner notify
+        // (we only care about the WindowDestroy one).
+        peer.set_nonblocking(true).unwrap();
+        let mut discard = [0u8; 4096];
+        while let Ok(n) = peer.read(&mut discard) {
+            if n == 0 {
+                break;
+            }
+        }
+
+        let mut destroy_body = Vec::with_capacity(4);
+        destroy_body.extend_from_slice(&OWNER_WIN.to_le_bytes());
+        let mut backend = RecordingBackend::new();
+        handle_destroy_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(OWNER_ID),
+            SequenceNumber(2),
+            &destroy_body,
+        )
+        .expect("handle_destroy_window");
+
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        let evt: [u8; 32] = all
+            .chunks_exact(32)
+            .find(|e| {
+                e[0] == crate::nested::XFIXES_FIRST_EVENT
+                    && e[1] == x11xfixes::SELECTION_NOTIFY_WINDOW_DESTROY
+            })
+            .map(|s| {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(s);
+                a
+            })
+            .expect("WindowDestroy notify in stream");
+
+        assert_eq!(
+            u32::from_le_bytes([evt[20], evt[21], evt[22], evt[23]]),
+            SET_OWNER_TIME,
+            "selection_timestamp must carry the prior SetSelectionOwner \
+             time arg (Xorg `selection->lastTimeChanged`); pre-fix the \
+             payload was zeroed",
+        );
+        // `timestamp` should be currentTime, not 0. We can't pin the
+        // exact value (it depends on the test's runtime), but any
+        // non-zero monotonic stamp matches Xorg's `currentTime.milliseconds`.
+        // Pinning > 0 is sufficient to catch the regression of "passed 0".
+        let ts = u32::from_le_bytes([evt[16], evt[17], evt[18], evt[19]]);
+        assert!(
+            ts > 0,
+            "timestamp must be a non-zero server uptime (currentTime), got {ts}",
+        );
+    }
+
+    /// Audit #9 (code-review follow-up): Xorg's
+    /// `XFixesSelectionCallback` (`xfixes/select.c:79-91`) walks
+    /// every matching subscription record and emits one event per
+    /// `(client, window, selection)` tuple. A single client that
+    /// has two windows subscribed to the same selection must
+    /// receive TWO events whose `window` fields are the two
+    /// distinct subscriber windows — not one collapsed event nor
+    /// two events with the same window field.
+    ///
+    /// `fanout_event_to_clients` deduplicates by ClientId *within
+    /// one call* via a freshly-allocated `seen` set, so calling it
+    /// once per subscription with a single-element slice is the
+    /// correct shape; the closure captures the per-iteration
+    /// subscriber window. This test pins that invariant against
+    /// future refactors.
+    #[test]
+    fn set_selection_owner_emits_one_event_per_subscription_when_client_has_two_windows() {
+        use std::io::Read;
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        const SUBSCRIBER: u32 = 13;
+        const APP: u32 = 14;
+        const WIN_A: u32 = 0x00d0_0001;
+        const WIN_B: u32 = 0x00d0_0002;
+        const OWNER_WIN: u32 = 0x00e0_0001;
+        const PRIMARY: u32 = 1;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, SUBSCRIBER);
+        let _ = install_client(&mut state, APP);
+
+        // Same client, two subscription records on the same selection.
+        state.xfixes_selection_masks.insert(
+            (SUBSCRIBER, ResourceId(WIN_A), AtomId(PRIMARY)),
+            x11xfixes::SELECTION_MASK_SET_OWNER,
+        );
+        state.xfixes_selection_masks.insert(
+            (SUBSCRIBER, ResourceId(WIN_B), AtomId(PRIMARY)),
+            x11xfixes::SELECTION_MASK_SET_OWNER,
+        );
+
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&OWNER_WIN.to_le_bytes());
+        body.extend_from_slice(&PRIMARY.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        handle_set_selection_owner(&mut state, ClientId(APP), SequenceNumber(1), &body)
+            .expect("handle_set_selection_owner");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        let mut subscriber_windows: Vec<u32> = all
+            .chunks_exact(32)
+            .filter(|e| {
+                e[0] == crate::nested::XFIXES_FIRST_EVENT
+                    && e[1] == x11xfixes::SELECTION_NOTIFY_SET_OWNER
+            })
+            .map(|e| u32::from_le_bytes([e[4], e[5], e[6], e[7]]))
+            .collect();
+        subscriber_windows.sort_unstable();
+        assert_eq!(
+            subscriber_windows,
+            vec![WIN_A, WIN_B],
+            "must get one event per (client, window, selection) subscription \
+             record with distinct `window` fields; got {} bytes total: {:02x?}",
+            all.len(),
+            all,
         );
     }
 

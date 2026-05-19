@@ -253,7 +253,7 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     }
     state
         .selections
-        .retain(|_, owner_window| !dead_windows.contains(owner_window));
+        .retain(|_, entry| !dead_windows.contains(&entry.0));
 
     // Host-side teardown. Order matches `nested::handle_client`'s tail
     // so behavior is bit-identical.

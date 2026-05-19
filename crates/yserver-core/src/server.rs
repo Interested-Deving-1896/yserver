@@ -190,8 +190,13 @@ pub struct ServerState {
     pub randr_select_masks: HashMap<(u32, ResourceId), u16>,
     /// XKB SelectEvents masks: (client, device spec) -> selected event mask.
     pub xkb_select_event_masks: HashMap<(u32, u16), u16>,
-    /// Selection ownership: maps selection atom → owning window (ResourceId).
-    pub selections: HashMap<AtomId, ResourceId>,
+    /// Selection ownership: maps selection atom → (owning window,
+    /// `lastTimeChanged` in ms). `lastTimeChanged` is the timestamp
+    /// from the `SetSelectionOwner` request that produced this entry;
+    /// it surfaces on the wire as `selection_timestamp` in
+    /// `XFixesSelectionNotify` events (Xorg `xfixes/select.c:89` reads
+    /// `selection->lastTimeChanged`).
+    pub selections: HashMap<AtomId, (ResourceId, u32)>,
     /// Active pointer grab: (grab owner, grab window). When set, all pointer
     /// events are redirected to the grab owner regardless of where the cursor is.
     pub pointer_grab: Option<(ClientId, ResourceId)>,
@@ -947,7 +952,7 @@ impl ServerState {
 
     #[must_use]
     pub fn selection_owner_target(&self, selection: AtomId) -> Option<(ResourceId, EventTarget)> {
-        let owner_window = *self.selections.get(&selection)?;
+        let owner_window = self.selections.get(&selection)?.0;
         let owner_client = self.resources.window_owner(owner_window)?;
         let target = self.client_target(owner_client)?;
         Some((owner_window, target))
