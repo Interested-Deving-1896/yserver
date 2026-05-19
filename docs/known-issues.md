@@ -141,6 +141,31 @@ from.
 
 ## Drawing / rendering artifacts
 
+- [ ] **wezterm client content briefly blank after heavy drag
+      stress (yoga / Snapdragon X1 / Turnip, release build,
+      observed once 2026-05-19 PM).** During a deliberate
+      window-drag stress test (purpose: check whether v2 spikes
+      CPU under marco-comp drag — it doesn't), wezterm's client
+      area went blank/white for a few seconds while marco's frame
+      decoration kept rendering normally. Resolved on its own.
+      Not reproducible on a debug build (timing-sensitive). No
+      telemetry capture at the moment of the symptom.
+      Two working hypotheses:
+      1. Buffer-age history loss during the drag-induced
+         ConfigureNotify storm + Stage 2e failed-flip recovery
+         momentarily presenting a stale/uninit BO for wezterm's
+         backing.
+      2. Marco briefly dropping its `NameWindowPixmap` alias on
+         wezterm mid-drag, so its compositor reads nothing for a
+         few frames and the COW shows marco's frame-fill (white)
+         through where wezterm content should be.
+      Reproduction hint: heavy drag of any window while wezterm is
+      running with btop or similar continuously-painting workload.
+      Capture `yserver-mate-hw-telemetry` log during a repro
+      attempt — diff per-second counters across the symptom
+      window for clues (especially `composite_submit`,
+      `frame_present`, scene-structure damage path).
+
 - [ ] **Stage 4c follow-up: multi-output coord-space for
       scene-structure damage rects.** `SceneCompositor::
       mark_scene_structure_damage_rects` (4c.1, scene.rs:410)
