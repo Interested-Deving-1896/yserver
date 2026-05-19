@@ -406,6 +406,12 @@ pub(crate) struct PlatformBackend {
     /// composite tick should bail.
     pub(crate) renderer_failed: bool,
     pub(crate) shutting_down: bool,
+
+    /// Stage 5 Phase B — DRM hardware cursor plane. `None` if init
+    /// failed (best-effort; SW fallback kicks in) or on the test
+    /// fixture. The shared dumb buffer + per-CRTC visibility map
+    /// live inside `CursorPlane` itself.
+    pub(crate) cursor_plane: Option<crate::kms::cursor_plane::CursorPlane>,
 }
 
 impl PlatformBackend {
@@ -499,6 +505,23 @@ impl PlatformBackend {
         }
         let first_pageflip_logged = vec![false; layouts.len()];
 
+        // Stage 5 Phase B — bring up the DRM cursor plane. Failure
+        // is non-fatal; v2 falls back to the SW scene cursor path.
+        let cursor_plane = match crate::kms::cursor_plane::CursorPlane::new(Arc::clone(&device)) {
+            Ok(plane) => {
+                log::info!(
+                    "v2 PlatformBackend: hardware cursor plane initialised (64x64 ARGB8888)"
+                );
+                Some(plane)
+            }
+            Err(e) => {
+                log::warn!(
+                    "v2 PlatformBackend: cursor plane init failed ({e}); SW cursor fallback",
+                );
+                None
+            }
+        };
+
         log::info!(
             "v2 PlatformBackend: ready — {} outputs, fb {}x{}, {} scanout pools live",
             layouts.len(),
@@ -525,6 +548,7 @@ impl PlatformBackend {
             first_pageflip_logged,
             renderer_failed: false,
             shutting_down: false,
+            cursor_plane,
         })
     }
 
@@ -576,11 +600,235 @@ impl PlatformBackend {
             first_pageflip_logged: vec![false],
             renderer_failed: false,
             shutting_down: false,
+            cursor_plane: None,
         }
     }
 
     pub(crate) fn fb_dimensions(&self) -> (u16, u16) {
         (self.fb_w, self.fb_h)
+    }
+
+    // ── Stage 5 Phase B — hardware cursor-plane hooks ─────────────
+    //
+    // The plan splits the legacy `set_cursor2`-driven path into
+    // narrow per-CRTC primitives so the Phase D `PendingAck`
+    // transition state machine can drive the plane without
+    // re-introducing the multi-output double-cursor hazard.
+    //
+    // - `cursor_plane_available()` is consulted by `build_scene`'s
+    //   pure `CursorAssignment` decision.
+    // - `cursor_plane_upload_image` memcpys bytes into the shared
+    //   dumb buffer ONLY. It does NOT call `set_cursor2`.
+    //   `set_cursor2(Some, …)` IS the show operation in legacy DRM;
+    //   upload-as-show would prematurely bind on CRTCs whose Sw→Hw
+    //   transition hasn't retired yet.
+    // - `cursor_plane_show_on_crtc` is the sole `set_cursor2(Some,
+    //   …)` site, called per-output from `handle_page_flip_complete`
+    //   when that CRTC's PendingAck queues a `ShowOnRetire`. The
+    //   immediate `move_to` follow-up is required because some
+    //   kernels reset the cursor position to (0, 0) on rebind (v1
+    //   pattern at `backend.rs:2173`).
+    // - `cursor_plane_rebind_visible_crtcs` is the steady-state
+    //   sprite-swap path: rebind only on CRTCs ALREADY showing the
+    //   cursor; the rebind-then-move pair runs synchronously off
+    //   the protocol handler thread.
+    // - `cursor_plane_move` is the pointer-fast-path entry point;
+    //   one ioctl per visible CRTC, no GPU work.
+    // - `cursor_plane_hide_on_crtc` and `cursor_plane_hide_all`
+    //   serve Phase D' output-local / global recovery respectively.
+
+    /// True iff the cursor plane was successfully initialised at
+    /// boot. The scene strategy decision (`CursorAssignment`) gates
+    /// on this without holding a `PlatformBackend` borrow.
+    #[must_use]
+    pub(crate) fn cursor_plane_available(&self) -> bool {
+        self.cursor_plane.is_some()
+    }
+
+    /// Memcpy `bgra_bytes` into the shared dumb buffer iff
+    /// `version` differs from the plane's tracked
+    /// `uploaded_version`. **No `set_cursor2`**. Idempotent on
+    /// repeated calls with the same version.
+    ///
+    /// # Errors
+    /// `InvalidInput` for dims > 64×64 or short byte slice; ioctl
+    /// errors are not returned by `load_image`.
+    pub(crate) fn cursor_plane_upload_image(
+        &mut self,
+        version: u64,
+        width: u32,
+        height: u32,
+        bgra_bytes: &[u8],
+    ) -> io::Result<()> {
+        let Some(plane) = self.cursor_plane.as_mut() else {
+            return Err(io::Error::other("cursor plane unavailable"));
+        };
+        plane.upload_image(version, width, height, bgra_bytes)
+    }
+
+    /// Version currently held in the dumb buffer. Compared by VALUE
+    /// in the Phase B/C upload-dedup paths.
+    #[must_use]
+    pub(crate) fn cursor_plane_uploaded_version(&self) -> Option<u64> {
+        self.cursor_plane
+            .as_ref()
+            .and_then(|p| p.uploaded_version())
+    }
+
+    /// Bind the plane on `output_idx`'s CRTC + position at `(x, y)`
+    /// in root-space (translated to CRTC-local coords here). The
+    /// sole `set_cursor2(crtc, Some(dumb), …)` call site.
+    ///
+    /// # Errors
+    /// `set_cursor2` or `move_cursor` ioctl failure; `NotFound` if
+    /// `output_idx` is out of range or plane is unavailable.
+    pub(crate) fn cursor_plane_show_on_crtc(
+        &mut self,
+        output_idx: usize,
+        hot_x: u16,
+        hot_y: u16,
+        x: i32,
+        y: i32,
+    ) -> io::Result<()> {
+        let Some(layout) = self.outputs.get(output_idx) else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no such output"));
+        };
+        let crtc = layout.output.crtc;
+        let layout_x = layout.x;
+        let layout_y = layout.y;
+        let Some(plane) = self.cursor_plane.as_mut() else {
+            return Err(io::Error::other("cursor plane unavailable"));
+        };
+        plane.show(crtc, (i32::from(hot_x), i32::from(hot_y)))?;
+        // set_cursor2 may reset the kernel-side cursor position to
+        // (0, 0) on rebind. Reposition immediately so the freshly
+        // shown plane doesn't briefly snap to the origin.
+        let cx = x - layout_x - i32::from(hot_x);
+        let cy = y - layout_y - i32::from(hot_y);
+        plane.move_to(crtc, cx, cy)
+    }
+
+    /// Steady-state sprite-swap path. Re-issues `set_cursor2(Some,
+    /// …)` ONLY on CRTCs whose plane state is already `visible`,
+    /// followed by `move_to(x, y)` to restore the position. Hidden
+    /// / pending CRTCs are untouched so the swap doesn't
+    /// prematurely show on a CRTC mid-`Sw→Hw` transition.
+    ///
+    /// # Errors
+    /// Aggregated — any per-CRTC ioctl failure is logged but does
+    /// not abort the loop; only a missing plane returns `Err`.
+    pub(crate) fn cursor_plane_rebind_visible_crtcs(
+        &mut self,
+        hot_x: u16,
+        hot_y: u16,
+        x: i32,
+        y: i32,
+    ) -> io::Result<()> {
+        // Snapshot output layouts so the per-CRTC ioctls below can
+        // borrow `&mut self.cursor_plane` exclusively.
+        let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
+            .outputs
+            .iter()
+            .map(|l| (l.output.crtc, l.x, l.y))
+            .collect();
+        let Some(plane) = self.cursor_plane.as_mut() else {
+            return Err(io::Error::other("cursor plane unavailable"));
+        };
+        for (crtc, layout_x, layout_y) in layouts {
+            if !plane.is_visible_on(crtc) {
+                continue;
+            }
+            if let Err(e) = plane.show(crtc, (i32::from(hot_x), i32::from(hot_y))) {
+                log::warn!("v2 cursor rebind: set_cursor2 on {crtc:?} failed: {e}");
+                continue;
+            }
+            let cx = x - layout_x - i32::from(hot_x);
+            let cy = y - layout_y - i32::from(hot_y);
+            if let Err(e) = plane.move_to(crtc, cx, cy) {
+                log::warn!("v2 cursor rebind: move_cursor on {crtc:?} failed: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// `drmModeMoveCursor` per visible CRTC. Hidden CRTCs are
+    /// skipped — the kernel naturally clips off-output coords on
+    /// the visible ones, so no per-output geometry test is needed
+    /// beyond the visibility filter.
+    ///
+    /// # Errors
+    /// Logged per-CRTC; `Err` only when the plane is unavailable.
+    pub(crate) fn cursor_plane_move(&mut self, x: i32, y: i32) -> io::Result<()> {
+        // Snapshot first (see `cursor_plane_rebind_visible_crtcs`).
+        let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
+            .outputs
+            .iter()
+            .map(|l| (l.output.crtc, l.x, l.y))
+            .collect();
+        let Some(plane) = self.cursor_plane.as_mut() else {
+            return Err(io::Error::other("cursor plane unavailable"));
+        };
+        for (crtc, layout_x, layout_y) in layouts {
+            if !plane.is_visible_on(crtc) {
+                continue;
+            }
+            let cx = x - layout_x;
+            let cy = y - layout_y;
+            if let Err(e) = plane.move_to(crtc, cx, cy) {
+                log::warn!("v2 cursor move on {crtc:?} failed: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Detach the plane on a single CRTC. Output-local recovery
+    /// (Phase D') uses this; the per-CRTC visibility map updates
+    /// so subsequent rebind / move calls skip the CRTC cleanly.
+    ///
+    /// # Errors
+    /// `NotFound` if `output_idx` is out of range or plane is
+    /// unavailable; `set_cursor2` ioctl failure otherwise.
+    pub(crate) fn cursor_plane_hide_on_crtc(&mut self, output_idx: usize) -> io::Result<()> {
+        let Some(layout) = self.outputs.get(output_idx) else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no such output"));
+        };
+        let crtc = layout.output.crtc;
+        let Some(plane) = self.cursor_plane.as_mut() else {
+            return Err(io::Error::other("cursor plane unavailable"));
+        };
+        plane.hide(crtc)
+    }
+
+    /// Detach the plane on every CRTC the plane has ever been bound
+    /// against AND every currently-known output. Global recovery
+    /// fallback only — `drain_all`, shutdown, VT-leave, DRM-master
+    /// loss. Per Phase D' this also invalidates `uploaded_version`
+    /// so the next acquire/modeset re-uploads cleanly.
+    ///
+    /// # Errors
+    /// Per-CRTC failures are logged; this never returns `Err`
+    /// unless the plane is unavailable.
+    pub(crate) fn cursor_plane_hide_all(&mut self) -> io::Result<()> {
+        // Union of currently-tracked CRTCs and current output CRTCs.
+        // Output disable could have removed a CRTC from `outputs`
+        // while a stale visibility entry survives; iterate both.
+        let mut crtcs: Vec<::drm::control::crtc::Handle> =
+            self.outputs.iter().map(|l| l.output.crtc).collect();
+        let Some(plane) = self.cursor_plane.as_mut() else {
+            return Err(io::Error::other("cursor plane unavailable"));
+        };
+        for c in plane.known_crtcs() {
+            if !crtcs.contains(&c) {
+                crtcs.push(c);
+            }
+        }
+        for crtc in crtcs {
+            if let Err(e) = plane.hide(crtc) {
+                log::warn!("v2 cursor hide_all on {crtc:?} failed: {e}");
+            }
+        }
+        plane.invalidate_uploaded_version();
+        Ok(())
     }
 
     pub(crate) fn take_input_ctx(&mut self) -> Option<crate::input::SendContext> {
