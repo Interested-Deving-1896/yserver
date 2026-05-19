@@ -560,25 +560,32 @@ fn activate_redirect_backing_for(
             // W: Automatic → true (scene walks W, samples B via
             // 4c.3 indirection). Manual → false (the external
             // compositor owns presentation and reintroduces the
-            // window via its own output/COW surface).
+            // window via its own output/COW surface, while the
+            // post-6ffd370 scene still emits W's own backing as
+            // its source — both controlled by the B flag below).
             //
-            // B: Automatic → true because scene samples B through
-            // W. Manual → false because B is an off-screen source
-            // for the compositor, not a scene participant.
-            let participating = matches!(mode, crate::server::CompositeRedirectMode::Automatic);
+            // B: always true. Post-6ffd370 the scene samples B
+            // through W's `redirected_target` in both modes
+            // (Automatic via W's own entry, Manual via the parent
+            // backing emit), so `store.damage(B_id, ..)` from
+            // every paint into the backing must accumulate.
+            // Leaving B non-participating in Manual mode silently
+            // drops all those damages and buffer-age compose
+            // retains stale BO pixels except where cursor damage
+            // happens to overlap.
+            let window_participating =
+                matches!(mode, crate::server::CompositeRedirectMode::Automatic);
             if let Err(err) =
-                backend.set_window_scene_participation(origin, host_window, participating)
+                backend.set_window_scene_participation(origin, host_window, window_participating)
             {
                 log::warn!(
-                    "set_window_scene_participation(0x{:x}, {participating}) failed: {err}",
+                    "set_window_scene_participation(0x{:x}, {window_participating}) failed: {err}",
                     window.0
                 );
             }
-            if let Err(err) =
-                backend.set_backing_scene_participation(origin, host_pixmap, participating)
-            {
+            if let Err(err) = backend.set_backing_scene_participation(origin, host_pixmap, true) {
                 log::warn!(
-                    "set_backing_scene_participation(0x{:x}, {participating}) failed: {err}",
+                    "set_backing_scene_participation(0x{:x}, true) failed: {err}",
                     host_pixmap.as_raw()
                 );
             }
@@ -639,8 +646,11 @@ fn flip_redirect_target_mode(
         activate_redirect_backing_for(state, backend, origin, target, new_mode);
         return;
     };
+    // See activate_redirect_backing_for for the rationale: B is
+    // always scene-participating because the post-6ffd370 scene
+    // samples B via `redirected_target` in both modes; only W's
+    // own scene presence toggles with mode.
     let window_participating = matches!(new_mode, crate::server::CompositeRedirectMode::Automatic);
-    let backing_participating = window_participating;
     if let Err(err) =
         backend.set_window_scene_participation(origin, host_window, window_participating)
     {
@@ -650,11 +660,9 @@ fn flip_redirect_target_mode(
             target.0
         );
     }
-    if let Err(err) =
-        backend.set_backing_scene_participation(origin, backing, backing_participating)
-    {
+    if let Err(err) = backend.set_backing_scene_participation(origin, backing, true) {
         log::warn!(
-            "flip_redirect_target_mode(0x{:x}, {backing_participating}): \
+            "flip_redirect_target_mode(0x{:x}, true): \
              set_backing_scene_participation failed: {err}",
             target.0
         );
@@ -852,21 +860,23 @@ fn rotate_redirected_backing_on_resize(
     }
 
     if let Some(mode) = effective_redirect_mode_for_window(state, window) {
-        let participating = matches!(mode, crate::server::CompositeRedirectMode::Automatic);
-        if let Err(err) = backend.set_window_scene_participation(origin, host_window, participating)
+        // See activate_redirect_backing_for: B always scene-
+        // participating so the post-6ffd370 scene's damage
+        // harvest sees paints through `redirected_target`.
+        let window_participating = matches!(mode, crate::server::CompositeRedirectMode::Automatic);
+        if let Err(err) =
+            backend.set_window_scene_participation(origin, host_window, window_participating)
         {
             log::warn!(
                 "rotate_redirected_backing_on_resize(0x{:x}): \
-                 set_window_scene_participation({participating}) failed: {err}",
+                 set_window_scene_participation({window_participating}) failed: {err}",
                 window.0
             );
         }
-        if let Err(err) =
-            backend.set_backing_scene_participation(origin, new_backing, participating)
-        {
+        if let Err(err) = backend.set_backing_scene_participation(origin, new_backing, true) {
             log::warn!(
                 "rotate_redirected_backing_on_resize(0x{:x}): \
-                 set_backing_scene_participation({participating}) failed: {err}",
+                 set_backing_scene_participation(true) failed: {err}",
                 window.0
             );
         }
@@ -13204,7 +13214,7 @@ mod tests {
     /// participant, or the scene path can double-present redirected
     /// client content behind/above the compositor's output surface.
     #[test]
-    fn manual_redirect_keeps_backing_out_of_scene() {
+    fn manual_redirect_keeps_window_out_of_scene() {
         use crate::backend::recording::RecordedCall;
 
         const WINDOW_XID: u32 = 0x0010_0001;
@@ -13257,8 +13267,11 @@ mod tests {
             crate::server::CompositeRedirectMode::Manual,
         );
 
+        // Window participation: Manual → false (the external
+        // compositor owns the window's presentation). The paired
+        // assertion that B *is* scene-participating lives in
+        // `manual_redirect_marks_backing_scene_participating_so_paints_emit_damage`.
         let calls = backend.calls();
-        // Window participation: Manual → false.
         assert!(
             calls.iter().any(|c| matches!(
                 c,
@@ -13269,16 +13282,81 @@ mod tests {
             )),
             "expected SetWindowSceneParticipation(W, false) for Manual mode; got {calls:?}",
         );
-        // Backing participation: Manual → false.
+    }
+
+    /// Manual-redirected backing must have scene_participating=true so
+    /// the v2 scene's damage harvest sees paints into it.
+    ///
+    /// Post-`6ffd370` the scene walk emits the Manual-redirected window
+    /// at its own coords but samples storage from the backing via
+    /// `redirected_target` indirection. `store.damage()` is gated on
+    /// the *target's* `scene_participating` — if the backing is marked
+    /// non-participating, every paint into it silently drops its scene
+    /// damage. Buffer-age clipped compose then never repaints the
+    /// affected region, and the BO retains whatever was in it the last
+    /// time it was flipped. Symptom: window content invisible except
+    /// where cursor damage happens to overlap the window's rect.
+    #[test]
+    fn manual_redirect_marks_backing_scene_participating_so_paints_emit_damage() {
+        use crate::backend::recording::RecordedCall;
+
+        const WINDOW_XID: u32 = 0x0010_0001;
+        const HOST_XID: u32 = 0x0040_0001;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+        }
+        state.composite_redirects.insert(
+            (ResourceId(WINDOW_XID), false),
+            crate::server::RedirectRecord {
+                mode: crate::server::CompositeRedirectMode::Manual,
+                owner: yserver_protocol::x11::ClientId(1),
+            },
+        );
+
+        activate_redirect_backing_for(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(WINDOW_XID),
+            crate::server::CompositeRedirectMode::Manual,
+        );
+
+        let calls = backend.calls();
         assert!(
             calls.iter().any(|c| matches!(
                 c,
                 RecordedCall::SetBackingSceneParticipation {
-                    participating: false,
+                    participating: true,
                     ..
                 }
             )),
-            "expected SetBackingSceneParticipation(B, false) for Manual mode; got {calls:?}",
+            "expected SetBackingSceneParticipation(B, true) for Manual mode so the \
+             scene's redirected_target damage-peek sees paints; got {calls:?}",
         );
     }
 
@@ -13448,15 +13526,19 @@ mod tests {
             )),
             "rotate must reapply Manual W scene_participating=false; got {calls:?}",
         );
+        // The fresh backing must be scene-participating so the
+        // scene's `redirected_target` damage-peek sees paints into
+        // it post-resize — same invariant as
+        // `manual_redirect_marks_backing_scene_participating_so_paints_emit_damage`.
         assert!(
             calls.iter().any(|c| matches!(
                 c,
                 RecordedCall::SetBackingSceneParticipation {
-                    participating: false,
+                    participating: true,
                     ..
                 }
             )),
-            "rotate must keep the fresh Manual backing out of scene; got {calls:?}",
+            "rotate must mark the fresh Manual backing scene-participating; got {calls:?}",
         );
     }
 

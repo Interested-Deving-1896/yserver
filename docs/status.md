@@ -1986,6 +1986,39 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     now bypasses the generic fill path and issues a direct opaque
     fill for server-owned background clears.
 
+    **2026-05-19 PM** (yoga / Snapdragon X1 / Turnip): mate-hw
+    smoke after the cc10689 + 6464531 + 6ffd370 + 8c5c841 + 22223f5
+    audit-fix stack still showed Control Center sidebar + other
+    bits invisible; cursor moves "uncovered" the missing pixels.
+    Diagnosis via temporary `store.damage` instrumentation: out
+    of 20,377 damage calls per session, **19,563 (96%) were
+    silently dropped** because their target had
+    `scene_participating=false`. Hot ids in the drop list were
+    Manual-redirect *backings* — e.g. id 152 was the backing for
+    panel-top window 0x4000c1, which the scene_walk trace
+    confirmed was being emitted with `source_id=152`. Root cause:
+    `activate_redirect_backing_for` / `flip_redirect_target_mode`
+    / `rotate_redirected_backing_on_resize` in
+    `yserver-core::core_loop::process_request` computed a single
+    `participating = mode == Automatic` flag and applied it to
+    both the window AND the backing. Post-`6ffd370` the scene
+    samples B via `redirected_target` in **both** modes, so B's
+    `scene_participating` must be `true` regardless of mode for
+    `store.damage(B_id, …)` to accumulate. Only the W flag should
+    toggle with mode. Buffer-age clipped compose then had no
+    damage region for the redirected-window areas, retained
+    whatever was in each BO, and the cursor-projected damage
+    (which goes directly into `projected_damage` in `build_scene`,
+    bypassing the store) was the only thing causing those areas
+    to repaint. This is the same v2-side change attempted as part
+    of the reverted 4d.8c, applied in isolation now that the audit
+    fixes have closed the side issues that pushed the original
+    revert. TDD: new `manual_redirect_marks_backing_scene_participating_so_paints_emit_damage`
+    test pins B's flag; `manual_redirect_keeps_backing_out_of_scene`
+    renamed to `_keeps_window_out_of_scene` and trimmed (the B
+    assertion moved out); `rotate_redirected_backing_preserves_manual_scene_participation`
+    backing assertion inverted to `participating: true`.
+
     ### Stage 4d close decision (pending implementation)
 
     v1's compositing "support" is a no-op fallback that
@@ -2157,8 +2190,12 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       Center sidebar (also missing in non-comp; likely a
       colored-source + glyph-mask Render::Composite path
       issue).
-    - Control Center "bits flicker on hover" under marco-comp
-      — buffer-age / damage-tracking hint.
+    - ~~Control Center "bits flicker on hover" under marco-comp
+      — buffer-age / damage-tracking hint.~~ **Resolved 2026-05-19 PM**
+      by the Manual-redirect backing `scene_participating=true`
+      fix above; was a manifestation of the same silent-damage-drop
+      bug. Yoga smoke confirmed no more cursor-uncovers-bits
+      symptom after the fix.
     - v2 should still backfill PictFormat tracking + alpha
       interpretation per picture format (Stage 4e or follow-on).
     - Client-created pixmaps now initialize to opaque black,
