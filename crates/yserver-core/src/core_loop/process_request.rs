@@ -2780,6 +2780,32 @@ fn handle_xfixes_request(
                         XFIXES_MAJOR_OPCODE,
                     );
                 }
+                // BadWindow on unknown window xid
+                // (`xfixes/region.c:158-163`) — Xorg sets
+                // `client->errorValue = stuff->window`.
+                if state.resources.window(ResourceId(window)).is_none() {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_WINDOW,
+                        window,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
+                // BadValue on `kind` outside {Bounding=0, Clip=1}
+                // (`xfixes/region.c:164-181`). The SHAPE-shaped
+                // Input(2) is explicitly rejected by Xorg here.
+                if kind > 1 {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        u32::from(kind),
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
                 let rects = crate::nested::shape_rects_for(state, ResourceId(window), kind);
                 state.xfixes_regions.insert(
                     region,
@@ -15098,6 +15124,145 @@ mod tests {
              got {} bytes: {:02x?}",
             all.len(),
             all,
+        );
+    }
+
+    /// Audit #7 (code-review follow-up): Xorg's
+    /// `ProcXFixesCreateRegionFromWindow` (`xfixes/region.c:158-163`)
+    /// returns BadWindow when `dixLookupResourceByType` on the
+    /// window xid fails, with `client->errorValue = stuff->window`.
+    /// Pre-fix yserver passed any xid (including 0) through to
+    /// `shape_rects_for` and silently inserted a default/empty
+    /// region.
+    #[test]
+    fn create_region_from_window_with_unknown_window_returns_bad_window() {
+        use std::io::Read;
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        const APP: u32 = 82;
+        const REGION_XID: u32 = 0x0082_0001;
+        const UNKNOWN_WIN: u32 = 0x0082_ffff;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, APP);
+        let mut backend = RecordingBackend::new();
+
+        // body: region(4) + window(4) + kind(1) + pad(3)
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&REGION_XID.to_le_bytes());
+        body.extend_from_slice(&UNKNOWN_WIN.to_le_bytes());
+        body.push(0); // kind = Bounding (valid)
+        body.extend_from_slice(&[0u8; 3]);
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(APP),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: x11xfixes::CREATE_REGION_FROM_WINDOW,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).expect("error reply delivered");
+        assert_eq!(
+            buf[1],
+            yserver_protocol::x11::error::BAD_WINDOW,
+            "expected BadWindow (3) for unknown window xid; got {}",
+            buf[1],
+        );
+        assert_eq!(
+            u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            UNKNOWN_WIN,
+            "error.bad_value must carry the offending window xid",
+        );
+        assert!(
+            !state.xfixes_regions.contains_key(&REGION_XID),
+            "no region must be inserted on BadWindow",
+        );
+    }
+
+    /// Audit #7 (code-review follow-up): Xorg's
+    /// `ProcXFixesCreateRegionFromWindow` (`xfixes/region.c:164-181`)
+    /// accepts only `WindowRegionBounding` (0) and `WindowRegionClip`
+    /// (1); any other `kind` returns BadValue with
+    /// `client->errorValue = stuff->kind`. The SHAPE-shaped value 2
+    /// (Input) is rejected per X11 XFIXES spec.
+    #[test]
+    fn create_region_from_window_with_invalid_kind_returns_bad_value() {
+        use std::io::Read;
+        use yserver_protocol::x11::{CreateWindowRequest, xfixes as x11xfixes};
+        const APP: u32 = 83;
+        const REGION_XID: u32 = 0x0083_0001;
+        const WIN_XID: u32 = 0x0083_0002;
+        const INVALID_KIND: u8 = 2;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, APP);
+        let mut backend = RecordingBackend::new();
+        // Window must exist so the BadWindow gate doesn't fire
+        // first — we want to isolate the BadValue(kind) path.
+        state.resources.create_window(
+            ClientId(APP),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WIN_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&REGION_XID.to_le_bytes());
+        body.extend_from_slice(&WIN_XID.to_le_bytes());
+        body.push(INVALID_KIND);
+        body.extend_from_slice(&[0u8; 3]);
+        let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(APP),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: x11xfixes::CREATE_REGION_FROM_WINDOW,
+                length_units,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 32];
+        peer.read_exact(&mut buf).expect("error reply delivered");
+        assert_eq!(
+            buf[1],
+            yserver_protocol::x11::error::BAD_VALUE,
+            "expected BadValue (2) for kind={INVALID_KIND}; got {}",
+            buf[1],
+        );
+        assert_eq!(
+            u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            u32::from(INVALID_KIND),
+            "error.bad_value must carry the offending kind",
+        );
+        assert!(
+            !state.xfixes_regions.contains_key(&REGION_XID),
+            "no region must be inserted on BadValue",
         );
     }
 
