@@ -557,7 +557,7 @@ thunar-xorg-trace real="$DISPLAY":
 # but launches mate-session and dumps to `mate.xtrace`. Use to
 # diff Caja's wheel-handling code path before and after the
 # stateful view-switch "fix".
-yserver-mate-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::render=trace,yserver::kms::v2::fill=trace,yserver::kms::v2::store=trace,yserver::kms::v2::paint=trace,yserver::diag::configure_notify=debug":
+yserver-mate-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::render=trace,yserver::kms::v2::fill=trace,yserver::kms::v2::store=trace,yserver::kms::v2::paint=trace,yserver::diag::configure_notify=debug,yserver_core::core_loop::damage_fanout=trace":
     cargo build --bin yserver
     rm -f mate.xtrace
     bash -c '\
