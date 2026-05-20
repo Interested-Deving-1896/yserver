@@ -180,6 +180,38 @@ fn accumulate_at_level(
         .map(|(id, _)| *id)
         .collect();
 
+    // Stage 4d shadow-hunt diagnostic: surface every accumulate call
+    // with its target drawable + how many DAMAGE subscriptions matched
+    // + how many of those have `pending_notify_fired=true` (i.e. would
+    // skip the notify). Grep this in the broken-state run to find:
+    // - level_drawable=0x<W> match_ids=0 (compositor never subscribed
+    //   to W, or subscribed to a different xid — hypothesis 2);
+    // - level_drawable=0x<W> match_ids>0 fired_count=match_ids (notify
+    //   would fire but compositor isn't subtracting fast enough);
+    // - "no entry for W" (paint handler isn't calling accumulate at
+    //   all for that path — hypothesis 1).
+    // Logged unconditionally at trace; enable with
+    // `yserver_core::core_loop::damage_fanout=trace` in `RUST_LOG`.
+    let fired_count = damage_ids
+        .iter()
+        .filter(|id| {
+            state
+                .damage_objects
+                .get(id)
+                .is_some_and(|d| d.pending_notify_fired)
+        })
+        .count();
+    log::trace!(
+        "damage_fanout: level_drawable=0x{:x} rect=({},{} {}x{}) match_ids={} fired_count={}",
+        level_drawable.0,
+        rx,
+        ry,
+        rw,
+        rh,
+        damage_ids.len(),
+        fired_count,
+    );
+
     if damage_ids.is_empty() {
         return;
     }
