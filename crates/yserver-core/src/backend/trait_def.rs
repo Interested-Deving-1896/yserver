@@ -445,6 +445,45 @@ pub trait Backend: Send {
         Ok(())
     }
 
+    /// Take an extra alias_registry reference on a redirected
+    /// backing. Used by `rotate_redirected_backing_on_resize` to
+    /// keep OLD's storage alive across the release→copy gap when
+    /// no `NameWindowPixmap` aliases hold it; paired with
+    /// [`Self::drop_backing_storage`] after the copy.
+    ///
+    /// Default no-op so test doubles and non-redirect backends
+    /// don't need to model the alias registry.
+    ///
+    /// # Errors
+    /// Propagates backend-internal failures (none today; reserved).
+    fn retain_backing_storage(
+        &mut self,
+        origin: Option<OriginContext>,
+        backing: PixmapHandle,
+    ) -> io::Result<()> {
+        let _ = (origin, backing);
+        Ok(())
+    }
+
+    /// Drop the extra alias_registry reference taken by
+    /// [`Self::retain_backing_storage`]. Frees the underlying
+    /// storage iff no other holds remain (no Reason-1 redirect
+    /// hold, no `NameWindowPixmap` aliases).
+    ///
+    /// Default no-op.
+    ///
+    /// # Errors
+    /// Propagates backend-internal failures from the free path on
+    /// the final-ref drop.
+    fn drop_backing_storage(
+        &mut self,
+        origin: Option<OriginContext>,
+        backing: PixmapHandle,
+    ) -> io::Result<()> {
+        let _ = (origin, backing);
+        Ok(())
+    }
+
     /// Stage 4b — capability flag: returns `true` when the backend
     /// implements the full COMPOSITE-redirect activation path
     /// (`allocate_redirected_backing` + `release_redirected_backing` +

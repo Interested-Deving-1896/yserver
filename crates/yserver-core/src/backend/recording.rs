@@ -89,6 +89,8 @@ pub enum RecordedCall {
     CloseFont(u32),
     Ping,
     ReleaseRedirectedBacking(u32),
+    RetainBackingStorage(u32),
+    DropBackingStorage(u32),
     AllocateRedirectedBacking {
         host_window: u32,
         width: u16,
@@ -429,6 +431,24 @@ impl Backend for RecordingBackend {
         backing: PixmapHandle,
     ) -> io::Result<()> {
         self.record(RecordedCall::ReleaseRedirectedBacking(backing.as_raw()));
+        Ok(())
+    }
+
+    fn retain_backing_storage(
+        &mut self,
+        _origin: Option<OriginContext>,
+        backing: PixmapHandle,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::RetainBackingStorage(backing.as_raw()));
+        Ok(())
+    }
+
+    fn drop_backing_storage(
+        &mut self,
+        _origin: Option<OriginContext>,
+        backing: PixmapHandle,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::DropBackingStorage(backing.as_raw()));
         Ok(())
     }
 

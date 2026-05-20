@@ -806,13 +806,29 @@ fn rotate_redirected_backing_on_resize(
         return;
     };
 
+    // Take a rotate-scoped retain on OLD's storage BEFORE the
+    // release. Without it, the no-alias case (no NameWindowPixmap
+    // outstanding on this backing) sees release_redirected_backing's
+    // alias_registry.decref hit refcount=0 → free_pixmap → store
+    // entry dropped → the copy_area below reads from a freed handle
+    // (observed as `copy_area dropped — src unknown` in HW smoke
+    // 2026-05-20 17:28:10Z). Paired with `drop_backing_storage`
+    // after the copy.
+    if let Err(err) = backend.retain_backing_storage(origin, old_backing) {
+        log::warn!(
+            "rotate_redirected_backing_on_resize: retain_backing_storage(0x{:x}) failed: {err}",
+            old_backing.as_raw()
+        );
+    }
+
     // Release the old backing FIRST so the backend's
     // `host_window_to_backing[W]` slot is clear before the allocate
     // below — otherwise allocate's idempotent short-circuit would
     // hand back the about-to-be-released handle and we'd free the
     // very pixmap we just chose to keep. Composite spec lets the
     // backing survive (alias-frozen) if `NameWindowPixmap` references
-    // still hold it via the alias registry.
+    // still hold it via the alias registry; the rotate-retain above
+    // covers the no-alias case.
     if let Err(err) = backend.release_redirected_backing(origin, old_backing) {
         log::warn!(
             "rotate_redirected_backing_on_resize: release_redirected_backing(0x{:x}) failed: {err}",
@@ -895,6 +911,16 @@ fn rotate_redirected_backing_on_resize(
             window.0,
             old_backing.as_raw(),
             new_backing.as_raw(),
+        );
+    }
+
+    // Drop the rotate-scoped retain we took before release. If no
+    // other holds remain (no NameWindowPixmap aliases), this is the
+    // final ref and OLD's storage is freed here.
+    if let Err(err) = backend.drop_backing_storage(origin, old_backing) {
+        log::warn!(
+            "rotate_redirected_backing_on_resize: drop_backing_storage(0x{:x}) failed: {err}",
+            old_backing.as_raw()
         );
     }
 
@@ -13758,28 +13784,34 @@ mod tests {
         );
 
         let calls = backend.calls();
-        // Release must come FIRST so the backend's idempotent
-        // `host_window_to_backing[W]` lookup misses on the
-        // subsequent allocate.
-        assert!(
-            calls.len() >= 2,
-            "expected 2 backend calls (release, allocate); got {calls:?}",
-        );
+        // RetainBackingStorage comes first to keep OLD's storage
+        // alive across the release→copy gap (see
+        // `rotate_redirected_backing_retains_old_storage_across_release_then_drops_after_copy`).
+        // Release must then precede Allocate so the backend's
+        // idempotent `host_window_to_backing[W]` lookup misses on
+        // the subsequent allocate.
         assert_eq!(
             calls[0],
-            RecordedCall::ReleaseRedirectedBacking(OLD_BACKING),
-            "step 1 must be ReleaseRedirectedBacking on the OLD backing — \
-             release-then-allocate is load-bearing (see fn doc-comment)",
+            RecordedCall::RetainBackingStorage(OLD_BACKING),
+            "step 1 must be RetainBackingStorage on OLD — keeps storage \
+             alive across the release→copy gap so the no-alias case \
+             doesn't drop the rotate copy",
         );
         assert_eq!(
             calls[1],
+            RecordedCall::ReleaseRedirectedBacking(OLD_BACKING),
+            "step 2 must be ReleaseRedirectedBacking on the OLD backing — \
+             release-before-allocate is load-bearing (see fn doc-comment)",
+        );
+        assert_eq!(
+            calls[2],
             RecordedCall::AllocateRedirectedBacking {
                 host_window: HOST_XID,
                 width: 100,
                 height: 75,
                 depth: 32,
             },
-            "step 2 must be AllocateRedirectedBacking at the NEW size",
+            "step 3 must be AllocateRedirectedBacking at the NEW size",
         );
 
         // Window resource now points at the freshly-allocated backing
@@ -13901,6 +13933,127 @@ mod tests {
              src=(0,0), dst=(0,0), {expected_w}x{expected_h}) — \
              missing the compCopyWindow analog that carries pre-resize \
              contents into the freshly-allocated backing. Calls: {calls:?}",
+        );
+    }
+
+    // Storage-alive invariant for the rotate copy. Observed in HW
+    // smoke (yserver-hw-mate.log 17:28:10Z) that the rotate path
+    // dropped tiny 1×1 CopyAreas with `copy_area dropped — src
+    // unknown` whenever OLD had no `NameWindowPixmap` aliases: the
+    // existing `release_redirected_backing` decref'd alias_registry
+    // to 0 → `free_pixmap` → store entry gone → `store.lookup(OLD)`
+    // returned None at the copy site → silent drop.
+    //
+    // Fix shape: take a rotate-scoped retain on OLD's storage
+    // BEFORE the release (so release's decref doesn't hit 0), drop
+    // it AFTER the copy (frees storage only if no other aliases
+    // hold it). This test pins the call ordering on
+    // RecordingBackend; the v2-side alias_registry incref/decref
+    // semantics are exercised by the v2 backend's own tests.
+    #[test]
+    fn rotate_redirected_backing_retains_old_storage_across_release_then_drops_after_copy() {
+        use crate::backend::recording::RecordedCall;
+
+        const WINDOW_XID: u32 = 0x0010_0001;
+        const HOST_XID: u32 = 0x0040_0001;
+        const OLD_BACKING: u32 = 0x0050_0001;
+        const OLD_W: u16 = 1;
+        const OLD_H: u16 = 1;
+        const NEW_W: u16 = 1;
+        const NEW_H: u16 = 1;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 32,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: OLD_W,
+                height: OLD_H,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+            w.redirected_backing = Some(crate::resources::RedirectedBacking {
+                host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(OLD_BACKING),
+                width: OLD_W,
+                height: OLD_H,
+                depth: 32,
+            });
+        }
+
+        rotate_redirected_backing_on_resize(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(WINDOW_XID),
+            NEW_W,
+            NEW_H,
+        );
+
+        let calls = backend.calls();
+        let retain_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::RetainBackingStorage(x) if *x == OLD_BACKING));
+        let release_idx = calls.iter().position(
+            |c| matches!(c, RecordedCall::ReleaseRedirectedBacking(x) if *x == OLD_BACKING),
+        );
+        let allocate_idx = calls.iter().position(|c| {
+            matches!(c, RecordedCall::AllocateRedirectedBacking { host_window, .. } if *host_window == HOST_XID)
+        });
+        let copy_idx = calls.iter().position(|c| {
+            matches!(c, RecordedCall::CopyArea { src_host_xid, .. } if *src_host_xid == OLD_BACKING)
+        });
+        let drop_idx = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::DropBackingStorage(x) if *x == OLD_BACKING));
+
+        let r = retain_idx.expect(
+            "rotate must retain OLD storage before releasing — otherwise the no-alias \
+             case frees storage before copy_area can read it (observed as `copy_area dropped \
+             — src unknown` in HW smoke)",
+        );
+        let rel = release_idx.expect("rotate must still release OLD's W→B map slot");
+        let a = allocate_idx.expect("rotate must allocate NEW");
+        let c = copy_idx.expect("rotate must copy OLD→NEW");
+        let d = drop_idx.expect(
+            "rotate must drop the retain after copy — leaving storage alive forever \
+             would leak the backing across every resize",
+        );
+
+        assert!(
+            r < rel,
+            "Retain(idx={r}) must precede Release(idx={rel}) — release's decref would \
+             otherwise hit refcount=0 and free OLD's storage before copy. Calls: {calls:?}",
+        );
+        assert!(
+            rel < a,
+            "Release(idx={rel}) must precede Allocate(idx={a}) — host_window_to_backing[W] \
+             idempotency would otherwise return OLD instead of allocating fresh. Calls: {calls:?}",
+        );
+        assert!(
+            a < c,
+            "Allocate(idx={a}) must precede Copy(idx={c}) — copy needs NEW as destination. \
+             Calls: {calls:?}",
+        );
+        assert!(
+            c < d,
+            "Copy(idx={c}) must precede Drop(idx={d}) — dropping the retain before the copy \
+             defeats the purpose of taking it. Calls: {calls:?}",
         );
     }
 

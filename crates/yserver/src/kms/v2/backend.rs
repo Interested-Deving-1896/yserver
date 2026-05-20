@@ -4299,6 +4299,44 @@ impl Backend for KmsBackendV2 {
     /// unredirect / destroy path) doesn't need a separate
     /// `set_backing_scene_participation(false)` call. The trait
     /// docstring is the canonical statement of this contract.
+    fn retain_backing_storage(
+        &mut self,
+        _origin: Option<OriginContext>,
+        backing: PixmapHandle,
+    ) -> io::Result<()> {
+        // Bump alias_registry refcount. The rotate path pairs this
+        // with `drop_backing_storage` around the release→copy gap
+        // so the no-alias case doesn't free OLD before the copy
+        // sources from it. A miss (`alias_registry.get` returns
+        // None) means the backing wasn't tracked here — log and
+        // pass through; the caller's later copy will hit the
+        // unknown-xid path with its own diagnostic.
+        if self.core.alias_registry.get(backing).is_some() {
+            self.core.alias_registry.incref(backing);
+        } else {
+            log::warn!(
+                "v2 retain_backing_storage: 0x{:x} not in alias_registry — no-op",
+                backing.as_raw(),
+            );
+        }
+        Ok(())
+    }
+
+    fn drop_backing_storage(
+        &mut self,
+        origin: Option<OriginContext>,
+        backing: PixmapHandle,
+    ) -> io::Result<()> {
+        // Symmetric to `retain_backing_storage`. Decref the
+        // alias_registry; if this was the final ref, free the
+        // underlying pixmap. Mirrors the alias-aware branch of
+        // `free_pixmap` for consistency.
+        if self.core.alias_registry.decref(backing) {
+            self.free_pixmap(origin, backing.as_raw())?;
+        }
+        Ok(())
+    }
+
     fn release_redirected_backing(
         &mut self,
         origin: Option<OriginContext>,
