@@ -3056,6 +3056,8 @@ impl RenderEngine {
         let _ = device; // silence unused if we add no further raw ops.
 
         end_and_submit_op(inner, platform, cb, &ticket)?;
+        touch_resolved_source_fence(store, src, &ticket);
+        touch_resolved_source_fence(store, mask, &ticket);
         store.touch_render_fence(dst_id, ticket.clone());
         // Damage hook: union of rect bboxes intersected with
         // clip_scissors (plan §5 default rule).
@@ -3705,6 +3707,7 @@ impl RenderEngine {
             .set_current_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
         end_and_submit_op(inner, platform, cb, &ticket)?;
+        touch_resolved_source_fence(store, src, &ticket);
         store.touch_render_fence(dst_id, ticket.clone());
         // Damage: the projected dst rect (post-clip is honoured by
         // scissoring; damage union is the union of clip-scissored
@@ -3766,6 +3769,16 @@ pub(crate) enum ResolvedSource {
     /// white-mask scratch so `mask.a == 1.0` makes the blend a
     /// no-op.
     None,
+}
+
+fn touch_resolved_source_fence(
+    store: &mut DrawableStore,
+    source: ResolvedSource,
+    ticket: &FenceTicket,
+) {
+    if let ResolvedSource::Drawable(id) = source {
+        store.touch_render_fence(id, ticket.clone());
+    }
 }
 
 /// Telemetry surface for one [`RenderEngine::render_composite`]

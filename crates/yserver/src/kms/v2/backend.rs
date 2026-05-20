@@ -2248,12 +2248,21 @@ impl KmsBackendV2 {
                 self.telemetry.record_image_view_create();
                 storage_allocated = true;
             }
-            Err(e) => {
+            Err(e)
+                if self.platform.vk.is_none()
+                    && e == ash::vk::Result::ERROR_INITIALIZATION_FAILED =>
+            {
                 // No Vk fixture (`for_tests`) → storage allocation
                 // returns ERROR_INITIALIZATION_FAILED. Tracking
                 // the geometry without storage is fine; the scene
                 // tick filters out null image-views.
                 log::debug!("v2 allocate_window_storage: no Vk for xid {host_xid:#x}: {e:?}",);
+            }
+            Err(e) => {
+                log::warn!(
+                    "v2 allocate_window_storage: allocation failed for xid {host_xid:#x} \
+                     {width}x{height} d{depth}: {e:?}"
+                );
             }
         }
         self.windows_v2.insert(

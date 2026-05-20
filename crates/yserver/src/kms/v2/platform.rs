@@ -1086,11 +1086,9 @@ impl PlatformBackend {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         };
 
-        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
-            .memory_type_index(mt)
-            .push_next(&mut dedicated);
+            .memory_type_index(mt);
         let memory = match unsafe { vk.device.allocate_memory(&alloc_info, None) } {
             Ok(m) => m,
             Err(e) => {
