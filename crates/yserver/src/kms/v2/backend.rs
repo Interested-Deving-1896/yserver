@@ -4475,10 +4475,18 @@ impl Backend for KmsBackendV2 {
                     }
                 }
             }
-            Err(vk_err) => {
+            Err(vk_err)
+                if vk_err == ash::vk::Result::ERROR_INITIALIZATION_FAILED
+                    && self.platform.vk.is_none() =>
+            {
                 // Test fixture path — no Vk available.
                 self.log_v2_gap("create_pixmap_no_vk");
-                let _ = vk_err;
+            }
+            Err(vk_err) => {
+                return Err(io::Error::other(format!(
+                    "create_pixmap: allocate_drawable_storage {width}x{height} d{depth}: \
+                     {vk_err:?}"
+                )));
             }
         }
         PixmapHandle::from_raw(xid).ok_or_else(|| io::Error::other("create_pixmap: xid was 0"))
