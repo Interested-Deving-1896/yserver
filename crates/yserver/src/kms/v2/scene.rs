@@ -2344,7 +2344,7 @@ fn record_compose_v2(
     let fd = bo
         .export_signaled_fd()
         .map_err(PresentError::Vk)?
-        .into_raw_fd();
+        .map_or(-1, IntoRawFd::into_raw_fd);
     bo.state.transition_to_submitted(fd);
 
     let mut out_fence: i32 = -1;

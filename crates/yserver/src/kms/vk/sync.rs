@@ -84,13 +84,11 @@ pub fn import_drm_syncobj(vk: &VkContext, fd: OwnedFd) -> Result<vk::Semaphore, 
 /// ownership transfers to the caller (Vulkan's internal copy is
 /// disjoint from this fd).
 pub fn export_sync_file(vk: &VkContext, semaphore: vk::Semaphore) -> Result<OwnedFd, vk::Result> {
-    use std::os::fd::FromRawFd;
     let info = vk::SemaphoreGetFdInfoKHR::default()
         .semaphore(semaphore)
         .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
     let raw = unsafe { vk.external_semaphore_fd.get_semaphore_fd(&info)? };
-    // SAFETY: vkGetSemaphoreFdKHR returns a fresh fd we own.
-    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    super::owned_fd_from_vk(raw, "vkGetSemaphoreFdKHR(SYNC_FD)")
 }
 
 /// Host-signal a timeline `VkSemaphore` to `value`. Phase 4.2.3

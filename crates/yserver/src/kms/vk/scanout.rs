@@ -99,7 +99,7 @@ impl BoState {
     pub fn transition_to_submitted(&mut self, in_fence_fd: i32) {
         debug_assert_eq!(self.phase, BoPhase::Recording);
         self.phase = BoPhase::Submitted;
-        self.in_fence_fd = Some(in_fence_fd);
+        self.in_fence_fd = (in_fence_fd >= 0).then_some(in_fence_fd);
     }
 
     /// `Submitted → Pending`: atomic accepted. Returns the in-fence
@@ -112,7 +112,7 @@ impl BoState {
         debug_assert_eq!(self.phase, BoPhase::Submitted);
         self.phase = BoPhase::Pending;
         let in_fence = self.in_fence_fd.take();
-        self.release_fence_fd = Some(out_fence_fd);
+        self.release_fence_fd = (out_fence_fd >= 0).then_some(out_fence_fd);
         in_fence
     }
 
@@ -452,19 +452,15 @@ impl ScanoutBo {
     /// Export a SYNC_FD payload from this bo's signal semaphore. Call
     /// this after `vkQueueSubmit2` with `signalSemaphore = vk_semaphore`
     /// — it returns the freshly-payloaded fd to hand KMS as
-    /// `IN_FENCE_FD`. KMS consumes the fd on atomic accept (kernel
-    /// closes it).
+    /// `IN_FENCE_FD`. `None` maps to the KMS `-1` no-fence sentinel.
     #[allow(dead_code)] // wired in by Task 2.5 (atomic-commit fence path).
-    pub fn export_signaled_fd(&self) -> Result<OwnedFd, vk::Result> {
+    pub fn export_signaled_fd(&self) -> Result<Option<OwnedFd>, vk::Result> {
         let ext = self.vk.external_semaphore_fd.clone();
         let info = vk::SemaphoreGetFdInfoKHR::default()
             .semaphore(self.vk_semaphore)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
         let raw_fd = unsafe { ext.get_semaphore_fd(&info)? };
-        // SAFETY: vkGetSemaphoreFdKHR returns a fresh fd that the
-        // caller owns. Wrap in OwnedFd so close() runs on Drop unless
-        // the fd is consumed (e.g. handed to KMS via IN_FENCE_FD).
-        Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+        super::optional_sync_fd_from_vk(raw_fd, "vkGetSemaphoreFdKHR(SYNC_FD)")
     }
 
     /// Mark this BO as "let process-exit clean up." Subsequent
@@ -1018,8 +1014,7 @@ fn allocate_vk_scanout_image(
             return Err(e);
         }
     };
-    // SAFETY: vkGetMemoryFdKHR returns a fresh fd we own.
-    let dmabuf = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let dmabuf = super::owned_fd_from_vk(raw_fd, "vkGetMemoryFdKHR(DMA_BUF)")?;
 
     Ok(VkScanoutImage {
         image,
@@ -1241,6 +1236,15 @@ mod tests {
     }
 
     #[test]
+    fn submit_with_no_fence_sentinel_does_not_store_fd() {
+        let mut bo = BoState::default();
+        bo.transition_to_recording();
+        bo.transition_to_submitted(/* no fence */ -1);
+        assert_eq!(bo.phase, BoPhase::Submitted);
+        assert!(bo.in_fence_fd.is_none());
+    }
+
+    #[test]
     fn atomic_accept_returns_in_fence_for_caller_to_close_and_stores_out_fence() {
         let mut bo = BoState::default();
         bo.transition_to_recording();
@@ -1254,6 +1258,16 @@ mod tests {
         );
         assert!(bo.in_fence_fd.is_none(), "moved out into reclaimed");
         assert_eq!(bo.release_fence_fd, Some(99));
+    }
+
+    #[test]
+    fn atomic_accept_with_no_out_fence_sentinel_does_not_store_release_fd() {
+        let mut bo = BoState::default();
+        bo.transition_to_recording();
+        bo.transition_to_submitted(42);
+        let reclaimed = bo.transition_to_pending(/* no out fence */ -1);
+        assert_eq!(reclaimed, Some(42));
+        assert!(bo.release_fence_fd.is_none());
     }
 
     #[test]

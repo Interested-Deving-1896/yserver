@@ -201,7 +201,7 @@ pub fn record_and_present_composite(
     let fd = bo
         .export_signaled_fd()
         .map_err(PresentError::Vk)?
-        .into_raw_fd();
+        .map_or(-1, IntoRawFd::into_raw_fd);
     bo.state.transition_to_submitted(fd);
 
     // Atomic commit with explicit fences. Reuses the same

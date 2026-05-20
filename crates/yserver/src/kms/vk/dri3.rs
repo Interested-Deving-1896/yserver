@@ -157,7 +157,6 @@ pub fn export_dmabuf(
     vk: &VkContext,
     drawable: &super::target::DrawableImage,
 ) -> Result<DmabufExport, vk::Result> {
-    use std::os::fd::FromRawFd as _;
     let ext = vk
         .external_memory_fd
         .as_ref()
@@ -179,7 +178,7 @@ pub fn export_dmabuf(
         .memory(memory)
         .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
     let raw_fd = unsafe { ext.get_memory_fd(&info)? };
-    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
+    let fd = super::owned_fd_from_vk(raw_fd, "vkGetMemoryFdKHR(DMA_BUF)")?;
     Ok(DmabufExport {
         fd,
         size,
