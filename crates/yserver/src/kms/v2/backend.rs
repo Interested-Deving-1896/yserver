@@ -5048,6 +5048,10 @@ impl Backend for KmsBackendV2 {
         height: u16,
     ) -> io::Result<()> {
         let Some(src) = self.store.lookup(src_host_xid) else {
+            log::warn!(
+                "v2 copy_area dropped — src unknown: src=0x{src_host_xid:x} dst=0x{dst_host_xid:x} \
+                 src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
+            );
             self.log_v2_gap("copy_area_unknown_xid");
             return Ok(());
         };
@@ -5058,6 +5062,10 @@ impl Backend for KmsBackendV2 {
         // src/dst resolution" — the X11 client reads from the
         // drawable as it sees it.
         let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
+            log::warn!(
+                "v2 copy_area dropped — dst unresolvable: src=0x{src_host_xid:x} dst=0x{dst_host_xid:x} \
+                 src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
+            );
             self.log_v2_gap("copy_area_unknown_xid");
             return Ok(());
         };
