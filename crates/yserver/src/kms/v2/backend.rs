@@ -12361,4 +12361,342 @@ mod tests {
         assert_eq!(got[0].offset.x, 0);
         assert_eq!(got[0].offset.y, 0);
     }
+
+    // ────────────────────────────────────────────────────────────
+    // Phase 2 root-cause pin (Task 7.5).
+    //
+    // The yserver-core sibling tests
+    // (`reparent_*_redirect_*` in
+    // `crates/yserver-core/src/core_loop/process_request.rs`) pin
+    // the backing-existence state on the resource layer. This test
+    // exercises the actual user-visible path: drive a
+    // `ReparentWindow` through the full `process_request`
+    // dispatcher, then assert
+    // `resolve_paint_target(nm_applet_host_xid)` routes through
+    // mate-panel's redirected ancestor with the correct
+    // screen-coord offset — the symptom that breaks the live
+    // mate-panel tray.
+    // ────────────────────────────────────────────────────────────
+
+    /// Synthesise a deterministic host xid for a nested `ResourceId`.
+    /// Mirrors the production "high bit set" convention used by the
+    /// sibling core tests so the v2 windows_v2 keys never collide
+    /// with low-numbered nested xids.
+    fn synth_host_xid(xid: yserver_protocol::x11::ResourceId) -> u32 {
+        0x8000_0000 | xid.0
+    }
+
+    /// Seed both the resource-layer `Window` *and* the v2 backend's
+    /// `windows_v2` + `store` entries so that:
+    /// - `state.resources.window(xid).host_xid` is set,
+    /// - `backend.windows_v2[host_xid]` exists with the requested
+    ///   geometry, and
+    /// - `backend.store.lookup(host_xid)` returns a real
+    ///   `DrawableId`.
+    fn seed_v2_window(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackendV2,
+        xid: yserver_protocol::x11::ResourceId,
+        parent: yserver_protocol::x11::ResourceId,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    ) {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::{ClientId, CreateWindowRequest};
+        state.resources.create_window(
+            ClientId(14),
+            CreateWindowRequest {
+                depth: 24,
+                window: xid,
+                parent,
+                x,
+                y,
+                width,
+                height,
+                border_width: 0,
+                class: 1,
+                visual: yserver_core::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let host_xid = synth_host_xid(xid);
+        if let Some(w) = state.resources.window_mut(xid) {
+            w.host_xid = yserver_core::backend::WindowHandle::from_raw(host_xid);
+        }
+        // v2 backend's windows_v2 + store mirror.
+        let parent_host = if parent == ROOT_WINDOW {
+            None
+        } else {
+            Some(synth_host_xid(parent))
+        };
+        backend.windows_v2.insert(
+            host_xid,
+            super::WindowGeometryV2 {
+                x,
+                y,
+                width,
+                height,
+                depth: 24,
+                mapped: true,
+                parent: parent_host,
+                stack_rank: 0,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        let _ = backend.store.allocate(
+            host_xid,
+            crate::kms::v2::store::DrawableKind::Window,
+            24,
+            true,
+            crate::kms::v2::store::Storage::for_tests_null(
+                ash::vk::Extent2D {
+                    width: u32::from(width.max(1)),
+                    height: u32::from(height.max(1)),
+                },
+                ash::vk::Format::B8G8R8A8_UNORM,
+            ),
+        );
+    }
+
+    /// Allocate a redirected backing for an already-seeded window
+    /// and install `set_redirected_target(W, Some(B))` so the
+    /// resolver routes paint against `W`'s host xid through `B`.
+    /// Also sets the resource-layer `redirected_backing` so the
+    /// reconciliation predicates in production code see the
+    /// "backing already present" state.
+    fn seed_v2_redirected_backing(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackendV2,
+        xid: yserver_protocol::x11::ResourceId,
+    ) {
+        let host_xid = synth_host_xid(xid);
+        let backing_xid = 0x9000_0000 | xid.0;
+        let (width, height, depth) = state
+            .resources
+            .window(xid)
+            .map(|w| (w.width, w.height, w.depth))
+            .expect("seed_v2_redirected_backing: window must exist");
+        // Allocate the backing in the v2 store.
+        let backing_id = backend
+            .store
+            .allocate(
+                backing_xid,
+                crate::kms::v2::store::DrawableKind::RedirectedBacking,
+                depth,
+                false,
+                crate::kms::v2::store::Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: u32::from(width.max(1)),
+                        height: u32::from(height.max(1)),
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("seed_v2_redirected_backing allocate");
+        let w_id = backend
+            .store
+            .lookup(host_xid)
+            .expect("window's drawable id");
+        backend.store.set_redirected_target(w_id, Some(backing_id));
+        // Mirror on the resource layer so the production
+        // reconciliation predicates see a backing present.
+        if let Some(w) = state.resources.window_mut(xid) {
+            w.redirected_backing = Some(yserver_core::resources::RedirectedBacking {
+                host_pixmap: yserver_core::backend::PixmapHandle::from_raw(backing_xid)
+                    .expect("non-zero PixmapHandle"),
+                width,
+                height,
+                depth,
+            });
+        }
+    }
+
+    /// Look up the v2 backing `DrawableId` for the redirected
+    /// `xid`. Returns `None` if no redirect was installed (or if
+    /// the window itself isn't in the store).
+    fn backing_drawable_id(
+        backend: &KmsBackendV2,
+        xid: yserver_protocol::x11::ResourceId,
+    ) -> Option<crate::kms::v2::store::DrawableId> {
+        let host_xid = synth_host_xid(xid);
+        let w_id = backend.store.lookup(host_xid)?;
+        backend.store.redirected_target(w_id)
+    }
+
+    /// Drive ReparentWindow through the public `process_request`
+    /// dispatcher (the v2 backend can't call `handle_reparent_window`
+    /// directly — it's `fn`-private to the core_loop module).
+    fn dispatch_reparent_window_v2(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackendV2,
+        window: yserver_protocol::x11::ResourceId,
+        parent: yserver_protocol::x11::ResourceId,
+        x: i16,
+        y: i16,
+    ) {
+        use yserver_core::{backend::Backend, core_loop::process_request};
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&window.0.to_le_bytes());
+        body.extend_from_slice(&parent.0.to_le_bytes());
+        body.extend_from_slice(&x.to_le_bytes());
+        body.extend_from_slice(&y.to_le_bytes());
+
+        process_request::process_request(
+            state,
+            backend as &mut dyn Backend,
+            ClientId(14),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 7, // ReparentWindow
+                data: 0,
+                length_units: 4,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request must succeed");
+    }
+
+    /// Register a client in `state.clients` so `process_request`'s
+    /// per-client sequence stamp + (potential) error-emission path
+    /// have a real `ClientState` to operate on. Uses
+    /// `resource_id_mask = u32::MAX` so the fixture xids are
+    /// trivially in-range.
+    fn install_client_for_v2(state: &mut yserver_core::server::ServerState, id: u32) {
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        use yserver_core::{resources::ROOT_WINDOW, server::ClientState};
+        use yserver_protocol::x11::ClientByteOrder;
+        let (a, _b) = UnixStream::pair().unwrap();
+        state.clients.insert(
+            id,
+            ClientState {
+                writer: Arc::new(Mutex::new(a)),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0,
+                resource_id_mask: u32::MAX,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: ROOT_WINDOW,
+                reader_control: None,
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_paint_target_after_reparent_out_routes_to_new_redirected_ancestor() {
+        use yserver_core::{
+            resources::ROOT_WINDOW,
+            server::{CompositeRedirectMode, RedirectRecord, ServerState},
+        };
+        use yserver_protocol::x11::{ClientId, ResourceId};
+
+        // Phase 2 root-cause pin: build a tree mirroring the live
+        // mate-panel case (root → mate-panel, root → nm-applet),
+        // dispatch a ReparentWindow that moves nm-applet under
+        // mate-panel's socket, then assert resolve_paint_target
+        // returns mate-panel's backing with the right offset.
+        //
+        // Pre-fix: nm-applet's stale Manual-redirect backing wins,
+        // resolve_paint_target returns it with offset (0, 0).
+        // Post-fix (handle_reparent_window's reconciliation): the
+        // backing is freed, resolve_paint_target walks up the
+        // ancestor chain to mate-panel's backing with the offset
+        // = nm-applet's screen-coord position within mate-panel.
+
+        let mut state = ServerState::new();
+        let mut backend = KmsBackendV2::for_tests();
+        install_client_for_v2(&mut state, 14);
+
+        let root_xid = ROOT_WINDOW;
+        let mate_panel_xid = ResourceId(0x110_0003);
+        let socket_xid = ResourceId(0x210_0013);
+        let nm_applet_xid = ResourceId(0x180_000b);
+
+        // Pre-state: root has RedirectSubwindows(Manual). mate-panel
+        // is a redirected direct child. socket is a child of mate-
+        // panel (not directly redirected). nm-applet is currently
+        // a direct child of root (and therefore inherits redirect).
+        state.composite_redirects.insert(
+            (root_xid, true),
+            RedirectRecord {
+                mode: CompositeRedirectMode::Manual,
+                owner: ClientId(14),
+            },
+        );
+
+        seed_v2_window(
+            &mut state,
+            &mut backend,
+            mate_panel_xid,
+            root_xid,
+            0,
+            0,
+            2560,
+            28,
+        );
+        seed_v2_redirected_backing(&mut state, &mut backend, mate_panel_xid);
+        let mate_panel_backing_id =
+            backing_drawable_id(&backend, mate_panel_xid).expect("mate-panel backing drawable id");
+        seed_v2_window(
+            &mut state,
+            &mut backend,
+            socket_xid,
+            mate_panel_xid,
+            2387,
+            0,
+            26,
+            27,
+        );
+        seed_v2_window(
+            &mut state,
+            &mut backend,
+            nm_applet_xid,
+            root_xid,
+            0,
+            0,
+            26,
+            27,
+        );
+        seed_v2_redirected_backing(&mut state, &mut backend, nm_applet_xid);
+
+        dispatch_reparent_window_v2(
+            &mut state,
+            &mut backend,
+            nm_applet_xid,
+            socket_xid,
+            /* x */ 0,
+            /* y */ 0,
+        );
+
+        let nm_applet_host_xid = synth_host_xid(nm_applet_xid);
+
+        let resolved = backend
+            .resolve_paint_target(nm_applet_host_xid)
+            .expect("resolve must succeed");
+
+        assert_eq!(
+            resolved.id, mate_panel_backing_id,
+            "paints into nm-applet must route to mate-panel's redirected backing post-reparent"
+        );
+        assert_eq!(
+            resolved.offset,
+            (2387, 0),
+            "offset must place the paint at nm-applet's screen-coord position within mate-panel's backing"
+        );
+    }
 }

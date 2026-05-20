@@ -16847,4 +16847,398 @@ mod tests {
              the damage call",
         );
     }
+
+    // ────────────────────────────────────────────────────────────
+    // Phase 2 reparent-redirect-reconciliation pins (Task 7).
+    //
+    // Mirrors Xorg's `compReparentWindow` (xserver/composite/
+    // compwindow.c:453-454) — which dispatches to
+    // `compUnredirectOneSubwindow` (revoke inherited redirect),
+    // `compRedirectOneSubwindow` (grant inherited redirect), and
+    // `flip_redirect_target_mode` (mode flip across redirected
+    // parents). Direct RedirectWindow(W) is per-window so the
+    // backing is not touched by reparent.
+    //
+    // The fifth, user-visible pin lives in
+    // `crates/yserver/src/kms/v2/backend.rs` — it drives the v2
+    // `resolve_paint_target` ancestor walk through the full
+    // `process_request` dispatcher.
+    // ────────────────────────────────────────────────────────────
+
+    fn make_test_state() -> ServerState {
+        ServerState::new()
+    }
+
+    /// Seed a `Window` resource under `parent` with the given size
+    /// and a deterministic `host_xid` derived from the nested xid.
+    /// Mirrors what the production `CreateWindow` path leaves in
+    /// `state.resources` once the host create has roundtripped.
+    fn seed_window(
+        state: &mut ServerState,
+        xid: ResourceId,
+        parent: ResourceId,
+        width: u16,
+        height: u16,
+    ) {
+        use yserver_protocol::x11::CreateWindowRequest;
+        state.resources.create_window(
+            ClientId(14),
+            CreateWindowRequest {
+                depth: 24,
+                window: xid,
+                parent,
+                x: 0,
+                y: 0,
+                width,
+                height,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        if let Some(w) = state.resources.window_mut(xid) {
+            // Synthesise a host_xid from the nested xid (high bit
+            // set so it can't collide with a low-numbered nested
+            // xid in a different role). Production assigns these
+            // out of the backend; tests just need stable values.
+            w.host_xid = crate::backend::WindowHandle::from_raw(0x8000_0000 | xid.0);
+        }
+    }
+
+    /// Attach a `RedirectedBacking` to an already-seeded window.
+    /// The `backend` argument keeps the helper's signature
+    /// symmetrical with the (eventual) production path which
+    /// allocates a real backing through the backend; the recording
+    /// backend doesn't need to be consulted for the test
+    /// pre-condition, so we just synthesise a PixmapHandle.
+    fn seed_redirected_window(
+        state: &mut ServerState,
+        _backend: &mut crate::backend::recording::RecordingBackend,
+        xid: ResourceId,
+    ) {
+        use crate::resources::RedirectedBacking;
+        if let Some(w) = state.resources.window_mut(xid) {
+            w.redirected_backing = Some(RedirectedBacking {
+                host_pixmap: crate::backend::PixmapHandle::from_raw(0x9000_0000 | xid.0)
+                    .expect("non-zero PixmapHandle"),
+                width: w.width,
+                height: w.height,
+                depth: w.depth,
+            });
+        }
+    }
+
+    /// Drive a ReparentWindow through `handle_reparent_window` (the
+    /// module-private dispatch path) via `process_request`'s public
+    /// entry. ReparentWindow body = window(4 LE) + parent(4 LE) +
+    /// x(2 LE i16) + y(2 LE i16) = 12 bytes; length_units = 4
+    /// (header + body = 16 bytes / 4).
+    fn dispatch_reparent_window(
+        state: &mut ServerState,
+        backend: &mut crate::backend::recording::RecordingBackend,
+        window: ResourceId,
+        parent: ResourceId,
+        x: i16,
+        y: i16,
+    ) {
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&window.0.to_le_bytes());
+        body.extend_from_slice(&parent.0.to_le_bytes());
+        body.extend_from_slice(&x.to_le_bytes());
+        body.extend_from_slice(&y.to_le_bytes());
+        process_request(
+            state,
+            backend,
+            ClientId(14),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 7, // ReparentWindow
+                data: 0,
+                length_units: 4,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request(ReparentWindow) must succeed");
+    }
+
+    #[test]
+    fn reparent_out_of_redirected_subtree_revokes_inherited_redirect() {
+        // Phase 2: mirrors compUnredirectOneSubwindow in
+        // /home/jos/Projects/xserver/composite/compwindow.c:453.
+        // A window that inherited redirect from its parent's
+        // RedirectSubwindows must lose its backing when reparented
+        // to a parent without RedirectSubwindows.
+        //
+        // The actual regression: nm-applet (created as a direct
+        // child of root with RedirectSubwindows(root, Manual)
+        // active, then reparented into mate-panel's notification
+        // socket) keeps a stale backing. Paints land there instead
+        // of in mate-panel's pixmap; the compositor reads mate-
+        // panel's pixmap and sees an empty tray area.
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+
+        let root_xid = crate::resources::ROOT_WINDOW;
+        let mate_panel_xid = ResourceId(0x110_0003);
+        let socket_xid = ResourceId(0x210_0013);
+        let nm_applet_xid = ResourceId(0x180_000b);
+
+        // root has RedirectSubwindows(Manual); socket does not.
+        state.composite_redirects.insert(
+            (root_xid, true),
+            crate::server::RedirectRecord {
+                mode: crate::server::CompositeRedirectMode::Manual,
+                owner: ClientId(14),
+            },
+        );
+
+        seed_window(&mut state, mate_panel_xid, root_xid, 2560, 28);
+        seed_redirected_window(&mut state, &mut backend, mate_panel_xid);
+        seed_window(&mut state, socket_xid, mate_panel_xid, 26, 27);
+        seed_window(&mut state, nm_applet_xid, root_xid, 26, 27);
+        seed_redirected_window(&mut state, &mut backend, nm_applet_xid);
+
+        assert!(
+            state
+                .resources
+                .window(nm_applet_xid)
+                .unwrap()
+                .redirected_backing
+                .is_some(),
+            "pre-condition: nm-applet has an inherited-redirect backing"
+        );
+
+        dispatch_reparent_window(&mut state, &mut backend, nm_applet_xid, socket_xid, 0, 0);
+
+        assert_eq!(
+            state.resources.window(nm_applet_xid).unwrap().parent,
+            socket_xid,
+        );
+        assert!(
+            state
+                .resources
+                .window(nm_applet_xid)
+                .unwrap()
+                .redirected_backing
+                .is_none(),
+            "post-condition: nm-applet's inherited-redirect backing is freed after \
+             reparenting out of the redirected subtree"
+        );
+    }
+
+    #[test]
+    fn reparent_into_redirected_subtree_grants_inherited_redirect() {
+        // Phase 2: mirrors compRedirectOneSubwindow at
+        // /home/jos/Projects/xserver/composite/compwindow.c:454. A
+        // window with no own redirect, no parent RedirectSubwindows,
+        // gains a backing when reparented under a parent with active
+        // RedirectSubwindows.
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+
+        let root_xid = crate::resources::ROOT_WINDOW;
+        let mate_panel_xid = ResourceId(0x110_0003);
+        let unredirected_parent_xid = ResourceId(0x300_0001);
+        let target_xid = ResourceId(0x300_0010);
+
+        state.composite_redirects.insert(
+            (mate_panel_xid, true),
+            crate::server::RedirectRecord {
+                mode: crate::server::CompositeRedirectMode::Automatic,
+                owner: ClientId(14),
+            },
+        );
+
+        seed_window(&mut state, mate_panel_xid, root_xid, 2560, 28);
+        seed_window(&mut state, unredirected_parent_xid, root_xid, 100, 100);
+        seed_window(&mut state, target_xid, unredirected_parent_xid, 50, 50);
+
+        assert!(
+            state
+                .resources
+                .window(target_xid)
+                .unwrap()
+                .redirected_backing
+                .is_none(),
+            "pre-condition: target has no backing"
+        );
+
+        dispatch_reparent_window(&mut state, &mut backend, target_xid, mate_panel_xid, 0, 0);
+
+        assert_eq!(
+            state.resources.window(target_xid).unwrap().parent,
+            mate_panel_xid,
+        );
+        assert!(
+            state
+                .resources
+                .window(target_xid)
+                .unwrap()
+                .redirected_backing
+                .is_some(),
+            "post-condition: target gained an inherited-redirect backing"
+        );
+    }
+
+    #[test]
+    fn reparent_with_direct_redirect_keeps_backing() {
+        // Phase 2 invariant: RedirectWindow(W) is a per-window
+        // redirect independent of W's parent. Reparenting W must
+        // NOT touch its backing.
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+
+        let root_xid = crate::resources::ROOT_WINDOW;
+        let mate_panel_xid = ResourceId(0x110_0003);
+        let socket_xid = ResourceId(0x210_0013);
+        let directly_redirected_xid = ResourceId(0x400_0001);
+
+        state.composite_redirects.insert(
+            (directly_redirected_xid, false),
+            crate::server::RedirectRecord {
+                mode: crate::server::CompositeRedirectMode::Manual,
+                owner: ClientId(14),
+            },
+        );
+
+        seed_window(&mut state, mate_panel_xid, root_xid, 2560, 28);
+        seed_window(&mut state, socket_xid, mate_panel_xid, 26, 27);
+        seed_window(&mut state, directly_redirected_xid, root_xid, 50, 50);
+        seed_redirected_window(&mut state, &mut backend, directly_redirected_xid);
+
+        let backing_before = state
+            .resources
+            .window(directly_redirected_xid)
+            .unwrap()
+            .redirected_backing
+            .as_ref()
+            .map(|b| b.host_pixmap);
+        assert!(backing_before.is_some());
+
+        dispatch_reparent_window(
+            &mut state,
+            &mut backend,
+            directly_redirected_xid,
+            socket_xid,
+            0,
+            0,
+        );
+
+        let backing_after = state
+            .resources
+            .window(directly_redirected_xid)
+            .unwrap()
+            .redirected_backing
+            .as_ref()
+            .map(|b| b.host_pixmap);
+        assert_eq!(
+            backing_before, backing_after,
+            "RedirectWindow(W) survives reparent"
+        );
+    }
+
+    #[test]
+    fn reparent_between_redirected_parents_with_different_modes_flips_mode() {
+        // Phase 2: when both old_parent and new_parent have
+        // RedirectSubwindows but with different modes (Manual ↔
+        // Automatic), the production reconciliation calls
+        // flip_redirect_target_mode. That helper preserves the
+        // backing handle (X Composite spec: old named pixmaps remain
+        // allocated until FreePixmap; only redirectDraw flips) and
+        // updates the window's own scene_participating flag per the
+        // new mode (Manual ⇒ false, Automatic ⇒ true).
+        let mut state = make_test_state();
+        let mut backend =
+            crate::backend::recording::RecordingBackend::new().with_redirect_activation();
+
+        let root_xid = crate::resources::ROOT_WINDOW;
+        let parent_manual_xid = ResourceId(0x500_0001);
+        let parent_automatic_xid = ResourceId(0x500_0002);
+        let target_xid = ResourceId(0x500_0010);
+
+        state.composite_redirects.insert(
+            (parent_manual_xid, true),
+            crate::server::RedirectRecord {
+                mode: crate::server::CompositeRedirectMode::Manual,
+                owner: ClientId(14),
+            },
+        );
+        state.composite_redirects.insert(
+            (parent_automatic_xid, true),
+            crate::server::RedirectRecord {
+                mode: crate::server::CompositeRedirectMode::Automatic,
+                owner: ClientId(14),
+            },
+        );
+
+        seed_window(&mut state, parent_manual_xid, root_xid, 100, 100);
+        seed_window(&mut state, parent_automatic_xid, root_xid, 100, 100);
+        // target is initially a child of parent_manual_xid → inherits
+        // Manual redirect → has a backing allocated, and its own
+        // scene_participating is false (Manual semantics).
+        seed_window(&mut state, target_xid, parent_manual_xid, 50, 50);
+        seed_redirected_window(&mut state, &mut backend, target_xid);
+
+        let backing_before = state
+            .resources
+            .window(target_xid)
+            .unwrap()
+            .redirected_backing
+            .as_ref()
+            .map(|b| b.host_pixmap);
+        assert!(
+            backing_before.is_some(),
+            "pre: target has Manual-inherited backing"
+        );
+
+        // Reparent to the Automatic parent.
+        dispatch_reparent_window(
+            &mut state,
+            &mut backend,
+            target_xid,
+            parent_automatic_xid,
+            0,
+            0,
+        );
+
+        let backing_after = state
+            .resources
+            .window(target_xid)
+            .unwrap()
+            .redirected_backing
+            .as_ref()
+            .map(|b| b.host_pixmap);
+        assert_eq!(
+            backing_before, backing_after,
+            "mode-flip across redirected parents preserves the backing handle (X Composite spec)"
+        );
+
+        // Mode flip side effect: scene_participating flag on the
+        // window itself follows the new parent's mode. The flip is
+        // visible in the RecordingBackend's call log — look for a
+        // SetWindowSceneParticipation(_, true) for target's host xid
+        // (Automatic ⇒ participating=true; pre-reparent it was
+        // false under Manual).
+        let calls = backend.calls.lock().expect("calls poisoned");
+        let saw_participation_true = calls.iter().any(|c| {
+            matches!(
+                c,
+                crate::backend::recording::RecordedCall::SetWindowSceneParticipation {
+                    participating: true,
+                    ..
+                }
+            )
+        });
+        assert!(
+            saw_participation_true,
+            "expected SetWindowSceneParticipation(_, true) after Manual → Automatic flip; \
+             got {:?}",
+            *calls,
+        );
+    }
 }
