@@ -4050,4 +4050,196 @@ mod tests {
             "top-level must be below cursor",
         );
     }
+
+    #[test]
+    fn build_scene_cow_some_strips_top_levels_and_keeps_cursor_at_top() {
+        // Phase 1 (2a): when a compositor has registered COW, the scene
+        // strips per-top-level entries — scanout becomes root + COW
+        // (+ cursor) only. Mirrors Xorg's compositor contract: the X
+        // server doesn't compose redirected toplevels itself; the
+        // compositor reads backings, composes, and Presents into COW.
+        // Cursor stays at top-of-z (last in draws).
+
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        // Two mapped top-levels with live storage (non-null sample
+        // views via alloc_stub_window's sentinel image_view) — under
+        // cow=None they would appear in draws. Under 2a they must NOT.
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x4000,
+            100,
+            100,
+            200,
+            150,
+            None,
+            true,
+        );
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x4001,
+            50,
+            50,
+            50,
+            50,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x4000);
+        core.top_level_order.push(0x4001);
+        let top_a_id = store.lookup(0x4000).expect("top-level A allocated");
+        let top_b_id = store.lookup(0x4001).expect("top-level B allocated");
+
+        // Register COW: allocate stub storage with a sentinel
+        // image_view (so build_scene doesn't filter on the null-view
+        // gate) and call store.allocate directly — same pattern as
+        // the existing build_scene_cow_none_emits_top_levels test.
+        let mut cow_storage = super::super::store::Storage::for_tests_null(
+            extent(800, 600), // matches PlatformBackend::for_tests() output
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let cow_sentinel: ash::vk::ImageView = ash::vk::Handle::from_raw(0xC0_C0_C0_C0);
+        cow_storage.image_view = cow_sentinel;
+        cow_storage.sample_view = cow_sentinel;
+        let cow_id = store
+            .allocate(
+                yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0,
+                DrawableKind::Window,
+                24,
+                true, // scene_participating
+                cow_storage,
+            )
+            .expect("alloc COW stub");
+
+        // Cursor.
+        let mut cursor_storage = super::super::store::Storage::for_tests_null(
+            extent(16, 16),
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let cursor_sentinel: ash::vk::ImageView = ash::vk::Handle::from_raw(0xCAFE_BABE);
+        cursor_storage.image_view = cursor_sentinel;
+        cursor_storage.sample_view = cursor_sentinel;
+        let cursor_id = store
+            .allocate(0xCAFE_0003, DrawableKind::Pixmap, 32, false, cursor_storage)
+            .expect("alloc cursor stub");
+        core.cursor_x = 50.0;
+        core.cursor_y = 60.0;
+        let cursor = CursorEntry {
+            id: cursor_id,
+            extent: extent(16, 16),
+            hot_x: 0,
+            hot_y: 0,
+            record_version: 0,
+            bgra_bytes: None,
+        };
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows_v2,
+            0,
+            &platform,
+            Some(cursor),
+            None,
+            Some(cow_id),
+            false,
+        );
+
+        // Expect: COW + cursor only (root storage isn't allocated
+        // in this fixture so it doesn't contribute a draw). Pin all
+        // four invariants explicitly so the test catches each
+        // possible breakage shape:
+        //
+        //   (a) no top-level layer sneaks through;
+        //   (b) the COW layer IS emitted (a regression that emits
+        //       nothing but the cursor must fail this);
+        //   (c) the COW layer has the right shape (source view,
+        //       full-extent dst, alpha-passthrough on);
+        //   (d) cursor is last (i.e. immediately above COW).
+        let top_a_view = store
+            .get(top_a_id)
+            .expect("top_a present")
+            .storage
+            .sample_view;
+        let top_b_view = store
+            .get(top_b_id)
+            .expect("top_b present")
+            .storage
+            .sample_view;
+        let cow_view = store.get(cow_id).expect("cow present").storage.sample_view;
+        let cursor_view = store
+            .get(cursor_id)
+            .expect("cursor present")
+            .storage
+            .sample_view;
+
+        // (a)
+        let top_emit_count = built
+            .scene
+            .draws
+            .iter()
+            .filter(|d| d.image_view == top_a_view || d.image_view == top_b_view)
+            .count();
+        assert_eq!(
+            top_emit_count, 0,
+            "cow-authoritative mode must strip top-level draws, got {} of them in {:?}",
+            top_emit_count, built.scene.draws,
+        );
+
+        // (b) + (c): exactly one COW draw, full-extent, alpha-
+        // passthrough, sampling cow_sentinel.
+        let cow_draws: Vec<_> = built
+            .scene
+            .draws
+            .iter()
+            .filter(|d| d.image_view == cow_view)
+            .collect();
+        assert_eq!(
+            cow_draws.len(),
+            1,
+            "exactly one COW draw expected, got {} in {:?}",
+            cow_draws.len(),
+            built.scene.draws,
+        );
+        let cow_draw = cow_draws[0];
+        assert_eq!(
+            cow_draw.image_view, cow_sentinel,
+            "COW draw must sample cow_sentinel"
+        );
+        assert_eq!(
+            cow_draw.dst_origin,
+            [0.0, 0.0],
+            "COW dst_origin must be (0, 0)"
+        );
+        assert_eq!(
+            cow_draw.dst_size,
+            [800.0, 600.0],
+            "COW dst_size must be full output extent (800x600)"
+        );
+        assert!(
+            cow_draw.alpha_passthrough,
+            "COW must blend with alpha_passthrough=true"
+        );
+
+        // (d): cursor is the last draw, COW immediately precedes it.
+        assert!(
+            built.scene.draws.len() >= 2,
+            "expected at least COW + cursor"
+        );
+        let last = built.scene.draws.last().expect("at least one draw");
+        let penultimate = &built.scene.draws[built.scene.draws.len() - 2];
+        assert_eq!(
+            last.image_view, cursor_view,
+            "cursor must be the top (last) scene draw"
+        );
+        assert_eq!(
+            penultimate.image_view, cow_view,
+            "COW must be immediately below cursor",
+        );
+    }
 }
