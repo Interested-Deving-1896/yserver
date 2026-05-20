@@ -10370,10 +10370,27 @@ fn copy_area_effective_dst_rects(
         .iter()
         .filter_map(|cid| {
             let c = state.resources.window(*cid)?;
+            // Manually-redirected children don't claim the parent's
+            // pixmap real estate — the redirecting compositor (which
+            // may BE the parent's own client; see
+            // notification-area-applet for a live example) puts the
+            // children's pixels there itself. Subtracting them
+            // strips the compositor's own composite-target rect to
+            // empty, blocking the icons from reaching the parent's
+            // backing. Automatic-redirected children are still
+            // subtracted: under Automatic mode the X server
+            // auto-composites them into the parent's pixmap, so the
+            // parent's own paint must avoid those rects to stay
+            // out of the auto-composite's way.
+            let is_manual = matches!(
+                effective_redirect_mode_for_window(state, *cid),
+                Some(crate::server::CompositeRedirectMode::Manual)
+            );
             (c.class == crate::resources::WindowClass::InputOutput
                 && c.map_state == crate::resources::MapState::Viewable
                 && c.width > 0
-                && c.height > 0)
+                && c.height > 0
+                && !is_manual)
                 .then_some(CopyAreaSubRect {
                     x: c.x,
                     y: c.y,
@@ -16841,6 +16858,219 @@ mod tests {
         assert_eq!(got[0].y, 0);
         assert_eq!(got[0].width, 100);
         assert_eq!(got[0].height, 80);
+    }
+
+    /// MANUALLY-redirected children must not be subtracted by
+    /// ClipByChildren. They don't claim the parent's pixmap real
+    /// estate — the redirecting compositor (which may be the
+    /// parent's own client) puts the children's pixels there
+    /// itself via subsequent ops. Subtracting them strips the
+    /// compositor's own composite-target rect to empty.
+    ///
+    /// Live trigger: mate-panel notification-area-applet, which
+    /// calls `RedirectWindow(socket, Manual)` on each tray slot and
+    /// then `CopyArea` from each embedded applet's redirected
+    /// pixmap into its own visible top-level. Pre-fix every such
+    /// CopyArea is "fully clipped, no backend call" because the
+    /// manually-redirected socket children fully overlap the
+    /// destination — so the tray icons never make it into the
+    /// notification-area-applet's own backing, and mate-compositor
+    /// (which reads that backing via NameWindowPixmap) shows the
+    /// panel without icons.
+    #[test]
+    fn copy_area_clip_by_children_ignores_manually_redirected_child() {
+        use crate::{
+            resources::{MapState, WindowClass},
+            server::{CompositeRedirectMode, RedirectRecord},
+        };
+        use yserver_protocol::x11::{ClientId, CreateWindowRequest, ResourceId};
+
+        let mut state = ServerState::new();
+        let parent_xid = ResourceId(0x0021_0003);
+        let child_xid = ResourceId(0x0021_0013);
+
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: parent_xid,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: child_xid,
+                parent: parent_xid,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let child = state.resources.window_mut(child_xid).expect("child");
+            child.map_state = MapState::Viewable;
+            assert_eq!(child.class, WindowClass::InputOutput);
+        }
+        // RedirectWindow(child, Manual). Key shape is
+        // `(window, subwindows=false)` for per-window
+        // RedirectWindow (vs `(parent, true)` for the inherited
+        // RedirectSubwindows form).
+        state.composite_redirects.insert(
+            (child_xid, false),
+            RedirectRecord {
+                mode: CompositeRedirectMode::Manual,
+                owner: ClientId(1),
+            },
+        );
+
+        let rect = yserver_protocol::x11::CopyAreaRequest {
+            src: ResourceId(0x1),
+            dst: parent_xid,
+            gc: ResourceId(0x1),
+            src_x: 0,
+            src_y: 0,
+            dst_x: 0,
+            dst_y: 0,
+            width: 100,
+            height: 80,
+        };
+        let draw_state = crate::backend::DrawState {
+            subwindow_mode: crate::backend::SubwindowMode::ClipByChildren,
+            ..Default::default()
+        };
+
+        let got = copy_area_effective_dst_rects(&state, parent_xid, &draw_state, &rect);
+        assert_eq!(
+            got.len(),
+            1,
+            "manual-redirected child must not be subtracted; got {got:?}"
+        );
+        assert_eq!(got[0].x, 0);
+        assert_eq!(got[0].y, 0);
+        assert_eq!(got[0].width, 100);
+        assert_eq!(got[0].height, 80);
+    }
+
+    /// Regression guard: an AUTOMATIC-redirected child *must*
+    /// still be subtracted by ClipByChildren. With Automatic
+    /// redirect the X server auto-composites the child's backing
+    /// into the parent's pixmap; the parent's own paint then
+    /// clipping out the child's area is the correct shape (the
+    /// child's pixels arrive via the auto-composite, not via the
+    /// parent's paint). The manual-only exception above must not
+    /// loosen this case.
+    #[test]
+    fn copy_area_clip_by_children_still_subtracts_automatic_redirected_child() {
+        use crate::{
+            resources::{MapState, WindowClass},
+            server::{CompositeRedirectMode, RedirectRecord},
+        };
+        use yserver_protocol::x11::{ClientId, CreateWindowRequest, ResourceId};
+
+        let mut state = ServerState::new();
+        let parent_xid = ResourceId(0x0022_0001);
+        let child_xid = ResourceId(0x0022_0002);
+
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: parent_xid,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: child_xid,
+                parent: parent_xid,
+                x: 10,
+                y: 10,
+                width: 50,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let child = state.resources.window_mut(child_xid).expect("child");
+            child.map_state = MapState::Viewable;
+            assert_eq!(child.class, WindowClass::InputOutput);
+        }
+        state.composite_redirects.insert(
+            (child_xid, false),
+            RedirectRecord {
+                mode: CompositeRedirectMode::Automatic,
+                owner: ClientId(1),
+            },
+        );
+
+        let rect = yserver_protocol::x11::CopyAreaRequest {
+            src: ResourceId(0x1),
+            dst: parent_xid,
+            gc: ResourceId(0x1),
+            src_x: 0,
+            src_y: 0,
+            dst_x: 0,
+            dst_y: 0,
+            width: 100,
+            height: 80,
+        };
+        let draw_state = crate::backend::DrawState {
+            subwindow_mode: crate::backend::SubwindowMode::ClipByChildren,
+            ..Default::default()
+        };
+
+        let got = copy_area_effective_dst_rects(&state, parent_xid, &draw_state, &rect);
+        // Automatic-redirected child is still subtracted, so we
+        // expect the original 100×80 rect to be split into four
+        // border strips around the (10,10 50x50) child rect.
+        assert!(
+            got.len() >= 2,
+            "automatic-redirected child must still be subtracted; expected > 1 \
+             strip, got {got:?}"
+        );
+        let child = (10_i32, 10_i32, 60_i32, 60_i32);
+        for r in &got {
+            let rr = (
+                i32::from(r.x),
+                i32::from(r.y),
+                i32::from(r.x) + i32::from(r.width),
+                i32::from(r.y) + i32::from(r.height),
+            );
+            let overlaps = rr.0 < child.2 && rr.2 > child.0 && rr.1 < child.3 && rr.3 > child.1;
+            assert!(
+                !overlaps,
+                "strip ({},{} {}x{}) overlaps automatic-redirected child (10,10 50x50)",
+                r.x, r.y, r.width, r.height,
+            );
+        }
     }
 
     /// RENDER paint ops must fire DamageNotify to damage subscribers on the
