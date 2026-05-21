@@ -426,6 +426,17 @@ struct RenderEngineInner {
     /// rendercheck's `copy_plane` corner.
     logic_fill_caches:
         HashMap<vk::Format, crate::kms::vk::logic_fill_pipeline::LogicFillPipelineCache>,
+    /// Stage 5 Task 4 layer 1: long-lived descriptor pool ring used
+    /// by `try_vk_render_composite` + `try_vk_render_traps_or_tris`.
+    /// Replaces per-call `BatchDescriptorArena` instantiation. Spec
+    /// `2026-05-21-descriptor-pool-ring-design.md`.
+    descriptor_pool_ring: super::descriptor_pool_ring::DescriptorPoolRing,
+    /// Stage 5 Task 4 layer 1: monotonic generation tag. Bumped on
+    /// every paint-op submission; used as the watermark for ring
+    /// pool recycling. The current value is passed to `acquire_set`
+    /// and stamped onto the resulting `SubmittedOp` so the retirement
+    /// loop can call `release_up_to(op.generation)`.
+    acquire_generation: u64,
 }
 
 impl RenderEngine {
@@ -439,6 +450,8 @@ impl RenderEngine {
     /// (no Vk). Production paths always have Vk.
     pub(crate) fn new(platform: &PlatformBackend) -> Result<Self, RenderError> {
         let vk = platform.vk().ok_or(RenderError::NoVk)?.clone();
+        let descriptor_pool_ring =
+            super::descriptor_pool_ring::DescriptorPoolRing::new(Arc::clone(&vk));
         Ok(Self {
             inner: Some(RenderEngineInner {
                 vk,
@@ -457,6 +470,8 @@ impl RenderEngine {
                 mask_scratch: None,
                 drawable_view_cache: HashMap::new(),
                 logic_fill_caches: HashMap::new(),
+                descriptor_pool_ring,
+                acquire_generation: 0,
             }),
         })
     }
@@ -540,6 +555,22 @@ impl RenderEngine {
     /// this to assert the lifecycle book-keeping.
     pub(crate) fn pending_count(&self) -> usize {
         self.inner.as_ref().map(|i| i.submitted.len()).unwrap_or(0)
+    }
+
+    /// Stage 5 Task 4 layer 1: lifetime count of `vkCreateDescriptorPool`
+    /// calls inside the ring. Backend polls this and bumps telemetry.
+    pub(crate) fn descriptor_pool_creates_lifetime(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .map_or(0, |i| i.descriptor_pool_ring.lifetime_creates())
+    }
+
+    /// Stage 5 Task 4 layer 1: lifetime count of successful
+    /// `vkResetDescriptorPool` calls inside the ring.
+    pub(crate) fn descriptor_pool_resets_lifetime(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .map_or(0, |i| i.descriptor_pool_ring.lifetime_resets())
     }
 
     /// Stage 3b: drop any GPU-side state cached for `host_pic`.
@@ -7018,5 +7049,19 @@ mod tests {
             swizzle_class_for_pict_format(vk::Format::R8_UNORM, 8, 0),
             SwizzleClass::AlphaOnlyR8,
         );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn engine_exposes_descriptor_pool_ring_lifetime_counters() {
+        let b = match super::super::backend::KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        assert_eq!(b.engine.descriptor_pool_creates_lifetime(), 0);
+        assert_eq!(b.engine.descriptor_pool_resets_lifetime(), 0);
     }
 }
