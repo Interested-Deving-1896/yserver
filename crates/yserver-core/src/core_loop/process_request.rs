@@ -7937,7 +7937,21 @@ fn handle_change_window_attributes(
                 .and_then(|w| w.host_xid)
                 .map(|w| w.as_raw())
         };
-        let cursor_host_xid = state.resources.cursor_host_xid(cid);
+        // X11 `cursor = None` (xid 0) means "clear the per-window
+        // cursor so the effective cursor inherits from the parent
+        // chain." Match Xorg `dix/window.c:1487-1491`, which sets
+        // `pCursor = (CursorPtr) None` in that case. Pre-fix, we
+        // silently dropped CWA cursor=0 because `cursor_host_xid(0)`
+        // returns None and the (Some, Some) match below failed —
+        // marco's resize-frame XDefineCursor(frame, None) reset never
+        // propagated to the backend, so the resize cursor sprite
+        // stayed visible after the pointer moved off the edge into
+        // the frame interior.
+        let cursor_host_xid = if cid.0 == 0 {
+            Some(0u32)
+        } else {
+            state.resources.cursor_host_xid(cid)
+        };
         if let (Some(hw), Some(ch)) = (host_window_raw, cursor_host_xid) {
             let _ = backend.define_cursor(origin, hw, ch);
         }
@@ -15185,6 +15199,92 @@ mod tests {
             "MapWindow on an already-mapped window must NOT accumulate \
              additional damage — full-extent damage on every redundant \
              call is what drives the recompositing flicker storm.",
+        );
+    }
+
+    /// Per X11 protocol: `cursor = None` (resource id 0) on
+    /// ChangeWindowAttributes(CWCursor) means "clear this window's
+    /// cursor so the effective cursor inherits from the parent
+    /// chain". Pre-fix the handler short-circuited because
+    /// `resources.cursor_host_xid(ResourceId(0))` returns `None` and
+    /// the `(Some, Some)` match below dropped the call — marco
+    /// resets its frame's cursor via `XDefineCursor(frame, None)`
+    /// when the pointer moves off the resize edge into the frame
+    /// interior, and that reset never propagated to the backend
+    /// (resize cursor sprite stayed visible until the pointer left
+    /// the top-level frame entirely). Matches Xorg
+    /// `dix/window.c:1487-1491`.
+    #[test]
+    fn cwa_cursor_none_propagates_define_cursor_zero_to_backend() {
+        use crate::backend::recording::RecordedCall;
+
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0020;
+        const HOST_XID: u32 = 0x0040_0020;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 80,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+        }
+
+        // CWA body: window xid (4) + value_mask (4) + values.
+        // CWCursor is bit 14 (mask = 0x4000); value = 0 means
+        // X11 None.
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&WINDOW_XID.to_le_bytes());
+        body.extend_from_slice(&0x4000u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+
+        handle_change_window_attributes(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_change_window_attributes");
+
+        let define_cursor_calls: Vec<_> = backend
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, RecordedCall::DefineCursor { .. }))
+            .collect();
+        assert_eq!(
+            define_cursor_calls,
+            vec![RecordedCall::DefineCursor {
+                host_window_xid: HOST_XID,
+                cursor_host_xid: 0,
+            }],
+            "CWA with CWCursor + value=0 must invoke \
+             `backend.define_cursor(window, 0)` so the backend clears \
+             its per-window cursor slot and refreshes the effective \
+             cursor. Pre-fix this dropped silently, leaving stale \
+             cursor state (marco's resize-frame XDefineCursor(frame, \
+             None) reset on edge→interior transitions had no effect).",
         );
     }
 

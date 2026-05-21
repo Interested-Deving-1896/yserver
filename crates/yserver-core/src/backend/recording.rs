@@ -115,6 +115,10 @@ pub enum RecordedCall {
         width: u16,
         height: u16,
     },
+    DefineCursor {
+        host_window_xid: u32,
+        cursor_host_xid: u32,
+    },
 }
 
 /// Test double for `Backend`. Auto-allocates host xids from a private
@@ -560,9 +564,13 @@ impl Backend for RecordingBackend {
     fn define_cursor(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_window_xid: u32,
-        _cursor_host_xid: u32,
+        host_window_xid: u32,
+        cursor_host_xid: u32,
     ) -> io::Result<()> {
+        self.record(RecordedCall::DefineCursor {
+            host_window_xid,
+            cursor_host_xid,
+        });
         Ok(())
     }
 

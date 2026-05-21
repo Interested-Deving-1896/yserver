@@ -223,6 +223,27 @@ Cross-cutting bugs and followups that don't fit a stage live in
   `pWin->mapped` before any redirect / MapNotify / exposure work;
   yserver now does the same. Regression:
   `map_window_on_already_mapped_window_is_no_op`.
+  Latest narrowing — same hardware-NVIDIA MATE run, cursor-shape
+  regression on resize-frame interior. Pointer entering a marco
+  resize-edge correctly swapped the cursor to the right resize shape,
+  and leaving the top-level frame entirely restored the default; but
+  moving from the edge back into the frame interior left the resize
+  cursor sticky. Marco implements this by issuing dynamic
+  `XDefineCursor(frame, resize_xid)` / `XDefineCursor(frame, None)`
+  pairs on motion, where the second call (`cursor = None = xid 0`)
+  must clear the per-window cursor so the effective cursor walks up
+  to the parent / `core.active_cursor` fallback. yserver's CWA
+  handler in `handle_change_window_attributes` short-circuited that
+  reset path: `state.resources.cursor_host_xid(ResourceId(0))`
+  returns `None` (no cursor resource with xid 0), and the
+  `if let (Some(hw), Some(ch))` guard around the
+  `backend.define_cursor` call dropped the request silently. Both v1
+  and v2 backends already treat `cursor_host_xid == 0` as the X11
+  None case (clear per-window cursor + refresh effective cursor) —
+  the bug was only in the protocol-layer routing. Match Xorg
+  `dix/window.c:1487-1491`, which sets `pCursor = (CursorPtr) None`
+  when `cursorID == None`. Regression:
+  `cwa_cursor_none_propagates_define_cursor_zero_to_backend`.
 
 ### What runs on v2 today (after 3f.15 + hardware-smoke fixes)
 
