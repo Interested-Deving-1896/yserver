@@ -9315,7 +9315,21 @@ fn handle_map_window(
         return Ok(RequestOutcome::Handled);
     }
 
-    let _ = state.resources.map_window(window);
+    // Per X11 protocol: "If the window is already mapped, this request
+    // has no effect." Without this guard a client that pounds MapWindow
+    // on an already-viewable popup (brisk-menu's GTK3
+    // `gtk_window_present` loop hits this at ~50 Hz) causes a fresh
+    // MapNotify → Expose → full-extent damage cascade every call. Marco
+    // reacts to each MapNotify with a `COMPOSITE::NameWindowPixmap` and
+    // full recomposite, which is visible as menu flicker on KMS.
+    let was_unmapped = state.resources.map_window(window);
+    if !was_unmapped {
+        debug!(
+            "client {} #{} MapWindow 0x{:x} (already mapped — no-op)",
+            client_id.0, sequence.0, window.0
+        );
+        return Ok(RequestOutcome::Handled);
+    }
     let host_xid = state.resources.window(window).and_then(|w| w.host_xid);
     let map_info = state
         .resources
@@ -15013,6 +15027,164 @@ mod tests {
              subscribed compositor repaints the new region into its \
              offscreen — pre-fix this is empty and the compositor \
              never sees the newly-mapped popup / tray icon / window",
+        );
+    }
+
+    /// Per X11 protocol spec: "If the window is already mapped, this
+    /// request has no effect." brisk-menu (Ubuntu MATE's standalone
+    /// applications popup) pounds `MapWindow` at ~50 Hz on its
+    /// already-viewable override-redirect popup via GTK3's
+    /// `gtk_window_present`/`XMapRaised` loop. Pre-fix every redundant
+    /// MapWindow re-emitted MapNotify → Expose → full-extent damage,
+    /// triggering Marco to issue `COMPOSITE::NameWindowPixmap` and a
+    /// full recomposite of the popup ~50× per second — visible as
+    /// menu flicker on the COW-authoritative KMS scene path.
+    #[test]
+    fn map_window_on_already_mapped_window_is_no_op() {
+        use crate::server::DamageObject;
+        use std::io::Read;
+
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0014;
+        const HOST_XID: u32 = 0x0040_0014;
+        const DAMAGE_ID: u32 = 0x0080_0014;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 80,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+        }
+
+        // Marco-like subscriber: SubstructureNotify on root +
+        // XDamageCreate on the new window.
+        state
+            .clients
+            .get_mut(&CLIENT_ID)
+            .unwrap()
+            .event_masks
+            .insert(ROOT_WINDOW, 0x0008_0000);
+        state.damage_objects.insert(
+            DAMAGE_ID,
+            DamageObject {
+                owner: ClientId(CLIENT_ID),
+                drawable: ResourceId(WINDOW_XID),
+                level: 0,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+                last_reported_geometry: None,
+            },
+        );
+
+        let mut body = Vec::with_capacity(4);
+        body.extend_from_slice(&WINDOW_XID.to_le_bytes());
+
+        // First map: genuine transition Unmapped → Viewable. Should
+        // emit MapNotify + accumulate damage.
+        handle_map_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_map_window first");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut tmp = [0u8; 1024];
+        let mut first_wire = Vec::new();
+        loop {
+            match peer.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => first_wire.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        let first_map_notifies = first_wire
+            .chunks_exact(32)
+            .filter(|chunk| chunk[0] & 0x7f == 19)
+            .count();
+        assert!(
+            first_map_notifies >= 1,
+            "first MapWindow on an unmapped window must emit MapNotify",
+        );
+        let first_rect_count = state
+            .damage_objects
+            .get(&DAMAGE_ID)
+            .expect("damage object")
+            .rects
+            .len();
+        assert!(
+            first_rect_count > 0,
+            "first MapWindow must accumulate damage on the window extent",
+        );
+
+        // Second map on the now-already-Viewable window. Per spec this
+        // is a no-op: no MapNotify, no extra damage rects.
+        handle_map_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(2),
+            &body,
+        )
+        .expect("handle_map_window second");
+
+        let mut second_wire = Vec::new();
+        loop {
+            match peer.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => second_wire.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        let second_map_notifies = second_wire
+            .chunks_exact(32)
+            .filter(|chunk| chunk[0] & 0x7f == 19)
+            .count();
+        assert_eq!(
+            second_map_notifies, 0,
+            "MapWindow on an already-mapped window must NOT re-emit \
+             MapNotify — repeated MapNotifies cause Marco to re-issue \
+             COMPOSITE::NameWindowPixmap and full recomposite on every \
+             redundant map (visible as brisk-menu flicker on KMS).",
+        );
+        let second_rect_count = state
+            .damage_objects
+            .get(&DAMAGE_ID)
+            .expect("damage object")
+            .rects
+            .len();
+        assert_eq!(
+            second_rect_count, first_rect_count,
+            "MapWindow on an already-mapped window must NOT accumulate \
+             additional damage — full-extent damage on every redundant \
+             call is what drives the recompositing flicker storm.",
         );
     }
 

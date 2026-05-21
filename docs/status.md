@@ -207,6 +207,22 @@ Cross-cutting bugs and followups that don't fit a stage live in
   it through every emitted `ConfigureNotify`. Regressions:
   `encode_configure_notify_event_writes_above_sibling` and
   `configure_notify_above_sibling_tracks_restacked_order`.
+  Latest narrowing from the first hardware-NVIDIA MATE run with
+  brisk-menu (Ubuntu MATE's standalone applications popup, replacing
+  the classic in-panel menu used on the other test box) found a
+  spec-conformance gap in `MapWindow`. Brisk-menu pounds
+  `XMapWindow`/`XMapRaised` on its already-viewable override-redirect
+  popup at ~40–60 Hz (GTK3's `gtk_window_present` loop, amplified by
+  yserver's stub `XIGrabDevice`). `handle_map_window` was discarding
+  the `was_unmapped` return from `state.resources.map_window` and
+  unconditionally re-emitting MapNotify → Expose → full-extent damage
+  on every call. Marco then issued a fresh
+  `COMPOSITE::NameWindowPixmap` and full recomposite of the popup
+  ~50×/s, visible as menu flicker on the COW-authoritative KMS scene.
+  Xorg `dix/window.c:2661` early-returns `Success` on
+  `pWin->mapped` before any redirect / MapNotify / exposure work;
+  yserver now does the same. Regression:
+  `map_window_on_already_mapped_window_is_no_op`.
 
 ### What runs on v2 today (after 3f.15 + hardware-smoke fixes)
 
