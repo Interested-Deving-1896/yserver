@@ -82,6 +82,65 @@ impl DescriptorPoolRing {
     pub(crate) fn lifetime_resets(&self) -> u64 {
         self.lifetime_resets
     }
+
+    /// Acquire one descriptor set with `layout`, tagging the issuing
+    /// pool with `generation`. Spec § "Architecture" / § "Internals
+    /// on acquire_set": (1) ensure an Active pool exists + has
+    /// capacity, (2) `vkAllocateDescriptorSets`, (3) bump the slot's
+    /// `high_water_generation` and decrement `sets_remaining`.
+    ///
+    /// Errors map directly from Vk: `ERROR_OUT_OF_HOST_MEMORY`,
+    /// `ERROR_OUT_OF_DEVICE_MEMORY`, etc. — propagated to the engine
+    /// which converts to `RenderError::Vk`.
+    pub(crate) fn acquire_set(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+        generation: u64,
+    ) -> Result<vk::DescriptorSet, vk::Result> {
+        if self.active.is_none() {
+            self.create_pool_active()?;
+        }
+        let idx = self.active.expect("active set above");
+        let pool = self.pools[idx].pool;
+        let layouts = [layout];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(pool)
+            .set_layouts(&layouts);
+        let sets = unsafe { self.vk.device.allocate_descriptor_sets(&alloc_info)? };
+        let slot = &mut self.pools[idx];
+        slot.sets_remaining = slot.sets_remaining.saturating_sub(1);
+        if slot.high_water_generation < generation {
+            slot.high_water_generation = generation;
+        }
+        Ok(sets[0])
+    }
+
+    fn create_pool_active(&mut self) -> Result<(), vk::Result> {
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(SAMPLERS_PER_POOL),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(UNIFORMS_PER_POOL),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(STORAGE_PER_POOL),
+        ];
+        let info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(SETS_PER_POOL)
+            .pool_sizes(&pool_sizes);
+        let pool = unsafe { self.vk.device.create_descriptor_pool(&info, None)? };
+        self.lifetime_creates += 1;
+        self.pools.push(PoolSlot {
+            pool,
+            state: PoolState::Active,
+            high_water_generation: 0,
+            sets_remaining: SETS_PER_POOL,
+        });
+        self.active = Some(self.pools.len() - 1);
+        Ok(())
+    }
 }
 
 impl Drop for DescriptorPoolRing {
@@ -119,5 +178,48 @@ mod tests {
         assert_eq!(ring.lifetime_creates(), 0);
         assert_eq!(ring.lifetime_resets(), 0);
         // Drop runs at end of scope; must not panic on empty ring.
+    }
+
+    fn make_layout(vk: &VkContext) -> vk::DescriptorSetLayout {
+        let bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        unsafe {
+            vk.device
+                .create_descriptor_set_layout(&info, None)
+                .expect("layout")
+        }
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn acquire_grows_when_no_free_pool() {
+        let Some(vk) = vk_or_skip() else { return };
+        let layout = make_layout(&vk);
+        let mut ring = DescriptorPoolRing::new(Arc::clone(&vk));
+        let set = ring.acquire_set(layout, 1).expect("acquire");
+        assert_ne!(set, vk::DescriptorSet::null());
+        assert_eq!(ring.pool_count(), 1);
+        // (Free, Active, InFlight, Poisoned)
+        assert_eq!(ring.state_counts(), (0, 1, 0, 0));
+        assert_eq!(ring.lifetime_creates(), 1);
+        unsafe { vk.device.destroy_descriptor_set_layout(layout, None) };
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn drop_destroys_all_pools() {
+        let Some(vk) = vk_or_skip() else { return };
+        let layout = make_layout(&vk);
+        {
+            let mut ring = DescriptorPoolRing::new(Arc::clone(&vk));
+            let _ = ring.acquire_set(layout, 1).expect("acquire");
+            // Drop the ring here. If destroy_descriptor_pool leaks,
+            // the validation layer flags it on VkDevice destroy.
+        }
+        unsafe { vk.device.destroy_descriptor_set_layout(layout, None) };
     }
 }
