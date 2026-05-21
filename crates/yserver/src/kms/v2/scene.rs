@@ -335,7 +335,7 @@ pub(crate) struct SceneCompositor {
     /// `build_scene` calls.
     hw_cursor_strategy_enabled: bool,
     /// Stage 4d — Composite Overlay Window scene entry. Lazily set
-    /// by `register_cow` on the first client paint into COW (the
+    /// by `register_cow` on the first overlay `PresentPixmap` (the
     /// xfwm4 case allocates COW but never paints into it, so
     /// registering eagerly would cover the scene with the depth-24
     /// force-opaque initial fill). Lives on the outer struct (not
@@ -541,9 +541,10 @@ impl SceneCompositor {
 
     /// Whether the Composite Overlay Window is currently registered
     /// as a scene entry. The backend uses this to lazy-register on
-    /// the first client paint into COW (the xfwm4 case allocates COW
-    /// but never paints into it, so registering on allocation would
-    /// cover the scene with the depth-24 force-opaque initial fill).
+    /// the first overlay `PresentPixmap` (the xfwm4 case allocates
+    /// COW but never paints into it directly, so registering on
+    /// allocation would cover the scene with the depth-24
+    /// force-opaque initial fill).
     pub(crate) fn is_cow_registered(&self) -> bool {
         self.cow.is_some()
     }
@@ -1571,8 +1572,8 @@ fn build_scene(
     }
     // Stage 4d — COW-authoritative mode (option 2a from the
     // shadow-hunt). Once a compositor has registered COW (i.e.
-    // `cow.is_some()` — set by `register_cow` on the first paint
-    // that lands in COW), the scene strips per-top-level entries.
+    // `cow.is_some()` — set by `register_cow` on the first overlay
+    // `PresentPixmap`), the scene strips per-top-level entries.
     // Scanout becomes `root + COW + cursor` only, mirroring Xorg's
     // compositor contract: the X server doesn't itself compose
     // redirected toplevels; the compositor reads the redirected

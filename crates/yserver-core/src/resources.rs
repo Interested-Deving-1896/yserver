@@ -482,6 +482,17 @@ impl ResourceTable {
         destroyed
     }
 
+    #[must_use]
+    pub fn configure_notify_above_sibling(&self, id: ResourceId) -> Option<ResourceId> {
+        let window = self.windows.get(&id.0)?;
+        let parent = self.windows.get(&window.parent.0)?;
+        let index = parent.children.iter().position(|child| *child == id)?;
+        index
+            .checked_sub(1)
+            .and_then(|i| parent.children.get(i))
+            .copied()
+    }
+
     /// Walk the about-to-be-destroyed window subtree and collect every
     /// retained bg-pixmap host XID. Caller frees them on the host.
     pub fn collect_bg_pixmap_host_xids(&self, root: ResourceId) -> Vec<u32> {
@@ -1247,6 +1258,17 @@ impl ResourceTable {
 
     pub fn pixmap(&self, id: ResourceId) -> Option<&Pixmap> {
         self.pixmaps.get(&id.0)
+    }
+
+    #[must_use]
+    pub fn composite_named_pixmap_owner_window(&self, pixmap: ResourceId) -> Option<ResourceId> {
+        self.windows.values().find_map(|window| {
+            window
+                .composite_named_pixmaps
+                .iter()
+                .any(|alias| alias.client_pixmap == pixmap)
+                .then_some(window.id)
+        })
     }
 
     #[must_use]
@@ -3505,6 +3527,38 @@ mod tests {
 
         assert_eq!(
             t.pointer_target_at(ROOT_WINDOW, 10, 10).map(|h| h.0),
+            Some(ResourceId(0x200))
+        );
+    }
+
+    #[test]
+    fn configure_notify_above_sibling_tracks_restacked_order() {
+        let mut t = three_mapped_children(0, 0, 0);
+        assert_eq!(t.configure_notify_above_sibling(ResourceId(0x200)), None);
+        assert_eq!(
+            t.configure_notify_above_sibling(ResourceId(0x300)),
+            Some(ResourceId(0x200))
+        );
+        assert_eq!(
+            t.configure_notify_above_sibling(ResourceId(0x400)),
+            Some(ResourceId(0x300))
+        );
+
+        assert!(
+            t.configure_window(restack_request(0x400, Some(0x200), 1))
+                .is_some()
+        );
+        assert_eq!(
+            t.children(ROOT_WINDOW),
+            &[ResourceId(0x400), ResourceId(0x200), ResourceId(0x300)]
+        );
+        assert_eq!(t.configure_notify_above_sibling(ResourceId(0x400)), None);
+        assert_eq!(
+            t.configure_notify_above_sibling(ResourceId(0x200)),
+            Some(ResourceId(0x400))
+        );
+        assert_eq!(
+            t.configure_notify_above_sibling(ResourceId(0x300)),
             Some(ResourceId(0x200))
         );
     }

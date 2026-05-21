@@ -758,6 +758,7 @@ pub(crate) fn handle_host_container_resize(
                 order,
                 crate::resources::ROOT_WINDOW,
                 crate::resources::ROOT_WINDOW,
+                None,
                 x11::Geometry {
                     root: crate::resources::ROOT_WINDOW,
                     x: 0,

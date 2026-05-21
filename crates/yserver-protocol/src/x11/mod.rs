@@ -1432,6 +1432,7 @@ pub fn encode_configure_notify_event(
     order: ClientByteOrder,
     event_window: ResourceId,
     window: ResourceId,
+    above_sibling: Option<ResourceId>,
     geometry: Geometry,
     override_redirect: bool,
 ) {
@@ -1440,7 +1441,7 @@ pub fn encode_configure_notify_event(
     write_u16(order, out, sequence.0);
     write_u32(order, out, event_window.0);
     write_u32(order, out, window.0);
-    write_u32(order, out, 0); // above-sibling
+    write_u32(order, out, above_sibling.unwrap_or(ResourceId(0)).0);
     write_i16(order, out, geometry.x);
     write_i16(order, out, geometry.y);
     write_u16(order, out, geometry.width);
@@ -2988,6 +2989,32 @@ pub fn write_get_modifier_mapping_reply_with_keycodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_configure_notify_event_writes_above_sibling() {
+        let mut buf = Vec::new();
+        encode_configure_notify_event(
+            &mut buf,
+            SequenceNumber(0x1234),
+            ClientByteOrder::LittleEndian,
+            ResourceId(0x100),
+            ResourceId(0x200),
+            Some(ResourceId(0x300)),
+            Geometry {
+                root: ResourceId(0x100),
+                x: 10,
+                y: 20,
+                width: 640,
+                height: 480,
+                border_width: 2,
+                depth: 24,
+            },
+            false,
+        );
+
+        assert_eq!(buf[0], 22);
+        assert_eq!(u32::from_le_bytes(buf[12..16].try_into().unwrap()), 0x300);
+    }
 
     #[test]
     fn write_list_fonts_with_info_reply_round_trip() {

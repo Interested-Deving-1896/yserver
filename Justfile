@@ -560,7 +560,7 @@ thunar-xorg-trace real="$DISPLAY":
 # MATE on yserver/KMS with x11trace recording the full X11 wire
 # protocol between clients and yserver. Follows the server default
 # cursor strategy, currently SW cursor.
-yserver-mate-hw-trace log="debug,yserver::kms::v2::scene=debug,yserver::kms::v2::backend=debug,yserver::kms::v2::platform=debug":
+yserver-mate-hw-trace log="debug,yserver_core::core_loop::damage_fanout=trace,yserver::xfixes::clip=trace,yserver::xfixes::region=trace,yserver::kms::v2::render=trace":
     cargo build --bin yserver
     rm -f mate.xtrace
     bash -c '\

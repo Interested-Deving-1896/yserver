@@ -21,14 +21,17 @@
 
 use std::{io, os::fd::OwnedFd};
 
-use log::debug;
+use log::{debug, trace};
 use yserver_protocol::x11::{self, AtomId, ClientId, RequestHeader, ResourceId, SequenceNumber};
 
 use crate::{
     backend::{Backend, OriginContext, params::FillState},
     core_loop::{
         client_io::{self, WriteOutcome},
-        damage_fanout::{accumulate_damage_full_to_state, accumulate_damage_to_state},
+        damage_fanout::{
+            accumulate_damage_full_to_state, accumulate_damage_to_state,
+            report_existing_damage_to_state,
+        },
         fanout::{
             client_target_id, emit_expose_subtree_to_state, emit_window_event_to_state,
             emit_xi2_focus_event_to_state, fanout_event_to_clients, fanout_raw_event_to_clients,
@@ -445,6 +448,24 @@ fn normalize_region_rects(
     rects: Vec<yserver_protocol::x11::xfixes::RegionRect>,
 ) -> Vec<yserver_protocol::x11::xfixes::RegionRect> {
     crate::nested::normalize_region_rects(rects)
+}
+
+fn format_region_rects(rects: &[yserver_protocol::x11::xfixes::RegionRect]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::from("[");
+    for (i, rect) in rects.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let _ = write!(
+            out,
+            "({},{} {}x{})",
+            rect.x, rect.y, rect.width, rect.height
+        );
+    }
+    out.push(']');
+    out
 }
 
 fn resolve_host_subwindow_visual_to_state(
@@ -1216,6 +1237,7 @@ fn handle_render_request(
             let Some(req) = x11::render_create_picture_request(body) else {
                 return Ok(RequestOutcome::Handled);
             };
+            let damage_drawable = render_picture_damage_drawable(state, req.drawable);
             let drawable_origin = state
                 .resources
                 .window(req.drawable)
@@ -1246,7 +1268,7 @@ fn handle_render_request(
                         host_picture_xid: host_pic,
                         host_owned_pixmap: None,
                         kind: crate::resources::PictureKind::Drawable,
-                        drawable: Some(req.drawable),
+                        drawable: Some(damage_drawable),
                     },
                 );
             }
@@ -2885,6 +2907,12 @@ fn handle_xfixes_request(
                     );
                 }
                 let rects = crate::nested::shape_rects_for(state, ResourceId(window), kind);
+                trace!(
+                    target: "yserver::xfixes::region",
+                    "CreateRegionFromWindow region=0x{region:08x} window=0x{window:08x} kind={} rects{}",
+                    kind,
+                    format_region_rects(&rects),
+                );
                 state.xfixes_regions.insert(
                     region,
                     crate::server::XFixesRegion {
@@ -2997,6 +3025,11 @@ fn handle_xfixes_request(
                     .get(&source)
                     .map(|r| r.rects.clone())
                     .unwrap_or_default();
+                trace!(
+                    target: "yserver::xfixes::region",
+                    "CopyRegion src=0x{source:08x} dst=0x{dest:08x} rects{}",
+                    format_region_rects(&rects),
+                );
                 state.xfixes_regions.insert(
                     dest,
                     crate::server::XFixesRegion {
@@ -3018,6 +3051,12 @@ fn handle_xfixes_request(
                     .get(&source2)
                     .map(|r| r.rects.clone())
                     .unwrap_or_default();
+                let op_name = match minor {
+                    x11xfixes::UNION_REGION => "UnionRegion",
+                    x11xfixes::INTERSECT_REGION => "IntersectRegion",
+                    x11xfixes::SUBTRACT_REGION => "SubtractRegion",
+                    _ => unreachable!(),
+                };
                 let rects = match minor {
                     x11xfixes::UNION_REGION => crate::nested::union_regions(&a, &b),
                     x11xfixes::INTERSECT_REGION => crate::nested::intersect_regions(&a, &b),
@@ -3031,6 +3070,13 @@ fn handle_xfixes_request(
                     }
                     _ => unreachable!(),
                 };
+                trace!(
+                    target: "yserver::xfixes::region",
+                    "{op_name} a=0x{source1:08x} rects{} b=0x{source2:08x} rects{} dst=0x{dest:08x} rects{}",
+                    format_region_rects(&a),
+                    format_region_rects(&b),
+                    format_region_rects(&rects),
+                );
                 state.xfixes_regions.insert(
                     dest,
                     crate::server::XFixesRegion {
@@ -3060,10 +3106,17 @@ fn handle_xfixes_request(
             }
         }
         x11xfixes::TRANSLATE_REGION => {
-            if let Some((region, dx, dy)) = x11xfixes::parse_translate_region(body)
-                && let Some(region) = state.xfixes_regions.get_mut(&region)
+            if let Some((region_id, dx, dy)) = x11xfixes::parse_translate_region(body)
+                && let Some(region) = state.xfixes_regions.get_mut(&region_id)
             {
+                let before = region.rects.clone();
                 crate::nested::translate_region(&mut region.rects, dx, dy);
+                trace!(
+                    target: "yserver::xfixes::region",
+                    "TranslateRegion region=0x{region_id:08x} delta=({dx}, {dy}) before{} after{}",
+                    format_region_rects(&before),
+                    format_region_rects(&region.rects),
+                );
             }
         }
         x11xfixes::REGION_EXTENTS => {
@@ -3194,6 +3247,16 @@ fn handle_xfixes_request(
                             .get(&req.region)
                             .map(|r| r.rects.clone())
                             .unwrap_or_default();
+                        trace!(
+                            target: "yserver::xfixes::clip",
+                            "SetPictureClipRegion client_pic=0x{:08x} host_pic=0x{hp:08x} region=0x{:08x} origin=({}, {}) n={} rects{}",
+                            req.picture,
+                            req.region,
+                            req.x_origin,
+                            req.y_origin,
+                            rects.len(),
+                            format_region_rects(&rects),
+                        );
                         // RENDER SetPictureClipRectangles body layout:
                         // picture(4) | x_origin(2) | y_origin(2) | rects(8*N).
                         let mut out = Vec::with_capacity(8 + rects.len() * 8);
@@ -4343,20 +4406,36 @@ fn handle_damage_request(
         }
         x11damage::CREATE => {
             if let Some((damage, drawable, level)) = x11damage::parse_create(body) {
+                let drawable_id = ResourceId(drawable);
                 state.damage_objects.insert(
                     damage,
                     crate::server::DamageObject {
                         owner: client_id,
-                        drawable: ResourceId(drawable),
+                        drawable: drawable_id,
                         level,
                         rects: Vec::new(),
                         pending_notify_fired: false,
+                        last_reported_geometry: None,
                     },
                 );
                 debug!(
                     "client {} #{} DAMAGE::Create damage=0x{damage:x} drawable=0x{drawable:x} level={level}",
                     client_id.0, sequence.0,
                 );
+                let seed_initial_damage = state
+                    .resources
+                    .window(drawable_id)
+                    .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+                if seed_initial_damage {
+                    log::trace!(
+                        target: "yserver_core::core_loop::damage_fanout",
+                        "damage_create_seed_full: damage=0x{:x} drawable=0x{:x} level={}",
+                        damage,
+                        drawable,
+                        level,
+                    );
+                    let _dropped = accumulate_damage_full_to_state(state, drawable_id);
+                }
             } else {
                 debug!(
                     "client {} #{} DAMAGE::Create parse_failed",
@@ -4414,8 +4493,23 @@ fn handle_damage_request(
                 let old_damage = state
                     .damage_objects
                     .get(&damage_id)
-                    .map(|d| d.rects.clone())
+                    .map(|d| normalize_region_rects(d.rects.clone()))
                     .unwrap_or_default();
+                let drawable = state
+                    .damage_objects
+                    .get(&damage_id)
+                    .map(|d| d.drawable.0)
+                    .unwrap_or(0);
+                let level = state
+                    .damage_objects
+                    .get(&damage_id)
+                    .map(|d| d.level)
+                    .unwrap_or(0);
+                let owner = state
+                    .damage_objects
+                    .get(&damage_id)
+                    .map(|d| d.owner.0)
+                    .unwrap_or(0);
                 let (parts_rects, new_damage) = if repair == 0 {
                     (old_damage.clone(), Vec::new())
                 } else {
@@ -4428,6 +4522,15 @@ fn handle_damage_request(
                         crate::nested::intersect_regions(&old_damage, &repair_rects),
                         crate::nested::subtract_regions(&old_damage, &repair_rects),
                     )
+                };
+                let repair_rects = if repair == 0 {
+                    Vec::new()
+                } else {
+                    state
+                        .xfixes_regions
+                        .get(&repair)
+                        .map(|r| r.rects.clone())
+                        .unwrap_or_default()
                 };
                 if parts != 0 {
                     state.xfixes_regions.insert(
@@ -4442,8 +4545,62 @@ fn handle_damage_request(
                     damage.rects = new_damage;
                     damage.pending_notify_fired = false;
                 }
+                if repair != 0
+                    && level != x11damage::report_level::RAW_RECTANGLES
+                    && state
+                        .damage_objects
+                        .get(&damage_id)
+                        .is_some_and(|d| !d.rects.is_empty())
+                {
+                    let _dropped = report_existing_damage_to_state(state, damage_id);
+                }
+                let parts_owner = if parts == 0 {
+                    0
+                } else {
+                    state.xfixes_regions.get(&parts).map_or(0, |r| r.owner.0)
+                };
+                trace!(
+                    "client {} #{} DAMAGE::Subtract damage=0x{damage_id:x} drawable=0x{drawable:x} \
+                     owner={} level={} repair=0x{repair:x} parts=0x{parts:x} parts_owner={} \
+                     old_n={} old={} repair_n={} repair_rects={} parts_n={} parts_rects={} \
+                     new_n={} new_rects={}",
+                    client_id.0,
+                    sequence.0,
+                    owner,
+                    level,
+                    parts_owner,
+                    old_damage.len(),
+                    format_region_rects(&old_damage),
+                    repair_rects.len(),
+                    format_region_rects(&repair_rects),
+                    if parts == 0 {
+                        0
+                    } else {
+                        state
+                            .xfixes_regions
+                            .get(&parts)
+                            .map_or(0, |r| r.rects.len())
+                    },
+                    format_region_rects(
+                        &state
+                            .xfixes_regions
+                            .get(&parts)
+                            .map(|r| r.rects.clone())
+                            .unwrap_or_default()
+                    ),
+                    state
+                        .damage_objects
+                        .get(&damage_id)
+                        .map_or(0, |d| d.rects.len()),
+                    format_region_rects(
+                        &state
+                            .damage_objects
+                            .get(&damage_id)
+                            .map(|d| d.rects.clone())
+                            .unwrap_or_default()
+                    ),
+                );
             }
-            debug!("client {} #{} DAMAGE::Subtract", client_id.0, sequence.0);
         }
         other => {
             debug!(
@@ -4763,17 +4920,48 @@ fn handle_present_request(
                         PRESENT_MAJOR_OPCODE,
                     );
                 }
-                backend.copy_area(
-                    origin,
-                    host_xid.as_raw(),
-                    dst.host_xid(),
-                    req.x_off,
-                    req.y_off,
-                    0,
-                    0,
-                    width,
-                    height,
-                )?;
+                if req.update != 0 {
+                    if let Some(region) = state.xfixes_regions.get(&req.update) {
+                        for rect in &region.rects {
+                            backend.copy_area(
+                                origin,
+                                host_xid.as_raw(),
+                                dst.host_xid(),
+                                rect.x,
+                                rect.y,
+                                req.x_off.saturating_add(rect.x),
+                                req.y_off.saturating_add(rect.y),
+                                rect.width,
+                                rect.height,
+                            )?;
+                        }
+                    } else {
+                        backend.copy_area(
+                            origin,
+                            host_xid.as_raw(),
+                            dst.host_xid(),
+                            0,
+                            0,
+                            req.x_off,
+                            req.y_off,
+                            width,
+                            height,
+                        )?;
+                    }
+                } else {
+                    backend.copy_area(
+                        origin,
+                        host_xid.as_raw(),
+                        dst.host_xid(),
+                        0,
+                        0,
+                        req.x_off,
+                        req.y_off,
+                        width,
+                        height,
+                    )?;
+                }
+                backend.wait_for_drawable_idle(dst.host_xid())?;
                 // Observer hook for the diagnostic drawable-dump.
                 // Pass the *host* (backend-side) xids — `req.pixmap`
                 // and `req.window` are CLIENT xids, but backends
@@ -4782,6 +4970,30 @@ fn handle_present_request(
                 // `host_xid.as_raw()` / `dst.host_xid()` keeps the
                 // lookup symmetric with `copy_area` above.
                 backend.note_present_pixmap(host_xid.as_raw(), dst.host_xid());
+                if req.update != 0 {
+                    if let Some(region) = state.xfixes_regions.get(&req.update) {
+                        let rects = region.rects.clone();
+                        for rect in rects {
+                            let _dropped = accumulate_damage_to_state(
+                                state,
+                                ResourceId(req.window),
+                                rect.x,
+                                rect.y,
+                                rect.width,
+                                rect.height,
+                            );
+                        }
+                    }
+                } else {
+                    let _dropped = accumulate_damage_to_state(
+                        state,
+                        ResourceId(req.window),
+                        req.x_off,
+                        req.y_off,
+                        width,
+                        height,
+                    );
+                }
             }
             state
                 .present_msc
@@ -4810,12 +5022,11 @@ fn handle_present_request(
             // Phase 4.2.3 enqueue + fire events. We mirror the
             // request onto the scheduler queue so a follow-up
             // vblank-driven submission path can pick it up; for now
-            // the synchronous copy_area above already produced the
-            // visible result, and we fire CompleteNotify { mode: Copy }
-            // and IdleNotify immediately. Per presentproto §3.3.2 a
-            // Copy makes the pixmap idle as soon as the GPU has
-            // finished reading the source — the synchronous backend
-            // already serialised that.
+            // copy_area plus wait_for_drawable_idle above has produced
+            // the visible result, and we fire CompleteNotify { mode:
+            // Copy } and IdleNotify immediately. Per presentproto
+            // §3.3.2 a Copy makes the pixmap idle as soon as the GPU
+            // has finished reading the source.
             //
             // Per design §4 AsyncMayTear silent-clear: mask the bit
             // off here when the cap isn't advertised.
@@ -4954,7 +5165,7 @@ fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             }
-            if let (
+            let copied_to_dst = if let (
                 Some(crate::resources::HostDrawableTarget::Pixmap {
                     host_xid,
                     width,
@@ -4964,24 +5175,37 @@ fn handle_present_request(
                 }),
                 Some(dst),
             ) = (src, dst)
-                && src_depth == dst.depth()
             {
-                let _ = backend.copy_area(
-                    origin,
-                    host_xid.as_raw(),
-                    dst.host_xid(),
-                    req.x_off,
-                    req.y_off,
-                    0,
-                    0,
-                    width,
-                    height,
+                src_depth == dst.depth()
+                    && backend
+                        .copy_area(
+                            origin,
+                            host_xid.as_raw(),
+                            dst.host_xid(),
+                            req.x_off,
+                            req.y_off,
+                            0,
+                            0,
+                            width,
+                            height,
+                        )
+                        .is_ok()
+                    && backend.wait_for_drawable_idle(dst.host_xid()).is_ok()
+            } else {
+                false
+            };
+            if !copied_to_dst {
+                log::debug!(
+                    "PRESENT::PixmapSynced copy path did not copy/wait before release signal \
+                     (window=0x{:x} pixmap=0x{:x})",
+                    req.window,
+                    req.pixmap
                 );
             }
             // Per design §3.3.2 Copy path: signal the client's
             // release_syncobj at release_value once the GPU has
-            // finished reading the source. The synchronous CopyArea
-            // above is the GPU read; host-signal immediately.
+            // finished reading the source. The copy/wait block above
+            // is the GPU read completion point; host-signal now.
             if req.release_syncobj != 0
                 && let Err(e) = backend.dri3_signal_syncobj(req.release_syncobj, req.release_value)
             {
@@ -7808,6 +8032,7 @@ fn handle_configure_window(
         );
     }
     if let Some((window_id, geometry, override_redirect)) = configure {
+        let above_sibling = state.resources.configure_notify_above_sibling(window_id);
         // TEMP STAGE-4D DIAG: log who actually receives ConfigureNotify
         // for this move, so we can verify marco gets dirty-region
         // triggers for CC frame drags. Remove after compositor-dirty
@@ -7834,6 +8059,7 @@ fn handle_configure_window(
                     order,
                     window_id,
                     window_id,
+                    above_sibling,
                     geometry,
                     override_redirect,
                 );
@@ -7847,6 +8073,7 @@ fn handle_configure_window(
                         order,
                         parent,
                         window_id,
+                        above_sibling,
                         geometry,
                         override_redirect,
                     );
@@ -7886,12 +8113,45 @@ fn handle_configure_window(
         // when a damage object exists on the drawable (the helper
         // filters on `damage_object.drawable == this`), so cost is
         // zero for unredirected/uncomposited windows.
-        if state
-            .resources
-            .window(window_id)
-            .is_some_and(|w| w.redirected_backing.is_some())
+        // Xorg's Composite wakeup on ConfigureWindow is about visible
+        // geometry changes of redirected windows. Pure restacks
+        // (CWSibling/CWStackMode only) do affect stacking order, but
+        // they are not modeled as "whole window damaged" events. Doing
+        // that here seeds bogus fullscreen damage on marco's desktop
+        // window (0x01300005), which then collapses the compositor's
+        // update region before later dialog composites run.
+        const CONFIGURE_DAMAGE_GEOMETRY_MASK: u16 = 0x001f; // x|y|w|h|border
+        let geometry_changed = (request.value_mask & CONFIGURE_DAMAGE_GEOMETRY_MASK) != 0;
+        if geometry_changed && let Some(mode) = effective_redirect_mode_for_window(state, window_id)
         {
+            log::trace!(
+                target: "yserver_core::core_loop::damage_fanout",
+                "configure_damage_emit: window=0x{:x} geom=({},{} {}x{}) old_size={:?} resized={} mode={:?} mask=0x{:x}",
+                window_id.0,
+                geometry.x,
+                geometry.y,
+                geometry.width,
+                geometry.height,
+                old_size,
+                resized,
+                mode,
+                request.value_mask,
+            );
             let _dropped = accumulate_damage_full_to_state(state, window_id);
+        } else {
+            log::trace!(
+                target: "yserver_core::core_loop::damage_fanout",
+                "configure_damage_skip: window=0x{:x} geom=({},{} {}x{}) old_size={:?} resized={} geometry_changed={} mask=0x{:x}",
+                window_id.0,
+                geometry.x,
+                geometry.y,
+                geometry.width,
+                geometry.height,
+                old_size,
+                resized,
+                geometry_changed,
+                request.value_mask,
+            );
         }
         let grew = old_size.is_some_and(|(ow, oh)| geometry.width > ow || geometry.height > oh);
         if grew {
@@ -8085,6 +8345,13 @@ fn dst_picture_is_sourceless(state: &ServerState, dst: ResourceId) -> bool {
         .resources
         .picture(dst)
         .is_some_and(|p| matches!(p.kind, crate::resources::PictureKind::Sourceless))
+}
+
+fn render_picture_damage_drawable(state: &ServerState, drawable: ResourceId) -> ResourceId {
+    state
+        .resources
+        .composite_named_pixmap_owner_window(drawable)
+        .unwrap_or(drawable)
 }
 
 fn emit_x11_error_with_minor(
@@ -9128,12 +9395,28 @@ fn handle_map_window(
     // mate-xorg.xtrace lines 5164→5173.
     if host_xid.is_some() {
         let _dropped = accumulate_damage_full_to_state(state, window);
+        accumulate_damage_viewable_descendants_to_state(state, window);
     }
     debug!(
         "client {} #{} MapWindow 0x{:x}",
         client_id.0, sequence.0, window.0
     );
     Ok(RequestOutcome::Handled)
+}
+
+fn accumulate_damage_viewable_descendants_to_state(state: &mut ServerState, root: ResourceId) {
+    let children: Vec<ResourceId> = state.resources.children(root).to_vec();
+    for child in children {
+        let viewable = state
+            .resources
+            .window(child)
+            .is_some_and(|w| w.map_state == MapState::Viewable);
+        if !viewable {
+            continue;
+        }
+        let _dropped = accumulate_damage_full_to_state(state, child);
+        accumulate_damage_viewable_descendants_to_state(state, child);
+    }
 }
 
 fn handle_map_subwindows(
@@ -13278,6 +13561,353 @@ mod tests {
         );
     }
 
+    #[test]
+    fn present_pixmap_update_region_emits_damage_on_destination_window() {
+        use crate::server::DamageObject;
+        use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest, xfixes::RegionRect};
+
+        const CLIENT: u32 = 14;
+        const WINDOW_XID: u32 = 0x00e0_0103;
+        const PIXMAP_XID: u32 = 0x00e0_0104;
+        const DAMAGE_XID: u32 = 0x00e0_0105;
+        const UPDATE_REGION_XID: u32 = 0x00e0_0106;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(WINDOW_XID));
+        if let Some(w) = state.resources.window_mut(ResourceId(WINDOW_XID)) {
+            w.host_xid = crate::backend::WindowHandle::from_raw(0x400103);
+        }
+
+        state.resources.create_pixmap(
+            ClientId(CLIENT),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(PIXMAP_XID),
+                drawable: ResourceId(WINDOW_XID),
+                width: 800,
+                height: 600,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(PIXMAP_XID),
+            crate::backend::PixmapHandle::from_raw(0x400104).expect("valid host pixmap"),
+        );
+
+        state.damage_objects.insert(
+            DAMAGE_XID,
+            DamageObject {
+                owner: ClientId(CLIENT),
+                drawable: ResourceId(WINDOW_XID),
+                level: 3,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+                last_reported_geometry: None,
+            },
+        );
+        state.xfixes_regions.insert(
+            UPDATE_REGION_XID,
+            crate::server::XFixesRegion {
+                owner: ClientId(CLIENT),
+                rects: vec![
+                    RegionRect {
+                        x: 100,
+                        y: 120,
+                        width: 80,
+                        height: 40,
+                    },
+                    RegionRect {
+                        x: 220,
+                        y: 260,
+                        width: 25,
+                        height: 35,
+                    },
+                ],
+            },
+        );
+
+        let mut body = vec![0u8; 68];
+        body[0..4].copy_from_slice(&WINDOW_XID.to_le_bytes());
+        body[4..8].copy_from_slice(&PIXMAP_XID.to_le_bytes());
+        body[16..20].copy_from_slice(&UPDATE_REGION_XID.to_le_bytes());
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::PIXMAP,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        let damage = state
+            .damage_objects
+            .get(&DAMAGE_XID)
+            .expect("damage object");
+        assert_eq!(
+            damage.rects, state.xfixes_regions[&UPDATE_REGION_XID].rects,
+            "PresentPixmap must feed its update region into DAMAGE on the destination window",
+        );
+    }
+
+    #[test]
+    fn present_pixmap_copy_uses_update_region_rects_as_copy_clips() {
+        use crate::backend::recording::RecordedCall;
+        use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest, xfixes::RegionRect};
+
+        const CLIENT: u32 = 15;
+        const WINDOW_XID: u32 = 0x00e0_0203;
+        const PIXMAP_XID: u32 = 0x00e0_0204;
+        const UPDATE_REGION_XID: u32 = 0x00e0_0206;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(WINDOW_XID));
+        if let Some(w) = state.resources.window_mut(ResourceId(WINDOW_XID)) {
+            w.host_xid = crate::backend::WindowHandle::from_raw(0x400203);
+        }
+
+        state.resources.create_pixmap(
+            ClientId(CLIENT),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(PIXMAP_XID),
+                drawable: ResourceId(WINDOW_XID),
+                width: 800,
+                height: 600,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(PIXMAP_XID),
+            crate::backend::PixmapHandle::from_raw(0x400204).expect("valid host pixmap"),
+        );
+
+        state.xfixes_regions.insert(
+            UPDATE_REGION_XID,
+            crate::server::XFixesRegion {
+                owner: ClientId(CLIENT),
+                rects: vec![
+                    RegionRect {
+                        x: 100,
+                        y: 120,
+                        width: 80,
+                        height: 40,
+                    },
+                    RegionRect {
+                        x: 220,
+                        y: 260,
+                        width: 25,
+                        height: 35,
+                    },
+                ],
+            },
+        );
+
+        let mut body = vec![0u8; 68];
+        body[0..4].copy_from_slice(&WINDOW_XID.to_le_bytes());
+        body[4..8].copy_from_slice(&PIXMAP_XID.to_le_bytes());
+        body[16..20].copy_from_slice(&UPDATE_REGION_XID.to_le_bytes());
+        body[20..22].copy_from_slice(&7_i16.to_le_bytes());
+        body[22..24].copy_from_slice(&11_i16.to_le_bytes());
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::PIXMAP,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        let copies: Vec<_> = backend
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                RecordedCall::CopyArea {
+                    src_host_xid,
+                    dst_host_xid,
+                    src_x,
+                    src_y,
+                    dst_x,
+                    dst_y,
+                    width,
+                    height,
+                } => Some((
+                    src_host_xid,
+                    dst_host_xid,
+                    src_x,
+                    src_y,
+                    dst_x,
+                    dst_y,
+                    width,
+                    height,
+                )),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            copies,
+            vec![
+                (0x400204, 0x400203, 100, 120, 107, 131, 80, 40),
+                (0x400204, 0x400203, 220, 260, 227, 271, 25, 35),
+            ],
+            "PresentPixmap Copy must copy only the update rects, offset into the destination by x_off/y_off",
+        );
+    }
+
+    #[test]
+    fn present_pixmap_copy_without_update_uses_dst_offset_not_src_offset() {
+        use crate::backend::recording::RecordedCall;
+        use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest};
+
+        const CLIENT: u32 = 16;
+        const WINDOW_XID: u32 = 0x00e0_0303;
+        const PIXMAP_XID: u32 = 0x00e0_0304;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 640,
+                height: 480,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(WINDOW_XID));
+        if let Some(w) = state.resources.window_mut(ResourceId(WINDOW_XID)) {
+            w.host_xid = crate::backend::WindowHandle::from_raw(0x400303);
+        }
+
+        state.resources.create_pixmap(
+            ClientId(CLIENT),
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(PIXMAP_XID),
+                drawable: ResourceId(WINDOW_XID),
+                width: 640,
+                height: 480,
+            },
+        );
+        let _ = state.resources.set_pixmap_host_xid(
+            ResourceId(PIXMAP_XID),
+            crate::backend::PixmapHandle::from_raw(0x400304).expect("valid host pixmap"),
+        );
+
+        let mut body = vec![0u8; 68];
+        body[0..4].copy_from_slice(&WINDOW_XID.to_le_bytes());
+        body[4..8].copy_from_slice(&PIXMAP_XID.to_le_bytes());
+        body[20..22].copy_from_slice(&13_i16.to_le_bytes());
+        body[22..24].copy_from_slice(&17_i16.to_le_bytes());
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::PIXMAP,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        let copies: Vec<_> = backend
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                RecordedCall::CopyArea {
+                    src_host_xid,
+                    dst_host_xid,
+                    src_x,
+                    src_y,
+                    dst_x,
+                    dst_y,
+                    width,
+                    height,
+                } => Some((
+                    src_host_xid,
+                    dst_host_xid,
+                    src_x,
+                    src_y,
+                    dst_x,
+                    dst_y,
+                    width,
+                    height,
+                )),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            copies,
+            vec![(0x400304, 0x400303, 0, 0, 13, 17, 640, 480)],
+            "PresentPixmap Copy without an update region must copy the whole pixmap to dst at x_off/y_off",
+        );
+    }
+
     // ---------------- extract_shm_zpixmap_region ----------------
     //
     // The protocol-level byte-extraction for MIT-SHM PutImage. Until
@@ -14357,6 +14987,7 @@ mod tests {
                 level: 0,
                 rects: Vec::new(),
                 pending_notify_fired: false,
+                last_reported_geometry: None,
             },
         );
 
@@ -14382,6 +15013,177 @@ mod tests {
              subscribed compositor repaints the new region into its \
              offscreen — pre-fix this is empty and the compositor \
              never sees the newly-mapped popup / tray icon / window",
+        );
+    }
+
+    #[test]
+    fn map_window_seeds_damage_for_newly_viewable_descendant() {
+        use crate::server::DamageObject;
+
+        const CLIENT_ID: u32 = 1;
+        const PARENT_XID: u32 = 0x0010_0012;
+        const PARENT_HOST_XID: u32 = 0x0040_0012;
+        const CHILD_XID: u32 = 0x0010_0013;
+        const CHILD_HOST_XID: u32 = 0x0040_0013;
+        const CHILD_DAMAGE_ID: u32 = 0x0080_0013;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(PARENT_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 300,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(CHILD_XID),
+                parent: ResourceId(PARENT_XID),
+                x: 20,
+                y: 30,
+                width: 200,
+                height: 80,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let parent = state
+                .resources
+                .window_mut(ResourceId(PARENT_XID))
+                .expect("parent installed");
+            parent.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(
+                PARENT_HOST_XID,
+            ));
+            parent.map_state = crate::resources::MapState::Unmapped;
+        }
+        {
+            let child = state
+                .resources
+                .window_mut(ResourceId(CHILD_XID))
+                .expect("child installed");
+            child.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(
+                CHILD_HOST_XID,
+            ));
+            child.map_state = crate::resources::MapState::Unviewable;
+        }
+
+        state.damage_objects.insert(
+            CHILD_DAMAGE_ID,
+            DamageObject {
+                owner: ClientId(CLIENT_ID),
+                drawable: ResourceId(CHILD_XID),
+                level: 0,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+                last_reported_geometry: None,
+            },
+        );
+
+        let mut body = Vec::with_capacity(4);
+        body.extend_from_slice(&PARENT_XID.to_le_bytes());
+        handle_map_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_map_window");
+
+        let child_damage = state
+            .damage_objects
+            .get(&CHILD_DAMAGE_ID)
+            .expect("child damage object survives");
+        assert!(
+            !child_damage.rects.is_empty(),
+            "mapping a parent must seed damage for descendants promoted from \
+             Unviewable to Viewable; otherwise compositors miss the child's \
+             first visible frame"
+        );
+    }
+
+    #[test]
+    fn damage_create_on_viewable_window_seeds_full_damage() {
+        use yserver_protocol::x11::{RequestHeader, damage as x11damage};
+
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0100;
+        const HOST_XID: u32 = 0x0040_0100;
+        const DAMAGE_ID: u32 = 0x0080_0100;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+
+        state.resources.create_window(
+            ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 11,
+                y: 22,
+                width: 200,
+                height: 80,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+            w.map_state = crate::resources::MapState::Viewable;
+        }
+        let mut body = Vec::new();
+        body.extend_from_slice(&DAMAGE_ID.to_le_bytes());
+        body.extend_from_slice(&WINDOW_XID.to_le_bytes());
+        body.push(x11damage::report_level::NON_EMPTY);
+        body.extend_from_slice(&[0, 0, 0]);
+
+        let header = RequestHeader {
+            opcode: 0,
+            data: x11damage::CREATE,
+            length_units: 0,
+        };
+        handle_damage_request(
+            &mut state,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("damage create handled");
+
+        let damage = state
+            .damage_objects
+            .get(&DAMAGE_ID)
+            .expect("damage object created");
+        assert!(
+            !damage.rects.is_empty(),
+            "creating DAMAGE on an already-viewable window must seed initial \
+             damage so the subscriber does not miss the current visible frame"
         );
     }
 
@@ -14461,6 +15263,7 @@ mod tests {
                 level: 0,
                 rects: Vec::new(),
                 pending_notify_fired: false,
+                last_reported_geometry: None,
             },
         );
 
@@ -14752,6 +15555,7 @@ mod tests {
                 level: 0,
                 rects: vec![damaged_rect],
                 pending_notify_fired: true,
+                last_reported_geometry: None,
             },
         );
         // Pre-create the parts region so the handler writes into it.
@@ -14789,6 +15593,69 @@ mod tests {
     }
 
     #[test]
+    fn damage_subtract_with_no_repair_canonicalizes_parts_region() {
+        use crate::server::{DamageObject, XFixesRegion};
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        state.damage_objects.insert(
+            0x40,
+            DamageObject {
+                owner: ClientId(1),
+                drawable: ResourceId(0x100),
+                level: 0,
+                rects: vec![
+                    RegionRect {
+                        x: 0,
+                        y: 0,
+                        width: 10,
+                        height: 10,
+                    },
+                    RegionRect {
+                        x: 10,
+                        y: 0,
+                        width: 10,
+                        height: 10,
+                    },
+                    RegionRect {
+                        x: 0,
+                        y: 0,
+                        width: 20,
+                        height: 10,
+                    },
+                ],
+                pending_notify_fired: true,
+                last_reported_geometry: None,
+            },
+        );
+        state.xfixes_regions.insert(
+            0x41,
+            XFixesRegion {
+                owner: ClientId(1),
+                rects: Vec::new(),
+            },
+        );
+
+        dispatch_damage_subtract(&mut state, &mut backend, 0x40, 0, 0x41);
+
+        let parts = state
+            .xfixes_regions
+            .get(&0x41)
+            .expect("parts region must exist");
+        assert_eq!(
+            parts.rects,
+            vec![RegionRect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 10,
+            }],
+            "with repair=None, parts must be canonicalized before they are handed to the client"
+        );
+    }
+
+    #[test]
     fn damage_subtract_with_repair_returns_intersection_and_subtracts_from_damage() {
         use crate::server::{DamageObject, XFixesRegion};
         use yserver_protocol::x11::xfixes::RegionRect;
@@ -14808,6 +15675,7 @@ mod tests {
                     height: 100,
                 }],
                 pending_notify_fired: true,
+                last_reported_geometry: None,
             },
         );
         // Repair: right-half strip 50x100 at (50, 0). MUST remain
@@ -14882,6 +15750,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn damage_subtract_with_remaining_nonempty_damage_rereports_immediately() {
+        use crate::server::{DamageObject, XFixesRegion};
+        use yserver_protocol::x11::{CreateWindowRequest, damage as x11damage, xfixes::RegionRect};
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let _peer = install_client(&mut state, 1);
+
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(0x100),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(0x100));
+
+        state.damage_objects.insert(
+            0x40,
+            DamageObject {
+                owner: ClientId(1),
+                drawable: ResourceId(0x100),
+                level: x11damage::report_level::NON_EMPTY,
+                rects: vec![RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                }],
+                pending_notify_fired: true,
+                last_reported_geometry: None,
+            },
+        );
+        state.xfixes_regions.insert(
+            0x41,
+            XFixesRegion {
+                owner: ClientId(1),
+                rects: vec![RegionRect {
+                    x: 50,
+                    y: 0,
+                    width: 50,
+                    height: 100,
+                }],
+            },
+        );
+        state.xfixes_regions.insert(
+            0x42,
+            XFixesRegion {
+                owner: ClientId(1),
+                rects: Vec::new(),
+            },
+        );
+
+        dispatch_damage_subtract(&mut state, &mut backend, 0x40, 0x41, 0x42);
+
+        let damage = state.damage_objects.get(&0x40).expect("damage object");
+        assert!(
+            !damage.rects.is_empty(),
+            "repair only covered part of the damage; some damage must remain"
+        );
+        assert!(
+            damage.pending_notify_fired,
+            "Xorg immediately re-reports remaining non-empty damage after Subtract; \
+             pre-fix yserver left fired=false and waited for unrelated future drawing"
+        );
+    }
+
     /// X11 Composite + DAMAGE interaction: a configure that changes a
     /// redirected window's screen-space presentation must emit a
     /// `DamageNotify` to the compositor's damage subscription on that
@@ -14904,7 +15849,7 @@ mod tests {
     fn configure_window_on_redirected_window_emits_damage_to_subscriber() {
         use crate::{
             resources::{ROOT_WINDOW, RedirectedBacking},
-            server::DamageObject,
+            server::{CompositeRedirectMode, DamageObject, RedirectRecord},
         };
         use std::io::Read;
         use yserver_protocol::x11::CreateWindowRequest;
@@ -14934,6 +15879,13 @@ mod tests {
             },
         );
         let _ = state.resources.map_window(ResourceId(FRAME_XID));
+        state.composite_redirects.insert(
+            (ResourceId(FRAME_XID), false),
+            RedirectRecord {
+                mode: CompositeRedirectMode::Manual,
+                owner: ClientId(MARCO),
+            },
+        );
         // Mark the frame as redirected (Manual-redirect activated
         // state). `host_pixmap` value is opaque to the damage path.
         if let Some(w) = state.resources.window_mut(ResourceId(FRAME_XID)) {
@@ -14955,6 +15907,7 @@ mod tests {
                 level: 3,
                 rects: Vec::new(),
                 pending_notify_fired: false,
+                last_reported_geometry: None,
             },
         );
 
@@ -15037,6 +15990,214 @@ mod tests {
             "DamageNotify.geometry must encode the window's CURRENT \
              root-relative position + extent; pre-fix this hardcodes \
              (0, 0, w, h) and breaks marco's screen-rect mapping",
+        );
+    }
+
+    /// Effective redirect state includes inherited `RedirectSubwindows`
+    /// mode, not just a directly populated `window.redirected_backing`.
+    /// A move-only ConfigureWindow under an inherited redirect still
+    /// needs to wake the compositor with DamageNotify.
+    #[test]
+    fn configure_window_on_inherited_redirect_emits_damage_to_subscriber() {
+        use crate::{
+            resources::ROOT_WINDOW,
+            server::{CompositeRedirectMode, DamageObject, RedirectRecord},
+        };
+        use std::io::Read;
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const MARCO: u32 = 14;
+        const CHILD_XID: u32 = 0x0010_0101;
+        const DAMAGE_XID: u32 = 0x0010_0102;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_client(&mut state, MARCO);
+
+        state.composite_redirects.insert(
+            (ROOT_WINDOW, true),
+            RedirectRecord {
+                mode: CompositeRedirectMode::Manual,
+                owner: ClientId(MARCO),
+            },
+        );
+
+        state.resources.create_window(
+            ClientId(MARCO),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(CHILD_XID),
+                parent: ROOT_WINDOW,
+                x: 100,
+                y: 100,
+                width: 545,
+                height: 204,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(CHILD_XID));
+
+        state.damage_objects.insert(
+            DAMAGE_XID,
+            DamageObject {
+                owner: ClientId(MARCO),
+                drawable: ResourceId(CHILD_XID),
+                level: 3,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+                last_reported_geometry: None,
+            },
+        );
+
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&CHILD_XID.to_le_bytes());
+        body.extend_from_slice(&0x0003u16.to_le_bytes());
+        body.extend_from_slice(&[0u8; 2]);
+        body.extend_from_slice(&250i32.to_le_bytes());
+        body.extend_from_slice(&300i32.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(MARCO),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 12,
+                data: 0,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        peer.set_nonblocking(true).unwrap();
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            all.chunks_exact(32)
+                .any(|evt| evt[0] == crate::nested::DAMAGE_FIRST_EVENT),
+            "move-only ConfigureWindow under inherited RedirectSubwindows \
+             must emit DamageNotify even when redirected_backing is not \
+             directly populated on the child window",
+        );
+    }
+
+    #[test]
+    fn configure_window_stack_only_on_redirected_window_does_not_emit_damage() {
+        use crate::{
+            resources::{ROOT_WINDOW, RedirectedBacking},
+            server::{CompositeRedirectMode, DamageObject, RedirectRecord},
+        };
+        use std::io::Read;
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const MARCO: u32 = 14;
+        const FRAME_XID: u32 = 0x0010_0201;
+        const SIBLING_XID: u32 = 0x0010_0202;
+        const DAMAGE_XID: u32 = 0x0010_0203;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_client(&mut state, MARCO);
+
+        for xid in [FRAME_XID, SIBLING_XID] {
+            state.resources.create_window(
+                ClientId(MARCO),
+                CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(xid),
+                    parent: ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 5120,
+                    height: 1440,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(ResourceId(xid));
+            state.composite_redirects.insert(
+                (ResourceId(xid), false),
+                RedirectRecord {
+                    mode: CompositeRedirectMode::Manual,
+                    owner: ClientId(MARCO),
+                },
+            );
+            if let Some(w) = state.resources.window_mut(ResourceId(xid)) {
+                w.host_xid = crate::backend::WindowHandle::from_raw(0xD000_0000 | xid);
+                w.redirected_backing = Some(RedirectedBacking {
+                    host_pixmap: crate::backend::PixmapHandle::from_raw(0xC000_0000 | xid).unwrap(),
+                    width: 5120,
+                    height: 1440,
+                    depth: 24,
+                });
+            }
+        }
+
+        state.damage_objects.insert(
+            DAMAGE_XID,
+            DamageObject {
+                owner: ClientId(MARCO),
+                drawable: ResourceId(FRAME_XID),
+                level: 3,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+                last_reported_geometry: None,
+            },
+        );
+
+        // value_mask = 0x60 = CWSibling | CWStackMode, no geometry bits.
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&FRAME_XID.to_le_bytes());
+        body.extend_from_slice(&0x0060u16.to_le_bytes());
+        body.extend_from_slice(&[0u8; 2]);
+        body.extend_from_slice(&SIBLING_XID.to_le_bytes());
+        body.push(1); // Below
+        body.extend_from_slice(&[0u8; 3]);
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(MARCO),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 12,
+                data: 0,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+
+        peer.set_nonblocking(true).unwrap();
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            !all.chunks_exact(32)
+                .any(|evt| evt[0] == crate::nested::DAMAGE_FIRST_EVENT),
+            "stack-only ConfigureWindow on a redirected window must not emit synthetic \
+             DamageNotify; that turns restacks into bogus full-window damage",
         );
     }
 
@@ -17589,6 +18750,7 @@ mod tests {
                 level: 3, // NonEmpty
                 rects: Vec::new(),
                 pending_notify_fired: false,
+                last_reported_geometry: None,
             },
         );
 
@@ -17624,6 +18786,60 @@ mod tests {
             "render_composite must call accumulate_damage_full_to_state on the \
              dst picture's drawable; got 0 rects — the RENDER path is missing \
              the damage call",
+        );
+    }
+
+    #[test]
+    fn render_picture_damage_drawable_prefers_named_window_pixmap_owner() {
+        use crate::{backend::PixmapHandle, resources::NamedCompositePixmap};
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const CLIENT: u32 = 7;
+        const WINDOW_XID: u32 = 0x0030_0001;
+        const ALIAS_PIXMAP_XID: u32 = 0x0030_0002;
+        const ALIAS_PIXMAP_HOST: u32 = 0x0050_0102;
+        const ORDINARY_PIXMAP_XID: u32 = 0x0030_0003;
+
+        let mut state = ServerState::new();
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: ROOT_WINDOW,
+                x: 100,
+                y: 200,
+                width: 800,
+                height: 600,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let window = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window");
+            window.composite_named_pixmaps.push(NamedCompositePixmap {
+                client_pixmap: ResourceId(ALIAS_PIXMAP_XID),
+                host_pixmap: PixmapHandle::from_raw_for_test(ALIAS_PIXMAP_HOST),
+                width: 800,
+                height: 600,
+            });
+        }
+        assert!(
+            render_picture_damage_drawable(&state, ResourceId(ALIAS_PIXMAP_XID))
+                == ResourceId(WINDOW_XID),
+            "RENDER pictures created on a NameWindowPixmap alias must route later damage to the \
+             owning window XID so XDamageCreate(window) subscriptions wake",
+        );
+        assert!(
+            render_picture_damage_drawable(&state, ResourceId(ORDINARY_PIXMAP_XID))
+                == ResourceId(ORDINARY_PIXMAP_XID),
+            "ordinary pixmaps must keep their own drawable identity; only Composite aliases \
+             remap to the owner window",
         );
     }
 

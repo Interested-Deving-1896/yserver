@@ -420,7 +420,6 @@ where
 pub(crate) fn normalize_region_rects(
     mut rects: Vec<x11xfixes::RegionRect>,
 ) -> Vec<x11xfixes::RegionRect> {
-    const MAX_RECTS: usize = 4096;
     rects.retain(|rect| !rect.is_empty());
     if rects.is_empty() {
         return rects;
@@ -472,9 +471,6 @@ pub(crate) fn normalize_region_rects(
                     width: (current.1 - current.0).clamp(0, i32::from(u16::MAX)) as u16,
                     height: (y1 - y0).clamp(0, i32::from(u16::MAX)) as u16,
                 });
-                if out.len() >= MAX_RECTS {
-                    return out;
-                }
                 current = span;
             }
         }
@@ -484,9 +480,6 @@ pub(crate) fn normalize_region_rects(
             width: (current.1 - current.0).clamp(0, i32::from(u16::MAX)) as u16,
             height: (y1 - y0).clamp(0, i32::from(u16::MAX)) as u16,
         });
-        if out.len() >= MAX_RECTS {
-            return out;
-        }
     }
     out
 }
@@ -1110,9 +1103,12 @@ mod tests {
         }
 
         #[test]
-        fn normalize_truncates_at_cap() {
+        fn normalize_preserves_rects_beyond_old_cap() {
             let rects: Vec<RegionRect> = (0..4097).map(|i| r(0, i as i16, 1, 1)).collect();
-            assert_eq!(normalize_region_rects(rects).len(), 4096);
+            let normalized = normalize_region_rects(rects);
+            assert_eq!(normalized.len(), 4097);
+            assert_eq!(normalized.first().copied(), Some(r(0, 0, 1, 1)));
+            assert_eq!(normalized.last().copied(), Some(r(0, 4096, 1, 1)));
         }
 
         #[test]

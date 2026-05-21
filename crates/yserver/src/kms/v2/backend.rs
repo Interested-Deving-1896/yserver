@@ -872,12 +872,11 @@ impl KmsBackendV2 {
     /// Test-only read of whether the Composite Overlay Window is
     /// currently a scene entry. The COW lifecycle splits "store
     /// allocation" (eager, on `GetOverlayWindow`) from "scene
-    /// registration" (lazy, on first client paint into COW) so a
-    /// compositor that allocates the COW but never paints into it
-    /// (xfwm4 with its child compositor window) does not cover the
-    /// real output with a zero-filled overlay. This accessor lets
-    /// the regression test pin that the lazy registration actually
-    /// fires.
+    /// registration" (lazy, on first overlay `PresentPixmap`) so a
+    /// compositor that allocates the COW but has not yet published
+    /// a complete frame does not hide the real top-levels behind a
+    /// partial overlay. This accessor lets the regression tests pin
+    /// that lazy registration actually fires.
     #[doc(hidden)]
     #[must_use]
     pub fn test_scene_cow_registered(&self) -> bool {
@@ -1068,24 +1067,16 @@ impl KmsBackendV2 {
     /// is the Composite Overlay Window storage and the scene has
     /// not yet registered it, register now.
     ///
-    /// Why lazy and not eager-on-`get_overlay_window`: xfwm4's
-    /// compositor allocates COW (so `XCompositeGetOverlayWindow`
-    /// returns a real xid) but paints into a child compositor
-    /// window, never into COW. An eager registration would emit
-    /// the zero-filled depth-24 COW as a scene-top force-opaque
-    /// layer (sample-side swizzle forces α=1.0 on depth-24), which
-    /// covers the actual output with solid black. Picom-style
-    /// Present-Pixmap compositors, by contrast, DO paint into COW
-    /// — the first `copy_area` / `put_image` / `render_*` whose dst
-    /// resolves to COW is the signal that the scene entry should
-    /// turn on.
+    /// Kept as a no-op compatibility hook: early Stage 4d wired
+    /// COW-authoritative mode on the first raw paint into the
+    /// overlay storage. That turns out to be too early for Marco:
+    /// startup trickles partial paints into COW before the first
+    /// full-frame `PresentPixmap`, so scanout hides the real
+    /// toplevels before the compositor has published a complete
+    /// replacement. Registration now happens on the first overlay
+    /// `PresentPixmap` in `note_present_pixmap`.
     pub(crate) fn maybe_register_cow_on_paint(&mut self, target_id: super::store::DrawableId) {
-        if !self.scene.is_cow_registered()
-            && let Some(cow_id) = self.cow_id
-            && cow_id == target_id
-        {
-            self.scene.register_cow(cow_id);
-        }
+        let _ = target_id;
     }
 
     fn resolve_paint_target_inner(
@@ -2595,18 +2586,38 @@ fn change_picture_apply_mask(core: &mut KmsCore, host_pic: u32, body: &[u8]) {
             }
             // CPClipXOrigin
             0x0010 => {
-                if let Some(PictureRecord::Drawable { clip_x, .. }) =
+                if let Some(PictureRecord::Drawable { clip, clip_x, .. }) =
                     core.pictures.get_mut(&host_pic)
                 {
-                    *clip_x = v as i16;
+                    let new_x = v as i16;
+                    let dx = i32::from(new_x) - i32::from(*clip_x);
+                    if dx != 0
+                        && let Some(rects) = clip.as_mut()
+                    {
+                        for r in rects {
+                            r.x = (i32::from(r.x) + dx).clamp(i16::MIN as i32, i16::MAX as i32)
+                                as i16;
+                        }
+                    }
+                    *clip_x = new_x;
                 }
             }
             // CPClipYOrigin
             0x0020 => {
-                if let Some(PictureRecord::Drawable { clip_y, .. }) =
+                if let Some(PictureRecord::Drawable { clip, clip_y, .. }) =
                     core.pictures.get_mut(&host_pic)
                 {
-                    *clip_y = v as i16;
+                    let new_y = v as i16;
+                    let dy = i32::from(new_y) - i32::from(*clip_y);
+                    if dy != 0
+                        && let Some(rects) = clip.as_mut()
+                    {
+                        for r in rects {
+                            r.y = (i32::from(r.y) + dy).clamp(i16::MIN as i32, i16::MAX as i32)
+                                as i16;
+                        }
+                    }
+                    *clip_y = new_y;
                 }
             }
             // CPClipMask: a depth-1 pixmap xid (or `None` = 0).
@@ -3415,6 +3426,30 @@ fn picture_client_clip(core: &KmsCore, host_pic: u32) -> Option<Vec<Rectangle16>
     }
 }
 
+fn format_clip_rects(rects: Option<&[Rectangle16]>) -> String {
+    use std::fmt::Write as _;
+
+    match rects {
+        None => "<None>".to_string(),
+        Some([]) => "<empty>".to_string(),
+        Some(rects) => {
+            let mut out = String::from("[");
+            for (i, rect) in rects.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                let _ = write!(
+                    out,
+                    "({},{} {}x{})",
+                    rect.x, rect.y, rect.width, rect.height
+                );
+            }
+            out.push(']');
+            out
+        }
+    }
+}
+
 /// Resolve the drawable depth for a new subwindow. `CopyFromParent`
 /// inherits the parent window's depth; only the root / untracked
 /// fallback defaults to 24.
@@ -3603,7 +3638,11 @@ impl Backend for KmsBackendV2 {
     }
 
     fn next_wakeup(&self) -> Option<std::time::Instant> {
-        self.scene.earliest_retry_deadline()
+        if self.scene.scene_structure_dirty {
+            Some(std::time::Instant::now())
+        } else {
+            self.scene.earliest_retry_deadline()
+        }
     }
 
     fn maybe_composite(&mut self) -> io::Result<()> {
@@ -3672,6 +3711,11 @@ impl Backend for KmsBackendV2 {
         if dst_window_xid != yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0 {
             return;
         }
+        if !self.scene.is_cow_registered()
+            && let Some(cow_id) = self.cow_id
+        {
+            self.scene.register_cow(cow_id);
+        }
         const CAP: usize = 16;
         // Deduplicate consecutive same-xid presents (marco
         // double-buffers two offscreens so the ring otherwise
@@ -3685,6 +3729,29 @@ impl Backend for KmsBackendV2 {
             self.present_to_cow_sources.pop_front();
         }
         self.present_to_cow_sources.push_back(src_pixmap_xid);
+    }
+
+    fn wait_for_drawable_idle(&mut self, host_xid: u32) -> io::Result<()> {
+        let Some(id) = self.store.lookup(host_xid) else {
+            return Ok(());
+        };
+        let ticket = self
+            .store
+            .get(id)
+            .and_then(|drawable| drawable.last_render_ticket.clone());
+        let Some(ticket) = ticket else {
+            return Ok(());
+        };
+        let Some(vk) = self.platform.vk.as_ref().cloned() else {
+            return Ok(());
+        };
+        let started = std::time::Instant::now();
+        ticket
+            .wait(&vk)
+            .map_err(|e| io::Error::other(format!("wait for drawable 0x{host_xid:x}: {e:?}")))?;
+        let waited_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.telemetry.record_fence_wait(waited_ns);
+        Ok(())
     }
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
@@ -5366,6 +5433,10 @@ impl Backend for KmsBackendV2 {
         }
         if all_ok {
             self.telemetry.record_paint_submit();
+            // Present Copy into COW/backings must wake the scene
+            // compositor immediately; otherwise the damage can sit
+            // until an unrelated input event arrives.
+            self.scene.wake_for_damage();
         }
         Ok(())
     }
@@ -6638,46 +6709,29 @@ impl Backend for KmsBackendV2 {
             let src_pict_format = picture_pict_format(&self.core, host_src);
             let mask_pict_format = picture_pict_format(&self.core, host_mask);
             let dst_pict_format = picture_pict_format(&self.core, host_dst);
-            // Format the clip rect list compactly. The clip rect
-            // *detail* is the load-bearing diagnostic for the
-            // Stage 4d "wallpaper overwrites window content" bug —
-            // marco relies on the wallpaper-fill composite's clip
-            // excluding the window regions, and we need to see
-            // what's actually in those rects, not just the count.
-            // None = "no clip set, paint everywhere" (the X11 default).
-            // Some(empty vec) = "empty clip region, paint nothing"
-            // (per X11 RENDER spec, post the empty-clip fix). Emit
-            // distinct markers so a grep can distinguish the two
-            // — they have opposite effects but used to look the
-            // same in this trace.
-            let clip_dump = match dst_clip.as_deref() {
-                None => "<None>".to_string(),
-                Some([]) => "<empty>".to_string(),
-                Some(rects) => {
-                    use std::fmt::Write as _;
-                    let mut s = String::from("[");
-                    for (i, r) in rects.iter().enumerate() {
-                        if i > 0 {
-                            s.push(' ');
-                        }
-                        let _ = write!(s, "({},{} {}x{})", r.x, r.y, r.width, r.height);
-                    }
-                    s.push(']');
-                    s
-                }
-            };
+            let dst_picture_clip =
+                resolve_dst_picture_for_render(&self.core, host_dst).and_then(|(_, clip)| clip);
+            let dst_picture_clip_dump = format_clip_rects(dst_picture_clip.as_deref());
+            let src_clip_dump = format_clip_rects(src_clip.as_deref());
+            let mask_clip_dump = format_clip_rects(mask_clip.as_deref());
+            let final_clip_dump = format_clip_rects(dst_clip.as_deref());
             log::trace!(
                 target: "yserver::kms::v2::render",
                 "render_composite op={op} src=0x{host_src:x}({src_kind},d={src_depth},fmt=0x{src_pict_format:x},repeat={src_repeat:?},xform={src_xform}) \
                  mask=0x{host_mask:x}({mask_kind},d={mask_depth},fmt=0x{mask_pict_format:x},repeat={mask_repeat:?},xform={mask_xform},ca={mask_component_alpha}) \
                  dst=0x{host_dst:x}->id={dst_id:?},d={dst_depth},fmt=0x{dst_pict_format:x} \
                  src_xy=({src_x},{src_y}) mask_xy=({mask_x},{mask_y}) dst_xy=({dst_x},{dst_y})+off=({off_x},{off_y}) {width}x{height} \
-                 clip{clip_dump}",
+                 src_clip={src_clip_dump} src_t=({src_tx},{src_ty}) mask_clip={mask_clip_dump} mask_t=({mask_tx},{mask_ty}) \
+                 dst_picture_clip={dst_picture_clip_dump} final_clip={final_clip_dump}",
                 src_xform = src_transform.is_some(),
                 mask_xform = mask_transform.is_some(),
                 dst_id = dst_target.id,
                 off_x = dst_target.offset.0,
                 off_y = dst_target.offset.1,
+                src_tx = src_translation.0,
+                src_ty = src_translation.1,
+                mask_tx = mask_translation.0,
+                mask_ty = mask_translation.1,
             );
         }
         // Audit #4 (2026-05-19) — thread src/mask/dst PictFormat IDs
@@ -9299,6 +9353,61 @@ mod tests {
                      pre-fix stored None which made composites paint \
                      everywhere instead of nothing. Got: {clip:?}",
                 );
+            }
+            _ => panic!("not Drawable"),
+        }
+    }
+
+    /// `ChangePicture(CPClipXOrigin/CPClipYOrigin)` must move the
+    /// already stored clip rectangles by the same delta. The v2
+    /// backend stores clip rects pre-shifted into picture-local
+    /// coordinates, so updating only the scalar origin fields leaves
+    /// stale scissors behind.
+    #[test]
+    fn change_picture_clip_origin_repositions_stored_rects() {
+        use yserver_core::backend::{AnyHandle, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let drawable =
+            AnyHandle::Pixmap(PixmapHandle::from_raw(0xDD00_EE00).expect("PixmapHandle"));
+        let pic = b
+            .render_create_picture(None, drawable, 0, 0, &[])
+            .expect("create_picture")
+            .expect("Some");
+        let pic_xid = pic.as_raw();
+
+        let mut clip_body: Vec<u8> = Vec::new();
+        clip_body.extend_from_slice(&pic_xid.to_le_bytes());
+        clip_body.extend_from_slice(&10_i16.to_le_bytes());
+        clip_body.extend_from_slice(&20_i16.to_le_bytes());
+        clip_body.extend_from_slice(&5_i16.to_le_bytes());
+        clip_body.extend_from_slice(&6_i16.to_le_bytes());
+        clip_body.extend_from_slice(&20_u16.to_le_bytes());
+        clip_body.extend_from_slice(&30_u16.to_le_bytes());
+        b.render_set_picture_clip_rectangles(None, pic_xid, &clip_body)
+            .expect("set clip");
+
+        let mut change_body: Vec<u8> = Vec::new();
+        change_body.extend_from_slice(&pic_xid.to_le_bytes());
+        change_body.extend_from_slice(&(0x0010_u32 | 0x0020_u32).to_le_bytes());
+        change_body.extend_from_slice(&30_u32.to_le_bytes());
+        change_body.extend_from_slice(&50_u32.to_le_bytes());
+        b.render_change_picture(None, pic_xid, &change_body)
+            .expect("change_picture");
+
+        match b.core.pictures.get(&pic_xid).expect("rec") {
+            PictureRecord::Drawable {
+                clip,
+                clip_x,
+                clip_y,
+                ..
+            } => {
+                let rects = clip.as_ref().expect("clip still present");
+                assert_eq!(rects.len(), 1);
+                assert_eq!(rects[0].x, 35, "x must move by +20 with CPClipXOrigin");
+                assert_eq!(rects[0].y, 56, "y must move by +30 with CPClipYOrigin");
+                assert_eq!(*clip_x, 30);
+                assert_eq!(*clip_y, 50);
             }
             _ => panic!("not Drawable"),
         }
@@ -12074,9 +12183,8 @@ mod tests {
     // ────────────────────────────────────────────────────────────────
 
     /// First call: COW xid resolves in store; refcount = 1;
-    /// backend `cow_id` set; scene registration is a no-op on
-    /// the stub fixture but the field flip is observable as a
-    /// `scene_structure_dirty` toggle on the live-Vk path.
+    /// backend `cow_id` set. Scene registration stays OFF until
+    /// the first overlay `PresentPixmap`.
     #[test]
     fn cow_get_overlay_first_call_allocates_storage() {
         let mut b = KmsBackendV2::for_tests();
@@ -12116,6 +12224,32 @@ mod tests {
         );
         assert_eq!(cow.storage.extent.width, u32::from(b.platform.fb_w));
         assert_eq!(cow.storage.extent.height, u32::from(b.platform.fb_h));
+        assert!(
+            !b.test_scene_cow_registered(),
+            "GetOverlayWindow alone must not arm cow-authoritative mode",
+        );
+    }
+
+    /// COW-authoritative mode must arm only once the compositor has
+    /// actually published a frame to the overlay via Present.
+    #[test]
+    fn cow_registers_on_first_present_to_overlay() {
+        let mut b = KmsBackendV2::for_tests();
+        b.get_overlay_window(None).expect("get_overlay_window");
+        assert!(
+            !b.test_scene_cow_registered(),
+            "precondition: allocation alone must not register COW",
+        );
+
+        b.note_present_pixmap(
+            0x4000_1234,
+            yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0,
+        );
+
+        assert!(
+            b.test_scene_cow_registered(),
+            "overlay PresentPixmap must arm cow-authoritative mode",
+        );
     }
 
     /// Second call without an intervening release just bumps the

@@ -487,6 +487,12 @@ pub struct DamageObject {
     /// accumulated region. Levels 2 (BoundingBox) and 3 (NonEmpty) emit at
     /// most one event per cycle; resetting this flag is the cycle boundary.
     pub pending_notify_fired: bool,
+    /// Geometry carried on the most recently emitted `DamageNotify`.
+    /// Coalesced DAMAGE levels report only one notify per cycle, but
+    /// window moves/resizes change the `geometry` payload even when
+    /// the area is still coalesced. Tracking the last report lets us
+    /// emit a follow-up notify when geometry changes mid-cycle.
+    pub last_reported_geometry: Option<x11::damage::Rectangle>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

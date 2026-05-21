@@ -47,12 +47,166 @@ Cross-cutting bugs and followups that don't fit a stage live in
   Telemetry from both XFCE and MATE rules out the current extracted
   perf fixes as the cause: no missed page flips, no KMS `EBUSY` loop,
   no hot `vkQueueWaitIdle`, and input/page-flip cadence stays healthy
-  during the repro. Treat this as a scene/COW/backing-content selection
-  bug, not CPU overhead or present starvation. Separately, hardware
-  cursor plane updates can still visually jam if enabled; the default
-  path uses the confirmed good software cursor, while
-  `YSERVER_V2_HW_CURSOR=1` remains opt-in for focused cursor-plane
-  debugging.
+  during the repro. Treat this as a compositor-update bug, not CPU
+  overhead or present starvation. Latest focused trace work narrowed
+  the failure much further than the earlier COW hypotheses:
+  `SetPictureClipRegion` for the fullscreen compositor pixmaps carried
+  only a tiny panel strip, and the matching `render_composite` calls
+  for Caja's frame/content therefore saw either that strip or an empty
+  final clip. The companion `damage_fanout` trace showed why: drawing
+  into the fullscreen compositor pixmaps never matched any DAMAGE
+  subscribers, so Marco's DAMAGE `Subtract` / update-region path only
+  saw panel damage and never the actual window-content damage. That
+  explains the current symptom where windows start hidden or disappear
+  during drag, then reappear when panel hover triggers some unrelated
+  repaint. The concrete fix now in tree is in the core Present Copy
+  path: after `PresentPixmap` copies into the destination window and
+  waits for the drawable to go idle, yserver now feeds DAMAGE on that
+  destination window using the request's `update` region when present,
+  or the copied pixmap bounds otherwise. A regression test
+  (`present_pixmap_update_region_emits_damage_on_destination_window`)
+  locks that in. Separately, the older silent `normalize_region_rects`
+  4096-rect cap was removed because it could truncate heavily
+  fragmented regions down to upper bands only; that was a real bug
+  surfaced by the perf run, but it was not sufficient to fix the MATE
+  hidden-window repro by itself. Separately, hardware cursor plane
+  updates can still visually jam if enabled; the default path uses the
+  confirmed good software cursor, while `YSERVER_V2_HW_CURSOR=1`
+  remains opt-in for focused cursor-plane debugging. The latest
+  damage/XFixes trace moved the bug boundary again. The region algebra
+  itself is behaving consistently in the bad frame; by the time Marco
+  starts its `CopyRegion` / `SubtractRegion` / `IntersectRegion` chain,
+  the accumulated update region is already wrong. The earlier
+  `NameWindowPixmap` drawable-identity fix was real, but it was not
+  sufficient for the startup-hidden/dialog-hidden repro. The latest
+  traces show a tighter ordering bug: on the failing frame yserver
+  reaches `SetPictureClipRegion(... n=0)` and `render_composite ...
+  final_clip=<empty>` for the dialog/window before the next
+  `damage_notify_queue` for that same redirected frame window lands.
+  Even more importantly, some redirected/viewable windows first become
+  interesting to marco only after yserver already emitted the initial
+  full-window configure/map damage, so that seed is lost
+  (`configure_damage_emit` with `match_ids=0`, followed later by the
+  first `match_ids=1`). That leaves the compositor with no initial
+  window region, and later damage can arrive one compositor cycle too
+  late; the window then stays hidden until an unrelated repaint (panel
+  hover, etc.) drives another pass. Xorg is broader here than the
+  previous fix: `DamageExtRegister()` immediately reports the current
+  `borderClip` for every window-backed `XDamageCreate`, not just
+  redirected windows. yserver now mirrors that behavior at the same
+  granularity it already uses for immediate seeds: any
+  already-viewable `XDamageCreate(window)` now seeds initial damage
+  right away. Regression:
+  `damage_create_on_viewable_window_seeds_full_damage`.
+  Latest narrowing after the next bad run: startup-hidden dialogs are
+  still reproducible, but the failure boundary is now concrete.
+  yserver was synthesizing full-window `DamageNotify` on every
+  redirected `ConfigureWindow`, including stack-only restacks
+  (`CWSibling` / `CWStackMode`) of marco's fullscreen desktop window
+  `0x01300005`. That injected bogus full-screen damage
+  (`damage=0xe0020d`), marco unioned it into the compositor update
+  region, and the next subtract cleared the whole region before the
+  dialog composites ran, leaving `SetPictureClipRegion(... n=0)` and
+  `render_composite ... final_clip=<empty>` for the dialog pass. The
+  current tree now limits synthetic ConfigureWindow damage to actual
+  geometry changes (`x/y/width/height/border`) and explicitly skips
+  pure restacks. Regression:
+  `configure_window_stack_only_on_redirected_window_does_not_emit_damage`.
+  Latest narrowing after the next dump/trace comparison found another
+  concrete Xorg mismatch in the DAMAGE extension itself. yserver's
+  `DAMAGE::Subtract` correctly computed `parts = old ∩ repair` and
+  `damage = old - repair`, but then only cleared
+  `pending_notify_fired=false` and waited for unrelated future drawing
+  before notifying again. Xorg's `ProcDamageSubtract` does more: when
+  `repair != None` and some damage remains, it immediately re-reports
+  the remaining region for the coalesced report levels
+  (Delta/BoundingBox/NonEmpty). Without that follow-up notify, marco
+  can drain one chunk of damage, see no new wake for the leftover
+  chunk, and temporarily build an empty compositor update region until
+  some later panel hover or repaint restarts the cycle. The current
+  tree now mirrors Xorg here: after `DAMAGE::Subtract`, remaining
+  coalesced damage is immediately re-notified via
+  `report_existing_damage_to_state(...)`. Regression:
+  `damage_subtract_with_remaining_nonempty_damage_rereports_immediately`.
+  Latest narrowing after another bad MATE run found a more basic
+  Present/Xorg mismatch in the Copy path. Xorg's
+  `present_copy_region()` does **not** interpret `x_off/y_off` as a
+  source origin. It performs `CopyArea(src=(0,0) -> dst=(x_off,y_off),
+  size=pixmap_wh)` and, when an `update` region is provided, installs
+  that region as a destination clip translated by `(x_off, y_off)`.
+  yserver had the opposite mapping in its immediate Copy fallback:
+  `copy_area(src=(x_off,y_off) -> dst=(0,0), size=pixmap_wh))`, and it
+  ignored the `update` region for the actual copy. That is a concrete
+  protocol-behavior bug and matches the compositor symptoms much better
+  than the earlier heuristic fixes. The current tree now mirrors Xorg's
+  shape: with an `update` region, yserver issues one backend copy per
+  update rect (`src=rect`, `dst=rect + x_off/y_off`); without an update
+  region it copies the full pixmap to destination offset
+  `(x_off, y_off)`. Regressions:
+  `present_pixmap_copy_uses_update_region_rects_as_copy_clips` and
+  `present_pixmap_copy_without_update_uses_dst_offset_not_src_offset`.
+  Latest narrowing from the next startup-hidden dump points at the
+  DAMAGE `Subtract(parts=...)` materialization itself. Marco's
+  fullscreen compositor pass copies the returned `parts` region into
+  its accumulated update region (`0x00e00255 -> 0x00e002b0` in the
+  trace), and in the bad frame that region is already a malformed set
+  of panel-edge bands before any window-specific subtract/intersect
+  runs. The cause is that yserver stores DAMAGE as an append-only raw
+  rect list in `damage_fanout`, but `DAMAGE::Subtract` was handing that
+  raw list straight back to the client when `repair == None`. Xorg's
+  internal damage state is a real canonical region, so clients see a
+  normalized parts region there rather than duplicate overlapping
+  rectangles. The current tree now canonicalizes the stored damage
+  rects before computing `parts` / `new_damage` in `DAMAGE::Subtract`.
+  Regressions:
+  `damage_subtract_with_no_repair_returns_old_damage_in_parts_and_clears`
+  and `damage_subtract_with_no_repair_canonicalizes_parts_region`.
+  Latest narrowing from the newest mixed startup run (panels hidden,
+  dialog visible) points at coalesced DAMAGE notify timing across
+  geometry changes. Xorg keeps notifying on coalesced damage when the
+  drawable geometry changes mid-cycle; yserver was only looking at the
+  boolean `pending_notify_fired`, so if a panel first reported damage
+  at `(0,-28)` and then moved to `(0,0)` before `DAMAGE::Subtract`,
+  the second full-window damage append was silently suppressed as
+  "already notified". That leaves marco draining damage against stale
+  geometry and stale update clips until some unrelated repaint wakes a
+  new cycle. The current tree now tracks
+  `DamageObject.last_reported_geometry` and re-emits coalesced damage
+  whenever the drawable geometry changes, even if the object is still
+  mid-cycle. Regression:
+  `geometry_change_rereports_damage_mid_cycle`.
+  Latest narrowing from the new startup-hidden-dialog run found the
+  remaining gap in the map/viewability path. The dialog window's
+  `XDamageCreate(window)` happened while the child was still
+  `Unviewable`, so the create-time seed correctly did nothing; later,
+  when the WM frame/ancestor map promoted that child to `Viewable`,
+  yserver emitted Expose down the subtree but only seeded DAMAGE for
+  the mapped parent itself, not for descendants that transitioned
+  `Unviewable -> Viewable`. That leaves marco without the dialog's
+  first visible pixels until some later configure/motion repaint lands.
+  The current tree now mirrors the map-time damage bump across the
+  newly-viewable subtree when handling `MapWindow`. Regression:
+  `map_window_seeds_damage_for_newly_viewable_descendant`.
+  Latest narrowing after startup-hidden was fixed but drag-hide
+  remained points at `ConfigureNotify` stack metadata, not window
+  pixels. The bad drag dump shows the keyring dialog backing is fully
+  correct while the COW/scanout omit it, which means marco is
+  compositing with the wrong stack model in that pass rather than
+  missing the dialog paint itself. yserver was sending
+  `ConfigureNotify` with `above-sibling = None` unconditionally:
+  `encode_configure_notify_event()` hardcoded zero, so every move/
+  restack update told clients "no sibling above me" regardless of the
+  actual root child order. That is a concrete WM-facing protocol bug
+  and a plausible explanation for marco treating the fullscreen
+  desktop window as if it sat above the dragged dialog during motion.
+  Follow-up: the first implementation got the direction wrong. Xorg's
+  `ConfigureNotify.aboveSibling` uses the sibling the window is
+  immediately **above** in stack order (the lower neighbor, Xorg's
+  `pSib` / `nextSib`), not the sibling above the window. yserver now
+  mirrors that exact direction from the parent child list and threads
+  it through every emitted `ConfigureNotify`. Regressions:
+  `encode_configure_notify_event_writes_above_sibling` and
+  `configure_notify_above_sibling_tracks_restacked_order`.
 
 ### What runs on v2 today (after 3f.15 + hardware-smoke fixes)
 

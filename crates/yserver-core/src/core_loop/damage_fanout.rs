@@ -39,6 +39,24 @@ struct PendingNotify {
 /// `Window.parent` chain, not a meaningful product limit.
 const ANCESTOR_WALK_MAX_DEPTH: u8 = 32;
 
+fn format_damage_rects(rects: &[xfixes::RegionRect]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::from("[");
+    for (i, rect) in rects.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let _ = write!(
+            out,
+            "({},{} {}x{})",
+            rect.x, rect.y, rect.width, rect.height
+        );
+    }
+    out.push(']');
+    out
+}
+
 /// Convenience: accumulate damage over the full extent of `drawable`
 /// (its width × height). Mirrors `nested::accumulate_damage_full`.
 pub fn accumulate_damage_full_to_state(
@@ -138,6 +156,138 @@ pub fn accumulate_damage_to_state(
         return Vec::new();
     }
 
+    let mut dropped: Vec<ClientId> = Vec::new();
+    for n in pending {
+        let geometry = n.geometry;
+        let area = n.area;
+        let extras = fanout_event_to_clients(state, &[n.owner], |buf, seq, order| {
+            encode_damage_notify(buf, order, seq, &n, timestamp, area, geometry);
+        });
+        for cid in extras {
+            if !dropped.contains(&cid) {
+                dropped.push(cid);
+            }
+        }
+    }
+    dropped
+}
+
+/// Re-report an already-accumulated damage object without appending a
+/// new rect. This mirrors Xorg's `ProcDamageSubtract` follow-up path:
+/// after subtracting a non-None repair region, any remaining damage is
+/// reported immediately for coalesced levels (Delta / BoundingBox /
+/// NonEmpty) instead of waiting for a future drawing op.
+pub fn report_existing_damage_to_state(state: &mut ServerState, damage_id: u32) -> Vec<ClientId> {
+    let Some((owner, drawable, level, fired, rects)) =
+        state.damage_objects.get(&damage_id).map(|d| {
+            (
+                d.owner,
+                d.drawable,
+                d.level,
+                d.pending_notify_fired,
+                d.rects.clone(),
+            )
+        })
+    else {
+        return Vec::new();
+    };
+    if fired || rects.is_empty() || !state.clients.contains_key(&owner.0) {
+        return Vec::new();
+    }
+
+    let geom_full = drawable_full_rect(state, drawable);
+    let (geom_x, geom_y) = if state.resources.window(drawable).is_some() {
+        let (ax, ay) = state.resources.window_absolute_position(drawable);
+        (
+            i16::try_from(ax).unwrap_or(i16::MAX),
+            i16::try_from(ay).unwrap_or(i16::MAX),
+        )
+    } else {
+        (0, 0)
+    };
+    let geometry = x11damage::Rectangle {
+        x: geom_x,
+        y: geom_y,
+        width: geom_full.width,
+        height: geom_full.height,
+    };
+
+    let mut pending: Vec<PendingNotify> = Vec::new();
+    match level {
+        x11damage::report_level::RAW_RECTANGLES | x11damage::report_level::DELTA_RECTANGLES => {
+            let more_base = level;
+            for (idx, rect) in rects.iter().enumerate() {
+                let level = if idx + 1 < rects.len() {
+                    more_base | x11damage::MORE_FLAG
+                } else {
+                    more_base
+                };
+                pending.push(PendingNotify {
+                    owner,
+                    damage_id,
+                    level,
+                    drawable: drawable.0,
+                    area: x11damage::Rectangle {
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                    },
+                    geometry,
+                });
+            }
+        }
+        x11damage::report_level::BOUNDING_BOX => {
+            let extents = crate::nested::region_extents(&rects);
+            pending.push(PendingNotify {
+                owner,
+                damage_id,
+                level,
+                drawable: drawable.0,
+                area: x11damage::Rectangle {
+                    x: extents.x,
+                    y: extents.y,
+                    width: extents.width,
+                    height: extents.height,
+                },
+                geometry,
+            });
+        }
+        x11damage::report_level::NON_EMPTY => {
+            pending.push(PendingNotify {
+                owner,
+                damage_id,
+                level,
+                drawable: drawable.0,
+                area: x11damage::Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: geom_full.width,
+                    height: geom_full.height,
+                },
+                geometry,
+            });
+        }
+        _ => return Vec::new(),
+    }
+
+    if let Some(d) = state.damage_objects.get_mut(&damage_id) {
+        d.pending_notify_fired = true;
+        d.last_reported_geometry = Some(geometry);
+    }
+    if let Some(d) = state.damage_objects.get(&damage_id) {
+        log::trace!(
+            "damage_notify_rereport: damage=0x{:x} owner={} drawable=0x{:x} level={} rects_n={} rects={}",
+            damage_id,
+            owner.0,
+            drawable.0,
+            level,
+            d.rects.len(),
+            format_damage_rects(&d.rects),
+        );
+    }
+
+    let timestamp = state.timestamp_now();
     let mut dropped: Vec<ClientId> = Vec::new();
     for n in pending {
         let geometry = n.geometry;
@@ -260,17 +410,23 @@ fn accumulate_at_level(
     };
 
     for damage_id in damage_ids {
-        let (level, fired, owner) = {
+        let (level, fired, owner, last_reported_geometry) = {
             let dmg = state
                 .damage_objects
                 .get(&damage_id)
                 .expect("just enumerated");
-            (dmg.level, dmg.pending_notify_fired, dmg.owner)
+            (
+                dmg.level,
+                dmg.pending_notify_fired,
+                dmg.owner,
+                dmg.last_reported_geometry,
+            )
         };
         if let Some(d) = state.damage_objects.get_mut(&damage_id) {
             d.rects.push(rect_i16);
         }
-        if !fired && state.clients.contains_key(&owner.0) {
+        let geometry_changed = last_reported_geometry.is_some_and(|prev| prev != geom_rect);
+        if state.clients.contains_key(&owner.0) && (!fired || geometry_changed) {
             // Per X11 DAMAGE spec + Xorg `damageext/damageext.c:117-126`
             // (`DamageExtNotify` with `pBoxes == NULL`): NonEmpty events
             // carry the full drawable extent in `area`, not the actual
@@ -299,8 +455,46 @@ fn accumulate_at_level(
                 geometry: geom_rect,
                 area: area_for_level,
             });
+            if let Some(d) = state.damage_objects.get(&damage_id) {
+                log::trace!(
+                    "damage_notify_queue: damage=0x{:x} owner={} drawable=0x{:x} level={} \
+                     area=({},{} {}x{}) geom=({},{} {}x{}) rects_n={} rects={}",
+                    damage_id,
+                    owner.0,
+                    level_drawable.0,
+                    level,
+                    area_for_level.x,
+                    area_for_level.y,
+                    area_for_level.width,
+                    area_for_level.height,
+                    geom_rect.x,
+                    geom_rect.y,
+                    geom_rect.width,
+                    geom_rect.height,
+                    d.rects.len(),
+                    format_damage_rects(&d.rects),
+                );
+            }
             if let Some(d) = state.damage_objects.get_mut(&damage_id) {
                 d.pending_notify_fired = true;
+                d.last_reported_geometry = Some(geom_rect);
+            }
+        } else {
+            let owner_alive = state.clients.contains_key(&owner.0);
+            if let Some(d) = state.damage_objects.get(&damage_id) {
+                log::trace!(
+                    "damage_notify_skip: damage=0x{:x} owner={} drawable=0x{:x} level={} \
+                     fired={} owner_alive={} geometry_changed={} rects_n={} rects={}",
+                    damage_id,
+                    owner.0,
+                    level_drawable.0,
+                    level,
+                    fired,
+                    owner_alive,
+                    geometry_changed,
+                    d.rects.len(),
+                    format_damage_rects(&d.rects),
+                );
             }
         }
     }
@@ -425,6 +619,7 @@ mod tests {
                 level: 3, // NonEmpty — same level marco uses
                 rects: Vec::new(),
                 pending_notify_fired: false,
+                last_reported_geometry: None,
             },
         );
     }
@@ -491,6 +686,36 @@ mod tests {
             w_dmg.pending_notify_fired,
             "W's damage object must have fired its notify too",
         );
+    }
+
+    #[test]
+    fn geometry_change_rereports_damage_mid_cycle() {
+        let mut state = ServerState::new();
+        add_client(&mut state, 1, 0x0010_0000);
+        let w_id = add_window(&mut state, 1, 0x0010_0001, ROOT_WINDOW, 0, -28, 2560, 28);
+        add_damage_on(&mut state, 1, 0xe000_0001, w_id);
+
+        let _ = accumulate_damage_full_to_state(&mut state, w_id);
+        let first = state
+            .damage_objects
+            .get(&0xe000_0001)
+            .and_then(|d| d.last_reported_geometry)
+            .expect("first notify should capture geometry");
+        assert_eq!(first.y, -28);
+
+        let window = state
+            .resources
+            .window_mut(w_id)
+            .expect("window must still exist");
+        window.y = 0;
+
+        let _ = accumulate_damage_full_to_state(&mut state, w_id);
+        let second = state
+            .damage_objects
+            .get(&0xe000_0001)
+            .and_then(|d| d.last_reported_geometry)
+            .expect("geometry-change notify should refresh geometry");
+        assert_eq!(second.y, 0);
     }
 
     /// Clipping at the ancestor boundary: child overhangs parent's
