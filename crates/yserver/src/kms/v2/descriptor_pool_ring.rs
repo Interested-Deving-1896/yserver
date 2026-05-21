@@ -498,4 +498,39 @@ mod tests {
         assert_eq!(err, vk::Result::ERROR_UNKNOWN);
         unsafe { vk.device.destroy_descriptor_set_layout(layout, None) };
     }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn pool_create_count_zero_after_warmup() {
+        let Some(vk) = vk_or_skip() else { return };
+        let layout = make_layout(&vk);
+        let mut ring = DescriptorPoolRing::new(Arc::clone(&vk));
+        const N: u64 = 5000;
+        for gen_id in 1..=N {
+            ring.acquire_set(layout, gen_id).expect("acquire");
+            // Retire the gen we just acquired before the next iter,
+            // mirroring the engine's "submit → retire" loop in the
+            // single-in-flight steady state.
+            ring.release_up_to(gen_id.saturating_sub(1));
+        }
+        // After warm-up: ≤ 2 pools resident. Lifetime creates should
+        // be a small multiple of (N / SETS_PER_POOL = 19.5) but
+        // bounded — anything ≤ 3 means the ring isn't growing on
+        // every cycle.
+        assert!(
+            ring.pool_count() <= 2,
+            "pool_count = {}, expected ≤ 2",
+            ring.pool_count()
+        );
+        assert!(
+            ring.lifetime_creates() <= 3,
+            "lifetime_creates = {}; expected ≤ 3 after warm-up",
+            ring.lifetime_creates()
+        );
+        assert!(
+            ring.lifetime_resets() > 0,
+            "lifetime_resets = 0; recycle path never ran"
+        );
+        unsafe { vk.device.destroy_descriptor_set_layout(layout, None) };
+    }
 }
