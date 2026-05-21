@@ -1383,6 +1383,31 @@ impl KmsBackendV2 {
         &self.telemetry
     }
 
+    /// Stage 5 Task 4 layer 1: test-side accessor to the ring's
+    /// pool residency. Used by the acceptance harness to assert
+    /// steady-state pool count stays small after warm-up.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn descriptor_pool_ring_pool_count(&self) -> usize {
+        self.engine.descriptor_pool_ring_pool_count()
+    }
+
+    /// Stage 5 Task 4 layer 1: test-side retirement driver. In
+    /// production, retirement runs from `on_page_flip_ready` and
+    /// invokes `engine.poll_retired` + `store.poll_pending_retire`.
+    /// Pixmap-only test fixtures never drive a page flip, so the
+    /// ring's recycle path can't run without this hook. The body
+    /// mirrors the production sequence 1:1 so the acceptance harness
+    /// exercises the same code paths any future store-retirement
+    /// work would touch — and adds the telemetry sync call so ring
+    /// delta counters land in `self.telemetry`.
+    #[doc(hidden)]
+    pub fn for_tests_poll_retired(&mut self) {
+        self.engine.poll_retired(&self.platform);
+        self.store.poll_pending_retire(&mut self.platform);
+        self.sync_descriptor_pool_telemetry();
+    }
+
     /// Stage 5 Task 4 layer 1: pull ring lifetime counter deltas
     /// into Telemetry. Called by the backend after every engine
     /// RENDER call site + retirement sweep. The bumps are

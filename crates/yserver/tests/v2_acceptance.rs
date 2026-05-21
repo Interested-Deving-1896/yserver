@@ -2654,3 +2654,94 @@ fn v2_render_composite_bumps_pool_create_telemetry() {
         t.lifetime.descriptor_pool_creates,
     );
 }
+
+/// Stage 5 Task 4 layer 1 acceptance: N render_composite ops with
+/// bounded in-flight depth must (1) bound pool creates, (2) actually
+/// recycle pools (resets observed), (3) keep pool residency small.
+/// Spec § 'Integration tests'.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_render_composite_pool_creates_bounded_after_warmup() {
+    const N: u32 = 2000;
+    // 256 sets per pool inside the ring (mirrors SETS_PER_POOL).
+    const SETS_PER_POOL: u32 = 256;
+    const WARMUP_SLACK: u64 = 4;
+    let expected_creates_upper = u64::from(N / SETS_PER_POOL) + WARMUP_SLACK;
+    let expected_resets_lower = u64::from(N / SETS_PER_POOL).saturating_sub(WARMUP_SLACK);
+
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let dst_pix = b.create_pixmap(None, 32, 4, 4).expect("dst pixmap");
+    let dst_xid = dst_pix.as_raw();
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 4, 4)
+        .expect("pre-fill blue");
+    let src_pic = b
+        .render_create_solid_fill(None, [0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF])
+        .expect("solid red")
+        .expect("Some");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("dst pic")
+        .expect("Some");
+
+    for i in 0..N {
+        b.render_composite(
+            None,
+            3,
+            src_pic.as_raw(),
+            0,
+            dst_pic.as_raw(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            4,
+            4,
+        )
+        .unwrap_or_else(|e| panic!("composite #{i} failed: {e:?}"));
+        // Retire often — every 32 ops drives the ring through full
+        // recycle cycles. Without retirement the ring just grows
+        // InFlight pools and never resets.
+        if i % 32 == 31 {
+            // Force fence completion via a sync get_image, then
+            // drive the retirement loop explicitly (page flips don't
+            // run in the pixmap-only fixture).
+            let _ = b
+                .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 4, 4, !0)
+                .expect("get_image");
+            b.for_tests_poll_retired();
+        }
+    }
+    // Final retirement to flush any remaining in-flight ops.
+    let _ = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 4, 4, !0)
+        .expect("final get_image");
+    b.for_tests_poll_retired();
+
+    let t = b.telemetry();
+    let creates = t.lifetime.descriptor_pool_creates;
+    let resets = t.lifetime.descriptor_pool_resets;
+    let residency = b.descriptor_pool_ring_pool_count();
+
+    assert!(
+        creates <= expected_creates_upper,
+        "creates={creates}, expected <= {expected_creates_upper} (N={N})",
+    );
+    assert!(
+        resets >= expected_resets_lower,
+        "resets={resets}, expected >= {expected_resets_lower} \
+         — recycle path didn't run; pools may be leaking as InFlight",
+    );
+    assert!(
+        residency <= 4,
+        "pool_count={residency} after warm-up; expected <= 4",
+    );
+}

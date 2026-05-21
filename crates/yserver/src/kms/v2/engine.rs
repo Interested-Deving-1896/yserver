@@ -568,6 +568,14 @@ impl RenderEngine {
             .map_or(0, |i| i.descriptor_pool_ring.lifetime_resets())
     }
 
+    /// Stage 5 Task 4 layer 1: ring residency for the acceptance
+    /// gate (`v2_render_composite_pool_creates_bounded_after_warmup`).
+    pub(crate) fn descriptor_pool_ring_pool_count(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map_or(0, |i| i.descriptor_pool_ring.pool_count())
+    }
+
     /// Stage 3b: drop any GPU-side state cached for `host_pic`.
     /// `KmsBackendV2::render_free_picture` calls this after
     /// removing the picture record from `KmsCore.pictures`. Stage
