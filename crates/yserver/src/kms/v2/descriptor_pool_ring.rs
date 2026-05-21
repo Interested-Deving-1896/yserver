@@ -115,6 +115,51 @@ impl DescriptorPoolRing {
         Ok(sets[0])
     }
 
+    /// Caller signals "all submissions up to and including generation
+    /// `retired_watermark` have retired." InFlight slots whose
+    /// `high_water_generation <= retired_watermark` move to Free via
+    /// `vkResetDescriptorPool`. Active pool is untouched.
+    ///
+    /// Returns the count of pools reclaimed for telemetry. On
+    /// `vkResetDescriptorPool` error the slot is moved to Poisoned;
+    /// the count of resets returned reflects only the `Ok` resets.
+    pub(crate) fn release_up_to(&mut self, retired_watermark: u64) -> usize {
+        let mut reclaimed = 0usize;
+        for i in 0..self.pools.len() {
+            let candidate = {
+                let slot = &self.pools[i];
+                slot.state == PoolState::InFlight && slot.high_water_generation <= retired_watermark
+            };
+            if !candidate {
+                continue;
+            }
+            let pool_handle = self.pools[i].pool;
+            let reset_result = unsafe {
+                self.vk
+                    .device
+                    .reset_descriptor_pool(pool_handle, vk::DescriptorPoolResetFlags::empty())
+            };
+            match reset_result {
+                Ok(()) => {
+                    let slot = &mut self.pools[i];
+                    slot.state = PoolState::Free;
+                    slot.sets_remaining = SETS_PER_POOL;
+                    slot.high_water_generation = 0;
+                    reclaimed += 1;
+                }
+                Err(e) => {
+                    log::error!(
+                        "DescriptorPoolRing: vkResetDescriptorPool failed on \
+                         pool {pool_handle:?}: {e:?} — poisoning slot",
+                    );
+                    self.pools[i].state = PoolState::Poisoned;
+                }
+            }
+        }
+        self.lifetime_resets = self.lifetime_resets.saturating_add(reclaimed as u64);
+        reclaimed
+    }
+
     /// Make sure there is an Active pool with at least one set
     /// remaining. Picks order:
     ///   1. current Active still has capacity → no-op.
@@ -265,6 +310,80 @@ mod tests {
         // First pool rotated to InFlight, second is Active.
         assert_eq!(ring.state_counts(), (0, 1, 1, 0));
         assert_eq!(ring.lifetime_creates(), 2);
+        unsafe { vk.device.destroy_descriptor_set_layout(layout, None) };
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn release_moves_inflight_to_free() {
+        let Some(vk) = vk_or_skip() else { return };
+        let layout = make_layout(&vk);
+        let mut ring = DescriptorPoolRing::new(Arc::clone(&vk));
+        // Fill pool A at gen=5, force rotate, then acquire gen=6 from
+        // a fresh pool B so A is InFlight with high_water=5.
+        for _ in 0..256 {
+            ring.acquire_set(layout, 5).unwrap();
+        }
+        ring.acquire_set(layout, 6).unwrap();
+        assert_eq!(ring.state_counts(), (0, 1, 1, 0));
+        // release_up_to(5) reclaims pool A.
+        let n = ring.release_up_to(5);
+        assert_eq!(n, 1);
+        assert_eq!(ring.state_counts(), (1, 1, 0, 0));
+        assert_eq!(ring.lifetime_resets(), 1);
+        unsafe { vk.device.destroy_descriptor_set_layout(layout, None) };
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn release_below_watermark_is_noop() {
+        let Some(vk) = vk_or_skip() else { return };
+        let layout = make_layout(&vk);
+        let mut ring = DescriptorPoolRing::new(Arc::clone(&vk));
+        for _ in 0..256 {
+            ring.acquire_set(layout, 10).unwrap();
+        }
+        ring.acquire_set(layout, 11).unwrap();
+        // release_up_to(9) — strictly below pool A's high_water=10.
+        let n = ring.release_up_to(9);
+        assert_eq!(n, 0);
+        assert_eq!(ring.state_counts(), (0, 1, 1, 0));
+        unsafe { vk.device.destroy_descriptor_set_layout(layout, None) };
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn interleaved_generations_partial_release() {
+        let Some(vk) = vk_or_skip() else { return };
+        let layout = make_layout(&vk);
+        let mut ring = DescriptorPoolRing::new(Arc::clone(&vk));
+        // Pool A: gen=100, fill.
+        for _ in 0..256 {
+            ring.acquire_set(layout, 100).unwrap();
+        }
+        // Pool B: gen=101, partial fill (1 set).
+        ring.acquire_set(layout, 101).unwrap();
+        assert_eq!(ring.state_counts(), (0, 1, 1, 0));
+        // Release watermark=100 → pool A frees, pool B stays Active.
+        assert_eq!(ring.release_up_to(100), 1);
+        assert_eq!(ring.state_counts(), (1, 1, 0, 0));
+
+        // Roll the cycle one more time: rotate B by filling it.
+        for _ in 0..255 {
+            ring.acquire_set(layout, 102).unwrap();
+        }
+        // B now has high_water=102 and is exhausted; one more acquire
+        // rotates B and reuses the Free A.
+        ring.acquire_set(layout, 103).unwrap();
+        assert_eq!(ring.pool_count(), 2);
+        assert_eq!(ring.state_counts(), (0, 1, 1, 0));
+        // Release 101 → not enough; B's high_water=102 > 101.
+        assert_eq!(ring.release_up_to(101), 0);
+        // Release 102 → B reclaims to Free.
+        assert_eq!(ring.release_up_to(102), 1);
+        assert_eq!(ring.state_counts(), (1, 1, 0, 0));
+        assert_eq!(ring.lifetime_resets(), 2);
+
         unsafe { vk.device.destroy_descriptor_set_layout(layout, None) };
     }
 }
