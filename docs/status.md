@@ -302,6 +302,20 @@ Cross-cutting bugs and followups that don't fit a stage live in
   setup (the alternative — `BadValue` — makes
   `mate-settings-daemon`'s "restore last session" path noisy at
   every login). Regression: `randr_set_crtc_config_validates_mode_id`.
+  Promoted `XFIXES::SetCursorName` from no-op accept to a full
+  round-trip with `XFIXES::GetCursorName`. `Cursor` gained a
+  `name_atom: Option<AtomId>` field; `SetCursorName` parses the
+  name bytes and interns via `state.atoms.intern(name,
+  only_if_exists=false)` (mirroring Xorg's `MakeAtom(tchar,
+  nbytes, TRUE)`), then stores the atom on the cursor.
+  `GetCursorName` (minor 24, previously unhandled → "unknown
+  minor" warning) reads the atom back and replies with the
+  spec-shaped 32-byte header + name + 4-byte-padded payload.
+  Unnamed cursors report atom=0 (X11 None) and an empty name,
+  matching `ProcXFixesGetCursorName`'s `pCursor->name == 0`
+  branch. Cross-checked against `xfixes/cursor.c` in the Xorg
+  checkout at `/home/jos/realhome/Projects/xserver`. Regression:
+  `xfixes_cursor_name_round_trip`.
 
 ### What runs on v2 today (after 3f.15 + hardware-smoke fixes)
 

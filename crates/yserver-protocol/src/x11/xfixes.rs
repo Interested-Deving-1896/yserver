@@ -27,6 +27,7 @@ pub const SET_GC_CLIP_REGION: u8 = 20;
 pub const SET_WINDOW_SHAPE_REGION: u8 = 21;
 pub const SET_PICTURE_CLIP_REGION: u8 = 22;
 pub const SET_CURSOR_NAME: u8 = 23;
+pub const GET_CURSOR_NAME: u8 = 24;
 pub const CHANGE_CURSOR_BY_NAME: u8 = 27;
 pub const HIDE_CURSOR: u8 = 29;
 pub const SHOW_CURSOR: u8 = 30;
@@ -310,6 +311,45 @@ pub fn parse_change_cursor_by_name(body: &[u8]) -> Option<(u32, &[u8])> {
     // bytes 6..8 are padding.
     let name = body.get(8..8 + nbytes)?;
     Some((cursor, name))
+}
+
+/// Parse XFIXES `SetCursorName` (minor 23). Wire shape matches
+/// `ChangeCursorByName`: cursor(4) + nbytes(2) + pad(2) + name(STRING8).
+/// Returns the cursor XID and the raw name bytes.
+#[must_use]
+pub fn parse_set_cursor_name(body: &[u8]) -> Option<(u32, &[u8])> {
+    parse_change_cursor_by_name(body)
+}
+
+/// Encode the XFIXES `GetCursorName` reply (minor 24). Per Xorg
+/// `xfixes/cursor.c:ProcXFixesGetCursorName`:
+/// 32-byte header containing the cursor's name atom + nbytes, followed
+/// by the raw name bytes and 4-byte alignment padding. The `length`
+/// field in the reply header counts 4-byte words of payload after the
+/// 32-byte header — that's `(nbytes + pad) / 4` where
+/// `pad = (4 - nbytes % 4) % 4`.
+#[must_use]
+pub fn encode_get_cursor_name_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    atom: u32,
+    name: &[u8],
+) -> Vec<u8> {
+    let nbytes = name.len();
+    let pad = (4 - nbytes % 4) % 4;
+    #[allow(clippy::cast_possible_truncation)]
+    let length = ((nbytes + pad) / 4) as u32;
+    let mut out = fixed_reply(byte_order, sequence, length);
+    write_u32(byte_order, &mut out, atom);
+    #[allow(clippy::cast_possible_truncation)]
+    let nbytes_u16 = nbytes.min(usize::from(u16::MAX)) as u16;
+    write_u16(byte_order, &mut out, nbytes_u16);
+    out.extend_from_slice(&[0u8; 18]);
+    debug_assert_eq!(out.len(), 32);
+    out.extend_from_slice(name);
+    out.extend_from_slice(&vec![0u8; pad]);
+    debug_assert_eq!(out.len(), 32 + nbytes + pad);
+    out
 }
 
 #[must_use]

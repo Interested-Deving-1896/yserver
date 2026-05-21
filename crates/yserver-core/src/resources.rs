@@ -1938,6 +1938,7 @@ impl ResourceTable {
                 id,
                 owner,
                 host_xid: None,
+                name_atom: None,
             },
         );
     }
@@ -1949,6 +1950,7 @@ impl ResourceTable {
                 id,
                 owner,
                 host_xid: None,
+                name_atom: None,
             },
         );
     }
@@ -1961,6 +1963,17 @@ impl ResourceTable {
 
     pub fn cursor_host_xid(&self, id: ResourceId) -> Option<u32> {
         self.cursors.get(&id.0)?.host_xid.map(|h| h.as_raw())
+    }
+
+    pub fn set_cursor_name_atom(&mut self, id: ResourceId, atom: yserver_protocol::x11::AtomId) {
+        if let Some(c) = self.cursors.get_mut(&id.0) {
+            c.name_atom = Some(atom);
+        }
+    }
+
+    #[must_use]
+    pub fn cursor_name_atom(&self, id: ResourceId) -> Option<yserver_protocol::x11::AtomId> {
+        self.cursors.get(&id.0)?.name_atom
     }
 
     /// Remove a cursor from the table and return the host XID (if any)
@@ -2522,6 +2535,12 @@ pub struct Cursor {
     pub id: ResourceId,
     pub owner: ClientId,
     pub host_xid: Option<crate::backend::CursorHandle>,
+    /// XFixes `SetCursorName` interns the client-supplied name as an
+    /// atom and stores it on the cursor; `GetCursorName` reads it back.
+    /// `None` (until first `SetCursorName`) reports as X11 `None` atom
+    /// (xid 0) on get, matching Xorg `xfixes/cursor.c`'s
+    /// `pCursor->name == 0` initial state.
+    pub name_atom: Option<yserver_protocol::x11::AtomId>,
 }
 
 #[cfg(test)]

@@ -3312,21 +3312,55 @@ fn handle_xfixes_request(
             }
         }
         x11xfixes::SET_CURSOR_NAME => {
-            // SetCursorName(cursor, name) — XFixes 2.0 way for clients
-            // to tag a cursor with a string name so XFixesGetCursorName
-            // can later read it back. Xcursor uses this when building
-            // themed cursors. yserver doesn't yet implement
-            // XFixesGetCursorName, so we accept the request silently
-            // (no reply) — same shape as other no-reply XFixes
-            // requests. Pre-fix this fell through to the "unknown
-            // minor" warning, which is noise (and means an
-            // automated-error harness might flag the session). Wire
-            // body: cursor(4) + nbytes(2) + pad(2) + name(STRING8) +
-            // pad-to-4. Parsing not needed — store-and-forget.
+            // SetCursorName(cursor, name) — XFixes 2.0: tag a cursor
+            // with a name string. Xorg interns the name as an atom and
+            // stores it on the cursor (`pCursor->name = atom`) so
+            // GetCursorName can read it back. yserver mirrors the same
+            // shape: intern, store on `Cursor.name_atom`.
+            if let Some((cursor_xid, name_bytes)) = x11xfixes::parse_set_cursor_name(body) {
+                let name = std::str::from_utf8(name_bytes).unwrap_or("");
+                let atom = state.atoms.intern(name, false);
+                state
+                    .resources
+                    .set_cursor_name_atom(ResourceId(cursor_xid), atom);
+                debug!(
+                    "client {} #{} XFIXES::SetCursorName cursor=0x{:x} atom={} \"{}\"",
+                    client_id.0, sequence.0, cursor_xid, atom.0, name,
+                );
+            } else {
+                debug!(
+                    "client {} #{} XFIXES::SetCursorName (malformed body, ignored)",
+                    client_id.0, sequence.0,
+                );
+            }
+        }
+        x11xfixes::GET_CURSOR_NAME => {
+            // GetCursorName(cursor) — reply with atom + name string.
+            // If no name was ever set, return atom=None(0) and an
+            // empty name, matching Xorg's behaviour for cursors with
+            // `pCursor->name == 0`.
+            let cursor_xid = body
+                .get(0..4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .unwrap_or(0);
+            let atom = state
+                .resources
+                .cursor_name_atom(ResourceId(cursor_xid))
+                .unwrap_or(AtomId(0));
+            let name = state.atoms.name(atom).map(str::as_bytes).unwrap_or(&[]);
             debug!(
-                "client {} #{} XFIXES::SetCursorName (no-op accept)",
-                client_id.0, sequence.0,
+                "client {} #{} XFIXES::GetCursorName cursor=0x{:x} atom={} ({} bytes)",
+                client_id.0,
+                sequence.0,
+                cursor_xid,
+                atom.0,
+                name.len(),
             );
+            let reply = x11xfixes::encode_get_cursor_name_reply(byte_order, sequence, atom.0, name);
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
         }
         x11xfixes::HIDE_CURSOR | x11xfixes::SHOW_CURSOR => {
             debug!(
@@ -15512,6 +15546,140 @@ mod tests {
              `backend.define_cursor(window, 0)` — same X11 None \
              semantics as the CWA cursor path.",
         );
+    }
+
+    /// XFixes `SetCursorName(cursor, "name")` interns the name as an
+    /// atom and stores it on the cursor; the subsequent
+    /// `GetCursorName(cursor)` returns the same atom + name bytes.
+    /// A cursor that was never named reports atom=0 (None) + empty
+    /// name, matching Xorg `xfixes/cursor.c:ProcXFixesGetCursorName`'s
+    /// `pCursor->name == 0` branch.
+    #[test]
+    fn xfixes_cursor_name_round_trip() {
+        use std::io::Read;
+
+        const CLIENT_ID: u32 = 1;
+        const CURSOR_XID: u32 = 0x0090_0042;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+        state
+            .resources
+            .create_cursor(ClientId(CLIENT_ID), ResourceId(CURSOR_XID));
+
+        let name = b"xterm";
+        // SetCursorName body: cursor(4) + nbytes(2) + pad(2) + name + pad.
+        let mut set_body = Vec::with_capacity(16);
+        set_body.extend_from_slice(&CURSOR_XID.to_le_bytes());
+        #[allow(clippy::cast_possible_truncation)]
+        set_body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        set_body.extend_from_slice(&[0u8; 2]);
+        set_body.extend_from_slice(name);
+        while !set_body.len().is_multiple_of(4) {
+            set_body.push(0);
+        }
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 140, // XFIXES major (dispatcher reads minor from header.data)
+            data: 23,    // SET_CURSOR_NAME
+            length_units: 3,
+        };
+        handle_xfixes_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &set_body,
+        )
+        .expect("SetCursorName");
+
+        // The atom must be stored on the cursor and resolve back to
+        // the original name.
+        let stored = state
+            .resources
+            .cursor_name_atom(ResourceId(CURSOR_XID))
+            .expect("name atom present after SetCursorName");
+        assert!(stored.0 != 0, "non-None atom expected for non-empty name");
+        assert_eq!(
+            state.atoms.name(stored).map(str::as_bytes),
+            Some(name.as_ref()),
+            "interned atom must reverse-resolve to the original name",
+        );
+
+        // GetCursorName body: cursor(4).
+        let get_body = CURSOR_XID.to_le_bytes().to_vec();
+        let get_header = yserver_protocol::x11::RequestHeader {
+            opcode: 140,
+            data: 24, // GET_CURSOR_NAME
+            length_units: 2,
+        };
+        handle_xfixes_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(2),
+            get_header,
+            &get_body,
+        )
+        .expect("GetCursorName");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut wire = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            match peer.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => wire.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        // Reply layout: type(1) + pad(1) + sequence(2) + length(4) +
+        // atom(4) + nbytes(2) + pad(18) + name(n) + pad-to-4.
+        assert_eq!(wire[0], 1, "X_Reply type byte");
+        let reply_atom = u32::from_le_bytes(wire[8..12].try_into().unwrap());
+        let reply_nbytes = u16::from_le_bytes(wire[12..14].try_into().unwrap()) as usize;
+        assert_eq!(reply_atom, stored.0, "reply atom matches stored atom");
+        assert_eq!(reply_nbytes, name.len());
+        assert_eq!(
+            &wire[32..32 + name.len()],
+            name,
+            "reply name bytes match the original",
+        );
+
+        // GetCursorName on an unnamed cursor → atom=0, nbytes=0.
+        const UNNAMED_XID: u32 = 0x0090_0099;
+        state
+            .resources
+            .create_cursor(ClientId(CLIENT_ID), ResourceId(UNNAMED_XID));
+        let get_body = UNNAMED_XID.to_le_bytes().to_vec();
+        handle_xfixes_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(3),
+            get_header,
+            &get_body,
+        )
+        .expect("GetCursorName unnamed");
+        let mut wire2 = Vec::new();
+        loop {
+            match peer.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => wire2.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        let reply_atom = u32::from_le_bytes(wire2[8..12].try_into().unwrap());
+        let reply_nbytes = u16::from_le_bytes(wire2[12..14].try_into().unwrap()) as usize;
+        assert_eq!(reply_atom, 0, "unnamed cursor reports atom=0 (None)");
+        assert_eq!(reply_nbytes, 0, "unnamed cursor reports empty name");
     }
 
     /// RANDR `SetCrtcConfig` with a mode that yserver advertises
