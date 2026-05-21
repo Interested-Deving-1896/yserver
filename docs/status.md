@@ -284,6 +284,24 @@ Cross-cutting bugs and followups that don't fit a stage live in
   `XIChangeCursor` as if `deviceid` were `AllMasterDevices`,
   which is what GTK relies on in practice. Regression:
   `xi_change_cursor_propagates_define_cursor_to_backend`.
+  Cleanup pass on the stub-handler audit from the same MATE/XFCE
+  smoke runs. (1) `XFIXES::SetCursorName` (minor 23, 47 hits
+  total) was falling through the XFIXES dispatch's
+  "unknown minor" warning branch — but the request is real:
+  Xcursor uses it to tag themed cursors with a name string so a
+  later `XFixesGetCursorName` can read it back. yserver doesn't
+  implement the GetCursorName side yet, but the per-request
+  warning was misleading — added a recognised no-op handler that
+  accepts and ignores. (2) `RANDR::Set{Screen,Crtc}Config` was
+  returning `status=Success(0)` unconditionally with a "stub"
+  log line; now validates the requested CRTC mode against
+  `state.randr.modes` and returns `status=Failed(3)` when the
+  mode is unknown (mode=0 = disable CRTC still accepts). Log
+  message clarified — no longer claims "stub" since the no-op
+  acceptance is intentional for yserver's fixed-KMS single-mode
+  setup (the alternative — `BadValue` — makes
+  `mate-settings-daemon`'s "restore last session" path noisy at
+  every login). Regression: `randr_set_crtc_config_validates_mode_id`.
 
 ### What runs on v2 today (after 3f.15 + hardware-smoke fixes)
 

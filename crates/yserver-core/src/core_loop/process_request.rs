@@ -2089,10 +2089,12 @@ fn handle_randr_request(
             // outputs/CRTCs on demand. Returning BadValue here makes
             // mate-settings-daemon (and any other RANDR-using "restore
             // last session" client) fail and warn the user about
-            // unsaved display settings every login. Stub Success
-            // instead — the screen stays as it is, which is fine for
-            // single-mode setups, and the client thinks its restore
-            // worked. status=Success(0), new_timestamp=now.
+            // unsaved display settings every login. Accept the request
+            // as a no-op when the client asks for a config we can
+            // honour (mode=0 disables a CRTC, or mode matches one of
+            // our advertised modes); reject with status=Failed(3)
+            // when the client asks for something we genuinely cannot
+            // provide.
             //
             // SetScreenConfig reply (32 bytes): status (in data byte) +
             // length=0 + new_timestamp(4) + config_timestamp(4) +
@@ -2100,7 +2102,32 @@ fn handle_randr_request(
             // reply (32 bytes): status (in data byte) + length=0 +
             // new_timestamp(4) + pad(20).
             let ts = state.timestamp_now();
-            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
+            // For SetCrtcConfig, body layout (post-header) is:
+            //   crtc(4) timestamp(4) config_timestamp(4) x(2) y(2)
+            //   mode(4) rotation(2) pad(2) outputs(4n)
+            // Status codes (per RandR 1.5): Success=0, InvalidConfigTime=1,
+            // InvalidTime=2, Failed=3.
+            let status: u8 = if minor == x11randr::RR_SET_CRTC_CONFIG {
+                let mode = body
+                    .get(16..20)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .unwrap_or(0);
+                if mode == 0 || state.randr.modes.iter().any(|m| m.mode_id == mode) {
+                    0
+                } else {
+                    3
+                }
+            } else {
+                // SetScreenConfig: legacy RandR 1.0 form taking
+                // SizeID + Rotation. yserver has a single screen size,
+                // so any SizeID != 0 is out of range — but mate's
+                // restore path passes the size we advertised, so
+                // accept across the board. A spec-strict
+                // implementation would validate against the advertised
+                // SizeID list.
+                0
+            };
+            let mut reply = x11::fixed_reply(byte_order, sequence, status, 0);
             x11::write_u32(byte_order, &mut reply, ts);
             if minor == x11randr::RR_SET_SCREEN_CONFIG {
                 x11::write_u32(byte_order, &mut reply, state.randr.timestamp);
@@ -2112,7 +2139,8 @@ fn handle_randr_request(
             }
             debug_assert_eq!(reply.len(), 32);
             debug!(
-                "client {} #{} RANDR::{} -> Success (stub) timestamp={}",
+                "client {} #{} RANDR::{} -> status={} timestamp={} (no-op accept; \
+                 yserver runs at the KMS-set mode and does not reconfigure outputs)",
                 client_id.0,
                 sequence.0,
                 if minor == x11randr::RR_SET_SCREEN_CONFIG {
@@ -2120,6 +2148,7 @@ fn handle_randr_request(
                 } else {
                     "SetCrtcConfig"
                 },
+                status,
                 ts,
             );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -3281,6 +3310,23 @@ fn handle_xfixes_request(
                     let _ = backend.xfixes_change_cursor_by_name(origin, host_cursor, name_bytes);
                 }
             }
+        }
+        x11xfixes::SET_CURSOR_NAME => {
+            // SetCursorName(cursor, name) — XFixes 2.0 way for clients
+            // to tag a cursor with a string name so XFixesGetCursorName
+            // can later read it back. Xcursor uses this when building
+            // themed cursors. yserver doesn't yet implement
+            // XFixesGetCursorName, so we accept the request silently
+            // (no reply) — same shape as other no-reply XFixes
+            // requests. Pre-fix this fell through to the "unknown
+            // minor" warning, which is noise (and means an
+            // automated-error harness might flag the session). Wire
+            // body: cursor(4) + nbytes(2) + pad(2) + name(STRING8) +
+            // pad-to-4. Parsing not needed — store-and-forget.
+            debug!(
+                "client {} #{} XFIXES::SetCursorName (no-op accept)",
+                client_id.0, sequence.0,
+            );
         }
         x11xfixes::HIDE_CURSOR | x11xfixes::SHOW_CURSOR => {
             debug!(
@@ -15465,6 +15511,105 @@ mod tests {
             "XIChangeCursor with cursor=None (xid 0) must invoke \
              `backend.define_cursor(window, 0)` — same X11 None \
              semantics as the CWA cursor path.",
+        );
+    }
+
+    /// RANDR `SetCrtcConfig` with a mode that yserver advertises
+    /// (the KMS-set one) replies status=0 (Success); with a mode
+    /// not in `state.randr.modes`, replies status=3 (Failed). The
+    /// "disable CRTC" form (mode=0) is always accepted. yserver
+    /// itself does not reconfigure outputs — this is just the
+    /// protocol-side answer.
+    #[test]
+    fn randr_set_crtc_config_validates_mode_id() {
+        use crate::randr::{RandrOutput, RandrState};
+
+        const CLIENT_ID: u32 = 1;
+        let outputs = vec![RandrOutput {
+            name: "test-0".to_string(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+        }];
+        let mut state = ServerState::new();
+        state.randr = RandrState::from_outputs(0, outputs);
+        let mut peer = install_client(&mut state, CLIENT_ID);
+
+        // Build a SetCrtcConfig body: crtc(4) ts(4) cts(4) x(2) y(2)
+        // mode(4) rotation(2) pad(2) outputs(4*N).
+        fn build_body(mode: u32) -> Vec<u8> {
+            let mut b = Vec::with_capacity(28);
+            b.extend_from_slice(&2u32.to_le_bytes()); // crtc
+            b.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+            b.extend_from_slice(&0u32.to_le_bytes()); // config_timestamp
+            b.extend_from_slice(&0i16.to_le_bytes()); // x
+            b.extend_from_slice(&0i16.to_le_bytes()); // y
+            b.extend_from_slice(&mode.to_le_bytes()); // mode
+            b.extend_from_slice(&1u16.to_le_bytes()); // rotation
+            b.extend_from_slice(&[0u8; 2]); // pad
+            b
+        }
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 140, // RANDR major (placeholder; dispatcher reads minor from header.data)
+            data: 21,    // RR_SET_CRTC_CONFIG
+            length_units: 7,
+        };
+
+        // Known mode → status=0 (Success).
+        handle_randr_request(
+            &mut state,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &build_body(3),
+        )
+        .expect("known mode");
+        // mode=0 (disable) → status=0.
+        handle_randr_request(
+            &mut state,
+            ClientId(CLIENT_ID),
+            SequenceNumber(2),
+            header,
+            &build_body(0),
+        )
+        .expect("disable");
+        // Unknown mode → status=3 (Failed).
+        handle_randr_request(
+            &mut state,
+            ClientId(CLIENT_ID),
+            SequenceNumber(3),
+            header,
+            &build_body(0xdead_beef),
+        )
+        .expect("unknown mode");
+
+        use std::io::Read;
+        peer.set_nonblocking(true).unwrap();
+        let mut wire = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            match peer.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => wire.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        // Each reply is 32 bytes. status byte is at offset 1.
+        let statuses: Vec<u8> = wire.chunks_exact(32).map(|c| c[1]).collect();
+        assert_eq!(
+            statuses,
+            vec![0, 0, 3],
+            "SetCrtcConfig must return Success(0) for advertised modes \
+             and mode=0 (disable), Failed(3) for modes yserver does not \
+             know about. Pre-fix every call returned 0 unconditionally, \
+             so a client could `Success`-fully request a mode that was \
+             never honoured.",
         );
     }
 
