@@ -336,6 +336,42 @@ from.
 - [x] **Text rendering broken under xfce4 / GTK heavy workloads.**
       Fixed by Phase 3E text-run migration + downstream rework;
       confirmed working on fuji 2026-05-15.
+- [ ] **PictFormat tracking + ARGB picture intent (Stage 4e
+      candidate).** Surfaced as residual from Stage 4 close
+      (2026-05-21). v2 forces opaque on depth-24 source pictures
+      (`d20f279`) and routes xRGB/RGB24 through the resolver as
+      forced-opaque, but doesn't track per-picture PictFormat
+      semantics (xRGB-as-render-intent vs ARGB) end-to-end. Full
+      compositor-WM correctness (consistent ARGB-aware shadow /
+      transparency / multi-layer Render::Composite) needs
+      PictFormat tracking on `PictureRecord::Drawable` + the
+      backend sampler, plus picture-source alpha interpretation
+      per format. Until then the cow-authoritative scene gating
+      keeps the compositor's path working but full Render
+      Composite correctness in complex DE chrome (e.g. tooltip
+      drop-shadows blending against arbitrary backgrounds) is
+      not guaranteed. Marked candidate "Stage 4e" in earlier
+      planning; not on the Stage 5 perf path.
+- [ ] **KmsCore.pictures disconnect cleanup.** Stale Picture
+      records from disconnected clients (e.g.
+      mate-session-check) can persist in v2's `KmsCore.pictures`,
+      causing `render_composite gap` noise lines.
+      `yserver-core/src/core_loop/process_disconnect.rs:261`
+      already loops `removed.freed_pictures` calling
+      `backend.render_free_picture`; verify v2's impl actually
+      evicts from `KmsCore.pictures` and add the missing eviction
+      if it doesn't. ~50 LoC. Surfaced from Stage 4d open items
+      (now in
+      [`status-archive-2026-05-21.md`](status-archive-2026-05-21.md)).
+- [ ] **MATE Control Center yellow group-header labels missing
+      (mate-no-comp).** Group headers in the Control Center
+      sidebar ("Filter", "Groups", "Common Tasks") render
+      invisible. Reproducible without a compositor, so not a
+      COW/redirect bug. Likely a colored-source + glyph-mask
+      Render::Composite path issue — yserver's Render glyph
+      compositing with a non-default source colour is the most
+      plausible suspect. Surfaced from the Stage 4d hardware
+      smoke (now archived).
 
 ## wmaker on KMS
 
