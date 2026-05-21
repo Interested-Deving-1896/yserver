@@ -227,6 +227,14 @@ pub trait Backend: Send {
     /// (e.g. host-X11) that don't drive their own composite loop.
     fn mark_dirty(&mut self) {}
 
+    /// Earliest backend-owned deadline the core loop must wake for
+    /// even when no fd is readable. Backends use this for retry
+    /// timers that would otherwise be stranded behind an indefinite
+    /// `poll()`. Default: no deadline.
+    fn next_wakeup(&self) -> Option<std::time::Instant> {
+        None
+    }
+
     /// If the backend has pending damage and no flip is currently in
     /// flight, kick the next composite. Called once per core-loop
     /// iteration so a backend that went dormant after the last

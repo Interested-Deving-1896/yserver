@@ -15,8 +15,10 @@
 # you on teardown.
 #
 # Args (env vars):
-#   RUST_LOG   default: warn   (keeps env_logger out of the profile)
-#   PERF_FREQ  default: 999
+#   SESSION_NAME    default: mate
+#   SESSION_COMMAND default: mate-session --display :7
+#   RUST_LOG        default: warn   (keeps env_logger out of the profile)
+#   PERF_FREQ       default: 999
 #   STRACE     default: 0      (set STRACE=1 to attach strace to caja
 #                               the moment it spawns; dumps poll/recvmsg/
 #                               sendmsg/read/futex/connect with fd-paths
@@ -59,15 +61,18 @@
 set -u
 
 NEST_DISPLAY=":7"
-PERF_DATA="yserver-mate.perf.data"
-PERF_LOG="yserver-mate.perf.log"
-YSERVER_LOG="yserver-hw.log"
-MATE_LOG="mate.log"
 
+SESSION_NAME="${SESSION_NAME:-mate}"
+SESSION_COMMAND="${SESSION_COMMAND:-mate-session --display $NEST_DISPLAY}"
 RUST_LOG="${RUST_LOG:-warn}"
 PERF_FREQ="${PERF_FREQ:-999}"
 STRACE="${STRACE:-0}"
 DBUS_MONITOR="${DBUS_MONITOR:-0}"
+
+PERF_DATA="yserver-${SESSION_NAME}.perf.data"
+PERF_LOG="yserver-${SESSION_NAME}.perf.log"
+YSERVER_LOG="yserver-hw.log"
+SESSION_LOG="${SESSION_NAME}.log"
 CAJA_STRACE="caja.strace"
 DBUS_MONITOR_LOG="dbus-monitor.log"
 
@@ -171,7 +176,8 @@ fi
 
 echo "perf:    $PERF_DATA (freq ${PERF_FREQ}Hz, $PERF_EVENTS)"
 echo "yserver: $YSERVER_LOG (RUST_LOG=$RUST_LOG)"
-echo "mate:    $MATE_LOG"
+echo "session: $SESSION_NAME ($SESSION_COMMAND)"
+echo "log:     $SESSION_LOG"
 
 # Optional: watch for caja and strace it the moment it spawns.
 # Run as sudo because Arch's default ptrace_scope=1 only lets parents
@@ -227,14 +233,15 @@ if [[ "$DBUS_MONITOR" == "1" ]]; then
         DISPLAY="$NEST_DISPLAY" GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 \
         XDG_RUNTIME_DIR="$NESTED_RUNTIME_DIR" \
         DBUS_MONITOR_LOG_FILE="$DBUS_MONITOR_LOG" \
-        dbus-run-session bash -c '
+        SESSION_COMMAND="$SESSION_COMMAND" dbus-run-session bash -c '
             dbus-monitor --session > "$DBUS_MONITOR_LOG_FILE" 2>&1 &
-            exec mate-session --display "'"$NEST_DISPLAY"'"
-        ' >"$MATE_LOG" 2>&1 || true
+            exec bash -c "$SESSION_COMMAND"
+        ' >"$SESSION_LOG" 2>&1 || true
 else
     env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
         DISPLAY="$NEST_DISPLAY" GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 \
         XDG_RUNTIME_DIR="$NESTED_RUNTIME_DIR" \
-        dbus-run-session mate-session --display "$NEST_DISPLAY" \
-        >"$MATE_LOG" 2>&1 || true
+        SESSION_COMMAND="$SESSION_COMMAND" \
+        dbus-run-session bash -c 'exec bash -c "$SESSION_COMMAND"' \
+        >"$SESSION_LOG" 2>&1 || true
 fi

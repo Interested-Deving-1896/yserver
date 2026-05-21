@@ -83,6 +83,13 @@ pub struct Output {
     pub picked: Mode,
     pub plane_fb_id_prop: property::Handle,
     pub plane_crtc_id_prop: property::Handle,
+    /// Cached explicit-sync plane property. `None` means the driver
+    /// did not expose it during modeset discovery; page-flip submission
+    /// falls back to lookup so compatibility stays unchanged.
+    pub plane_in_fence_fd_prop: Option<property::Handle>,
+    /// Cached explicit-sync CRTC property. See
+    /// [`Self::plane_in_fence_fd_prop`].
+    pub crtc_out_fence_ptr_prop: Option<property::Handle>,
     /// DRM modifiers accepted by the primary plane for XRGB8888
     /// scanout, parsed from the optional IN_FORMATS property. Empty
     /// means the driver did not expose IN_FORMATS or parsing failed;
@@ -307,6 +314,10 @@ fn finalize_output(
     let plane_props_map = PropMap::for_object(device, asg.plane)?;
     let plane_fb_id_prop = plane_props_map.id("FB_ID")?;
     let plane_crtc_id_prop = plane_props_map.id("CRTC_ID")?;
+    let plane_in_fence_fd_prop = plane_props_map.id("IN_FENCE_FD").ok();
+    let crtc_out_fence_ptr_prop = PropMap::for_object(device, asg.crtc)
+        .and_then(|props| props.id("OUT_FENCE_PTR"))
+        .ok();
     let scanout_modifiers = plane_scanout_modifiers(device, asg.plane)?;
 
     log::info!(
@@ -330,6 +341,8 @@ fn finalize_output(
         picked,
         plane_fb_id_prop,
         plane_crtc_id_prop,
+        plane_in_fence_fd_prop,
+        crtc_out_fence_ptr_prop,
         scanout_modifiers,
     })
 }

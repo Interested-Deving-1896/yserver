@@ -496,6 +496,11 @@ yserver-mate-hw log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::rende
 yserver-mate-hw-perf log="warn" freq="999":
     RUST_LOG={{log}} PERF_FREQ={{freq}} tools/profile-mate.sh
 
+yserver-xfce-hw-perf log="warn" freq="999":
+    RUST_LOG={{log}} PERF_FREQ={{freq}} \
+        SESSION_NAME=xfce SESSION_COMMAND='xfce4-session --display :7' \
+        tools/profile-mate.sh
+
 yserver-cinnamon-hw log="debug,yserver::kms::v2::scene=trace":
     cargo build --bin yserver
     bash -c '\
@@ -757,6 +762,21 @@ yserver-mate-hw-telemetry log="info":
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
             XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
             dbus-run-session mate-session --display :7 > mate.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
+
+yserver-xfce-hw-telemetry log="info":
+    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-hw-xfce.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            dbus-run-session xfce4-session --display :7 > xfce.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'

@@ -353,14 +353,22 @@ pub fn run_core(
         let poll_timeout = if !deferred_requests.is_empty() {
             Some(Duration::ZERO)
         } else {
-            // If a key is currently held, wake the loop in time to fire
-            // the next synthetic repeat. `Duration::ZERO` keeps mio
-            // returning immediately when we're already past `next_fire`.
-            state.repeat_state.as_ref().map(|r| {
-                r.next_fire
-                    .checked_duration_since(Instant::now())
-                    .unwrap_or(Duration::ZERO)
-            })
+            // Wake for the earliest deadline owned by either core
+            // key-repeat or the backend (for example, a compositor
+            // commit retry). `Duration::ZERO` keeps mio returning
+            // immediately when a deadline is already due.
+            let now = Instant::now();
+            let repeat_deadline = state.repeat_state.as_ref().map(|r| r.next_fire);
+            let backend_deadline = backend.next_wakeup();
+            repeat_deadline
+                .into_iter()
+                .chain(backend_deadline)
+                .min()
+                .map(|deadline| {
+                    deadline
+                        .checked_duration_since(now)
+                        .unwrap_or(Duration::ZERO)
+                })
         };
         poll.poll(&mut events, poll_timeout)?;
         let iter_start = if telemetry.enabled {

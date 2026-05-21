@@ -588,6 +588,8 @@ impl PlatformBackend {
                     },
                     plane_fb_id_prop: ::drm::control::from_u32(1).unwrap(),
                     plane_crtc_id_prop: ::drm::control::from_u32(1).unwrap(),
+                    plane_in_fence_fd_prop: None,
+                    crtc_out_fence_ptr_prop: None,
                     scanout_modifiers: Vec::new(),
                 },
                 swapchain: drm::Swapchain::empty_for_tests(),

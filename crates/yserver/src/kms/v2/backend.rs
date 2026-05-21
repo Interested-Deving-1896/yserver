@@ -3602,6 +3602,10 @@ impl Backend for KmsBackendV2 {
         self.scene.wake_for_damage();
     }
 
+    fn next_wakeup(&self) -> Option<std::time::Instant> {
+        self.scene.earliest_retry_deadline()
+    }
+
     fn maybe_composite(&mut self) -> io::Result<()> {
         let result = if !self.scene.scene_structure_dirty {
             Ok(())

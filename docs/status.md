@@ -41,15 +41,18 @@ Cross-cutting bugs and followups that don't fit a stage live in
   parallel-implementation lessons. Don't ship anything from there.
 - Current live work (2026-05-21): `cow-authoritative-mode` is the
   active Stage 5/COW-authoritative validation branch. Hardware MATE
-  runs currently show two related symptoms: COW/Present churn can make
-  windows appear/disappear, and the same storm produces primary-plane
-  atomic `EBUSY` plus standalone cursor-plane `EBUSY`. The pointer
-  state still moves (hover highlights follow it), but the hardware
-  cursor can visually jam if a cursor plane move/show is dropped while
-  a page flip is pending. `YSERVER_V2_HW_CURSOR` is therefore back to
-  opt-in (`=1` / `true` / `yes` / `on`); the default uses the confirmed
-  good software cursor path. The HW cursor path still uses nonblocking
-  cursor ioctls and is kept only for focused cursor-plane debugging.
+  still shows COW/redirect rendering failures: `nm-applet` may not
+  appear, windows can disappear while moving, and the MATE pager still
+  tracks the moving window even when the real window is invisible.
+  Telemetry from both XFCE and MATE rules out the current extracted
+  perf fixes as the cause: no missed page flips, no KMS `EBUSY` loop,
+  no hot `vkQueueWaitIdle`, and input/page-flip cadence stays healthy
+  during the repro. Treat this as a scene/COW/backing-content selection
+  bug, not CPU overhead or present starvation. Separately, hardware
+  cursor plane updates can still visually jam if enabled; the default
+  path uses the confirmed good software cursor, while
+  `YSERVER_V2_HW_CURSOR=1` remains opt-in for focused cursor-plane
+  debugging.
 
 ### What runs on v2 today (after 3f.15 + hardware-smoke fixes)
 

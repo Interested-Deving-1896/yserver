@@ -75,16 +75,20 @@ fn submit_flip_inner(
         // IN_FENCE_FD is a plane property. Its value is the fence fd
         // (sign-extended to u64; -1 means "no fence", which differs
         // from "absent").
-        let plane_props = PropMap::for_object(device, output.plane)?;
-        let prop = plane_props.id("IN_FENCE_FD")?;
+        let prop = match output.plane_in_fence_fd_prop {
+            Some(prop) => prop,
+            None => PropMap::for_object(device, output.plane)?.id("IN_FENCE_FD")?,
+        };
         req.add_raw_property(output.plane.into(), prop, fd as i64 as u64);
     }
     if let Some(holder) = out_fence_holder {
         // OUT_FENCE_PTR is a CRTC property. Its value is a userspace
         // pointer (cast to u64) where the kernel writes the freshly
         // allocated fence fd on a successful commit.
-        let crtc_props = PropMap::for_object(device, output.crtc)?;
-        let prop = crtc_props.id("OUT_FENCE_PTR")?;
+        let prop = match output.crtc_out_fence_ptr_prop {
+            Some(prop) => prop,
+            None => PropMap::for_object(device, output.crtc)?.id("OUT_FENCE_PTR")?,
+        };
         let ptr_value = (holder as *mut i32) as usize as u64;
         req.add_raw_property(output.crtc.into(), prop, ptr_value);
     }

@@ -631,6 +631,16 @@ impl SceneCompositor {
         );
     }
 
+    /// Earliest pending commit-retry deadline across outputs.
+    pub(crate) fn earliest_retry_deadline(&self) -> Option<std::time::Instant> {
+        self.inner
+            .as_ref()?
+            .outputs
+            .iter()
+            .filter_map(|o| o.next_submit_retry_at)
+            .min()
+    }
+
     /// Stage 5 Phase D — cursor-plane mode aggregate query for the
     /// pointer fast path. Returns `Hw` ONLY when every active
     /// output has retired its Sw→Hw transition AND no PendingAck
