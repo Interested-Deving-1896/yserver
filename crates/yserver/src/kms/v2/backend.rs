@@ -1503,13 +1503,27 @@ impl KmsBackendV2 {
         }
     }
 
-    /// Topmost mapped top-level under the cursor. Walks
-    /// `core.top_level_order` back-to-front so the topmost match
-    /// wins. v2 hit-tests against `windows_v2` (parity with v1's
-    /// `self.windows`); SHAPE-input precedence matches v1.
+    /// Deepest mapped window under the cursor. Walks
+    /// `core.top_level_order` back-to-front for the topmost top-level
+    /// match, then descends the sub-window tree picking the topmost
+    /// mapped child at each level whose screen-coords box contains
+    /// the cursor. SHAPE-input (or bounding) trims the hittable
+    /// region at every level.
+    ///
+    /// Why descend: xfwm4 attaches resize-edge cursors to thin frame
+    /// sub-windows (one child per edge under each frame top-level),
+    /// not to the frame top-level itself. Without sub-window descent
+    /// the pointer-window stays pinned to the frame, the cursor walk
+    /// in `effective_cursor_walking_chain` picks up only the frame's
+    /// (`None`) cursor + the root fallback, and the resize sprites
+    /// never become effective — the cursor stays as the default
+    /// arrow over xfwm4 frame edges. Matches Xorg `dix/events.c`'s
+    /// `XYToWindow` descent. The depth bound mirrors the cursor
+    /// walk's 64.
     fn window_under_cursor(&self) -> Option<u32> {
         let cx = f64::from(self.core.cursor_x);
         let cy = f64::from(self.core.cursor_y);
+        let mut hit: Option<(u32, f64, f64)> = None;
         for &window_id in self.core.top_level_order.iter().rev() {
             let Some(w) = self.windows_v2.get(&window_id) else {
                 continue;
@@ -1519,33 +1533,81 @@ impl KmsBackendV2 {
             }
             let wx = f64::from(w.x);
             let wy = f64::from(w.y);
-            let ww = f64::from(w.width);
-            let wh = f64::from(w.height);
-            if cx < wx || cx >= wx + ww || cy < wy || cy >= wy + wh {
+            if cx < wx || cx >= wx + f64::from(w.width) || cy < wy || cy >= wy + f64::from(w.height)
+            {
                 continue;
             }
-            // SHAPE input precedence — empty SHAPE = unhittable.
-            let shape = self
-                .core
-                .shape_input
-                .get(&window_id)
-                .or_else(|| self.core.shape_bounding.get(&window_id));
-            if let Some(rects) = shape {
-                let inside = rects.iter().any(|r| {
-                    let rx = wx + f64::from(r.x);
-                    let ry = wy + f64::from(r.y);
-                    cx >= rx
-                        && cx < rx + f64::from(r.width)
-                        && cy >= ry
-                        && cy < ry + f64::from(r.height)
-                });
-                if !inside {
+            if !self.cursor_inside_shape(window_id, cx - wx, cy - wy) {
+                continue;
+            }
+            hit = Some((window_id, wx, wy));
+            break;
+        }
+        let (mut parent_xid, mut parent_x, mut parent_y) = hit?;
+        for _ in 0..64 {
+            let mut children: Vec<(u32, u64, i16, i16, u16, u16)> = self
+                .windows_v2
+                .iter()
+                .filter_map(|(xid, g)| {
+                    (g.parent == Some(parent_xid) && g.mapped).then_some((
+                        *xid,
+                        g.stack_rank,
+                        g.x,
+                        g.y,
+                        g.width,
+                        g.height,
+                    ))
+                })
+                .collect();
+            children.sort_by(|a, b| b.1.cmp(&a.1));
+            let mut next: Option<(u32, f64, f64)> = None;
+            for (child_id, _rank, cxoff, cyoff, cw, ch) in children {
+                let cax = parent_x + f64::from(cxoff);
+                let cay = parent_y + f64::from(cyoff);
+                if cx < cax || cx >= cax + f64::from(cw) || cy < cay || cy >= cay + f64::from(ch) {
                     continue;
                 }
+                if !self.cursor_inside_shape(child_id, cx - cax, cy - cay) {
+                    continue;
+                }
+                next = Some((child_id, cax, cay));
+                break;
             }
-            return Some(window_id);
+            match next {
+                Some((child, cax, cay)) => {
+                    parent_xid = child;
+                    parent_x = cax;
+                    parent_y = cay;
+                }
+                None => break,
+            }
         }
-        None
+        Some(parent_xid)
+    }
+
+    /// SHAPE-input (preferred) / bounding (fallback) hit-test for a
+    /// single window. `local_x`/`local_y` are the pointer position
+    /// in the window's own coordinate space (origin = window's top-
+    /// left). Returns `true` when no SHAPE is set or the cursor lies
+    /// inside at least one rectangle; an empty rect list means the
+    /// window is unhittable.
+    fn cursor_inside_shape(&self, window_id: u32, local_x: f64, local_y: f64) -> bool {
+        let shape = self
+            .core
+            .shape_input
+            .get(&window_id)
+            .or_else(|| self.core.shape_bounding.get(&window_id));
+        let Some(rects) = shape else {
+            return true;
+        };
+        rects.iter().any(|r| {
+            let rx = f64::from(r.x);
+            let ry = f64::from(r.y);
+            local_x >= rx
+                && local_x < rx + f64::from(r.width)
+                && local_y >= ry
+                && local_y < ry + f64::from(r.height)
+        })
     }
 
     /// Event-window-relative coords for an event whose `host_xid`
@@ -11111,6 +11173,115 @@ mod tests {
         b.core.cursor_x = 75.0;
         b.core.cursor_y = 75.0;
         assert_eq!(b.window_under_cursor(), Some(0x1000));
+    }
+
+    /// `window_under_cursor` descends into mapped sub-windows so the
+    /// returned xid is the deepest match. xfwm4 attaches resize-edge
+    /// cursors to frame sub-windows; without descent the cursor walk
+    /// stops at the (cursor=None) frame top-level and the resize
+    /// sprites never become effective on hover. Pinned: top-edge
+    /// child wins when pointer is in the edge band; the frame
+    /// top-level wins in the interior; topmost sibling wins on
+    /// overlap; unmapped sub-windows are skipped (parent wins).
+    #[test]
+    fn window_under_cursor_descends_into_subwindow_tree() {
+        let mut b = KmsBackendV2::for_tests();
+        // Frame top-level at (100,100, 800x600), no cursor.
+        b.windows_v2.insert(
+            0x1000,
+            super::WindowGeometryV2 {
+                x: 100,
+                y: 100,
+                width: 800,
+                height: 600,
+                depth: 24,
+                mapped: true,
+                parent: None,
+                stack_rank: 0,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        b.core.top_level_order.push(0x1000);
+        // Top-edge resize sub-window at parent-local (0,0, 800x10),
+        // i.e. screen (100,100, 800x10). Has its own resize cursor.
+        b.windows_v2.insert(
+            0x1001,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 10,
+                depth: 24,
+                mapped: true,
+                parent: Some(0x1000),
+                stack_rank: 0,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: Some(0xdead_0001),
+            },
+        );
+        // Bottom-edge resize sub-window at parent-local (0,590, 800x10),
+        // screen (100,690, 800x10). Different cursor.
+        b.windows_v2.insert(
+            0x1002,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 590,
+                width: 800,
+                height: 10,
+                depth: 24,
+                mapped: true,
+                parent: Some(0x1000),
+                stack_rank: 1,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: Some(0xdead_0002),
+            },
+        );
+
+        // Cursor in the top-edge band: deepest hit is the top sub-window.
+        b.core.cursor_x = 150.0;
+        b.core.cursor_y = 105.0;
+        assert_eq!(b.window_under_cursor(), Some(0x1001));
+
+        // Cursor in the bottom-edge band: bottom sub-window.
+        b.core.cursor_x = 150.0;
+        b.core.cursor_y = 695.0;
+        assert_eq!(b.window_under_cursor(), Some(0x1002));
+
+        // Cursor in the frame interior (not in any edge band): the
+        // frame top-level itself.
+        b.core.cursor_x = 400.0;
+        b.core.cursor_y = 300.0;
+        assert_eq!(b.window_under_cursor(), Some(0x1000));
+
+        // Overlap test — add a second top-edge child at the same
+        // location with higher stack_rank; topmost wins.
+        b.windows_v2.insert(
+            0x1003,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 10,
+                depth: 24,
+                mapped: true,
+                parent: Some(0x1000),
+                stack_rank: 99,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: Some(0xdead_0003),
+            },
+        );
+        b.core.cursor_x = 150.0;
+        b.core.cursor_y = 105.0;
+        assert_eq!(b.window_under_cursor(), Some(0x1003));
+
+        // Unmap the topmost overlap entry — sibling beneath wins.
+        b.windows_v2.get_mut(&0x1003).unwrap().mapped = false;
+        assert_eq!(b.window_under_cursor(), Some(0x1001));
     }
 
     /// `on_host_input` no longer logs the `v2: on_host_input not

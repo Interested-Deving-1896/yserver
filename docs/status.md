@@ -244,6 +244,30 @@ Cross-cutting bugs and followups that don't fit a stage live in
   `dix/window.c:1487-1491`, which sets `pCursor = (CursorPtr) None`
   when `cursorID == None`. Regression:
   `cwa_cursor_none_propagates_define_cursor_zero_to_backend`.
+  Latest narrowing — same NVIDIA hardware, XFCE this time: the
+  CWA-cursor-None fix made marco's frame work in MATE but XFCE
+  still showed a stuck arrow cursor on xfwm4 frame edges. xfwm4
+  attaches resize-edge cursors to thin frame sub-windows (one
+  child per edge under each frame top-level) — not to the frame
+  top-level itself, in contrast to marco, which dynamically swaps
+  the cursor on the frame top-level via `XDefineCursor`. Pre-fix,
+  v2's `window_under_cursor` only iterated `core.top_level_order`
+  and returned at the topmost top-level containing the cursor.
+  `prev_pointer_window` therefore stayed pinned to the frame
+  top-level, the cursor chain walk picked up only the frame's
+  (`None`) cursor + the root fallback, and the xfwm4 resize
+  sprites never became effective. Sub-window descent now matches
+  Xorg `dix/events.c`'s `XYToWindow`: after locking the topmost
+  mapped top-level, walk children sorted by `stack_rank`
+  back-to-front and descend into the topmost mapped child whose
+  parent-relative box contains the cursor; SHAPE-input (or
+  bounding) trims hittable region at every level; the depth bound
+  matches the cursor walk's 64. Regression:
+  `window_under_cursor_descends_into_subwindow_tree`. Side
+  effect: button-press routing also descends now, so xfwm4's
+  resize-edge sub-windows receive their `ButtonPress` events
+  when the user starts a resize (was previously delivered to the
+  frame top-level, which has no resize behaviour bound to it).
 
 ### What runs on v2 today (after 3f.15 + hardware-smoke fixes)
 
