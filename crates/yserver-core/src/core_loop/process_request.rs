@@ -1348,12 +1348,12 @@ fn handle_render_request(
                     origin, req.op, host_src, host_mask, host_dst, req.src_x, req.src_y,
                     req.mask_x, req.mask_y, req.dst_x, req.dst_y, req.width, req.height,
                 );
-                if req.width > 0 && req.height > 0 {
-                    if let Some(dst_drawable) =
+                if req.width > 0
+                    && req.height > 0
+                    && let Some(dst_drawable) =
                         state.resources.picture(req.dst).and_then(|p| p.drawable)
-                    {
-                        let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
-                    }
+                {
+                    let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
                 }
             }
         }
@@ -1527,12 +1527,11 @@ fn handle_render_request(
                     origin, minor, req.op, host_src, host_dst, mask_fmt, host_gs, req.src_x,
                     req.src_y, &req.items, 0, 0,
                 );
-                if !req.items.is_empty() {
-                    if let Some(dst_drawable) =
+                if !req.items.is_empty()
+                    && let Some(dst_drawable) =
                         state.resources.picture(req.dst).and_then(|p| p.drawable)
-                    {
-                        let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
-                    }
+                {
+                    let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
                 }
             }
         }
@@ -1558,12 +1557,11 @@ fn handle_render_request(
             if let Some(host_dst) = host_dst {
                 let _ = backend
                     .render_fill_rectangles(origin, host_dst, req.op, req.color, &req.rects, 0, 0);
-                if !req.rects.is_empty() {
-                    if let Some(dst_drawable) =
+                if !req.rects.is_empty()
+                    && let Some(dst_drawable) =
                         state.resources.picture(req.dst).and_then(|p| p.drawable)
-                    {
-                        let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
-                    }
+                {
+                    let _dropped = accumulate_damage_full_to_state(state, dst_drawable);
                 }
             }
         }
@@ -5117,7 +5115,7 @@ fn present_path_for_synced(
 /// Pixmap format/modifier and the output's scanout-compat set are
 /// stubbed to defaults: tracking imported-pixmap dma-buf metadata
 /// + plumbing the kernel's scanout-compat probe through the
-/// Backend trait is real work the alien-BO bridge will do.
+///   Backend trait is real work the alien-BO bridge will do.
 fn build_path_selector_inputs<'a>(
     state: &ServerState,
     window: u32,

@@ -149,7 +149,7 @@ impl LoopTelemetry {
             .iter()
             .map(|(op, (cnt, t))| (*op, *cnt, *t))
             .collect();
-        by_time.sort_by(|a, b| b.2.cmp(&a.2));
+        by_time.sort_by_key(|(_, _, total)| std::cmp::Reverse(*total));
         let top_time: Vec<String> = by_time
             .iter()
             .take(TELEMETRY_TOP_N)
@@ -157,7 +157,7 @@ impl LoopTelemetry {
             .collect();
 
         let mut by_count = by_time.clone();
-        by_count.sort_by(|a, b| b.1.cmp(&a.1));
+        by_count.sort_by_key(|(_, count, _)| std::cmp::Reverse(*count));
         let top_count: Vec<String> = by_count
             .iter()
             .take(TELEMETRY_TOP_N)

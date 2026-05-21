@@ -184,8 +184,8 @@ pub struct ResourceTable {
     colormaps: HashMap<u32, Colormap>,
 }
 
-impl ResourceTable {
-    pub fn new() -> Self {
+impl Default for ResourceTable {
+    fn default() -> Self {
         let mut windows = HashMap::new();
         windows.insert(
             ROOT_WINDOW.0,
@@ -335,6 +335,12 @@ impl ResourceTable {
             visuals,
             colormaps,
         }
+    }
+}
+
+impl ResourceTable {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn visual(&self, id: ResourceId) -> Option<&Visual> {
