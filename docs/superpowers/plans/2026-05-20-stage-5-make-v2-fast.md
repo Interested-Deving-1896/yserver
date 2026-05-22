@@ -260,6 +260,35 @@ without proper per-op characterization. Re-profile data first.
 Exit gate unchanged: `cpu_fence_wait_ns/sec` either negligible or
 removed from steady-state compose by syncobj/in-fence submission.
 
+### Task 6.1 - PRESENT IN_FENCE_FD ⏳ (opened 2026-05-22)
+
+Driven by the bee 2026-05-22 render-batch UAF fix-out (full chain
+in §"Bee 2026-05-22 render-batch UAF + PRESENT wait" below). The
+correctness fix made `wait_for_drawable_idle` flush + synchronously
+wait on the GPU before PRESENT::Pixmap emits CompleteNotify /
+triggers the WSI idle_fence. Pre-fix code raced (returned before
+the CB had even been submitted, Mesa WSI woke on stale content);
+post-fix is correct but adds a per-PRESENT CPU-side fence wait
+that visibly lags interactive drag on bee. Not a measured
+regression — no matched pre-fix steady-state on bee to compare
+against — but interactively perceptible and worth eliminating.
+
+The wait belongs on the *KMS atomic-commit* path, not the request
+handler. Wire the batch's `VkFence` through to the pageflip as
+`DRM_MODE_ATOMIC_IN_FENCE_FD` and let the display controller block
+the flip in-kernel until the GPU signals. Request handler returns
+immediately; pageflip lands on the right vblank; correctness
+preserved without the synchronous CPU wait.
+
+`ScanoutBo::export_semaphore` already wires the same mechanism
+for the existing scanout-side fence (`KMS_FB_IN_FENCE_FD`) — the
+work is plumbing the *render-batch* ticket through to PRESENT,
+not designing from scratch.
+
+Exit gate: bee CC drag wall-clock latency comparable to the
+pre-fix racy path while preserving the post-fix correctness
+(verifiable by `addr_binding_report` clean + visible smoke).
+
 ## Task 7 - optional headroom: direct scanout and planes ⏳ (deferred)
 
 Out of scope until the composed desktop is responsive across the
@@ -1080,6 +1109,234 @@ Four Vk-backed lavapipe tests parallel to the cow POC:
   silence verification; couldn't repro on master, perf HEAD,
   or with the stashed changes. Filed as a non-repro flake;
   scanouts saved off-tree for later inspection.
+
+## Bee 2026-05-22 render-batch UAF + PRESENT wait — fix landed
+
+Bee re-validation after the perf branch FF'd to master surfaced a
+hard correctness bug in the Task 3 coalescing on Rembrandt RDNA2.
+Three rounds of diagnosis, two rounds of fix. The final shape
+trades a real-but-bounded perf regression for closed correctness.
+
+### Round 1 — the UAF (original symptom)
+
+Plain `just yserver-mate-hw` on bee, mate-session, idle desktop.
+yserver wedged after ~2 s with `ERROR_DEVICE_LOST` flooding every
+paint path. RADV's `addr_binding_report` (captured via the new
+`yserver-mate-hw-vkdebug` recipe — see below) named it:
+
+```
+Failing VM page: 0x800102140000
+CLIENT_ID: (TCP) 0x8, PERMISSION_FAULTS: 3, RW: 0
+
+bind   DEVICE_MEMORY VA=0x800102130000-170000  (256KB image)
+bind   IMAGE         VA=0x800102130000-170000
+unbind IMAGE                                    ← FreePixmap
+unbind DEVICE_MEMORY                            ← gpu-allocator returns memory
+bind   DEVICE_MEMORY VA=0x800102130000-140000  ← 115 µs later, smaller image
+bind   IMAGE         VA=0x800102130000-140000   ← reused at same VA
+
+Potential use-after-free detected!
+```
+
+Decoded: a 256×256 d32 pixmap (mate-panel icon-upload churn) was
+created, bound, sampled by a `render_composite` whose CB was still
+sitting in `pending_render_batch` un-submitted, then FreePixmap'd.
+The CB held a descriptor pointing at the now-destroyed VkImageView;
+gpu-allocator recycled the slab in 115 µs into a smaller image at
+the same VA; the next pageflip's CB executed, TCP sampled the
+recycled page, crossed the new image's bound, faulted.
+
+The bug is in the Task 3 coalescing design: `render_composite`
+appends to `PendingRenderBatch` and adds src to `touched_drawables`,
+but `store.touch_render_fence(src, ticket)` only ran at *flush*
+time (`engine.rs:flush_render_batch:2629-2632`). Between append
+and flush, `src.last_render_ticket == None` (or a signaled stale
+ticket from a prior op), so `store.decref(src)` saw "no live work
+on this drawable" and called `destroy_now`. Same shape in the
+cow-batch path (`flush_cow_batch:2161-2163`).
+
+### Why bee was the only failure
+
+Logical UAF exists on every platform that runs the Task 3 coalescer.
+Only bee surfaces it because of two compounding factors:
+
+1. **APU GTT fast-recycle.** Renoir/Rembrandt has no VRAM —
+   drawable storage lives in GTT (the `0x8...` aperture in the
+   fault address). Radv's GTT allocator on this iGPU returns
+   freed slabs to its pool in microseconds. silence (rx580/GCN4)
+   uses VRAM with much slower eviction; the freed page typically
+   isn't recycled by the time the queued CB runs. yoga (Adreno/
+   Turnip) and fuji (Intel HD 620/ANV) use separate allocator
+   paths that also don't sub-microsecond-recycle.
+2. **RDNA2 TCP boundary check.** The texture-cache pipeline on
+   RDNA2 page-faults on out-of-bounds sampling more readily than
+   GCN/Vega/Adreno; on those, the same dangling descriptor would
+   typically silently sample garbage (visual corruption) rather
+   than fault.
+
+Three-platform spread for the same code:
+
+| Platform | GPU + driver           | Result    |
+|----------|------------------------|-----------|
+| silence  | rx580 / GCN4, radv     | ✓ (latent) |
+| yoga     | Adreno X1, turnip      | ✓ (latent) |
+| fuji     | Intel HD 620, ANV      | ✓ (latent) |
+| bee      | Rembrandt RDNA2, radv  | ✗         |
+
+Note: silence/yoga/fuji being green is *not* a clean bill — they
+ran without the fix and the UAF is just silent on their stacks.
+Consistent with the pattern in `project_amd_lag_investigation`
+(bee canaries class-of-bug things the discrete GPUs hide).
+
+### Round 2 — first fix attempt (eager touch) introduced a deadlock
+
+The natural fix: touch the batch ticket onto src/mask/dst at *append*
+time, not flush time. Closes the UAF window. Three engine-level
+regression tests gate it (`render_composite_open_marks_src_last_
+render_ticket_immediately`, `render_composite_open_then_decref_src_
+returns_pending_fence`, `cow_copy_area_open_marks_src_last_render_
+ticket_immediately`), all red against master, green after.
+
+But running the patched build on bee: display went black, mouse
+froze, kernel still alive (Magic-SysRq + SAK reboot worked), no
+dmesg crash trace, no radv hang dump. The PRESENT path was stalling:
+
+```
+[18:03:23Z] client 14 #699 PRESENT dispatch minor=1 body.len()=68
+[18:03:26Z] yserver: Ctrl-Alt-Backspace pressed — requesting shutdown
+[18:03:28Z] request handler error (client 14 opcode 145):
+              wait for drawable 0x103: TIMEOUT
+```
+
+Root cause from `backend.rs:wait_for_drawable_idle:4238`:
+
+```rust
+let ticket = self.store.get(id)
+    .and_then(|d| d.last_render_ticket.clone());
+let Some(ticket) = ticket else { return Ok(()); };
+ticket.wait(&vk)  // 5-second FenceTicket timeout
+```
+
+Pre-Task-3 invariant: `last_render_ticket == Some(t)` *implied*
+"t is a submitted-to-GPU fence that will signal soon." `wait`
+always made forward progress. The eager-touch fix broke that
+invariant — the batch ticket is set at append, but the CB isn't
+submitted until flush (next `maybe_composite` tick, after this
+request handler returns). `wait` blocked on a fence whose CB
+hadn't even hit the queue, 5-second timed out, stalled PRESENT,
+froze marco's pump, screen went black.
+
+### Round 3 — final fix (flush-before-wait)
+
+Two changes layered on top of the eager-touch:
+
+1. **`wait_for_drawable_idle` flushes pending batches** before
+   sampling `last_render_ticket`. Restores the invariant that
+   "a ticket exists ⇒ the CB has been submitted." Engine helper
+   `has_pending_batches_for_tests` exposed for the regression
+   test.
+2. **Backend-level regression test** `v2_wait_for_drawable_idle_
+   flushes_pending_batches`: opens a pending render batch via
+   the Backend trait, calls `wait_for_drawable_idle`, asserts
+   no pending batches afterward. Non-blocking assertion — fails
+   fast (0.05 s green / 5.31 s red with the exact production
+   error string `wait for drawable 0x…: TIMEOUT`).
+
+### Round 3 perf characteristic — not a measured regression
+
+bee re-test under plain `yserver-mate-hw`: yserver stays alive,
+no DEVICE_LOST, no RendererFailed flood. mate-control-center
+drag visibly lags — "slow as fuck, but I've seen worse."
+
+There is **no pre-fix steady-state measurement on bee** to call
+this a regression from — pre-fix bee crashed before reaching
+steady state. The silence pre-fix run was qualitatively fast,
+but silence is a much faster machine (i9 13900k + rx580 discrete
+vs Rembrandt iGPU on bee) so its "fast" doesn't separate raw
+horsepower from racing skip. The post-fix bee CC drag lag is
+better framed as **a perf characteristic to address, not as
+"slower than before."**
+
+`yserver-mate-hw-perf` (release build, system-wide perf, MATE
+drag of CC window) breakdown:
+
+```
+yserver total          4.47%  of 16 cores ≈ ~70% of one core
+  [kernel] (ioctl)     2.63%   ← amdgpu syscall round-trip
+  libvulkan_radeon     0.71%
+  yserver binary       0.59%   ← FLAT, no Rust symbol > 0.05%
+  libc.so.6            0.38%   (0.14% in `ioctl`)
+  libdrm_amdgpu        0.13%
+```
+
+Same shape as the pre-fix perf-branch baseline (4.26% on the same
+workload). The fix does not add a CPU hotspot. The lag is **pure
+latency**, not CPU.
+
+Mechanism: PRESENT::Pixmap (`process_request.rs:5055`) calls
+`wait_for_drawable_idle(dst)` immediately after the protocol's
+copy_area into the COW. Post-fix, that wait correctly serializes
+on the GPU finishing its outstanding cow_batch / render_batch for
+*this* frame. Pre-fix code found `last_render_ticket == None` (the
+batched copy hadn't been flushed yet, the eager touch wasn't
+there), returned immediately, and let Mesa's WSI client wake up
+on the idle_fence *before* the GPU had actually copied the new
+content. That's a correctness issue — client got "ready"
+notification before the new content existed in COW — independent
+of whether the resulting perf was good or bad on any specific
+machine.
+
+During an interactive drag, marco's compositor pump issues PRESENT
+at frame rate. Each one now blocks the request handler until the
+GPU completes ~one-frame of accumulated cow_copy + render_composite
+work. On bee's Rembrandt iGPU that serialization is visibly slow;
+on silence's i9 + rx580 it likely won't be; on yoga / fuji
+unknown until measured.
+
+### Followup — move the wait off the CPU
+
+The right long-term fix is to move the GPU-fence wait out of the
+request handler into the KMS atomic-commit path: attach the
+batch's `VkFence` as `DRM_MODE_ATOMIC_IN_FENCE_FD` on the
+pageflip and let the display controller block the flip in-kernel
+until the GPU signals. The request handler returns immediately;
+the pageflip still lands on the right vblank; correctness preserved
+without the synchronous CPU wait.
+
+`ScanoutBo::export_semaphore` already exists for this exact pattern
+— it's used for the existing scanout-side fence on `KMS_FB_IN_FENCE_FD`
+— so the work is wiring the *batch* ticket through to the PRESENT
+pageflip rather than designing the mechanism from scratch.
+
+Filed as **Stage 5 Task 6.1** (PRESENT IN_FENCE_FD); slot in before
+Task 6's broader async-submit work. Not blocking master FF of the
+correctness fix — bee CC drag was already lag-prone under different
+mechanisms (`project_amd_lag_investigation`) and we have no
+matched pre-fix steady-state measurement to call this a regression
+from.
+
+### Tooling addition: `just yserver-mate-hw-vkdebug`
+
+The radv address-binding report that unambiguously named the UAF
+came from a new recipe added during diagnosis:
+
+```
+RADV_DEBUG=hang,syncshaders
+MESA_VK_ABORT_ON_DEVICE_LOSS=1
+VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
+VK_LAYER_ENABLES=...SYNCHRONIZATION_VALIDATION_EXT
+YSERVER_VK_VALIDATION=1
+```
+
+**Warning**: not survivable on bee (Rembrandt) — `RADV_DEBUG=
+syncshaders` puts catastrophic pressure on the GPU command
+processor by inserting `wait_idle` after every shader stage, and
+on Renoir's display controller it stalls the pipeline hard enough
+that the user-side display goes unrecoverable (kernel alive, but
+screen + input frozen — only Magic-SysRq recovers). The harness
+*itself* takes the box down on Renoir even with code that's fully
+correct. Use on other AMD hardware for Vulkan validation; on
+Renoir/Rembrandt use only when you have SSH access for SysRq.
 
 ## Close protocol
 

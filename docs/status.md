@@ -2344,6 +2344,49 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     master, on perf HEAD, or with the relaxed POC reverted.
     Filed as a non-repro flake. Scanouts saved off-tree.
 
+    **Bee re-validation 2026-05-22 surfaced UAF + PRESENT
+    deadlock + drag latency.** Plain `yserver-mate-hw` on
+    bee (Rembrandt RDNA2 iGPU) wedged with `ERROR_DEVICE_LOST`
+    flooding paint paths. RADV's `addr_binding_report` named
+    it: a 256×256 d32 mate-panel icon pixmap was destroyed
+    while a coalesced `render_composite` CB still held a
+    descriptor for its VkImageView; gpu-allocator recycled
+    the slab in 115 µs into a smaller image at the same VA;
+    the next pageflip's CB sampled the recycled page; TCP
+    permission fault. Bee-only because Rembrandt's GTT
+    fast-recycle path + RDNA2's strict TCP boundary check
+    expose the dangling-descriptor window that silence
+    (rx580/GCN4), yoga (Adreno/turnip), and fuji (Intel/ANV)
+    silently survived. **Fix landed:** engine eagerly stamps
+    the batch ticket onto src/mask/dst at append time (closes
+    the destroy_now path on `decref` while the batch CB is
+    pending), and `wait_for_drawable_idle` now flushes
+    pending batches before sampling `last_render_ticket`
+    (the round-2 deadlock the eager touch alone introduced
+    — `wait for drawable 0x103: TIMEOUT`, screen black, kernel
+    alive via SAK + SysRq). Four regression tests gate it
+    (three engine-level + one backend-level), all verified
+    red→green. bee CC drag visibly lags post-fix — not a
+    *measured* regression though (pre-fix bee crashed before
+    steady state, silence pre-fix was qualitatively fast but
+    silence is a much faster machine). yserver-side CPU
+    shape is unchanged from the perf-branch baseline (4.47 %
+    of 16 cores vs 4.26 %, flat user-space). The lag is the
+    PRESENT path correctly serializing on the GPU finishing
+    its frame's cow_batch/render_batch — pre-fix raced
+    (`last_render_ticket == None` → immediate return → Mesa
+    WSI client woke before COW actually had the content),
+    independent of whether that race happened to feel fast
+    on any given machine. Followup filed as Stage 5 Task 6.1
+    (PRESENT IN_FENCE_FD — move the wait off the CPU into
+    the KMS atomic-commit path via `ScanoutBo::export_
+    semaphore`). Full chain in the Stage 5 plan §"Bee
+    2026-05-22 render-batch UAF + PRESENT wait — fix landed".
+    Diagnostic recipe `just yserver-mate-hw-vkdebug` added
+    (with a warning that it's not survivable on Renoir —
+    `RADV_DEBUG=syncshaders` stalls the display controller
+    hard enough to need SysRq recovery).
+
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 
 v1 stays in tree past Stage 3 close. Deletion happens only when
