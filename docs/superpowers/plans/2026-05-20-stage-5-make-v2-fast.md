@@ -856,23 +856,163 @@ Bee re-capture pending hardware access; the POC stays on
 
 ### What remains for Task 3 closure
 
-The POC validates the aggregation shape and delivers the
+The COW POC validated the aggregation shape and delivered the
 single largest hotspot (75 % of `copy_area` traffic). The
 remaining 60 % of all coalesce savings sit on:
 
-- **`render_composite`** — 88 k savings. Same shape as the
-  cow batch, but the aggregation key needs `(target_id, op,
-  src_class, mask_class, pipeline_id)` instead of just
-  `target_id`. Engine bookkeeping is meaningfully larger
-  because per-call descriptor sets diverge by key.
+- **`render_composite`** — 88 k savings. Generalization landed
+  2026-05-22 (`68af625`); see §"Task 3 generalization
+  2026-05-22 — render_composite" below.
 - **`render_fill`** — 8 k savings. Sub-case of
-  `render_composite` (same engine code path); folds in once
-  the composite aggregation lands.
+  `render_composite` (Solid src); deliberately excluded from
+  the conservative predicate. Would need `record_solid_color_clear`
+  hoisted out of the render pass (Vulkan disallows
+  `cmd_clear_color_image` inside `cmd_begin_rendering`/
+  `cmd_end_rendering`). Out of scope until measured value
+  justifies the work; the trace analysis below shows it didn't
+  on silence.
 
-These extensions ride on the same `begin → append → flush`
-pattern proved out by the POC. Plan: implement
-`render_composite` aggregation as the next slice using the
-same trace-and-verify discipline.
+## Task 3 generalization 2026-05-22 — `render_composite`
+
+Landed on `perf` at `68af625`. Took two iterations.
+
+### Iteration 1 (over-strict key) — measured failure
+
+First implementation keyed on the full per-call signature:
+`(dst, op, src_id, mask_id_opt, src_repeat, mask_repeat,
+mask_component_alpha, src_pict_format, mask_pict_format,
+dst_pict_format)`. Silence verification showed near-zero
+coalescing:
+
+- `render_batches_flushed/s` avg 2,002, `render_composites_coalesced/s`
+  avg 2,012 → **1.005 calls per batch** (~500 of 91,500
+  eligible calls actually coalesced).
+- `paint_submits/s` avg 5,653 → 6,158 (**regression**, +9 %).
+
+Diagnosis from the post-iter-1 trace: 110,671 consecutive
+`render_composite → render_composite` transitions in the
+workload, but the trace fields captured `op | src_class |
+mask_class` — they do NOT capture `src_id`. Marco's dominant
+compositor-pump pattern is "composite N different window
+backings into one stage texture" (same shape as cow
+`copy_area`'s N srcs → 1 dst). The conservative predicate
+rejected every same-target run because `src_id` varied per call.
+
+Trace-design lesson: aggregation-key-relevant dimensions
+(notably `src_id`, `mask_id`) need to be in the trace schema,
+not collapsed into a class. The current trace records `src_class`
+("direct" / "solid" / "gradient_linear" / ...) but not the
+concrete drawable id — so a "consecutive same-key run" in the
+trace can still be N distinct srcs sharing the same class.
+
+### Iteration 2 (relaxed key) — measured success
+
+Predicate cut to four fields:
+
+```
+RenderBatchKey {
+    dst,
+    op,
+    dst_pict_format,
+    mask_component_alpha,
+}
+```
+
+These are exactly the inputs to pipeline binding + render-pass
+attachment. Everything else is re-encoded per append:
+
+- **`src_id`, `mask_id`, src/mask `pict_format`, src/mask
+  `repeat`**: each append resolves its own views via
+  `ensure_drawable_view` (sampler-config + swizzle-class
+  cached), allocates its own descriptor set from the ring,
+  calls `cmd_bind_descriptor_sets` inside the still-open
+  render pass before drawing. Pipeline stays bound from open;
+  rebinding the descriptor between draws is legal.
+- **`src_transform`, `mask_transform`**: encoded into
+  `RenderPushConsts` per draw.
+- **`clip_rects`**: `cmd_set_scissor` per draw.
+
+Refactor on `vk/ops/render.rs`:
+
+- `record_render_composite_open(cb, dst, pipeline)` — dropped
+  the descriptor binding (now per-append). Still records dst
+  barrier + `cmd_begin_rendering` + viewport + pipeline.
+- `record_render_composite_draws(cb, pipeline_layout,
+  descriptor_set, extent, attrs, rects, clip_scissors)` —
+  added `descriptor_set` param; binds at top then iterates
+  scissors × rects with per-rect push consts + draw.
+- `record_render_composite_close(cb, dst)` — unchanged.
+- The unbatched wrapper `record_render_composite` threads the
+  descriptor through; behaviour unchanged for the per-call
+  path (Solid / Gradient / dst_readback / self-alias).
+
+Engine state:
+
+- `PendingRenderBatch` grows `touched_drawables:
+  HashSet<DrawableId>` (every src + mask sampled by any
+  append in the batch) so `flush_render_batch` can
+  `touch_render_fence` them all. `any_mask: bool` lets the
+  flush record's `has_mask` reflect "at least one append
+  had a mask" for trace fidelity.
+
+### Silence verification — same 45.5 s MATE drag
+
+| metric                          | pre-POC | cow-only | render-relaxed |
+| ------------------------------- | ------: | -------: | -------------: |
+| `paint_submits/s` avg           |   6,852 |    5,653 |  **4,180**     |
+| `paint_submits/s` peak          |  18,910 |   14,040 |   14,814       |
+| `queue_submit2/s` avg           |   7,069 |    5,850 |  **4,377**     |
+| `composite_submits/s` avg       |      98 |       98 |       98 ✓     |
+| `render_batches_flushed/s` avg  |   n/a   |   n/a    |   1,294        |
+| `render_composites_coalesced/s` avg | n/a |   n/a    |   2,018        |
+
+Cumulative reduction in `paint_submits/s` avg: **−39 % vs
+pre-POC**, **−26 % on top of cow alone**.
+
+Render batch shape on the post-POC trace:
+
+- Pixmap dst batches: 122,103 flushes containing 174,953
+  underlying composites = **avg 1.43 calls/batch, peak 8**.
+- 30 % fewer render-path submits than the pre-POC trace's
+  168 k render_composite events.
+
+`composite_submits/s` unchanged at 98 confirms the scene
+compose path is untouched as designed.
+
+### Tests landed
+
+Four Vk-backed lavapipe tests parallel to the cow POC:
+
+1. `render_composite_batch_coalesces_two_same_key_calls` —
+   two same-key composites with **different srcs** (the
+   marco pattern) → one CB, two descriptor sets bound back-
+   to-back, both halves of dst show correct colours,
+   `coalesced_count=2`.
+2. `render_composite_batch_key_mismatch_flushes` — OP_OVER
+   then OP_SRC → first batch flushes, fresh batch opens
+   with the new op.
+3. `render_composite_batch_solid_src_skips_batched_path` —
+   `ResolvedSource::Solid` → `deferred_to_batch=false`,
+   per-call submit, no pending batch.
+4. `render_composite_batch_flush_via_non_render_op` —
+   render_composite then `fill_rect` on a third drawable
+   → auto-flush hook fires, dst pixels reflect the prior
+   render.
+
+### Outstanding for full Task 3 closure
+
+- `render_fill` (Solid src, 8 k of the original 143 k
+  savings): would require lifting `record_solid_color_clear`
+  out of the render pass. Trace shows the actual workload
+  pattern doesn't make this worthwhile until bee re-capture
+  proves otherwise.
+- Cross-machine confirmation: bee re-capture pending hardware
+  access. Yoga not in critical path (descriptor-pool path
+  was its bottleneck, fixed by Task 4 layer 1).
+- One transient "eog window stayed at origin" reported during
+  silence verification; couldn't repro on master, perf HEAD,
+  or with the stashed changes. Filed as a non-repro flake;
+  scanouts saved off-tree for later inspection.
 
 ## Close protocol
 

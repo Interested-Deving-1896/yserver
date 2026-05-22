@@ -2277,6 +2277,74 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     mask_class, pipeline_id)` instead of just `target_id`,
     and per-call descriptor sets diverge per key.
 
+  - [~] **Task 3 generalization — `render_composite` batching
+    landed 2026-05-22** on `perf` at `68af625`. Full design in
+    the Stage 5 plan §"Task 3 generalization 2026-05-22 —
+    render_composite". Took two iterations:
+
+    **Iteration 1 (over-strict key)** — failed by measurement.
+    Predicate keyed on the full per-call signature including
+    `src_id`, `mask_id`, src/mask `repeat`, src/mask
+    `pict_format`. Silence verification: **1.005 calls/batch**
+    (essentially no coalescing); `paint_submits/s` *regressed*
+    from 5,653 to 6,158 (+9 %). Diagnosis: marco's compositor
+    pump is "N different srcs → one stage texture" (same shape
+    as cow `copy_area`); the over-strict predicate rejected
+    every same-target run because `src_id` varied per call.
+    The submit-trace's `src_class` column conflated distinct
+    `src_id`s into "direct", which mis-led the original
+    Iter-1 analysis — trace schema lesson for future Task 3
+    work.
+
+    **Iteration 2 (relaxed key)** — measured success. Predicate
+    cut to four fields that drive pipeline + render-pass:
+    `dst`, `op`, `dst_pict_format`, `mask_component_alpha`.
+    Everything else (`src_id` / `mask_id`, src/mask `repeat`,
+    src/mask `pict_format`, transforms, `clip_rects`) is
+    re-encoded per append: each append allocates its own
+    descriptor set, `cmd_bind_descriptor_sets` inside the
+    open render pass, scissor + push consts per draw.
+    `record_render_composite_open/draws/close` split so the
+    pipeline binds once at open and the per-append descriptor
+    binding happens inside `_draws`.
+
+    **Silence verification — same 45.5 s MATE drag:**
+
+    | metric                            | pre-POC | cow-only | render-relaxed |
+    | --------------------------------- | ------: | -------: | -------------: |
+    | `paint_submits/s` avg             |   6,852 |    5,653 |   **4,180**    |
+    | `paint_submits/s` peak            |  18,910 |   14,040 |   14,814       |
+    | `queue_submit2/s` avg             |   7,069 |    5,850 |   **4,377**    |
+    | `composite_submits/s` avg         |      98 |       98 |       98 ✓     |
+    | `render_batches_flushed/s` avg    |   n/a   |   n/a    |   1,294        |
+    | `render_composites_coalesced/s` avg | n/a   |   n/a    |   2,018        |
+
+    Cumulative reduction in `paint_submits/s` avg: **−39 %
+    vs pre-POC, −26 % on top of cow alone.** Render batch
+    shape: 122,103 flushes containing 174,953 underlying
+    composites = **avg 1.43 calls/batch, peak 8**.
+    `composite_submits/s` unchanged at 98 — scene compose
+    path untouched as designed.
+
+    **Tests:** four new Vk-backed lavapipe tests covering
+    same-key coalesce (with **different srcs** to verify
+    per-append descriptor rebinding), key mismatch flush,
+    Solid src skipping the batched path, and the per-method
+    auto-flush hook. 368 lib + 44 lavapipe tests pass;
+    default clippy clean.
+
+    **Out of scope for the POC:**
+    - `render_fill` (Solid src, ~8 k of the 143 k total
+      coalesce savings) — would need `record_solid_color_clear`
+      lifted out of the render pass; deferred until bee
+      re-capture justifies it.
+    - Bee + yoga re-capture pending hardware access.
+
+    **One transient "eog window stayed at origin" observed
+    during silence verification.** Could not repro on
+    master, on perf HEAD, or with the relaxed POC reverted.
+    Filed as a non-repro flake. Scanouts saved off-tree.
+
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 
 v1 stays in tree past Stage 3 close. Deletion happens only when
