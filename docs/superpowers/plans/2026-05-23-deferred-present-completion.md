@@ -111,31 +111,30 @@ pub enum BackendFdKind {
 }
 ```
 
-- [ ] **Step 4: Add the dispatch arm in `run_core`**
+- [ ] **Step 4: Add the `PRESENT_COMPLETION_TOKEN` constant**
 
-In `crates/yserver-core/src/core_loop/run.rs:328-335`, the existing dispatch sets tokens to variants of `BackendFdKind`. Add a new constant + arm. Find the existing arms (something like):
-
-```rust
-            BackendFdKind::Libinput => LIBINPUT_TOKEN,
-            BackendFdKind::Drm => DRM_TOKEN,
-            BackendFdKind::HostX11 => HOST_X11_TOKEN,
-```
-
-and add:
+The fixed system tokens live in `crates/yserver-core/src/core_loop/poll_tokens.rs`. Current constants are `LISTENER_TOKEN: Token(1)` through `HOST_X11_TOKEN: Token(5)`. Add the new one as `Token(6)`:
 
 ```rust
-            BackendFdKind::PresentCompletion => PRESENT_COMPLETION_TOKEN,
+/// Stage 5 Task 6.1: backend-internal epoll FD aggregating per-entry
+/// sync_file FDs for deferred PRESENT completion. Readiness drives
+/// `Backend::drain_completed_present_events`.
+pub const PRESENT_COMPLETION_TOKEN: Token = Token(6);
 ```
 
-Then add the token definition near the others:
+Also extend the `fixed_tokens_are_distinct` test in the same file (search for the existing test list of `[NOTIFY_TOKEN.0, LISTENER_TOKEN.0, ...]`) to include `PRESENT_COMPLETION_TOKEN.0`. Same for `system_tokens_decode_to_none`.
+
+- [ ] **Step 5: Add the dispatch arm in `run_core`**
+
+In `crates/yserver-core/src/core_loop/run.rs:~328`, the existing dispatch maps `BackendFdKind` variants to tokens. Add:
 
 ```rust
-const PRESENT_COMPLETION_TOKEN: Token = Token(/* next sequential id */);
+            BackendFdKind::PresentCompletion => crate::core_loop::poll_tokens::PRESENT_COMPLETION_TOKEN,
 ```
 
-Verify by grepping for `LIBINPUT_TOKEN` / `DRM_TOKEN` / `HOST_X11_TOKEN` to see the existing pattern; copy it exactly. Token ids are typically `Token(0)`, `Token(1)`, etc.; the new one takes the next unused slot.
+(Or import the new constant alongside the existing `LIBINPUT_TOKEN` / `DRM_TOKEN` / `HOST_X11_TOKEN` imports at the top of `run.rs`.)
 
-In the loop body where ready tokens dispatch (e.g. `match token { LIBINPUT_TOKEN => ..., DRM_TOKEN => ..., HOST_X11_TOKEN => ..., }`), add a stub arm for `PRESENT_COMPLETION_TOKEN` that logs at trace level and does nothing else. The real drain wiring lands in Task 11.
+In the loop body where ready tokens dispatch (the existing `match token { LIBINPUT_TOKEN => ..., DRM_TOKEN => ..., HOST_X11_TOKEN => ..., }` arm cluster), add a stub arm for `PRESENT_COMPLETION_TOKEN` that logs at trace level. The real drain wiring lands in Task 11:
 
 ```rust
             PRESENT_COMPLETION_TOKEN => {
@@ -145,7 +144,7 @@ In the loop body where ready tokens dispatch (e.g. `match token { LIBINPUT_TOKEN
             }
 ```
 
-- [ ] **Step 5: Run all tests, confirm pass**
+- [ ] **Step 6: Run all tests, confirm pass**
 
 ```
 cargo +nightly fmt
@@ -156,10 +155,11 @@ cargo test -p yserver --lib
 ```
 Expected: all green, clippy clean.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add crates/yserver-core/src/backend/trait_def.rs \
+        crates/yserver-core/src/core_loop/poll_tokens.rs \
         crates/yserver-core/src/core_loop/run.rs
 git commit -m "feat(backend): BackendFdKind::PresentCompletion variant + dispatch stub
 
@@ -175,6 +175,8 @@ lands in a later commit. Spec
 ## Task 2: Arc-wrap xshmfence registry + by-handle signal API
 
 `KmsBackendV2.dri3_xshmfences: HashMap<u32, FenceMapping>` at `backend.rs:221` wraps `FenceMapping` directly. To support lifetime-pinning past `XFixesDestroyFence`, wrap the value type in `Arc<FenceMapping>` and add a by-handle signal method that bypasses xid lookup.
+
+**Cross-crate dependency note:** `yserver-core` (the trait crate) cannot directly reference `yserver`-side types like `FenceMapping` — the dep direction is yserver → yserver-core, not the other way. The plan resolves this by defining a small **opaque trait** `XshmfenceHandle` in `yserver-core` that the yserver-side `FenceMapping` blanket-implements. The `Backend` trait method signatures take `Arc<dyn XshmfenceHandle>`; the concrete type is internal to `yserver`.
 
 **Files:**
 - Modify: `crates/yserver/src/kms/v2/backend.rs:221` (struct field type)
@@ -247,9 +249,26 @@ Find every site that touches `dri3_xshmfences` (use `grep -n 'dri3_xshmfences' c
 
 In `crates/yserver/src/kms/backend.rs:707-720` (or wherever `dri3_xshmfences` is defined on `KmsBackend`), apply the same `Arc` wrap. v1 doesn't use the deferred-completion path but the trait method signatures (Task 5) need consistent types across both backends.
 
-- [ ] **Step 5: Add by-handle methods to the `Backend` trait**
+- [ ] **Step 5: Define the `XshmfenceHandle` opaque trait + by-handle methods**
 
-In `crates/yserver-core/src/backend/trait_def.rs`, near the existing `dri3_trigger_fence`:
+In `crates/yserver-core/src/backend/trait_def.rs`, add a small opaque trait near the existing `Dri3Caps` (or wherever the other DRI3 types live):
+
+```rust
+/// Stage 5 Task 6.1: opaque handle to a DRI3 xshmfence's underlying
+/// shared-memory segment. Concrete impl in `yserver::kms::xshmfence::
+/// FenceMapping`. Held as `Arc<dyn XshmfenceHandle>` by the deferred
+/// PRESENT completion path so the underlying primitive can be
+/// lifetime-pinned past `XFixesDestroyFence` while the resource id's
+/// registry entry is dropped.
+pub trait XshmfenceHandle: std::fmt::Debug + Send + Sync {
+    /// Set the shared-memory fence's counter so any futex waiter on
+    /// the client side wakes up. Mirrors the body of the existing
+    /// `Backend::dri3_trigger_fence(xid)` after its registry lookup.
+    fn trigger(&self) -> std::io::Result<()>;
+}
+```
+
+Then add the by-handle Backend trait methods near the existing `dri3_trigger_fence`:
 
 ```rust
     /// Stage 5 Task 6.1: take an Arc clone of the xshmfence's
@@ -259,7 +278,7 @@ In `crates/yserver-core/src/backend/trait_def.rs`, near the existing `dri3_trigg
     fn dri3_xshmfence_handle(
         &self,
         _fence_xid: u32,
-    ) -> Option<std::sync::Arc<crate::kms::xshmfence::FenceMapping>> {
+    ) -> Option<std::sync::Arc<dyn XshmfenceHandle>> {
         None
     }
 
@@ -268,17 +287,39 @@ In `crates/yserver-core/src/backend/trait_def.rs`, near the existing `dri3_trigg
     /// drain when the resource id may have been freed mid-flight.
     fn dri3_trigger_fence_via_handle(
         &mut self,
-        _handle: &std::sync::Arc<crate::kms::xshmfence::FenceMapping>,
+        handle: &std::sync::Arc<dyn XshmfenceHandle>,
     ) -> std::io::Result<()> {
-        Err(std::io::Error::other("dri3_trigger_fence_via_handle not implemented"))
+        handle.trigger()
     }
 ```
 
-Note: the `crate::kms::xshmfence::FenceMapping` path is in the yserver crate, not yserver-core. This creates a cross-crate dependency for the trait surface. If `yserver-core` doesn't already import from `yserver`, this is a problem — invert the dependency by defining a re-export or moving `FenceMapping` to yserver-core. Verify the current crate dependency direction (`grep -n 'kms::xshmfence' crates/yserver-core/src/`) — if zero results, the dependency goes the other way (yserver-core → yserver) and `FenceMapping` needs to move or be re-defined in the trait crate.
+Re-export from `crates/yserver-core/src/backend/mod.rs`:
 
-**Likely fix**: introduce an opaque trait in `yserver-core` like `trait XshmfenceHandle: Send + Sync {}` blank-implemented for the concrete type in yserver; the trait methods take `&dyn XshmfenceHandle`. Simpler alternative: use `&dyn std::any::Any + Send + Sync` for the handle parameter type since the trait method is opaque to yserver-core consumers. Pick whichever is cleanest given the existing dependency direction.
+```rust
+pub use trait_def::{
+    ActiveCursorImage, Backend, BackendFdKind, Dri3Caps, HostSocketStatus, PresentCaps,
+    XshmfenceHandle,   // <-- ADD
+};
+```
 
-- [ ] **Step 6: Implement the trait method on `KmsBackendV2`**
+- [ ] **Step 6: Implement `XshmfenceHandle` for `FenceMapping` + the by-handle Backend methods**
+
+In `crates/yserver/src/kms/xshmfence.rs`, add the blanket impl:
+
+```rust
+impl yserver_core::backend::XshmfenceHandle for FenceMapping {
+    fn trigger(&self) -> std::io::Result<()> {
+        // Extract the body of the existing dri3_trigger_fence
+        // implementation that runs after the xid lookup. If the
+        // existing trigger logic is inline in `KmsBackendV2::
+        // dri3_trigger_fence` at backend.rs:8774-8780, refactor it
+        // into a `FenceMapping::trigger` inherent method first
+        // (which the existing xid-keyed path also calls), then this
+        // impl just delegates.
+        self.trigger_inherent()
+    }
+}
+```
 
 In `crates/yserver/src/kms/v2/backend.rs`, inside the existing `impl Backend for KmsBackendV2` block:
 
@@ -286,25 +327,22 @@ In `crates/yserver/src/kms/v2/backend.rs`, inside the existing `impl Backend for
     fn dri3_xshmfence_handle(
         &self,
         fence_xid: u32,
-    ) -> Option<std::sync::Arc<crate::kms::xshmfence::FenceMapping>> {
+    ) -> Option<std::sync::Arc<dyn yserver_core::backend::XshmfenceHandle>> {
         self.dri3_xshmfences.get(&fence_xid).cloned()
     }
 
-    fn dri3_trigger_fence_via_handle(
-        &mut self,
-        handle: &std::sync::Arc<crate::kms::xshmfence::FenceMapping>,
-    ) -> std::io::Result<()> {
-        // Direct trigger on the held primitive — no registry lookup.
-        // `FenceMapping::trigger` is the same method
-        // `dri3_trigger_fence(xid)` ultimately calls after its lookup.
-        handle.trigger()
-            .map_err(|e| std::io::Error::other(format!("xshmfence trigger: {e}")))
-    }
+    // The default impl already does this — it delegates to
+    // `handle.trigger()` via the XshmfenceHandle trait — so we
+    // don't need to override `dri3_trigger_fence_via_handle` on
+    // KmsBackendV2 unless we want a Backend-side log line. Leaving
+    // the default in place is fine.
 ```
 
-If `FenceMapping::trigger` doesn't yet exist as a method, extract it from the existing inline trigger code at backend.rs:8774-8780 (or wherever the actual trigger logic lives) into a method on `FenceMapping`. Then both `dri3_trigger_fence` (xid path) and `dri3_trigger_fence_via_handle` call the same method.
+If `FenceMapping::trigger` doesn't yet exist as an inherent method, extract it from the existing inline trigger code at backend.rs:8774-8780 (or wherever the actual trigger logic lives) into a method `FenceMapping::trigger_inherent(&self) -> io::Result<()>`. Then the `XshmfenceHandle` trait impl delegates to it, AND the existing xid-keyed `Backend::dri3_trigger_fence(xid)` body also delegates to it after its lookup. One source of truth.
 
-- [ ] **Step 7: Implement v1's trait method as a no-op**
+The `.cloned()` on `Arc<FenceMapping>` (line `self.dri3_xshmfences.get(&fence_xid).cloned()`) returns `Option<Arc<FenceMapping>>`. To coerce to `Arc<dyn XshmfenceHandle>`, use `.map(|arc| arc as std::sync::Arc<dyn yserver_core::backend::XshmfenceHandle>)`.
+
+- [ ] **Step 7: Mirror on v1's `KmsBackend`**
 
 In `crates/yserver/src/kms/backend.rs`'s `impl Backend for KmsBackend`:
 
@@ -312,20 +350,15 @@ In `crates/yserver/src/kms/backend.rs`'s `impl Backend for KmsBackend`:
     fn dri3_xshmfence_handle(
         &self,
         fence_xid: u32,
-    ) -> Option<std::sync::Arc<crate::kms::xshmfence::FenceMapping>> {
-        self.dri3_xshmfences.get(&fence_xid).cloned()
-    }
-
-    fn dri3_trigger_fence_via_handle(
-        &mut self,
-        handle: &std::sync::Arc<crate::kms::xshmfence::FenceMapping>,
-    ) -> std::io::Result<()> {
-        handle.trigger()
-            .map_err(|e| std::io::Error::other(format!("xshmfence trigger: {e}")))
+    ) -> Option<std::sync::Arc<dyn yserver_core::backend::XshmfenceHandle>> {
+        self.dri3_xshmfences
+            .get(&fence_xid)
+            .cloned()
+            .map(|arc| arc as std::sync::Arc<dyn yserver_core::backend::XshmfenceHandle>)
     }
 ```
 
-v1 doesn't have a deferred path but the method works the same; it would be called only if some future code path on v1 needed it.
+The `dri3_trigger_fence_via_handle` default impl is fine; v1 inherits it. v1 doesn't have a deferred path but the method works the same.
 
 - [ ] **Step 8: Run the test, confirm pass**
 
@@ -361,6 +394,8 @@ drain. Existing xid-keyed dri3_trigger_fence unchanged."
 ## Task 3: Arc-wrap syncobj registry + by-handle signal API
 
 Same shape as Task 2 but for the DRM syncobj path. The syncobj registry stores `vk::Semaphore` (a `Copy` u64 handle); we need a struct that owns the destruction so `Arc<OwnedSemaphore>` can pin lifetime.
+
+Same cross-crate resolution as Task 2: define a `SyncobjHandle` opaque trait in `yserver-core`; `OwnedSemaphore` in `yserver` blanket-implements it. `Backend` trait surface uses `Arc<dyn SyncobjHandle>`.
 
 **Files:**
 - Create: `crates/yserver/src/kms/v2/owned_semaphore.rs` — small RAII wrapper around `vk::Semaphore`
@@ -505,9 +540,25 @@ Specifically:
 
 In `crates/yserver/src/kms/backend.rs`, apply the same wrap. v1's `dri3_sync_resources` storage + insertion/removal/signal sites change shape identically.
 
-- [ ] **Step 6: Add trait methods**
+- [ ] **Step 6: Define the `SyncobjHandle` opaque trait + by-handle Backend methods**
 
-In `crates/yserver-core/src/backend/trait_def.rs`:
+In `crates/yserver-core/src/backend/trait_def.rs`, alongside the `XshmfenceHandle` trait added in Task 2:
+
+```rust
+/// Stage 5 Task 6.1: opaque handle to a DRI3 syncobj's underlying
+/// VkSemaphore. Concrete impl in `yserver::kms::v2::owned_semaphore::
+/// OwnedSemaphore`. Held as `Arc<dyn SyncobjHandle>` by the deferred
+/// PRESENT completion path so the underlying semaphore can be
+/// lifetime-pinned past `FreeSyncobj`.
+pub trait SyncobjHandle: std::fmt::Debug + Send + Sync {
+    /// Signal the timeline-semaphore at the given value. Mirrors
+    /// the body of the existing `Backend::dri3_signal_syncobj(xid,
+    /// value)` after its registry lookup.
+    fn signal(&self, value: u64) -> std::io::Result<()>;
+}
+```
+
+Add the by-handle Backend methods:
 
 ```rust
     /// Stage 5 Task 6.1: take an Arc clone of the syncobj's
@@ -517,7 +568,7 @@ In `crates/yserver-core/src/backend/trait_def.rs`:
     fn dri3_syncobj_handle(
         &self,
         _syncobj_xid: u32,
-    ) -> Option<std::sync::Arc<crate::kms::v2::owned_semaphore::OwnedSemaphore>> {
+    ) -> Option<std::sync::Arc<dyn SyncobjHandle>> {
         None
     }
 
@@ -525,38 +576,54 @@ In `crates/yserver-core/src/backend/trait_def.rs`:
     /// Arc clone, bypassing xid lookup.
     fn dri3_signal_syncobj_via_handle(
         &mut self,
-        _handle: &std::sync::Arc<crate::kms::v2::owned_semaphore::OwnedSemaphore>,
-        _value: u64,
+        handle: &std::sync::Arc<dyn SyncobjHandle>,
+        value: u64,
     ) -> std::io::Result<()> {
-        Err(std::io::Error::other("dri3_signal_syncobj_via_handle not implemented"))
+        handle.signal(value)
     }
 ```
 
-Cross-crate caveat: same as Task 2 — yserver-core can't directly reference yserver's `OwnedSemaphore`. If that's the actual dependency direction, define the trait methods to take a `&dyn yserver_core::backend::SyncobjHandle` (a new trait local to yserver-core) blanket-impl'd for `OwnedSemaphore` in yserver. Pick the approach that mirrors what you did in Task 2.
+Re-export from `crates/yserver-core/src/backend/mod.rs`:
 
-- [ ] **Step 7: Implement on `KmsBackendV2`**
+```rust
+pub use trait_def::{
+    ActiveCursorImage, Backend, BackendFdKind, Dri3Caps, HostSocketStatus, PresentCaps,
+    XshmfenceHandle, SyncobjHandle,   // <-- ADD SyncobjHandle
+};
+```
+
+- [ ] **Step 7: Implement `SyncobjHandle` for `OwnedSemaphore`**
+
+In `crates/yserver/src/kms/v2/owned_semaphore.rs`:
+
+```rust
+impl yserver_core::backend::SyncobjHandle for OwnedSemaphore {
+    fn signal(&self, value: u64) -> std::io::Result<()> {
+        self.signal(value)
+            .map_err(|e| std::io::Error::other(format!("vkSignalSemaphore: {e:?}")))
+    }
+}
+```
+
+(There's a name collision: `OwnedSemaphore::signal(&self, u64) -> Result<(), vk::Result>` is the inherent method, and `SyncobjHandle::signal(&self, u64) -> io::Result<()>` is the trait method. Rust disambiguates by trait — inside the trait impl, `self.signal(value)` would recurse. Rename one. Easiest: rename the inherent method to `signal_vk` and call that from the trait impl.)
+
+- [ ] **Step 8: Implement on `KmsBackendV2`**
 
 ```rust
     fn dri3_syncobj_handle(
         &self,
         syncobj_xid: u32,
-    ) -> Option<std::sync::Arc<crate::kms::v2::owned_semaphore::OwnedSemaphore>> {
-        self.dri3_sync_resources.get(&syncobj_xid).cloned()
-    }
-
-    fn dri3_signal_syncobj_via_handle(
-        &mut self,
-        handle: &std::sync::Arc<crate::kms::v2::owned_semaphore::OwnedSemaphore>,
-        value: u64,
-    ) -> std::io::Result<()> {
-        handle.signal(value)
-            .map_err(|e| std::io::Error::other(format!("vkSignalSemaphore: {e:?}")))
+    ) -> Option<std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>> {
+        self.dri3_sync_resources
+            .get(&syncobj_xid)
+            .cloned()
+            .map(|arc| arc as std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>)
     }
 ```
 
-Same on v1's `KmsBackend` (if v1's syncobj storage exists; if not, leave as default no-op).
+The `dri3_signal_syncobj_via_handle` default impl is fine; both backends inherit it. v1's `KmsBackend` should also implement `dri3_syncobj_handle` with the same shape if v1's syncobj storage exists.
 
-- [ ] **Step 8: Run + commit**
+- [ ] **Step 9: Run + commit**
 
 ```
 cargo +nightly fmt
@@ -803,7 +870,21 @@ pub enum PresentWake {
 }
 ```
 
-- [ ] **Step 3: Add trait methods with default impls**
+- [ ] **Step 3: Re-export from `backend/mod.rs`**
+
+In `crates/yserver-core/src/backend/mod.rs`, extend the existing `pub use trait_def::{...}` block to include the new types so downstream callers can write `yserver_core::backend::CompletedPresentEvent` (paths used in Tasks 6, 9, 10, 12, 13):
+
+```rust
+pub use trait_def::{
+    ActiveCursorImage, Backend, BackendFdKind, Dri3Caps, HostSocketStatus, PresentCaps,
+    XshmfenceHandle, SyncobjHandle,
+    CompletedPresentEvent, PresentWake,   // <-- ADD
+};
+```
+
+(`XshmfenceHandle` + `SyncobjHandle` were already added in Tasks 2 + 3; mention them here for clarity.)
+
+- [ ] **Step 4: Add trait methods with default impls**
 
 Inside the existing `pub trait Backend { ... }` block:
 
@@ -829,7 +910,7 @@ Inside the existing `pub trait Backend { ... }` block:
     }
 ```
 
-- [ ] **Step 4: Run, confirm pass**
+- [ ] **Step 5: Run, confirm pass**
 
 ```
 cargo +nightly fmt
@@ -840,10 +921,11 @@ cargo test -p yserver --lib
 ```
 Expected: green.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add crates/yserver-core/src/backend/trait_def.rs
+git add crates/yserver-core/src/backend/trait_def.rs \
+        crates/yserver-core/src/backend/mod.rs
 git commit -m "feat(backend): enqueue/drain trait methods + CompletedPresentEvent
 
 Foundation prereq #4 for Stage 5 Task 6.1. Adds
@@ -880,12 +962,9 @@ Create `crates/yserver/src/kms/v2/present_completion.rs`:
 
 use std::{os::fd::OwnedFd, sync::Arc};
 
-use yserver_core::backend::CompletedPresentEvent;
+use yserver_core::backend::{CompletedPresentEvent, SyncobjHandle, XshmfenceHandle};
 
-use crate::kms::{
-    v2::{owned_semaphore::OwnedSemaphore, platform::FenceTicket},
-    xshmfence::FenceMapping,
-};
+use crate::kms::v2::platform::FenceTicket;
 
 /// One queued PRESENT awaiting cow_batch retirement. The drain
 /// fires the wake signal via `wake_pin` + returns the `event`
@@ -910,8 +989,8 @@ pub(crate) struct PendingPresentEntry {
 /// via the held `Arc` regardless of whether the X11 resource id is
 /// still in the registry.
 pub(crate) enum PinnedWake {
-    Pixmap(Arc<FenceMapping>),
-    PixmapSynced { handle: Arc<OwnedSemaphore>, value: u64 },
+    Pixmap(Arc<dyn XshmfenceHandle>),
+    PixmapSynced { handle: Arc<dyn SyncobjHandle>, value: u64 },
     /// Client passed no wake object (idle_fence_xid == 0 or
     /// release_syncobj == 0). Drain skips the signal step; X11 event
     /// emission still happens.
@@ -988,15 +1067,13 @@ Two `OwnedFd` fields, created at init, registered together so the eventfd lives 
 **Files:**
 - Modify: `crates/yserver/src/kms/v2/backend.rs` (struct fields + constructors)
 - Modify: `crates/yserver/src/kms/v2/platform.rs:845` (`poll_fds`)
-- Modify: `crates/yserver/Cargo.toml` (add `libc` or `rustix` dep if not present)
+- (No `Cargo.toml` changes needed — `nix.workspace = true` is already present.)
 
 - [ ] **Step 1: Verify dep availability**
 
-```
-grep -E "^libc|^rustix" crates/yserver/Cargo.toml
-```
+`nix.workspace = true` is already in `crates/yserver/Cargo.toml` (confirmed via `grep -n nix crates/yserver/Cargo.toml`). The codebase's existing epoll/eventfd usage goes through `nix` (see `crates/yserver/src/input_thread.rs`). Use `nix::sys::{epoll, eventfd}` throughout this task — do NOT introduce `rustix` as a separate dep.
 
-`rustix` is the cleaner Rust-native option for `epoll` + `eventfd`. If neither is in `Cargo.toml`, add `rustix = { version = "0.38", features = ["event", "fs"] }` (or the latest available).
+If the workspace's `nix` feature set doesn't include `event` / `eventfd`, add the feature in the workspace `Cargo.toml`'s `nix` declaration. Current usage in `input_thread.rs` already enables epoll; eventfd typically rides the same `event` feature.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -1033,34 +1110,35 @@ The cleanest home is `PlatformBackend` since that's where `poll_fds()` lives. Mo
     /// sync_file FDs for deferred PRESENT completion. Exposed via
     /// `poll_fds()` under `BackendFdKind::PresentCompletion`. Spec
     /// `2026-05-23-deferred-present-completion-design.md`.
-    pub(crate) present_completion_epfd: std::os::fd::OwnedFd,
+    pub(crate) present_completion_epfd: nix::sys::epoll::Epoll,
 
     /// Stage 5 Task 6.1: eventfd used to wake the main loop when an
     /// already-signaled fence is enqueued (vkGetFenceFdKHR returned
     /// -1) or any other force-wake condition arises. Registered with
     /// `present_completion_epfd` at init under EPOLLIN.
-    pub(crate) wakeup_eventfd: std::os::fd::OwnedFd,
+    pub(crate) wakeup_eventfd: nix::sys::eventfd::EventFd,
 ```
 
-Create both FDs in the `PlatformBackend::new` (or equivalent) constructor:
+Create both FDs in the `PlatformBackend::new` (or equivalent) constructor using `nix`:
 
 ```rust
-let present_completion_epfd = rustix::event::epoll::create(rustix::event::epoll::CreateFlags::CLOEXEC)
+use nix::sys::{
+    epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags},
+    eventfd::{EventFd, EfdFlags},
+};
+
+let present_completion_epfd = Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC)
     .map_err(|e| io::Error::other(format!("epoll_create1: {e}")))?;
-let wakeup_eventfd = rustix::event::eventfd(
-    0,
-    rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
-)
-.map_err(|e| io::Error::other(format!("eventfd: {e}")))?;
-// Register wakeup_eventfd with the inner epoll once at init.
-rustix::event::epoll::add(
-    &present_completion_epfd,
-    &wakeup_eventfd,
-    rustix::event::epoll::EventData::new_u64(WAKEUP_EVENTFD_TOKEN),
-    rustix::event::epoll::EventFlags::IN,
-)
-.map_err(|e| io::Error::other(format!("epoll_ctl ADD wakeup_eventfd: {e}")))?;
+let wakeup_eventfd = EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+    .map_err(|e| io::Error::other(format!("eventfd: {e}")))?;
+// Register wakeup_eventfd with the inner epoll once at init under a
+// distinguishing token. EpollEvent::new takes (flags, u64 data).
+present_completion_epfd
+    .add(&wakeup_eventfd, EpollEvent::new(EpollFlags::EPOLLIN, WAKEUP_EVENTFD_TOKEN))
+    .map_err(|e| io::Error::other(format!("epoll_ctl ADD wakeup_eventfd: {e}")))?;
 ```
+
+`Epoll` and `EventFd` in `nix` both yield `OwnedFd` semantics on Drop — they own and close their underlying FD. Store them directly (no `OwnedFd` wrap needed). Adjust the field types from `OwnedFd` to `Epoll` and `EventFd` respectively.
 
 `WAKEUP_EVENTFD_TOKEN` is a constant `u64` value the inner-epoll drain uses to distinguish wakeup-eventfd readiness from per-entry sync_file readiness. Define near the top of the file:
 
@@ -1216,7 +1294,7 @@ The load-bearing backend implementation. Captures the lifetime pin + exports the
 - Modify: `crates/yserver/src/kms/v2/backend.rs` (Backend trait method bodies delegate here)
 - Add: `crates/yserver/src/kms/v2/backend.rs` field `pending_present_events: VecDeque<PendingPresentEntry>`
 
-- [ ] **Step 1: Add the queue field**
+- [ ] **Step 1: Add the queue field + test accessors**
 
 In `KmsBackendV2` struct (around backend.rs:214 area):
 
@@ -1231,6 +1309,29 @@ Initialise in every constructor (backend.rs:465 + :987 etc.):
 
 ```rust
     pending_present_events: std::collections::VecDeque::new(),
+```
+
+Add `#[doc(hidden)] pub` accessors so integration tests in `crates/yserver/tests/v2_acceptance.rs` can observe internal state. Mirrors the existing `has_pending_batches_for_tests` accessor pattern from the bee fix:
+
+```rust
+    /// Test-only: number of entries currently in the deferred
+    /// PRESENT completion queue. Used by the v2_acceptance suite
+    /// to assert enqueue/drain behaviour from outside the crate.
+    #[doc(hidden)]
+    pub fn pending_present_events_len_for_tests(&self) -> usize {
+        self.pending_present_events.len()
+    }
+
+    /// Test-only: drain a single ticket signal check + emit cycle
+    /// without going through the main loop. Equivalent to one outer-
+    /// loop iteration's drain hook. Returns the same events the loop
+    /// would have collected.
+    #[doc(hidden)]
+    pub fn drain_completed_present_events_for_tests(
+        &mut self,
+    ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
+        self.drain_completed_present_events_impl()
+    }
 ```
 
 - [ ] **Step 2: Write the failing test**
@@ -1265,7 +1366,7 @@ Add to `crates/yserver/src/kms/v2/present_completion.rs`:
 ```rust
 use std::collections::VecDeque;
 
-use rustix::event::epoll;
+use nix::sys::epoll::{EpollEvent, EpollFlags};
 use yserver_core::backend::PresentWake;
 
 use crate::kms::v2::platform::WAKEUP_EVENTFD_TOKEN;
@@ -1300,22 +1401,15 @@ pub(crate) fn enqueue(
 
     let fence_fd = match fd_opt {
         Some(fd) => {
-            // Register with the inner epoll under a per-entry token.
-            // Per-entry token: the entry's queue index isn't stable
-            // (insertion mutates the queue); use a backend-managed
-            // monotonic counter instead. Simpler: don't bother with
-            // per-entry tokens since drain re-polls every entry's
-            // ticket.poll_signaled() anyway — the inner-epoll wake is
-            // a "something signaled, go look" signal, not a per-entry
-            // dispatcher. Token can be 0 or any non-WAKEUP value.
-            let token = 0_u64; // not load-bearing; see note above
-            epoll::add(
-                &platform.present_completion_epfd,
-                &fd,
-                epoll::EventData::new_u64(token),
-                epoll::EventFlags::IN,
-            )
-            .map_err(|e| std::io::Error::other(format!("epoll_ctl ADD: {e}")))?;
+            // Register with the inner epoll. drain re-polls every
+            // entry's ticket.poll_signaled() anyway, so the
+            // inner-epoll wake is just a "something signaled, go
+            // look" signal — token value isn't load-bearing for
+            // dispatch. Use 0 (or any non-WAKEUP_EVENTFD_TOKEN value).
+            platform
+                .present_completion_epfd
+                .add(&fd, EpollEvent::new(EpollFlags::EPOLLIN, 0))
+                .map_err(|e| std::io::Error::other(format!("epoll_ctl ADD: {e}")))?;
             Some(fd)
         }
         None => {
@@ -1338,21 +1432,14 @@ pub(crate) fn enqueue(
 fn write_wakeup_eventfd(
     platform: &crate::kms::v2::platform::PlatformBackend,
 ) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::fd::AsRawFd;
-    let raw = platform.wakeup_eventfd.as_raw_fd();
-    let buf: [u8; 8] = 1_u64.to_ne_bytes();
-    // SAFETY: writing to an eventfd is a syscall; raw fd is owned by
-    // platform. EAGAIN on saturation is benign.
-    let n = unsafe { libc::write(raw, buf.as_ptr().cast(), buf.len()) };
-    if n < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EAGAIN) {
-            return Ok(()); // saturation, benign
-        }
-        return Err(err);
+    // nix::sys::eventfd::EventFd exposes a `write(u64) -> Result<usize>`
+    // method. EAGAIN on saturation is benign — the queue already has
+    // a pending entry so drain will run anyway.
+    match platform.wakeup_eventfd.write(1) {
+        Ok(_) => Ok(()),
+        Err(nix::errno::Errno::EAGAIN) => Ok(()),
+        Err(e) => Err(std::io::Error::other(format!("eventfd write: {e}"))),
     }
-    Ok(())
 }
 
 fn dummy_signaled_ticket(
@@ -1455,25 +1542,37 @@ impl KmsBackendV2 {
         use std::io::Read;
         use std::os::fd::AsRawFd;
 
-        // Drain wakeup_eventfd
-        let raw = self.platform.wakeup_eventfd.as_raw_fd();
-        let mut buf = [0u8; 8];
-        let _ = unsafe { libc::read(raw, buf.as_mut_ptr().cast(), buf.len()) };
+        // Drain wakeup_eventfd. nix EventFd::read returns Ok(u64)
+        // with the accumulated counter; Err(EAGAIN) when zero (no
+        // pending wake — benign).
+        match self.platform.wakeup_eventfd.read() {
+            Ok(_) | Err(nix::errno::Errno::EAGAIN) => {}
+            Err(e) => log::warn!("wakeup_eventfd read: {e}"),
+        }
 
         let mut completed = Vec::new();
         let vk = self.platform.vk().expect("vk live for v2").clone();
+        // Spec §"Error handling" Renderer-failure branch: if the
+        // renderer is in fatal state, force-fire every entry
+        // unconditionally (the fences won't signal further; clients
+        // mustn't be left blocked).
+        let renderer_failed = self.platform.renderer_failed;
+        if renderer_failed && !self.pending_present_events.is_empty() {
+            log::warn!(
+                "renderer_failed: force-firing {} pending PRESENT entries",
+                self.pending_present_events.len()
+            );
+        }
         while let Some(front) = self.pending_present_events.front() {
-            let ready = front.fence_fd.is_none()
+            let ready = renderer_failed
+                || front.fence_fd.is_none()
                 || front.ticket.poll_signaled(&vk);
             if !ready {
                 break;
             }
             let entry = self.pending_present_events.pop_front().expect("just peeked");
             if let Some(fd) = entry.fence_fd.as_ref() {
-                let _ = rustix::event::epoll::delete(
-                    &self.platform.present_completion_epfd,
-                    fd,
-                );
+                let _ = self.platform.present_completion_epfd.delete(fd);
             }
             // Fire the wake signal via the held Arc.
             match &entry.wake_pin {
@@ -1536,22 +1635,73 @@ And `enqueue_present_completion`:
     }
 ```
 
-- [ ] **Step 5: Run, confirm pass**
+- [ ] **Step 5: Write the renderer-failed test**
+
+Per spec §"Error handling": when `platform.renderer_failed` is true, drain must force-fire every entry unconditionally (the fences won't signal further; clients mustn't be left blocked).
+
+Append to `crates/yserver/tests/v2_acceptance.rs`:
+
+```rust
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_drain_force_fires_all_pending_on_renderer_failed() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    // Set up: enqueue 3 pending entries against unsignaled fences.
+    let src = b.create_pixmap(None, 32, 4, 4).expect("src");
+    let cow = b.create_pixmap(None, 32, 4, 4).expect("cow");
+    for serial in 1..=3 {
+        b.copy_area(None, src.as_raw(), cow.as_raw(), 0, 0, 0, 0, 4, 4)
+            .expect("copy");
+        b.enqueue_present_completion(yserver_core::backend::CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(0),
+            serial,
+            host_xid: src.as_raw(),
+            dst_host_xid: cow.as_raw(),
+            options: 0,
+            wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+        });
+    }
+    assert_eq!(b.pending_present_events_len_for_tests(), 3);
+    // Normal drain: 0 entries ready (fences not signaled).
+    assert_eq!(b.drain_completed_present_events_for_tests().len(), 0);
+    assert_eq!(b.pending_present_events_len_for_tests(), 3);
+
+    // Flip renderer_failed (test helper or direct field assignment via
+    // a #[doc(hidden)] pub fn set_renderer_failed_for_tests). Then
+    // drain returns all 3 entries unconditionally.
+    b.set_renderer_failed_for_tests(true);
+    let drained = b.drain_completed_present_events_for_tests();
+    assert_eq!(drained.len(), 3);
+    assert_eq!(b.pending_present_events_len_for_tests(), 0);
+}
+```
+
+The `set_renderer_failed_for_tests` helper is a new `#[doc(hidden)] pub fn` on `KmsBackendV2` that flips `self.platform.renderer_failed = true`. Mirrors the test-only accessors elsewhere.
+
+- [ ] **Step 6: Run, confirm pass**
 
 ```
 cargo +nightly fmt
 cargo clippy -p yserver --tests -- -D warnings
 cargo test -p yserver --lib
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
-  cargo test -p yserver --test v2_acceptance enqueue_present_completion -- --ignored
+  cargo test -p yserver --test v2_acceptance -- --ignored \
+    enqueue_present_completion v2_drain_force_fires_all_pending_on_renderer_failed
 ```
 Expected: green.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add crates/yserver/src/kms/v2/present_completion.rs \
-        crates/yserver/src/kms/v2/backend.rs
+        crates/yserver/src/kms/v2/backend.rs \
+        crates/yserver/tests/v2_acceptance.rs
 git commit -m "feat(v2): enqueue + drain deferred PRESENT completions
 
 Stage 5 Task 6.1 backend internals. enqueue_present_completion
@@ -2031,10 +2181,7 @@ In `crates/yserver/src/kms/v2/backend.rs:1669`:
         // failure path).
         for entry in self.pending_present_events.drain(..) {
             if let Some(fd) = entry.fence_fd {
-                let _ = rustix::event::epoll::delete(
-                    &self.platform.present_completion_epfd,
-                    &fd,
-                );
+                let _ = self.platform.present_completion_epfd.delete(&fd);
             }
             self.pending_completed_events_on_shutdown.push(entry.event);
         }
@@ -2061,7 +2208,25 @@ And a new accessor:
     }
 ```
 
-- [ ] **Step 3: Call from `lib.rs`**
+- [ ] **Step 3: Add delegation on `KmsBackendKind`**
+
+`lib.rs::run` holds the backend as `KmsBackendKind` (a v1/v2 enum at `crates/yserver/src/kms/dispatch.rs:33`), not as a `Box<dyn Backend>`. The new `take_shutdown_present_events` method must be reachable through the enum wrapper. Following the same pattern as the existing `disable_output` at `dispatch.rs:141`, add:
+
+```rust
+    /// Stage 5 Task 6.1: pick up any PRESENT completions that were
+    /// queued through to shutdown. Delegates per backend variant; v1
+    /// returns an empty Vec (no deferred-completion mechanism).
+    pub fn take_shutdown_present_events(
+        &mut self,
+    ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
+        match self {
+            KmsBackendKind::V1(_) => Vec::new(),
+            KmsBackendKind::V2(b) => b.take_shutdown_present_events(),
+        }
+    }
+```
+
+- [ ] **Step 4: Call from `lib.rs`**
 
 In `crates/yserver/src/lib.rs:295`:
 
@@ -2085,7 +2250,7 @@ In `crates/yserver/src/lib.rs:295`:
 
 (This requires `take_shutdown_present_events` on the Backend trait too, with a default returning `Vec::new()`.)
 
-- [ ] **Step 4: Run + commit**
+- [ ] **Step 5: Run + commit**
 
 ```
 cargo +nightly fmt
@@ -2097,6 +2262,7 @@ Expected: green.
 
 ```bash
 git add crates/yserver/src/kms/v2/backend.rs \
+        crates/yserver/src/kms/dispatch.rs \
         crates/yserver/src/lib.rs \
         crates/yserver-core/src/backend/trait_def.rs \
         crates/yserver/tests/v2_acceptance.rs
