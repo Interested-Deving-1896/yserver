@@ -32,10 +32,10 @@ Cross-cutting bugs and followups that don't fit a stage live in
   abandoned `render-convolution-filter` branch: QueryFilters
   standard list, NameWindowPixmap diagnosis docs, Justfile xtrace
   `rm`, picom validation harness.
-- Active dev branch: `rendering-model-v2`, off
-  `graphics-followups`. v2 spec at base; Stages 1a/1b/2a–2f and
-  3a through 3f.15 landed on top (see "Done" / "In progress"
-  below for commit hashes). `YSERVER_RENDER_MODEL=v2` is the
+- Active dev branch: `master`. All v2 work (Stages 1–4 + Stage 5
+  Task 3 + Task 4 layer 1) has been fast-forwarded from
+  `rendering-model-v2` → `cow-authoritative-mode` → `perf` into
+  `master`; HEAD `4ecb271`. `YSERVER_RENDER_MODEL=v2` is the
   **boot default** as of `3afa5bd` (2026-05-17 — previously the
   status doc claimed v2 default but `dispatch.rs` had v1 as the
   fallthrough; three smoke sessions silently tested v1). v1
@@ -45,7 +45,7 @@ Cross-cutting bugs and followups that don't fit a stage live in
   convolution Phase 1+2, the rotate fix, and the
   parallel-implementation lessons. Don't ship anything from there.
 - **Stage 4 closed 2026-05-21** on `cow-authoritative-mode`
-  (unmerged branch — integration to master is a separate decision).
+  (since merged into `master` via the perf-branch FF).
   Two-phase plan
   (`docs/superpowers/plans/2026-05-20-cow-authoritative-mode.md`)
   + a long correctness fix chain. Phase 1 (`19ed354`) gates
@@ -1537,7 +1537,7 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
   driver coverage) needs to gate stage close, not be
   reserved for the final acceptance pass.
 - [x] **Stage 4 — re-enable COMPOSITE + COW. Closed 2026-05-21
-  on `cow-authoritative-mode` (unmerged branch).** Manual-redirect
+  on `cow-authoritative-mode`, now in `master`.** Manual-redirect
   backing routing, NameWindowPixmap, scene treats COW as
   always-on-top entry. xfce drop-shadow renders correctly. picom
   composites and updates per Damage event. The actual closure
@@ -1982,8 +1982,8 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
 
     ### Stage 4 close (2026-05-21)
 
-    Stage 4 closed on `cow-authoritative-mode` (unmerged
-    branch). The pragmatic-floor and PictFormat options framed
+    Stage 4 closed on `cow-authoritative-mode`, since merged into
+    `master`. The pragmatic-floor and PictFormat options framed
     in the pre-close retrospective (now archived to
     [`status-archive-2026-05-21.md`](status-archive-2026-05-21.md))
     were not what landed — instead, a two-phase plan
@@ -2167,11 +2167,10 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         damage saturation exposes the `pick_repaint_region`
         correctness gap (smearing).
 
-    Perf branch (`origin/perf`) staying open across machines for
-    Task 3 + Task 4 (damage strategy) + Task 5 follow-ups; no
-    intent to merge Task 4 layer 1 to master yet — gating that on
-    Task 3 landing too, so master sees one perf-branch closure
-    rather than a half-fix.
+    Task 4 layer 1 + Task 3 POC + render_composite generalization
+    fast-forwarded to `master` together (HEAD `4ecb271`). Remaining
+    Stage 5 work (Task 3 `render_fill` extension, Task 4 damage
+    strategy, Task 5 follow-ups) continues directly on `master`.
 
   - [~] **Task 3 prep — submit-trace instrumentation +
     diagnostic capture.** Landed on `perf` 2026-05-22.
