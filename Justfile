@@ -386,10 +386,37 @@ yserver-wmaker-xterm-hw log="debug":
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-wmaker.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        DISPLAY=:7 wmaker > wmaker-hw.log 2>&1 &\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 YSERVER_V2_SCENE_WALK_ALL=1\
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            wmaker > wmaker-hw.log 2>&1 &\
         sleep 2;\
         DISPLAY=:7 wezterm;\
         kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
+# wmaker + wezterm on yserver with x11trace tunnelling. wmaker connects
+# to the fake display `:8`; x11trace forwards every request/event to
+# yserver on `:7` and writes a per-request/per-event trace to
+# `wmaker.xtrace`. Use when debugging which window/drawable wmaker is
+# painting (the yserver debug log omits drawable xids on PolySegment /
+# PolyFillRectangle / ClearArea); compare against an Xorg capture or
+# read alongside `yserver-hw-wmaker.log`.
+yserver-wmaker-xterm-hw-trace log="debug":
+    cargo build --bin yserver
+    rm -f wmaker.xtrace
+    bash -c '\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-wmaker.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -d :7 -D :8 -n -o wmaker.xtrace &\
+        xtrace_pid=$!;\
+        sleep 1;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 YSERVER_V2_SCENE_WALK_ALL=1\
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            wmaker > wmaker-hw.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:8 wezterm;\
+        kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
 # Run picom against yserver as a RENDER smoke test. picom v13's

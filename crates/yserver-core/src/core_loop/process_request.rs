@@ -10688,7 +10688,12 @@ fn handle_poly_point(
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }
-    debug!("client {} #{} PolyPoint", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} PolyPoint drawable=0x{:x}",
+        client_id.0,
+        sequence.0,
+        x11::drawable_request_id(body).map_or(0, |d| d.0),
+    );
     Ok(RequestOutcome::Handled)
 }
 
@@ -10720,7 +10725,12 @@ fn handle_poly_line(
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }
-    debug!("client {} #{} PolyLine", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} PolyLine drawable=0x{:x}",
+        client_id.0,
+        sequence.0,
+        x11::drawable_request_id(body).map_or(0, |d| d.0),
+    );
     Ok(RequestOutcome::Handled)
 }
 
@@ -10745,7 +10755,12 @@ fn handle_poly_segment(
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }
-    debug!("client {} #{} PolySegment", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} PolySegment drawable=0x{:x}",
+        client_id.0,
+        sequence.0,
+        x11::drawable_request_id(body).map_or(0, |d| d.0),
+    );
     Ok(RequestOutcome::Handled)
 }
 
@@ -10770,7 +10785,12 @@ fn handle_poly_rectangle(
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }
-    debug!("client {} #{} PolyRectangle", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} PolyRectangle drawable=0x{:x}",
+        client_id.0,
+        sequence.0,
+        x11::drawable_request_id(body).map_or(0, |d| d.0),
+    );
     Ok(RequestOutcome::Handled)
 }
 
@@ -10795,7 +10815,12 @@ fn handle_poly_arc(
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }
-    debug!("client {} #{} PolyArc", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} PolyArc drawable=0x{:x}",
+        client_id.0,
+        sequence.0,
+        x11::drawable_request_id(body).map_or(0, |d| d.0),
+    );
     Ok(RequestOutcome::Handled)
 }
 
@@ -10827,7 +10852,12 @@ fn handle_fill_poly(
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }
-    debug!("client {} #{} FillPoly", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} FillPoly drawable=0x{:x}",
+        client_id.0,
+        sequence.0,
+        x11::drawable_request_id(body).map_or(0, |d| d.0),
+    );
     Ok(RequestOutcome::Handled)
 }
 
@@ -10858,7 +10888,12 @@ fn handle_poly_fill_rectangle(
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }
-    debug!("client {} #{} PolyFillRectangle", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} PolyFillRectangle drawable=0x{:x}",
+        client_id.0,
+        sequence.0,
+        x11::drawable_request_id(body).map_or(0, |d| d.0),
+    );
     Ok(RequestOutcome::Handled)
 }
 
@@ -10888,7 +10923,12 @@ fn handle_poly_fill_arc(
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }
-    debug!("client {} #{} PolyFillArc", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} PolyFillArc drawable=0x{:x}",
+        client_id.0,
+        sequence.0,
+        x11::drawable_request_id(body).map_or(0, |d| d.0),
+    );
     Ok(RequestOutcome::Handled)
 }
 
@@ -10964,7 +11004,12 @@ fn handle_clear_area(
             }
         }
     }
-    debug!("client {} #{} ClearArea", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} ClearArea drawable=0x{:x}",
+        client_id.0,
+        sequence.0,
+        x11::clear_area_request(body).map_or(0, |r| r.window.0),
+    );
     Ok(RequestOutcome::Handled)
 }
 
@@ -11453,7 +11498,10 @@ fn handle_copy_plane(
             let _ = write_to_client(client, client_id, &buf);
         }
     }
-    debug!("client {} #{} CopyPlane", client_id.0, sequence.0);
+    debug!(
+        "client {} #{} CopyPlane src=0x{:x} dst=0x{:x} src=({},{}) dst=({},{}) {}x{} plane=0x{:x}",
+        client_id.0, sequence.0, src.0, dst.0, sx, sy, dx, dy, w, h, plane,
+    );
     Ok(RequestOutcome::Handled)
 }
 
