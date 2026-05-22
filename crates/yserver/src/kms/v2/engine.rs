@@ -5707,9 +5707,14 @@ fn unpack_to_staging(
             }
         }
         1 => {
-            // 1 bit per pixel MSB-first → 1 byte per pixel
-            // (0xFF if set, 0x00 if clear). Unpack each
-            // requested column from the source bit position.
+            // 1 bit per pixel → 1 byte per pixel (0xFF if set,
+            // 0x00 if clear). Unpack each requested column from
+            // the source bit position. Bit order matches the
+            // server's advertised `bitmap-bit-order` — we forward
+            // the client's `byte_order` from setup (typically
+            // `LSBFirst` on x86), so bit 0 of a byte is pixel 0
+            // in that 8-pixel group. Mirrors v1's depth-1 PutImage
+            // unpacker at `kms::backend.rs:3995`.
             let row_dst_bytes = dst_w as usize;
             for row in 0..dst_h {
                 let src_row_off = (sy + row) as usize * src_row_bytes;
@@ -5719,7 +5724,7 @@ fn unpack_to_staging(
                     for col in 0..dst_w as usize {
                         let bit_index = sx as usize + col;
                         let byte = row_src[bit_index / 8];
-                        let bit = (byte >> (7 - (bit_index % 8))) & 0x1;
+                        let bit = (byte >> (bit_index % 8)) & 0x1;
                         *dst.add(col) = if bit != 0 { 0xFF } else { 0x00 };
                     }
                 }
@@ -5761,8 +5766,12 @@ fn pack_from_storage(raw: &[u8], w: u32, h: u32, depth: u8) -> Result<Vec<u8>, R
             Ok(out)
         }
         1 => {
-            // Pack 0xFF/0x00 bytes back to 1bpp MSB-first;
-            // scanline padded to 32 bits.
+            // Pack 0xFF/0x00 bytes back to 1bpp; scanline
+            // padded to 32 bits. Bit order matches the server's
+            // advertised `bitmap-bit-order` (LSBFirst when the
+            // client requested it, which is the x86 default); bit
+            // 0 of a byte is pixel 0 in that 8-pixel group.
+            // Mirrors `unpack_to_staging`'s depth-1 branch above.
             let row_bytes = w.div_ceil(32) as usize * 4;
             let mut out = vec![0u8; row_bytes * h as usize];
             for row in 0..h as usize {
@@ -5770,7 +5779,7 @@ fn pack_from_storage(raw: &[u8], w: u32, h: u32, depth: u8) -> Result<Vec<u8>, R
                 let dst_off = row * row_bytes;
                 for col in 0..w as usize {
                     if raw[src_off + col] != 0 {
-                        out[dst_off + col / 8] |= 1 << (7 - (col % 8));
+                        out[dst_off + col / 8] |= 1 << (col % 8);
                     }
                 }
             }
@@ -5963,9 +5972,11 @@ mod tests {
 
     #[test]
     fn depth1_unpack_round_trip() {
-        // 1×8 source padded to a 32-bit scanline (4 bytes); MSB
-        // first the first byte holds the bits 10101010 = 0xAA,
-        // the remaining 3 bytes are scanline pad.
+        // 1×8 source padded to a 32-bit scanline (4 bytes). Bit
+        // order LSB-first per the server's advertised
+        // `bitmap-bit-order`: 0xAA = 1010_1010 = bits 1, 3, 5, 7
+        // set → pixels 1, 3, 5, 7 set. Remaining 3 bytes are
+        // scanline pad.
         let src = vec![0xAAu8, 0x00, 0x00, 0x00];
         let src_extent = vk::Extent2D {
             width: 8,
@@ -5973,11 +5984,13 @@ mod tests {
         };
         let mut out = vec![0u8; 8];
         unpack_to_staging(&src, src_extent, 0, 0, 8, 1, 1, out.as_mut_ptr()).unwrap();
-        assert_eq!(out, vec![0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00]);
+        assert_eq!(out, vec![0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF]);
 
         let packed = pack_from_storage(&out, 8, 1, 1).unwrap();
         // Row stride is 4 bytes (32 bits) per depth-1 pad rule;
-        // the high byte holds the data.
+        // the first byte holds the data, repacked LSB-first →
+        // 0xAA round-trips (the byte is self-symmetric under
+        // pack/unpack inversion).
         assert_eq!(packed.len(), 4);
         assert_eq!(packed[0], 0xAA);
     }

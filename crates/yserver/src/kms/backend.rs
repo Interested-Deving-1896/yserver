@@ -151,6 +151,122 @@ fn read_mirror_pixel_for_plane(rb: &MirrorReadback, depth: u8, x: usize, y: usiz
     }
 }
 
+/// Backend-side cache of a depth-1 / depth-8 GC clip-mask pixmap's
+/// bytes plus the geometry needed to gate paint rects against it.
+/// Populated synchronously at `set_clip_pixmap` time by either
+/// backend; lifetime is the duration the GC clip stays
+/// `ClipState::Pixmap`.
+///
+/// `depth` and `row_stride` together describe the byte layout:
+///   - `depth=1`: bytes are wire-format ZPixmap (packed bits LSB-first
+///     within each byte — bit 0 = leftmost pixel — scanline-padded to
+///     32 bits — `row_stride = ((width + 31) / 32) * 4`). Matches the
+///     server's advertised `bitmap-bit-order=LSBFirst`.
+///   - `depth=8`: bytes are one byte per pixel (any non-zero byte = set);
+///     `row_stride = ((width + 3) / 4) * 4` for X11 wire format, or
+///     `row_stride = width` for storage R8 readback (v1's path).
+pub(crate) struct ClipMaskCache {
+    /// Host xid of the mask pixmap. Used by `apply_clip_state` to
+    /// skip re-readback when the GC is re-applied with the same
+    /// pixmap + origin between paints.
+    pub(crate) pixmap_xid: u32,
+    pub(crate) origin: (i16, i16),
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) depth: u8,
+    pub(crate) row_stride: u32,
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// Rasterise an X11 pixmap clip-mask against a paint-rect list.
+///
+/// X11 GC clip-mask: a pixel paints iff the mask bit at
+/// `(dst_x - clip_origin.x, dst_y - clip_origin.y)` is 1. Mask
+/// coordinates outside `[0, mask_width) × [0, mask_height)` are
+/// treated as 0 (no paint).
+///
+/// `mask_depth` is 1 (canonical) or 8 (any non-zero byte = paint).
+/// `mask_row_stride` is the number of bytes per row in `mask_bytes`
+/// (X11 scanline-padded; for depth-1 with the server's 32-bit
+/// scanline pad this is `((width + 31) / 32) * 4`).
+///
+/// Bit order for depth-1 is **LSB-first** within each byte (bit 0 =
+/// leftmost pixel in that byte's 8-pixel group). Matches the
+/// server's advertised `bitmap-bit-order` (`LSBFirst` for the
+/// x86-default client byte order), v1's depth-1 PutImage unpacker,
+/// and v2's `pack_from_storage` / `unpack_to_staging` depth-1
+/// branches — all forwards/backwards round-trip through LSB-first
+/// packed bytes.
+///
+/// Emits horizontal runs as rectangles (consecutive set bits in a
+/// row become one wide rect). Empty input or fully-masked paints
+/// return an empty Vec.
+pub(crate) fn rasterize_pixmap_mask_to_rects(
+    paint_rects: &[Rectangle16],
+    mask_bytes: &[u8],
+    mask_width: u16,
+    mask_height: u16,
+    mask_depth: u32,
+    mask_row_stride: u32,
+    clip_origin: (i16, i16),
+) -> Vec<Rectangle16> {
+    let mw = i32::from(mask_width);
+    let mh = i32::from(mask_height);
+    let ox = i32::from(clip_origin.0);
+    let oy = i32::from(clip_origin.1);
+    let stride = mask_row_stride as usize;
+    let mut out: Vec<Rectangle16> = Vec::new();
+    let pixel_set = |mx: i32, my: i32| -> bool {
+        if mx < 0 || my < 0 || mx >= mw || my >= mh {
+            return false;
+        }
+        let row = my as usize * stride;
+        match mask_depth {
+            1 => {
+                let byte = row + (mx as usize / 8);
+                let bit = (mx as usize) % 8;
+                mask_bytes.get(byte).is_some_and(|b| (b >> bit) & 1 != 0)
+            }
+            8 => mask_bytes.get(row + mx as usize).is_some_and(|b| *b != 0),
+            _ => false,
+        }
+    };
+    for r in paint_rects {
+        let rx0 = i32::from(r.x);
+        let ry0 = i32::from(r.y);
+        let rx1 = rx0 + i32::from(r.width);
+        let ry1 = ry0 + i32::from(r.height);
+        for dy in ry0..ry1 {
+            let my = dy - oy;
+            let mut run_start: Option<i32> = None;
+            for dx in rx0..rx1 {
+                let mx = dx - ox;
+                if pixel_set(mx, my) {
+                    if run_start.is_none() {
+                        run_start = Some(dx);
+                    }
+                } else if let Some(s) = run_start.take() {
+                    out.push(Rectangle16 {
+                        x: s as i16,
+                        y: dy as i16,
+                        width: (dx - s) as u16,
+                        height: 1,
+                    });
+                }
+            }
+            if let Some(s) = run_start {
+                out.push(Rectangle16 {
+                    x: s as i16,
+                    y: dy as i16,
+                    width: (rx1 - s) as u16,
+                    height: 1,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Convert an X11 24-bit pixel (0xRRGGBB) to a Pixman Color.
 /// Append 1×1 rects covering a Bresenham line from (x0,y0) to (x1,y1).
 pub(crate) fn bresenham_segment(x0: i32, y0: i32, x1: i32, y1: i32, out: &mut Vec<Rectangle16>) {
@@ -707,6 +823,16 @@ pub struct KmsBackend {
     /// "Renderer-disabled design" section.
     pub(crate) renderer_failed: bool,
 
+    /// Cached readback of the current GC clip-mask pixmap (depth-1
+    /// or depth-8). Populated at `set_clip_pixmap` time by reading
+    /// the pixmap bytes via `read_mirror_pixels`; consumed by
+    /// `intersect_with_current_clip` so depth-1 pixmap clipping
+    /// actually gates paint to the mask shape. Cleared whenever
+    /// `current_clip` transitions away from `ClipState::Pixmap`.
+    /// Bytes are R8 storage format (1 byte per pixel; 0xFF for set,
+    /// 0x00 for clear). See [`rasterize_pixmap_mask_to_rects`].
+    pub(crate) clip_mask_cache: Option<ClipMaskCache>,
+
     /// Set by `disable_output` so the rest of teardown can run
     /// without `composite_and_flip` racing in and resubmitting a
     /// new frame. Latched once; never cleared.
@@ -1160,6 +1286,7 @@ impl KmsBackend {
             compositor_pipeline: None,
             ops_command_pool: None,
             renderer_failed: false,
+            clip_mask_cache: None,
             shutting_down: false,
             composite_defer_stats: CompositeDeferStats::default(),
             ops_staging: None,
@@ -1972,6 +2099,7 @@ impl KmsBackend {
             compositor_pipeline,
             ops_command_pool,
             renderer_failed: false,
+            clip_mask_cache: None,
             shutting_down: false,
             composite_defer_stats: CompositeDeferStats::default(),
             ops_staging,
@@ -2771,39 +2899,94 @@ impl KmsBackend {
         Some(out)
     }
 
-    /// Intersect each rect in `rects` against the current GC clip. Returns
-    /// the original list when no clip is active. For `ClipState::Pixmap` we
-    /// pass through untouched (TODO: rasterise the mask).
+    /// Intersect each rect in `rects` against the current GC clip.
+    /// Handles all three `ClipState` variants — `None` (pass through),
+    /// `Rectangles` (rect-vs-rect intersection), and `Pixmap` (per-pixel
+    /// mask gating via `rasterize_pixmap_mask_to_rects` against the
+    /// readback cached at `set_clip_pixmap` time). Mirrors the v2
+    /// helper at `kms::v2::backend::intersect_with_current_clip`.
     fn intersect_with_current_clip(&self, rects: &[Rectangle16]) -> Vec<Rectangle16> {
-        let Some(clip_rects) = self.current_clip_rects_in_dst_space() else {
-            return rects.to_vec();
-        };
-        let mut out = Vec::with_capacity(rects.len());
-        for r in rects {
-            let rx0 = r.x as i32;
-            let ry0 = r.y as i32;
-            let rx1 = rx0 + r.width as i32;
-            let ry1 = ry0 + r.height as i32;
-            for c in &clip_rects {
-                let cx0 = c.x as i32;
-                let cy0 = c.y as i32;
-                let cx1 = cx0 + c.width as i32;
-                let cy1 = cy0 + c.height as i32;
-                let ix0 = rx0.max(cx0);
-                let iy0 = ry0.max(cy0);
-                let ix1 = rx1.min(cx1);
-                let iy1 = ry1.min(cy1);
-                if ix0 < ix1 && iy0 < iy1 {
-                    out.push(Rectangle16 {
-                        x: ix0 as i16,
-                        y: iy0 as i16,
-                        width: (ix1 - ix0) as u16,
-                        height: (iy1 - iy0) as u16,
-                    });
+        match &self.core.current_clip {
+            ClipState::None => rects.to_vec(),
+            ClipState::Rectangles { .. } => {
+                let clip_rects = self.current_clip_rects_in_dst_space().unwrap_or_default();
+                let mut out = Vec::with_capacity(rects.len());
+                for r in rects {
+                    let rx0 = r.x as i32;
+                    let ry0 = r.y as i32;
+                    let rx1 = rx0 + r.width as i32;
+                    let ry1 = ry0 + r.height as i32;
+                    for c in &clip_rects {
+                        let cx0 = c.x as i32;
+                        let cy0 = c.y as i32;
+                        let cx1 = cx0 + c.width as i32;
+                        let cy1 = cy0 + c.height as i32;
+                        let ix0 = rx0.max(cx0);
+                        let iy0 = ry0.max(cy0);
+                        let ix1 = rx1.min(cx1);
+                        let iy1 = ry1.min(cy1);
+                        if ix0 < ix1 && iy0 < iy1 {
+                            out.push(Rectangle16 {
+                                x: ix0 as i16,
+                                y: iy0 as i16,
+                                width: (ix1 - ix0) as u16,
+                                height: (iy1 - iy0) as u16,
+                            });
+                        }
+                    }
                 }
+                out
+            }
+            ClipState::Pixmap { .. } => {
+                // Cache populated at `set_clip_pixmap`. Missing cache =
+                // mask readback failed; degrade to no-paint (safer than
+                // pass-through, which would obliterate prior decoration).
+                let Some(cache) = self.clip_mask_cache.as_ref() else {
+                    return Vec::new();
+                };
+                rasterize_pixmap_mask_to_rects(
+                    rects,
+                    &cache.bytes,
+                    cache.width,
+                    cache.height,
+                    u32::from(cache.depth),
+                    cache.row_stride,
+                    cache.origin,
+                )
             }
         }
-        out
+    }
+
+    /// Synchronously read a depth-1 mask pixmap's R8 storage bytes via
+    /// `read_mirror_pixels` and return a `ClipMaskCache` ready for
+    /// `intersect_with_current_clip`. Returns `None` if the pixmap
+    /// isn't mirrored, isn't depth-1, or the readback fails.
+    /// `depth=8` in the cache means "one byte per pixel, any non-zero
+    /// = paint" — matches what `read_mirror_pixels` emits for
+    /// `R8_UNORM` storage (0xFF for set, 0x00 for clear).
+    fn read_clip_mask_bytes(
+        &mut self,
+        host_pixmap_xid: u32,
+        origin: (i16, i16),
+    ) -> Option<ClipMaskCache> {
+        if self.drawable_depth(host_pixmap_xid) != Some(1) {
+            return None;
+        }
+        let rb = self.read_mirror_pixels(host_pixmap_xid)?;
+        if rb.bytes_per_pixel != 1 {
+            return None;
+        }
+        let width = u16::try_from(rb.width).ok()?;
+        let height = u16::try_from(rb.height).ok()?;
+        Some(ClipMaskCache {
+            pixmap_xid: host_pixmap_xid,
+            origin,
+            width,
+            height,
+            depth: 8,
+            row_stride: rb.width,
+            bytes: rb.bytes,
+        })
     }
 
     /// Fill `rects` on `dst_xid`, honoring `self.core.current_fill`. For
@@ -10186,6 +10369,7 @@ impl Backend for KmsBackend {
 
     fn clear_clip_rectangles(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
         self.core.current_clip = ClipState::None;
+        self.clip_mask_cache = None;
         Ok(())
     }
 
@@ -10201,6 +10385,7 @@ impl Backend for KmsBackend {
             },
             None => ClipState::None,
         };
+        self.clip_mask_cache = None;
         Ok(())
     }
 
@@ -10211,18 +10396,23 @@ impl Backend for KmsBackend {
         clip_x_origin: i16,
         clip_y_origin: i16,
     ) -> io::Result<()> {
-        // Pixmap clip-masks aren't enforced yet — the rasteriser only knows
-        // how to intersect rect lists. Store the state so future work can pick
-        // it up; right now this means a pixmap-mask GC clip is silently
-        // ignored (matches pre-fix behaviour for that specific shape).
         let Some(handle) = PixmapHandle::from_raw(host_pixmap) else {
             self.core.current_clip = ClipState::None;
+            self.clip_mask_cache = None;
             return Ok(());
         };
         self.core.current_clip = ClipState::Pixmap {
             origin: (clip_x_origin, clip_y_origin),
             pixmap: handle,
         };
+        // Eagerly read the mask pixmap so subsequent Core paint can
+        // gate per pixel via `intersect_with_current_clip`. Mirrors
+        // v2's path (kms::v2::backend::set_clip_pixmap). Depth-1 mirrors
+        // store as R8 (1 byte / pixel, 0xFF or 0x00 — see
+        // `read_depth1_pixmap`), so we hand the helper depth=8 mode
+        // with row_stride = width (no padding).
+        self.clip_mask_cache =
+            self.read_clip_mask_bytes(host_pixmap, (clip_x_origin, clip_y_origin));
         Ok(())
     }
 
@@ -10247,6 +10437,25 @@ impl Backend for KmsBackend {
         clip: &ClipState,
     ) -> io::Result<()> {
         self.core.current_clip = clip.clone();
+        // Mirror v2: ChangeGC clip-mask=<pixmap> dispatches here, not
+        // through `set_clip_pixmap`. Populate the cache so
+        // `intersect_with_current_clip` can gate paint to the mask
+        // shape on the next paint.
+        match clip {
+            ClipState::Pixmap { origin, pixmap } => {
+                let xid = pixmap.as_raw();
+                let stale = match self.clip_mask_cache.as_ref() {
+                    Some(c) => c.pixmap_xid != xid || c.origin != *origin,
+                    None => true,
+                };
+                if stale {
+                    self.clip_mask_cache = self.read_clip_mask_bytes(xid, *origin);
+                }
+            }
+            _ => {
+                self.clip_mask_cache = None;
+            }
+        }
         Ok(())
     }
 
@@ -13245,5 +13454,170 @@ mod tests {
         backend.renderer_failed = true;
         // Even with dirty outputs, composite returns Ok early.
         assert!(backend.composite_and_flip().is_ok());
+    }
+
+    // ── rasterize_pixmap_mask_to_rects ─────────────────────────────
+    // Pure rasteriser shared by v1 and v2 backends for GC clip-mask
+    // (depth-1 pixmap clip). X11 spec: a pixel paints iff the mask
+    // bit at (dst_x - clip_origin.x, dst_y - clip_origin.y) is 1.
+    // Pixels outside the mask extents are treated as 0 (no paint).
+    // Depth-1 bit order is LSB-first within each byte (bit 0 =
+    // leftmost pixel in that 8-pixel group) — matches what
+    // pack_from_storage / unpack_to_staging emit/consume; both align
+    // with the server's advertised `bitmap-bit-order=LSBFirst`.
+
+    fn rect(x: i16, y: i16, w: u16, h: u16) -> Rectangle16 {
+        Rectangle16 {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn rasterize_pixmap_mask_empty_mask_drops_all_pixels() {
+        // 4x4 depth-1 mask, stride 4 bytes (32-bit padded).
+        let mask = [0u8; 4 * 4];
+        let paint = [rect(0, 0, 4, 4)];
+        let out = super::rasterize_pixmap_mask_to_rects(&paint, &mask, 4, 4, 1, 4, (0, 0));
+        assert!(
+            out.is_empty(),
+            "all-zero mask must produce no paint, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn rasterize_pixmap_mask_full_mask_emits_full_paint_rect() {
+        // 4x4 depth-1 mask, all ones. Stride 4 bytes; first byte covers
+        // 8 columns; LSB-first so low 4 bits = columns 0..=3.
+        let mut mask = [0u8; 4 * 4];
+        for row in 0..4 {
+            mask[row * 4] = 0x0F; // bits 0..=3 set = columns 0..=3 paint
+        }
+        let paint = [rect(0, 0, 4, 4)];
+        let out = super::rasterize_pixmap_mask_to_rects(&paint, &mask, 4, 4, 1, 4, (0, 0));
+        // Four horizontal runs of width 4, one per scanline.
+        assert_eq!(out.len(), 4, "expected 4 runs, got {out:?}");
+        for (i, r) in out.iter().enumerate() {
+            assert_eq!(
+                (r.x, r.y, r.width, r.height),
+                (0, i as i16, 4, 1),
+                "run {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn rasterize_pixmap_mask_horizontal_run_coalesces() {
+        // 4x1 mask, all four pixels set (LSB-first low nibble) → one rect 4x1.
+        let mask = [0x0Fu8, 0, 0, 0];
+        let paint = [rect(0, 0, 4, 1)];
+        let out = super::rasterize_pixmap_mask_to_rects(&paint, &mask, 4, 1, 1, 4, (0, 0));
+        assert_eq!(out, vec![rect(0, 0, 4, 1)]);
+    }
+
+    #[test]
+    fn rasterize_pixmap_mask_isolated_pixels_become_1x1_rects() {
+        // 4x4 mask with diagonal set: (0,0), (1,1), (2,2), (3,3).
+        // LSB-first: pixel 0 = bit 0, pixel 1 = bit 1, ...
+        let mut mask = [0u8; 4 * 4];
+        for d in 0..4 {
+            mask[d * 4] |= 1u8 << d;
+        }
+        let paint = [rect(0, 0, 4, 4)];
+        let out = super::rasterize_pixmap_mask_to_rects(&paint, &mask, 4, 4, 1, 4, (0, 0));
+        assert_eq!(out.len(), 4);
+        for (d, r) in out.iter().enumerate() {
+            assert_eq!((r.x, r.y, r.width, r.height), (d as i16, d as i16, 1, 1));
+        }
+    }
+
+    #[test]
+    fn rasterize_pixmap_mask_clip_origin_shifts_lookup() {
+        // 4x4 mask placed at clip_origin (5,5). Paint rect at (5,5) 4x4
+        // with full mask → returns 4 runs at (5,5..8).
+        let mut mask = [0u8; 4 * 4];
+        for row in 0..4 {
+            mask[row * 4] = 0x0F;
+        }
+        let paint = [rect(5, 5, 4, 4)];
+        let out = super::rasterize_pixmap_mask_to_rects(&paint, &mask, 4, 4, 1, 4, (5, 5));
+        assert_eq!(out.len(), 4);
+        for (i, r) in out.iter().enumerate() {
+            assert_eq!(
+                (r.x, r.y, r.width, r.height),
+                (5, 5 + i as i16, 4, 1),
+                "run {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn rasterize_pixmap_mask_wmaker_button_geometry() {
+        // wmaker title-bar close button geometry from the actual trace:
+        // paint rect = button-local (0, 0) 25x25, mask 10x10 all-ones,
+        // clip-origin (7, 7). The 10x10 glyph paints at button-local
+        // (7..17, 7..17) — centered in the 25x25 button.
+        let mut mask = [0u8; 4 * 10];
+        for row in 0..10 {
+            // 10 low bits set per row = columns 0..=9 paint (LSB-first).
+            mask[row * 4] = 0xFF;
+            mask[row * 4 + 1] = 0x03; // bits 0,1 = pixels 8,9
+        }
+        let paint = [rect(0, 0, 25, 25)];
+        let out = super::rasterize_pixmap_mask_to_rects(&paint, &mask, 10, 10, 1, 4, (7, 7));
+        assert_eq!(
+            out.len(),
+            10,
+            "expected 10 horizontal runs (one per glyph row)"
+        );
+        for (i, r) in out.iter().enumerate() {
+            assert_eq!(
+                (r.x, r.y, r.width, r.height),
+                (7, 7 + i as i16, 10, 1),
+                "run {i} should be at button-local (7, {}, 10, 1)",
+                7 + i,
+            );
+        }
+    }
+
+    #[test]
+    fn rasterize_pixmap_mask_paint_outside_mask_extents_is_dropped() {
+        // 4x4 mask all ones at origin (0,0). Paint rect 8x8 at (0,0).
+        // Only the (0,0..3, 0..3) sub-region paints; rest is implicit 0.
+        let mut mask = [0u8; 4 * 4];
+        for row in 0..4 {
+            mask[row * 4] = 0x0F;
+        }
+        let paint = [rect(0, 0, 8, 8)];
+        let out = super::rasterize_pixmap_mask_to_rects(&paint, &mask, 4, 4, 1, 4, (0, 0));
+        assert_eq!(out.len(), 4);
+        for (i, r) in out.iter().enumerate() {
+            assert_eq!(
+                (r.x, r.y, r.width, r.height),
+                (0, i as i16, 4, 1),
+                "run {i} should not extend past mask"
+            );
+        }
+    }
+
+    #[test]
+    fn rasterize_pixmap_mask_lsb_first_bit_order_for_depth_1() {
+        // 10-pixel row, only leftmost pixel set (LSB-first → bit 0 of byte 0).
+        let mask = [0x01u8, 0x00, 0x00, 0x00];
+        let paint = [rect(0, 0, 10, 1)];
+        let out = super::rasterize_pixmap_mask_to_rects(&paint, &mask, 10, 1, 1, 4, (0, 0));
+        assert_eq!(out, vec![rect(0, 0, 1, 1)]);
+    }
+
+    #[test]
+    fn rasterize_pixmap_mask_depth_1_byte_boundary() {
+        // 10-pixel row, set pixel 9 (second byte, LSB-first index 1
+        // = bit 1 of byte 1).
+        let mask = [0x00u8, 0x02, 0x00, 0x00];
+        let paint = [rect(0, 0, 10, 1)];
+        let out = super::rasterize_pixmap_mask_to_rects(&paint, &mask, 10, 1, 1, 4, (0, 0));
+        assert_eq!(out, vec![rect(9, 0, 1, 1)]);
     }
 }

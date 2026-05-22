@@ -174,6 +174,15 @@ pub struct KmsBackendV2 {
     /// §"`KmsCore` scope — narrowly drawn" split.
     pub(crate) cow_id: Option<crate::kms::v2::store::DrawableId>,
 
+    /// Cached readback of the current GC clip-mask pixmap (depth-1
+    /// or depth-8). Populated at `set_clip_pixmap` time by reading
+    /// the pixmap bytes via `engine.get_image`; consumed by
+    /// `intersect_with_current_clip` so depth-1 pixmap clipping
+    /// actually gates paint to the mask shape (wmaker title-bar
+    /// button glyphs are the canonical client). Cleared whenever
+    /// `current_clip` transitions away from `ClipState::Pixmap`.
+    pub(crate) clip_mask_cache: Option<crate::kms::backend::ClipMaskCache>,
+
     /// Test-only counter: bumps every time
     /// `clear_window_area_with_background` is entered. Used by the
     /// `cwa_on_redirected_window_does_not_clear_backing` regression
@@ -450,6 +459,7 @@ impl KmsBackendV2 {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            clip_mask_cache: None,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
@@ -971,6 +981,7 @@ impl KmsBackendV2 {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            clip_mask_cache: None,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
             present_to_cow_sources: std::collections::VecDeque::with_capacity(16),
@@ -2146,38 +2157,117 @@ impl KmsBackendV2 {
     }
 
     /// Intersect each rect in `rects` against the current GC clip.
-    /// Mirrors v1's helper byte-for-byte. Returns `rects` unchanged
-    /// when no clip is active.
+    /// Handles three states:
+    ///   - `ClipState::None` → pass through (input unchanged).
+    ///   - `ClipState::Rectangles` → rect-vs-rect intersection (mirrors v1).
+    ///   - `ClipState::Pixmap` → per-pixel mask gating via
+    ///     [`super::super::backend::rasterize_pixmap_mask_to_rects`]
+    ///     against the readback cached at `set_clip_pixmap` time.
     pub(crate) fn intersect_with_current_clip(&self, rects: &[Rectangle16]) -> Vec<Rectangle16> {
-        let Some(clip_rects) = self.current_clip_rects_in_dst_space() else {
-            return rects.to_vec();
-        };
-        let mut out = Vec::with_capacity(rects.len());
-        for r in rects {
-            let rx0 = i32::from(r.x);
-            let ry0 = i32::from(r.y);
-            let rx1 = rx0 + i32::from(r.width);
-            let ry1 = ry0 + i32::from(r.height);
-            for c in &clip_rects {
-                let cx0 = i32::from(c.x);
-                let cy0 = i32::from(c.y);
-                let cx1 = cx0 + i32::from(c.width);
-                let cy1 = cy0 + i32::from(c.height);
-                let ix0 = rx0.max(cx0);
-                let iy0 = ry0.max(cy0);
-                let ix1 = rx1.min(cx1);
-                let iy1 = ry1.min(cy1);
-                if ix0 < ix1 && iy0 < iy1 {
-                    out.push(Rectangle16 {
-                        x: ix0 as i16,
-                        y: iy0 as i16,
-                        width: (ix1 - ix0) as u16,
-                        height: (iy1 - iy0) as u16,
-                    });
+        match &self.core.current_clip {
+            ClipState::None => rects.to_vec(),
+            ClipState::Rectangles { .. } => {
+                let clip_rects = self.current_clip_rects_in_dst_space().unwrap_or_default();
+                let mut out = Vec::with_capacity(rects.len());
+                for r in rects {
+                    let rx0 = i32::from(r.x);
+                    let ry0 = i32::from(r.y);
+                    let rx1 = rx0 + i32::from(r.width);
+                    let ry1 = ry0 + i32::from(r.height);
+                    for c in &clip_rects {
+                        let cx0 = i32::from(c.x);
+                        let cy0 = i32::from(c.y);
+                        let cx1 = cx0 + i32::from(c.width);
+                        let cy1 = cy0 + i32::from(c.height);
+                        let ix0 = rx0.max(cx0);
+                        let iy0 = ry0.max(cy0);
+                        let ix1 = rx1.min(cx1);
+                        let iy1 = ry1.min(cy1);
+                        if ix0 < ix1 && iy0 < iy1 {
+                            out.push(Rectangle16 {
+                                x: ix0 as i16,
+                                y: iy0 as i16,
+                                width: (ix1 - ix0) as u16,
+                                height: (iy1 - iy0) as u16,
+                            });
+                        }
+                    }
                 }
+                out
+            }
+            ClipState::Pixmap { .. } => {
+                // Cache populated at `set_clip_pixmap`. Missing cache =
+                // mask readback failed; degrade to no-paint (safer than
+                // pass-through, which would obliterate prior decoration).
+                let Some(cache) = self.clip_mask_cache.as_ref() else {
+                    return Vec::new();
+                };
+                crate::kms::backend::rasterize_pixmap_mask_to_rects(
+                    rects,
+                    &cache.bytes,
+                    cache.width,
+                    cache.height,
+                    u32::from(cache.depth),
+                    cache.row_stride,
+                    cache.origin,
+                )
             }
         }
-        out
+    }
+
+    /// Synchronously read a pixmap's full extent via `engine.get_image`
+    /// and return a `ClipMaskCache` ready for `intersect_with_current_clip`
+    /// consumption. Returns `None` if the pixmap isn't in the store, has
+    /// an unsupported depth (anything other than 1/8), or the readback
+    /// errors. Bytes are in X11 wire format per
+    /// `kms::v2::engine::pack_from_storage` — depth-1 packed MSB-first,
+    /// scanline-padded to 32 bits; depth-8 one byte per pixel,
+    /// scanline-padded to 32 bits.
+    pub(crate) fn read_clip_mask_bytes(
+        &mut self,
+        host_pixmap_xid: u32,
+        origin: (i16, i16),
+    ) -> Option<crate::kms::backend::ClipMaskCache> {
+        let id = self.store.lookup(host_pixmap_xid)?;
+        let (width, height, depth) = {
+            let d = self.store.get(id)?;
+            let extent = d.storage.extent;
+            (
+                u16::try_from(extent.width).ok()?,
+                u16::try_from(extent.height).ok()?,
+                d.depth,
+            )
+        };
+        if !matches!(depth, 1 | 8) {
+            return None;
+        }
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x: 0, y: 0 },
+            extent: ash::vk::Extent2D {
+                width: u32::from(width),
+                height: u32::from(height),
+            },
+        };
+        let bytes = self
+            .engine
+            .get_image(&mut self.store, &mut self.platform, id, rect, depth)
+            .ok()?;
+        // pack_from_storage convention: depth-1 → ((w + 31) / 32) * 4;
+        // depth-8 → ((w + 3) / 4) * 4. Both scanline-padded to 32 bits.
+        let row_stride: u32 = match depth {
+            1 => u32::from(width).div_ceil(32) * 4,
+            8 => u32::from(width).div_ceil(4) * 4,
+            _ => return None,
+        };
+        Some(crate::kms::backend::ClipMaskCache {
+            pixmap_xid: host_pixmap_xid,
+            origin,
+            width,
+            height,
+            depth,
+            row_stride,
+            bytes,
+        })
     }
 
     /// Storage dimensions for a host xid, in pixels. `None` if the
@@ -5565,6 +5655,7 @@ impl Backend for KmsBackendV2 {
             },
             None => ClipState::None,
         };
+        self.clip_mask_cache = None;
         Ok(())
     }
 
@@ -5575,21 +5666,24 @@ impl Backend for KmsBackendV2 {
         clip_x_origin: i16,
         clip_y_origin: i16,
     ) -> io::Result<()> {
-        // Stage 3f.3: store the ClipState::Pixmap so apply_clip_state +
-        // subsequent paint paths can route through a depth-1 mask
-        // sampler. The mask-sampling itself is deferred to Stage 5
-        // perf-plans (no real-app smoke matrix client uses it; v1 has
-        // the same shape — stores but doesn't enforce). Bookkeeping
-        // is correct so Core paint that follows can see the pixmap
-        // handle if/when a future engine pass picks it up.
         let Some(handle) = PixmapHandle::from_raw(host_pixmap) else {
             self.core.current_clip = ClipState::None;
+            self.clip_mask_cache = None;
             return Ok(());
         };
         self.core.current_clip = ClipState::Pixmap {
             origin: (clip_x_origin, clip_y_origin),
             pixmap: handle,
         };
+        // Eagerly read the mask pixmap so subsequent Core paint can
+        // gate per pixel via `intersect_with_current_clip`. wmaker's
+        // title-bar buttons are the canonical client: ChangeGC
+        // clip-mask=<glyph_pixmap> + PolyFillRectangle button_window
+        // 25x25, where the depth-1 mask gates the solid fill to the
+        // X / − glyph shape. Without this readback the whole 25x25
+        // gets painted in foreground and the glyphs vanish.
+        self.clip_mask_cache =
+            self.read_clip_mask_bytes(host_pixmap, (clip_x_origin, clip_y_origin));
         Ok(())
     }
 
@@ -5628,6 +5722,28 @@ impl Backend for KmsBackendV2 {
         clip: &ClipState,
     ) -> io::Result<()> {
         self.core.current_clip = clip.clone();
+        // X11 ChangeGC clip-mask=<pixmap> propagates through
+        // `resolve_draw_state` → here, not `set_clip_pixmap`. Populate
+        // the mask cache so `intersect_with_current_clip` can gate
+        // paint to the mask shape. wmaker title-bar buttons are the
+        // canonical client: the title bar uses the same GC, alternating
+        // clip-mask=<glyph> with clip-mask=None for solid fills, so the
+        // cache MUST follow the GC state per paint setup.
+        match clip {
+            ClipState::Pixmap { origin, pixmap } => {
+                let xid = pixmap.as_raw();
+                let stale = match self.clip_mask_cache.as_ref() {
+                    Some(c) => c.pixmap_xid != xid || c.origin != *origin,
+                    None => true,
+                };
+                if stale {
+                    self.clip_mask_cache = self.read_clip_mask_bytes(xid, *origin);
+                }
+            }
+            _ => {
+                self.clip_mask_cache = None;
+            }
+        }
         Ok(())
     }
 
@@ -6020,9 +6136,11 @@ impl Backend for KmsBackendV2 {
                 }
                 let pixel: u32 = match src_depth {
                     1 => {
+                        // LSB-first: bit 0 of byte = leftmost pixel.
+                        // Matches `pack_from_storage` depth=1 emit.
                         let row_off = sy as usize * row_bytes;
                         let byte = src_bytes[row_off + (sx as usize) / 8];
-                        let bit = (byte >> (7 - (sx as usize & 7))) & 1;
+                        let bit = (byte >> (sx as usize & 7)) & 1;
                         u32::from(bit)
                     }
                     8 => {

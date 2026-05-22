@@ -445,14 +445,15 @@ fn v2_copy_plane_depth1_extracts_mask_bits() {
         }
     };
 
-    // depth-1 source 8×1. Bits MSB-first in one byte:
-    // 0b1010_0000 → [1, 0, 1, 0, 0, 0, 0, 0].
+    // depth-1 source 8×1. Bits LSB-first in one byte (matches the
+    // server's advertised `bitmap-bit-order`):
+    // 0b0000_0101 = bit 0 + bit 2 set → pixels [1, 0, 1, 0, 0, 0, 0, 0].
     let src_pix = b
         .create_pixmap(None, 1, 8, 1)
         .expect("create_pixmap depth=1");
     // Depth-1 wire row stride = ceil(w/32)*4 = 4 bytes (one
-    // scanline). Bit pattern in the high byte, zero pad.
-    let src_bytes: Vec<u8> = vec![0b1010_0000, 0, 0, 0];
+    // scanline). Bit pattern in the low byte, zero pad.
+    let src_bytes: Vec<u8> = vec![0b0000_0101, 0, 0, 0];
     b.put_image(None, src_pix.as_raw(), 1, 8, 1, 0, 0, &src_bytes)
         .expect("put_image depth=1");
 
@@ -2841,4 +2842,106 @@ fn v2_render_traps_pool_creates_bounded_after_warmup() {
         residency <= 4,
         "pool_count={residency} after warm-up; expected <= 4",
     );
+}
+
+/// Acceptance for GC clip-mask (depth-1 pixmap clip on Core paint).
+/// This is the wmaker title-bar button glyph path: ChangeGC
+/// clip-mask=<mask_pixmap> + PolyFillRectangle full_button. The depth-1
+/// mask gates per-pixel paint to the mask shape.
+///
+/// Workflow:
+///   1. Create depth-24 dst 8x8 pre-filled blue.
+///   2. Create depth-1 mask 8x8 with the top half all ones and the
+///      bottom half all zeros.
+///   3. PutImage the mask bits (MSB-first packed, scanline-pad=4).
+///   4. set_clip_pixmap mask at origin (0, 0).
+///   5. poly_fill_rectangle full 8x8 in red.
+///   6. clear_clip_rectangles to drop the clip.
+///   7. GetImage dst: top half (rows 0..4) must be red; bottom half
+///      (rows 4..8) must remain blue.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_clip_pixmap_mask_gates_poly_fill_to_mask_shape() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Dst depth-24 8x8 pre-filled blue (0xFF0000FF → BGRA [0xFF,0,0,0xFF]).
+    let dst_xid = b.create_pixmap(None, 24, 8, 8).unwrap().as_raw();
+    b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 8, 8)
+        .expect("fill_rectangle dst blue");
+
+    // Mask depth-1 8x8: rows 0..4 all ones, rows 4..8 all zeros.
+    // Each row is 8 bits = 1 byte of data; scanline-padded to 4 bytes.
+    let mask_xid = b.create_pixmap(None, 1, 8, 8).unwrap().as_raw();
+    let mut mask_bits = vec![0u8; 4 * 8];
+    for row in 0..4 {
+        mask_bits[row * 4] = 0xFF;
+    }
+    b.put_image(None, mask_xid, 1, 8, 8, 0, 0, &mask_bits)
+        .expect("put_image mask");
+
+    // Route through `apply_clip_state` — the actual live entry point
+    // for ChangeGC clip-mask=<pixmap>. `set_clip_pixmap` is only used
+    // by the host_x11/ynest path; KMS dispatch goes
+    // `handle_change_gc -> resolve_draw_state ->
+    // backend.apply_clip_state(&ClipState::Pixmap)`.
+    use yserver_core::backend::ClipState;
+    use yserver_core::backend::PixmapHandle as ApplyPixmapHandle;
+    let mask_handle = ApplyPixmapHandle::from_raw(mask_xid).expect("mask handle");
+    b.apply_clip_state(
+        None,
+        &ClipState::Pixmap {
+            origin: (0, 0),
+            pixmap: mask_handle,
+        },
+    )
+    .expect("apply_clip_state Pixmap");
+
+    // PolyFillRectangle full 8x8 in red. Without the clip-mask path
+    // honoured, every pixel turns red. With it, only the top half does.
+    let rect_bytes = {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&i16::to_le_bytes(0));
+        buf.extend_from_slice(&i16::to_le_bytes(0));
+        buf.extend_from_slice(&u16::to_le_bytes(8));
+        buf.extend_from_slice(&u16::to_le_bytes(8));
+        buf
+    };
+    b.poly_fill_rectangle(None, dst_xid, 0xFFFF0000, &rect_bytes)
+        .expect("poly_fill_rectangle");
+
+    b.clear_clip_rectangles(None).expect("clear clip");
+
+    let out = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 8, 8, !0)
+        .expect("get_image")
+        .expect("Some(bytes)");
+
+    // Top half rows: red (BGRA [0,0,0xFF,0xFF]).
+    for row in 0..4 {
+        for col in 0..8 {
+            let off = (row * 8 + col) * 4;
+            assert_eq!(
+                &out[off..off + 4],
+                &[0x00, 0x00, 0xFF, 0xFF],
+                "row {row} col {col} should be red (mask=1)",
+            );
+        }
+    }
+    // Bottom half rows: blue (BGRA [0xFF,0,0,0xFF]).
+    for row in 4..8 {
+        for col in 0..8 {
+            let off = (row * 8 + col) * 4;
+            assert_eq!(
+                &out[off..off + 4],
+                &[0xFF, 0x00, 0x00, 0xFF],
+                "row {row} col {col} should remain blue (mask=0)",
+            );
+        }
+    }
 }
