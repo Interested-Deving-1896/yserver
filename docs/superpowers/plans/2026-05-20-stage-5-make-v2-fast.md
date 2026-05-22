@@ -739,6 +739,141 @@ The instrumentation can re-run anywhere with no rebuild — same
 recipe, set `YSERVER_SUBMIT_TRACE=…` in env or via the updated
 `-telemetry` recipes.
 
+## Task 3 POC 2026-05-22 — COW `copy_area` coalescing
+
+First Task 3 implementation landed on `perf` at `0bec1b3`.
+Smallest valuable slice per the trace data above: coalesce
+consecutive `copy_area` submits to the COMPOSITE Overlay
+Window (marco's compositor pump) into one CB + one
+`vkQueueSubmit2`.
+
+### Implementation shape
+
+- `PendingCowBatch` (cb, ticket, dst, srcs_in_batch,
+  dst_damage, coalesced_count) on `RenderEngineInner`, `None`
+  between flushes.
+- `engine.cow_copy_area(cow_id, src, src_rect, dst_pos)`:
+  first append allocates CB + fence ticket via the existing
+  `begin_op_cb`, transitions `dst → TRANSFER_DST` and `src →
+  TRANSFER_SRC`, records `vkCmdCopyImage`, accumulates the
+  damage rect; subsequent appends record only
+  `vkCmdCopyImage` (and a new src transition the first time
+  a given src appears in the batch).
+- `engine.flush_cow_batch(store, platform) -> Option<u32>`:
+  records exit transitions for every src and the dst (→
+  `SHADER_READ`), ends the CB, submits via
+  `platform.submit_paint_cb`, pushes one `SubmittedOp`,
+  clones the fence ticket onto every touched drawable via
+  `store.touch_render_fence`, applies accumulated damage,
+  pushes `coalesced_count` into a flush-records queue, and
+  returns it.
+- Auto-flush hooks at the top of every other engine entry
+  point (`fill_rect_batch`, `logic_fill`, `copy_area`,
+  `put_image`, `get_image`, `image_text`, `composite_glyphs`,
+  `render_composite`, `render_traps_or_tris`). Same-queue
+  submission order is the correctness rule: any unrelated op
+  submits its own CB and must see the batch CB on the queue
+  first.
+- `engine.drain_cow_flush_records()` returns the queue for
+  telemetry; backend drains it once per `maybe_composite`
+  tick after the explicit pre-`scene.tick` flush.
+
+Routing predicate at the backend layer:
+`self.cow_id == Some(dst_target.id) && src != dst_target.id`
+— same-image self-copies stay on the regular path. Per-call
+`record_paint_submit` + `trace_simple` are suppressed for
+cow-routed copies; one event is emitted per flush instead,
+with `batch_size = coalesced_count`.
+
+### Vk-backed tests (lavapipe)
+
+1. `cow_copy_area_coalesces_four_srcs_into_one_submit` —
+   drives marco's pattern (4 distinct srcs → 1 cow dst);
+   asserts `inner.submitted` grows by 1 (not 4) across the
+   batch, pending batch shows `coalesced_count=4`, drained
+   flush record is `[4]`, dst read-back shows the four
+   colour columns at the expected offsets.
+2. `cow_copy_area_repeated_src_skips_redundant_transition`
+   — same src appended twice; `srcs_in_batch` set holds one
+   entry, `coalesced_count=2`, both halves of dst show src
+   colour.
+3. `cow_copy_area_flush_via_non_cow_op` — `cow_copy_area`
+   then an unrelated `fill_rect` on a third drawable;
+   verifies the per-method flush hook fired (pending batch
+   cleared, flush record present, cow contents correct).
+
+All 40 lavapipe-backed yserver tests pass; 368 lib tests +
+35 acceptance tests pass; clippy default clean. (Pedantic has
+one over-100-lines warning on `cow_copy_area`; deferred to a
+later cleanup pass.)
+
+### Silence verification — 45 s MATE drag
+
+Pre-POC capture vs same-recipe re-run on `perf` `0bec1b3`:
+
+| metric                    | pre-POC | post-POC | Δ        |
+| ------------------------- | ------: | -------: | -------: |
+| `paint_submits/s` avg     |   6,852 |    5,653 | **−18 %** |
+| `paint_submits/s` peak    |  18,910 |   14,040 | **−26 %** |
+| `queue_submit2/s` avg     |   7,069 |    5,850 |   −17 %  |
+| `queue_submit2/s` peak    |  19,379 |   14,438 |   −25 %  |
+| `cpu_fence_wait_ns/s` avg |   76 ms |    45 ms | **−40 %** |
+| `composite_submits/s` avg |      98 |       98 | unchanged ✓ |
+| `cow_batches_flushed/s` avg |    n/a |     171 | new      |
+| `cow_copies_coalesced/s` avg |   n/a |     927 | new      |
+
+Cow batch shape (post-POC):
+
+- 10,111 cow flushes recorded across the 45 s capture.
+- Average batch size **5.41**, peak **46**.
+- Underlying cow `copy_area` count (sum of batch sizes):
+  ~54,700 — slightly higher than the pre-POC baseline of
+  46,920 (workload variance — the drag isn't bit-identical).
+- Cow-path submit collapse: pre-POC 46,920 individual
+  cow `copy_area` submits → post-POC 10,111 flushes =
+  **78 % fewer submits on the cow path**.
+- Non-cow `copy_area` count: 15,644, avg `batch_size=1.00`
+  (path untouched as designed).
+
+### Bee projection
+
+Pre-POC bee bound at ~2 k submits/s under the same workload.
+Same workload's pre-POC silence ran 8.4 k/s. Post-POC silence
+runs 5.7 k/s. Applying the same ratio to bee → projected
+~1.4 k/s — comfortably below the user-perceived lag floor.
+Bee re-capture pending hardware access; the POC stays on
+`perf` until that confirmation lands.
+
+### Outstanding artifacts
+
+- **End-of-session damage artifacts** observed in the
+  post-POC drag (scanout dumps saved off-tree for later).
+  User confirmed these are almost certainly pre-existing —
+  the silence `pick_repaint_region` saturation bug
+  (`damage_fraction → 1.0` while `full_redraw_fallback`
+  stays ~0) reproduces unchanged in this run. Task 4
+  correctness corollary; not POC-caused.
+
+### What remains for Task 3 closure
+
+The POC validates the aggregation shape and delivers the
+single largest hotspot (75 % of `copy_area` traffic). The
+remaining 60 % of all coalesce savings sit on:
+
+- **`render_composite`** — 88 k savings. Same shape as the
+  cow batch, but the aggregation key needs `(target_id, op,
+  src_class, mask_class, pipeline_id)` instead of just
+  `target_id`. Engine bookkeeping is meaningfully larger
+  because per-call descriptor sets diverge by key.
+- **`render_fill`** — 8 k savings. Sub-case of
+  `render_composite` (same engine code path); folds in once
+  the composite aggregation lands.
+
+These extensions ride on the same `begin → append → flush`
+pattern proved out by the POC. Plan: implement
+`render_composite` aggregation as the next slice using the
+same trace-and-verify discipline.
+
 ## Close protocol
 
 For each task:

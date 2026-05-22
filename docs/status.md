@@ -2218,6 +2218,65 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     DescriptorPoolRing / Task 4 layer 1), with the COW
     `copy_area` slice as the smallest valuable proof-of-concept.
 
+  - [~] **Task 3 POC — COW `copy_area` coalescing landed
+    2026-05-22** on `perf` at `0bec1b3`. Full design + numbers
+    in the Stage 5 plan §"Task 3 POC 2026-05-22 — COW
+    `copy_area` coalescing".
+
+    `RenderEngine` grows `PendingCowBatch` (one CB + ticket
+    across N appends) plus `cow_copy_area` /
+    `flush_cow_batch` / `drain_cow_flush_records`. Auto-flush
+    hooks at the top of every other engine entry point keep
+    same-queue submission order correct. Backend routes
+    `copy_area` to the batched path when
+    `dst_target.id == self.cow_id`; per-call telemetry
+    suppressed and re-emitted at flush time with
+    `batch_size = coalesced_count`. New `cow_batches_flushed`
+    + `cow_copies_coalesced` counters on `Telemetry`.
+
+    **Silence verification — same 45 s MATE drag:**
+
+    | metric                    | pre-POC | post-POC | Δ        |
+    | ------------------------- | ------: | -------: | -------: |
+    | `paint_submits/s` avg     |   6,852 |    5,653 | **−18 %** |
+    | `paint_submits/s` peak    |  18,910 |   14,040 | **−26 %** |
+    | `queue_submit2/s` avg     |   7,069 |    5,850 |  −17 %   |
+    | `queue_submit2/s` peak    |  19,379 |   14,438 |  −25 %   |
+    | `cpu_fence_wait_ns/s` avg |   76 ms |    45 ms | **−40 %** |
+    | `composite_submits/s` avg |      98 |       98 | unchanged ✓ |
+
+    Cow batch shape: 10,111 flushes; **avg batch size 5.41,
+    peak 46**. Cow-path submit collapse: 46,920 → 10,111 =
+    **78 % fewer cow submits**. Non-cow `copy_area` path
+    untouched (`avg_batch_size = 1.00` as designed).
+
+    **Bee projection:** pre-POC bee bound at ~2 k submits/s;
+    pre-POC silence ran 8.4 k/s; post-POC silence 5.7 k/s →
+    projected bee ~1.4 k/s, comfortably below the
+    user-perceived lag floor. Bee re-capture pending hardware
+    access.
+
+    **Tests:** 3 Vk-backed lavapipe tests cover the marco
+    pattern (4 distinct srcs → 1 cow dst), same-src repeat
+    dedupe, and the per-method auto-flush hook. 368 lib + 40
+    lavapipe + 35 acceptance tests pass; default clippy
+    clean. (One pedantic over-100-lines warning on
+    `cow_copy_area`; deferred.)
+
+    **End-of-session damage artifacts** observed on the
+    post-POC drag are the pre-existing silence
+    `pick_repaint_region` damage-saturation bug
+    (`damage_fraction → 1.0` while `full_redraw_fallback`
+    stays ~0) reproducing unchanged — not POC-caused. Scanout
+    dumps held off-tree for the Task 4 correctness fix later.
+
+    **Remaining Task 3 work**: extend the aggregation pattern
+    to `render_composite` (88 k savings) + `render_fill`
+    (8 k savings). Same `begin → append → flush` shape but
+    aggregation key needs `(target_id, op, src_class,
+    mask_class, pipeline_id)` instead of just `target_id`,
+    and per-call descriptor sets diverge per key.
+
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 
 v1 stays in tree past Stage 3 close. Deletion happens only when
