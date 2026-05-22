@@ -2048,14 +2048,33 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     `resets=7`, `residency=2` on both Composite and Trapezoid paths
     — pools recycle, residency stays bounded.
 
-    **Hardware capture pending** (user runs on yoga / Snapdragon X1 /
-    Turnip out-of-band):
-      - `just yserver-mate-hw-telemetry` — expected `descriptor_pool_creates/s`
-        ≤ 5 steady state (was ~4700 via per-call `vkCreateDescriptorPool`);
-        `descriptor_pool_resets/s` tens-per-second tracking
-        `paint_submits/s / SETS_PER_POOL`.
-      - `just yserver-mate-hw-perf` — expected `create_descriptor_pool`
-        → `msm_ioctl_vm_bind` drop from ~1.63% to ≤ 0.1% of total CPU.
+    **Bee hardware capture 2026-05-22** (Ryzen 9 6900HX / RDNA2 /
+    RADV, MATE drag workload; perf data `yserver-mate.perf.data`,
+    telemetry `yserver-hw-mate.log`, full analysis in the Stage 5
+    plan §"Bee 2026-05-22 perf-branch findings"):
+      - Ring fix delivered as designed: `descriptor_pool_creates/s = 0`
+        through the drag; `descriptor_pool_resets/s = 5-6` (recycle
+        path runs).
+      - The yoga/Turnip pathology (per-call `vkCreateDescriptorPool`
+        → `msm_ioctl_vm_bind` shmem pin) was never material on bee,
+        so the bee drag-lag user-perceived state did NOT improve.
+      - Bee's drag-lag hot path is `ioctl → libvulkan_radeon →
+        amdgpu` at `queue_submit2/s = 2119` (~35 submits/frame, one
+        kernel round-trip every ~470 µs). Next perf-branch layer:
+        Stage 5 Task 3 (paint-submit aggregation), diagnostic-first
+        per the timeline-semaphore lesson in
+        `feedback_perf_branch_2026_05_10`.
+
+    **Yoga capture still pending** (where the design's motivating
+    36%-of-CPU hot path lives). Expected on yoga:
+      - `descriptor_pool_creates/s` ≤ 5 steady state (was implicit
+        ~4700).
+      - `create_descriptor_pool` → `msm_ioctl_vm_bind` drop from
+        ~1.63% to ≤ 0.1% of total CPU.
+
+    Perf branch (`origin/perf`) staying open across machines for
+    Task 3 + Task 5 follow-ups; no intent to merge Task 4 layer 1
+    to master yet.
 
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 
