@@ -2065,16 +2065,40 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         per the timeline-semaphore lesson in
         `feedback_perf_branch_2026_05_10`.
 
-    **Yoga capture still pending** (where the design's motivating
-    36%-of-CPU hot path lives). Expected on yoga:
-      - `descriptor_pool_creates/s` ≤ 5 steady state (was implicit
-        ~4700).
-      - `create_descriptor_pool` → `msm_ioctl_vm_bind` drop from
-        ~1.63% to ≤ 0.1% of total CPU.
+    **Yoga hardware capture 2026-05-22** (Snapdragon X1 / Adreno X1
+    / Turnip, same MATE drag workload; full analysis in the Stage 5
+    plan §"Yoga 2026-05-22 perf-branch findings"). This is the
+    capture the design was authored against — the 2026-05-21
+    baseline showed `vkCreateDescriptorPool → msm_ioctl_vm_bind`
+    shmem-pin path at ~36% of yserver's own CPU.
+      - `descriptor_pool_creates/s = 0` in 50 of 52 one-second
+        buckets; **2 total creates** across the entire 52-second
+        drag (was implicit ~4700/s on the pre-ring baseline — four
+        orders of magnitude reduction).
+      - `descriptor_pool_resets/s = 0–26` (avg ~6–10 during drag);
+        recycle path runs as designed.
+      - `descriptor_allocations/s = 180–183` (unchanged from
+        baseline — same allocations, recycled pools).
+      - Peak `paint_submits/s = 8117` (drag avg 3807; baseline was
+        700–4700, so we're at parity or higher).
+      - yserver total CPU **0.32%** of system (`perf report` with
+        system-wide capture); `libvulkan_freedreno.so` inside
+        yserver another 0.44%. No Rust symbol above 0.05%.
+      - The `create_descriptor_pool → msm_ioctl_vm_bind` path that
+        hit ~1.63% of total system CPU on the baseline is no longer
+        measurable at the 0.05% threshold.
+      - User subjective: **no CPU spikes during drag** — matches
+        the data.
+
+    The per-hardware-class bottleneck split is now empirically
+    established: yoga's bottleneck was descriptor-pool churn (fixed
+    by Task 4 layer 1); bee's bottleneck is `vkQueueSubmit2`
+    syscall rate (Task 3 territory).
 
     Perf branch (`origin/perf`) staying open across machines for
     Task 3 + Task 5 follow-ups; no intent to merge Task 4 layer 1
-    to master yet.
+    to master yet — gating that on Task 3 landing too, so master
+    sees one perf-branch closure rather than a half-fix.
 
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 

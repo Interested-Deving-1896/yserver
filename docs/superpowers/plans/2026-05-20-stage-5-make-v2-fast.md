@@ -338,6 +338,101 @@ concern; Task 6 covers it. Don't touch until Tasks 3 and 5 land.
 The perf branch is staying open across machines for this work; no
 intent to land Task 4 layer 1 to master yet.
 
+## Yoga 2026-05-22 perf-branch findings
+
+Captured on `perf` branch HEAD `d34dcb0`, same MATE drag workload
+as the bee capture. Host: `yoga` (Snapdragon X1 / Adreno X1 /
+Turnip). Artifacts: `yserver-mate.perf.data` (perf record,
+~106 MB / 720k samples), `yserver-hw-mate.log` (52 one-second
+v2_telemetry buckets), `mate.log` (session).
+
+This is the capture the DescriptorPoolRing design was authored
+against. The 2026-05-21 baseline (pre-ring) showed
+`vkCreateDescriptorPool → drmIoctl → msm_ioctl_vm_bind →
+vm_bind_job_pin_objects → msm_gem_get_pages_locked →
+shmem_alloc_and_add_folio` at ~36% of yserver's own CPU during
+moderate-lag steady state.
+
+### Telemetry deltas vs the spec's targets
+
+| metric                          | spec target                          | observed                            | result               |
+| ------------------------------- | ------------------------------------ | ----------------------------------- | -------------------- |
+| `descriptor_pool_creates/s`     | ≤ 5 in steady state (was ~4700 impl) | **0** in 50/52 buckets; 1 in 2      | better than gate     |
+| `descriptor_pool_resets/s`      | tracks paint_submits/s / SETS_PER_POOL | 0–26 range; avg ~6–10 during drag | matches              |
+| `descriptor_allocations/s`      | unchanged                            | 180–183                              | unchanged ✓          |
+| `paint_submits/s`               | unchanged                            | peak **8117**, drag avg **3807**     | parity (baseline was 700–4700) |
+| `queue_submit2/s`               | n/a (not the bottleneck on yoga)     | peak **8238**                        | —                    |
+| `composite_submits/s`           | vsync-bound                          | 60–61                                | flip-pending gate holding |
+
+**Two pool creates across the entire 52-second drag** — the ring
+warmed up to its working set once and then stayed there. Compared
+with the implicit ~4700 per second on the pre-ring baseline, that's
+a four-orders-of-magnitude reduction.
+
+### Perf-flamegraph evidence
+
+System-wide capture:
+
+- yserver process: **0.32%** of total CPU.
+- `libvulkan_freedreno.so` (inside yserver): **0.44%**.
+- kernel time inside yserver: **1.04%**.
+- swapper / idle: **89.5%**.
+
+`perf report --comms=yserver --percent-limit=0.05` shows no Rust
+symbol above 0.05% in yserver user-space. The only path reaching
+`msm_ioctl_vm_bind` through yserver in the new capture is via the
+inlined `sync_descriptor_pool_telemetry → descriptor_pool_creates_lifetime`
+chain — i.e. the telemetry reader, not the create path — and only
+at "0.00%" entries.
+
+The 2026-05-21 baseline's `create_descriptor_pool →
+msm_ioctl_vm_bind` path that hit ~1.63% of total system CPU is no
+longer measurable.
+
+User subjective: **"no CPU spikes at all"** during the drag.
+Confirmed by the data.
+
+### What this tells us about the per-hardware split
+
+Yoga (Turnip): the design's motivating bottleneck. Fully resolved.
+
+Bee (RADV): descriptor-pool churn was never the bottleneck. The
+fix delivered the designed telemetry numbers (`creates/s = 0`,
+`resets/s = 5–6`) but the user-perceived drag-lag did not improve
+because the cost on bee sits on the `queue_submit2/s = 2119`
+ioctl-rate axis, not the descriptor allocator path.
+
+The per-hardware-class bottleneck split is now empirically
+established: the same workload runs into completely different walls
+on the two GPUs. Task 4 layer 1 was the right fix for yoga; the bee
+fix is Task 3 (paint-submit aggregation).
+
+### Next bottleneck candidates visible in the yoga telemetry
+
+Despite yoga showing no user-perceived spikes, the data points at
+two follow-up candidates if Task 4 layer 2 work is pursued:
+
+- **`storage_allocations/s` + `image_view_creates/s` at peak 1946,
+  1:1.** This is the spec's explicit layer-2 follow-up ("Image-view
+  caching; stable storage should have stable views"). Same caveat as
+  the bee analysis above: at the call sites, view creation is
+  co-located with storage allocation, and the `drawable_view_cache`
+  already handles per-paint reuse. The 1946/s peak is X11-protocol-
+  driven storage allocations — likely the same compositor backing-
+  pixmap pattern from bee, mapped to higher peaks because yoga's
+  higher composite cap (60 Hz × wider damage region) drives more
+  paint surfaces.
+- **`descriptor_allocations/s` flat at 180**. The spec's layer-2
+  ("descriptor set caching by view tuple") would key sets on
+  `(src_view, mask_view, dst_view)` and avoid the
+  `vkAllocateDescriptorSets + vkUpdateDescriptorSets` pair on cache
+  hits. 180/s suggests roughly that many distinct view tuples per
+  second under this drag.
+
+Neither is materially affecting yoga (no spikes observed). Both
+are pre-staged followups for if the post-Task-3 / post-Task-5
+profile re-opens a yoga gap.
+
 ## Close protocol
 
 For each task:
