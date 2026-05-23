@@ -39,6 +39,10 @@ pub const SIGNAL_TOKEN: Token = Token(3);
 pub const LIBINPUT_TOKEN: Token = Token(4);
 /// Host X11 connection fd; F2 reroutes host I/O onto the core poller.
 pub const HOST_X11_TOKEN: Token = Token(5);
+/// Stage 5 Task 6.1: backend-internal epoll FD aggregating per-entry
+/// sync_file FDs for deferred PRESENT completion. Readiness drives
+/// `Backend::drain_completed_present_events`.
+pub const PRESENT_COMPLETION_TOKEN: Token = Token(6);
 
 /// First token usable for per-client writers. Picked far above the
 /// fixed system tokens so they're cheap to recognise on a hot poll.
@@ -122,6 +126,7 @@ mod tests {
             SIGNAL_TOKEN,
             LIBINPUT_TOKEN,
             HOST_X11_TOKEN,
+            PRESENT_COMPLETION_TOKEN,
         ] {
             assert!(token_to_client(tok).is_none(), "{tok:?}");
         }
@@ -150,6 +155,7 @@ mod tests {
             SIGNAL_TOKEN.0,
             LIBINPUT_TOKEN.0,
             HOST_X11_TOKEN.0,
+            PRESENT_COMPLETION_TOKEN.0,
         ];
         let mut sorted: Vec<_> = all.to_vec();
         sorted.sort_unstable();

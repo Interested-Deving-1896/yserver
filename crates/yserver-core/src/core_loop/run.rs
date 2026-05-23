@@ -25,7 +25,7 @@ use super::{
     message::{HostInputEvent, Message, SetupAllocateResponse},
     poll_tokens::{
         ClientIdAllocator, DRM_TOKEN, HOST_X11_TOKEN, LIBINPUT_TOKEN, LISTENER_TOKEN, NOTIFY_TOKEN,
-        client_token, token_to_client,
+        PRESENT_COMPLETION_TOKEN, client_token, token_to_client,
     },
     process_request::{RequestOutcome, process_request},
     sender::{CoreReceiver, CoreSender},
@@ -330,6 +330,7 @@ pub fn run_core(
             BackendFdKind::Drm => DRM_TOKEN,
             BackendFdKind::Libinput => LIBINPUT_TOKEN,
             BackendFdKind::HostX11 => HOST_X11_TOKEN,
+            BackendFdKind::PresentCompletion => PRESENT_COMPLETION_TOKEN,
         };
         poll.registry()
             .register(&mut SourceFd(&fd), token, Interest::READABLE)?;
@@ -461,6 +462,11 @@ pub fn run_core(
                             return Ok(());
                         }
                     }
+                }
+                PRESENT_COMPLETION_TOKEN => {
+                    log::trace!(
+                        "core loop: PresentCompletion fd ready (drain wiring lands in Task 11)"
+                    );
                 }
                 tok if let Some(client_id) = token_to_client(tok) => {
                     // I3: WRITABLE-readiness on a client writer fd.

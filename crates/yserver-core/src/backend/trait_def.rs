@@ -39,6 +39,12 @@ pub enum BackendFdKind {
     /// Host X11 connection fd (ynest only); readiness drives
     /// `Backend::drain_host_socket` on the core thread.
     HostX11,
+    /// Stage 5 Task 6.1: backend-internal epoll FD aggregating
+    /// per-entry sync_file FDs for deferred PRESENT completion +
+    /// a wakeup_eventfd. Readiness drives
+    /// `Backend::drain_completed_present_events`. Spec
+    /// `2026-05-23-deferred-present-completion-design.md`.
+    PresentCompletion,
 }
 
 /// Outcome of a single `Backend::drain_host_socket` pass. Re-exported
@@ -1394,6 +1400,20 @@ pub trait Backend: Send {
     ) -> io::Result<(u8, Vec<u32>)>;
 
     fn get_modifier_mapping(&mut self, origin: Option<OriginContext>) -> io::Result<(u8, Vec<u8>)>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BackendFdKind;
+
+    #[test]
+    fn present_completion_kind_distinct_from_existing_kinds() {
+        // Sanity: the new variant exists and isn't accidentally
+        // aliased to an existing one.
+        assert_ne!(BackendFdKind::PresentCompletion, BackendFdKind::Libinput);
+        assert_ne!(BackendFdKind::PresentCompletion, BackendFdKind::Drm);
+        assert_ne!(BackendFdKind::PresentCompletion, BackendFdKind::HostX11);
+    }
 }
 
 // Compile-time assertion that `Backend` is object-safe and that the
