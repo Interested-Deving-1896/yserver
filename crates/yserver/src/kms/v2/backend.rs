@@ -1762,6 +1762,23 @@ impl KmsBackendV2 {
             .map(|_| ())
     }
 
+    /// Phase A T12: drain pending flush outcomes into telemetry, then
+    /// return `telemetry.lifetime.submit_group_flushes`. Using the
+    /// per-backend lifetime counter instead of the global
+    /// `queue_submit2_count` avoids inter-test interference when the
+    /// suite runs in parallel.
+    pub fn telemetry_submit_group_flushes_for_tests(&mut self) -> u64 {
+        for outcome in self.engine.drain_flush_outcomes() {
+            if outcome.aborted {
+                self.telemetry.record_submit_group_abort();
+            } else {
+                self.telemetry
+                    .record_submit_group_flush(outcome.flushed_entries, outcome.reason);
+            }
+        }
+        self.telemetry.lifetime.submit_group_flushes
+    }
+
     /// Stage 5 Task 6.1: pick up any PRESENT completions that were
     /// queued past `disable_output` so the caller (lib.rs::run) can
     /// fan them out to clients before tearing down the socket.

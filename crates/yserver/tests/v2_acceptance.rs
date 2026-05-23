@@ -3377,3 +3377,164 @@ fn submit_group_failure_drops_pending_ops_and_short_circuits() {
     // VkImage is still registered even though the renderer is dead.
     let _ = b.store_drawable_exists_for_tests(dst_xid);
 }
+
+/// Phase A T12 regression gate: mixed-sequence smoke test that pins the
+/// flush-trigger ordering invariant across the full Phase A paint surface.
+///
+/// Sequence mirrors a representative MATE drag tick:
+///   1. cow_copy_area (via Backend::copy_area into COW xid) — opens cow_batch
+///   2. fill_rectangle on a non-COW dst — flushes cow_batch into group, parks fill CB
+///   3. render_composite (SolidFill→dst picture) — parks composite CB
+///   4. image_text8 (with "fixed" font) — parks glyph upload + draw CBs
+///   5. get_image — SyncBoundary flush (drains group) + readback submit flush
+///
+/// Expected `submit_group_flushes` delta = **2**: one SyncBoundary at the
+/// top of get_image (drains the buffered cow→fill→composite→glyph chain)
+/// and one SyncBoundary for the readback CB itself.
+///
+/// Note: maybe_composite is not driven (no public wrapper available on
+/// KmsBackendV2 that ticks the scene/compose loop); the covered surface
+/// is: cow_batch path, fill_rect, render_composite, glyph upload, and
+/// the two get_image flush-trigger sites.
+///
+/// Counter used: per-backend `telemetry.lifetime.submit_group_flushes`
+/// (via `telemetry_submit_group_flushes_for_tests`) — not the global
+/// `queue_submit2_count`, so the assertion is parallel-safe.
+#[test]
+#[ignore = "lavapipe vk"]
+fn submit_group_mixed_sequence_smoke_exact_submit_count() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // ── Setup ──────────────────────────────────────────────────────
+    // Register the Composite Overlay Window so that copy_area to the
+    // COW xid routes through engine.cow_copy_area (opens cow_batch).
+    b.get_overlay_window(None).expect("get_overlay_window");
+    let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+
+    // Source pixmap (small: 8×8, depth 32).
+    let src = b.create_pixmap(None, 32, 8, 8).expect("src pixmap");
+    let src_xid = src.as_raw();
+
+    // Destination pixmap for non-cow ops (fill, composite, image_text).
+    let dst = b.create_pixmap(None, 32, 32, 32).expect("dst pixmap");
+    let dst_xid = dst.as_raw();
+
+    // Drain all setup CBs (cow zero-fill, pixmap zero-fills) so the
+    // baseline group is clean, then capture the initial flush count.
+    b.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+    let initial_flushes = b.telemetry_submit_group_flushes_for_tests();
+
+    // ── Mixed sequence ────────────────────────────────────────────
+    // Step 1: copy_area into COW xid → routes to cow_copy_area →
+    // opens a cow_batch (CB deferred in batch state, not yet in group).
+    b.copy_area(None, src_xid, cow_xid, 0, 0, 0, 0, 8, 8)
+        .expect("cow copy_area");
+
+    // Step 2: fill_rectangle on non-cow dst → flush_cow_batch fires
+    // (appends cow CB to group), then the fill CB appends after it.
+    b.fill_rectangle(None, dst_xid, 0xFF_00_00_FF, 0, 0, 8, 8)
+        .expect("fill_rectangle");
+
+    // Step 3: render_composite (SolidFill src → dst picture) →
+    // opens render_batch, parks composite CB in group on flush_render_batch
+    // (fired at the next non-composite op or explicit flush).
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst), 0, 0, &[])
+        .expect("render_create_picture dst")
+        .expect("Some(dst picture)");
+    let src_pic = b
+        .render_create_solid_fill(
+            None,
+            // opaque red: premul RGBA u16LE = R=0xFFFF G=0 B=0 A=0xFFFF
+            [0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF],
+        )
+        .expect("render_create_solid_fill")
+        .expect("Some(src picture)");
+    b.render_composite(
+        None,
+        1, // Src op
+        src_pic.as_raw(),
+        0, // no mask
+        dst_pic.as_raw(),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        8,
+        8,
+    )
+    .expect("render_composite");
+
+    // Step 4: image_text8 — try to open the "fixed" bitmap font;
+    // skip the step gracefully if fontconfig can't find it in this
+    // environment (the step is exercised opportunistically).
+    let font_set = if let Ok((font_handle, _metrics)) = b.open_font(None, "fixed") {
+        let mut ds = DrawState::default();
+        ds.font = Some(font_handle);
+        b.apply_draw_state(None, &ds).expect("apply_draw_state");
+        // image_text8 body: 8 bytes of header (drawable+gc, unused here)
+        // + x(2,LE) + y(2,LE) + text bytes.
+        let mut body = vec![0u8; 12 + 1];
+        body[8..10].copy_from_slice(&1i16.to_le_bytes()); // x=1
+        body[10..12].copy_from_slice(&12i16.to_le_bytes()); // y=12 (below ascent)
+        body[12] = b'a';
+        b.image_text8(None, dst_xid, 0xFF_FF_FF_FF, 0, 1, &body)
+            .expect("image_text8");
+        true
+    } else {
+        eprintln!("T12: 'fixed' font not found; skipping image_text8 step");
+        false
+    };
+    let _ = font_set; // suppress unused-variable warning
+
+    // Step 5: get_image — sync barrier.
+    // Internally: flush_cow_batch (no-op), flush_render_batch (closes
+    // the render batch CB → appends to group), then two
+    // flush_submit_group calls:
+    //   [A] SyncBoundary — drains all buffered CBs (cow+fill+composite+glyph*)
+    //   [B] SyncBoundary — submits the readback CB itself
+    let _ = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 8, 8, !0)
+        .expect("get_image");
+
+    // ── Assertions ────────────────────────────────────────────────
+    let after_flushes = b.telemetry_submit_group_flushes_for_tests();
+    let delta = after_flushes - initial_flushes;
+    // Exact count: 2. One SyncBoundary drains the buffered paint chain;
+    // the second SyncBoundary submits get_image's own readback CB.
+    // These are the only two flush_submit_group call sites inside
+    // engine.rs::get_image (verified at lines 3219 and 3309).
+    assert_eq!(
+        delta, 2,
+        "expected exactly 2 submit_group flushes from get_image SyncBoundary pair; got {delta}",
+    );
+
+    // End state: group fully drained, no parked ops, renderer healthy.
+    assert!(
+        !b.platform_submit_group_is_open_for_tests(),
+        "submit group must be closed after get_image"
+    );
+    assert_eq!(
+        b.platform_submit_group_size_for_tests(),
+        0,
+        "submit group size must be 0 after get_image"
+    );
+    assert_eq!(
+        b.engine_pending_group_ops_count_for_tests(),
+        0,
+        "pending_group_ops must be empty after get_image"
+    );
+    assert!(
+        !b.platform_renderer_failed_for_tests(),
+        "renderer_failed must remain false throughout"
+    );
+}
