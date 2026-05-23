@@ -181,12 +181,12 @@ Each variant's payload includes (a) the parameters needed to
 record the Vulkan commands at close time, (b) the indices into
 the frame's pin vectors for any heap resource the replay needs,
 and (c) the destination/source `DrawableId`s for layout overlay
-lookups. Variants are intentionally `#[repr(default)]`-shaped
-(no special packing); the op list churn is per-frame at MATE
-drag rates, but `#[repr(C, packed)]` micro-opts wait for the
-Phase B perf pass that runs *after* the structural change lands
-(spec § Phase B open question 1 — "rerun the size profile after
-the structure is in tree, not before").
+lookups. Variants are intentionally plain Rust types — no
+special `#[repr]` packing. The op list churns per-frame at MATE
+drag rates, but layout micro-opts wait for the Phase B perf
+pass that runs *after* the structural change lands (spec §
+Phase B open question 1 — "rerun the size profile after the
+structure is in tree, not before").
 
 **Why symbolic with pinning, not pure-symbolic or pure-prepared:**
 
@@ -194,9 +194,11 @@ the structure is in tree, not before").
   the descriptor set being freed between append and close. The
   DescriptorPoolRing (Stage 5 Task 4 layer 1) already gates
   recycle on the frame ticket via Phase A's
-  `descriptor_ring_does_not_reset_in_use_group` discipline; the
-  same Arc-clone-into-frame pattern keeps individual descriptor
-  *sets* live across the frame open window.
+  `descriptor_ring_does_not_reset_in_use_group` discipline; an
+  equivalent ring-watermark snapshot at append-time (see §
+  "Frame-wide resource pinning" — descriptor sets are
+  generation-tracked, not Arc-tracked) keeps individual
+  descriptor sets live across the frame open window.
 - Pure-prepared ("record the Vulkan command into a secondary CB
   at append") needs CB pool ownership, layout state, and barrier
   insertion at append time — defeating the deferred-recording
@@ -208,6 +210,51 @@ the structure is in tree, not before").
   recorded straight-through. The pinning surface is bounded
   per-frame (capped by `max_pinned_resources_per_frame` —
   fail-the-frame guard, not silent growth).
+
+### Drawable lifetime — append-time frame-ticket touch
+
+Today's code prevents the FreePixmap-before-flush UAF (the
+2026-05-22 Rembrandt iGPU fault chain) by calling
+`store.touch_render_fence(id, ticket.clone())` on every
+drawable a pending CB references AT THE MOMENT the CB starts
+referencing it — `engine.rs:2862` is the load-bearing site
+(dst + src + mask all touch the batch ticket the moment the
+batch opens). `DrawableStore::decref` (`store.rs:708`) and
+`poll_pending_retire` (`store.rs:881`) then gate destruction
+on the touched ticket. Phase B's deferred recording opens a
+longer "between append and submit" window than Phase A's
+batch did; the same UAF guard must move with it.
+
+**Contract.** At each `RecordedOp` append, the frame builder
+calls `store.touch_render_fence(id, frame_ticket.clone())` on
+EVERY drawable the op will read or write — dst + src + mask +
+any clip-source. The frame ticket is the same one cloned into
+every retire-gating consumer Phase A already wires
+(scene compositor pending-ack list, the `SubmittedOp` queue,
+etc.). A `FreePixmap(src)` issued after the op append but
+before frame close therefore observes a non-signaled ticket
+and goes via the existing `RetireDecision::PendingFence` path;
+the storage drops only after the frame ticket signals.
+
+**Why ticket-touch instead of pinning the storage via Arc.**
+`Drawable::storage` is not Arc-owned today; it's a struct
+member of `Drawable`. Wrapping it would require touching the
+entire drawable store. The ticket-touch discipline is
+load-bearing already (the 2026-05-22 fix added it explicitly
+for the per-class batches); Phase B is the same discipline
+extended to "one frame" as the unit instead of "one batch".
+Implementation cost: one method call per drawable per op
+append, in cache (drawables already loaded by the op's
+parameter resolution).
+
+**Atlas image.** `V2GlyphAtlas` holds its `vk::Image` as a
+raw handle, not in a drawable. Frame-close's success commit
+moves the frame ticket onto the atlas as a new
+`V2GlyphAtlas::last_render_ticket: Option<FenceTicket>` field;
+atlas destruction (only on `KmsBackendV2::shutdown`) gates on
+that ticket the same way `DrawableStore::poll_pending_retire`
+gates drawable destruction. This is a small new field; the
+plan touches `glyph_atlas.rs` directly.
 
 ### Glyph upload — speculative atlas overlay
 
@@ -306,7 +353,7 @@ overlay; any code path that pre-dates Phase B and reads
 data because the open-frame's overlay hasn't committed yet —
 its mutations have not actually executed on the GPU.
 
-### Multi-output topology — one CB, N render passes, N semaphores
+### Multi-output topology — one CB, N rendering instances, N semaphores
 
 Spec § Phase B open question 4. The frame builder must support
 multi-output (silence's dual 2560×1440, future > 2-output
@@ -314,11 +361,13 @@ configs) without reintroducing the multi-CB submit shape that
 bee faults on.
 
 **Phase B picks option (a) from the spec sketch**: one primary
-CB containing N back-to-back render passes (one per ready
-output's scanout BO), signaling N binary semaphores at the end
-of the CB. Each pageflip ack-semaphore acquires its
-output-specific scanout BO via `KMS_FB_IN_FENCE_FD`. Single-
-output reduces to N=1 trivially.
+CB containing N back-to-back dynamic-rendering instances
+(`cmd_begin_rendering` … `cmd_end_rendering`, the same API the
+current `record_compose_v2` already uses at `scene.rs:2528`),
+one per ready output's scanout BO, signaling N binary
+semaphores at the end of the CB. Each pageflip ack-semaphore
+acquires its output-specific scanout BO via
+`KMS_FB_IN_FENCE_FD`. Single-output reduces to N=1 trivially.
 
 Reasoning vs the spec-sketched alternative (b) — N CBs in one
 `vkQueueSubmit2`:
@@ -332,18 +381,21 @@ Reasoning vs the spec-sketched alternative (b) — N CBs in one
   at frame-close from `scene.tick`'s output-readiness sweep
   (the existing logic in `scene.rs:1517 build_scene`); the
   paint half of the frame doesn't depend on BO selection.
-- (a) trades render pass switching inside one CB for
-  CB-switching inside one submit. Render-pass switching is
-  cheaper than CB switching on every implementation tested
-  (no allocator overhead, just `vkCmdEndRenderPass2` +
-  `vkCmdBeginRenderPass2` with the next per-output target).
+- (a) trades rendering-instance switching inside one CB for
+  CB-switching inside one submit. Dynamic-rendering instance
+  switching is cheaper than CB switching on every
+  implementation tested (no allocator overhead, just
+  `cmd_end_rendering` + `cmd_begin_rendering` with the next
+  per-output target).
 
-**Per-output semaphores:** today `record_compose_v2` exports a
-`KMS_FB_IN_FENCE_FD` per output. Phase B's close emits N
-`vk::SemaphoreSubmitInfo` signal-entries on the single CB's
-submit, each exported as an FD for the matching output's
-pageflip. The fence ticket signals once all N render passes
-complete.
+**Per-output semaphores:** today `record_compose_v2` queues a
+`vkQueueSubmit2` then calls `bo.export_signaled_fd()` to obtain
+the SYNC_FD handed to `submit_flip_with_fences` (`scene.rs:2385
+-2398`). Phase B's close emits N `vk::SemaphoreSubmitInfo`
+signal-entries on the single CB's submit, calls
+`export_signaled_fd` per output AFTER the submit returns, and
+attaches each SYNC_FD to its output's pageflip. The fence
+ticket signals once all N rendering instances complete.
 
 ### Frame close triggers
 
@@ -358,6 +410,21 @@ unbounded and paint never reaches the GPU.
    frame.is_open()` triggers `close_into_cb` with attached
    compose. Paint + compose land in one CB, one submit. This is
    the design's normal "one frame ⇒ one submit" path.
+1b. **PRESENT-completion semaphore attached.** When a COW
+   PRESENT request attaches a `present_completion` semaphore
+   to a paint op (today: `engine.rs:2460`-ish flush before
+   semaphore export in Phase A), the open frame closes
+   IMMEDIATELY so `vkGetSemaphoreFdKHR(SYNC_FD)` observes a
+   queued signal-op. This is the Phase-A
+   `PresentCompletionSignal` flush trigger lifted into the
+   frame builder: same VUID-VkFenceGetFdInfoKHR-handleType-
+   01457 hazard (the Task 6.1 yoga hang); same mitigation.
+   Submit shape: the frame closes, the submit signals the
+   present-completion semaphore as one of its signal entries
+   (alongside any per-output compose semaphores if compose
+   joined the frame in the same tick), then the
+   semaphore-export FD threads through to PRESENT's
+   CompleteNotify.
 2. **`get_image` sync-barrier** (inherited from Phase A § flush
    trigger 1). `get_image` is the only `ticket.wait()` site
    after Phase A's Task 15 cleanup. Phase B routes get_image
@@ -366,7 +433,16 @@ unbounded and paint never reaches the GPU.
    recording its readback CB. The readback itself stays a
    one-shot small CB outside the frame builder — its lifetime
    matches today's `get_image` bypass path under Phase A.
-3. **Timeout** (idle / no-pageflip case). A frame that's been
+3. **Non-frame-builder paint op** (only relevant during B.1–
+   B.4 sub-phase rollout — see § "Migration boundaries").
+   Any paint op that hasn't been ported to the frame builder
+   yet closes the open frame BEFORE recording its own CB. This
+   is the hard boundary that keeps mixed-rollout correct: a
+   non-ported op cannot see the open-frame layout overlay, so
+   the only safe ordering is "flush + commit the frame, then
+   the non-ported op runs against committed `current_layout`
+   state". Trigger retires at B.5 when SubmitGroup is deleted.
+4. **Timeout** (idle / no-pageflip case). A frame that's been
    open for > T ms without a ready output forces a close to
    release pinned resources. Default T = 16 ms (one vblank at
    60 Hz). Configurable via env knob
@@ -374,10 +450,10 @@ unbounded and paint never reaches the GPU.
    triage. The timeout closes the frame without compose
    (compose runs at the next `maybe_composite` tick that
    observes a ready output).
-4. **Shutdown.** `KmsBackendV2::shutdown` closes any open frame
+5. **Shutdown.** `KmsBackendV2::shutdown` closes any open frame
    before tearing down platform state. Mirrors Phase A's
    `Shutdown` flush reason.
-5. **Pin-set ceiling.** `max_pinned_resources_per_frame` =
+6. **Pin-set ceiling.** `max_pinned_resources_per_frame` =
    1024 (initial guess, retune from telemetry). Catches a
    pathological glyph-storm or self-aliasing-readback loop that
    would otherwise exhaust descriptor pool / staging pools
@@ -394,45 +470,78 @@ frame.
 ### Frame-wide resource pinning
 
 Spec § Phase B open question 6. Task 6.1 solved Arc-pinning for
-xshmfence/syncobj specifically; Phase B generalises.
+xshmfence/syncobj specifically; Phase B generalises. The
+generalisation has TWO retirement mechanisms because v2's
+resource model splits the same way today:
 
-**Pin set shape:** `FrameBuilder` carries six typed
-`Vec<Arc<...>>` fields, one per resource class. Each
-`RecordedOp` variant records indices into these vectors instead
-of strong references; the vector entries hold the Arc clones
-that keep the resources live across the open-frame window.
+**Mechanism 1 — Arc-tracked resources.** Things that have an
+owning `Arc<...>` already (or can trivially get one): per-op
+staging buffers, gradient/sampler caches, owned syncobj /
+xshmfence handles, owned semaphores. These pin via Arc clone
+into the frame's pin vectors:
 
 ```rust
 pub(crate) struct FramePinSet {
-    image_views: Vec<Arc<OwnedImageView>>,
-    descriptor_sets: Vec<Arc<OwnedDescriptorSet>>,
     staging_buffers: Vec<Arc<StagingBuffer>>,
-    atlas_pages: Vec<Arc<AtlasPageHandle>>,
     sync_objects: Vec<Arc<OwnedSyncObject>>,
-    scratch_resources: Vec<Arc<ScratchHandle>>,
+    semaphores: Vec<Arc<OwnedSemaphore>>,
+    // Future: image_views once they're Arc-wrapped. Today the
+    // drawable_view_cache returns raw vk::ImageView handles
+    // whose lifetime is tied to the owning drawable; the
+    // append-time touch_render_fence (see § "Drawable lifetime")
+    // is what keeps THOSE handles live, not Arc clones.
 }
 ```
 
-(Existing concrete types: `Owned*` wrappers may need adding for
-items that today are raw vk handles. The implementation plan
-sizes that churn against the existing pool ring lifetimes — see
-§ "Migration boundaries".)
+**Mechanism 2 — Generation-watermark resources.** Things
+already tracked by a monotonic generation counter:
+descriptor sets via `DescriptorPoolRing` (`engine.rs:553` /
+`engine.rs:686`); scratch images / `DstReadback` /
+`src_alias_readback` / solid color scratch / `mask_scratch`
+via their per-engine high-water counters. These pin via a
+*watermark snapshot*, not an Arc clone:
+
+```rust
+pub(crate) struct FrameWatermarks {
+    descriptor_pool_gen: u64,
+    // Other generation counters added as their owners exist.
+}
+```
+
+The frame builder, at every op append that touches a
+generation-tracked resource, calls
+`acquire_for_frame(&mut frame.watermarks)` on the ring/pool;
+the ring captures `acquire_generation` as a high-water value
+on the frame. Retirement (frame ticket signal) is the gate at
+which `DescriptorPoolRing::release_up_to` can recycle pools
+whose generation is ≤ the watermark. This mirrors Phase A's
+`descriptor_ring_does_not_reset_in_use_group` invariant — but
+the unit shifts from "the SubmitGroup's shared ticket" to
+"the frame's ticket".
+
+**Equivalence with Phase A.** Phase A held the same two
+mechanisms implicitly: `SubmittedOp` Arc'd its staging /
+scratch / atlas_ticket refs; `DescriptorPoolRing` already
+gated recycle on `acquire_generation` watermark. Phase B keeps
+both mechanisms; what changes is the lifetime *unit* (frame
+vs op/batch) and the explicit naming.
 
 **Lifetime contract:** frame-close-success moves the pin set
-into a `FrameSubmittedRecord` parked alongside the frame
-ticket; on ticket-signal (CPU side, retirement sweep) the pin
-set drops and Arcs decrement, returning resources to their
-pools. Frame-close-failure drops the pin set immediately
-(CBs never executed, resources never read).
++ watermarks into a `FrameSubmittedRecord` parked alongside
+the frame ticket; on ticket-signal (CPU side, retirement
+sweep) the Arcs decrement (returning resources to their pools)
+AND the descriptor pool ring's `release_up_to(watermark)` is
+called. Frame-close-failure drops both immediately (CBs never
+executed, resources never read).
 
-**Retention math:** Phase A's worst-case retention was `16 ×
+**Retention math.** Phase A's worst-case retention was `16 ×
 worst-op footprint`. Phase B's worst-case is *one frame's*
-footprint — bounded by `max_pinned_resources_per_frame` and the
-per-frame paint count. For a MATE drag frame with ~55 paints
-(today's bee average), the per-frame retention is roughly
-equal to Phase A's max group at the cap, modulo the larger
-pin set vs Phase A's per-op `SubmittedOp` set. Phase B keeps
-Phase A's `active_staging_bytes` /
+footprint — bounded by `max_pinned_resources_per_frame` and
+the per-frame paint count. For a MATE drag frame with ~55
+paints (today's bee average), the per-frame retention is
+roughly equal to Phase A's max group at the cap, modulo the
+larger pin set vs Phase A's per-op `SubmittedOp` set. Phase B
+keeps Phase A's `active_staging_bytes` /
 `active_descriptor_pool_count` telemetry and adds a new
 `active_pinned_resources` gauge.
 
@@ -454,7 +563,9 @@ op list:
    refactored to take a `&CbRecorder` instead of submitting,
    and (c) any layout transitions for the *next* op that
    require a separate barrier. Compose ops emit
-   `vkCmdBeginRenderPass2` per output target.
+   `cmd_begin_rendering` / `cmd_end_rendering` per output
+   target (same dynamic-rendering API as today's
+   `record_compose_v2`).
 3. **Finalise pass.** End the CB, build the
    `VkSubmitInfo2` with N signal semaphores (one per compose
    target, exported via `vkGetSemaphoreFdKHR(SYNC_FD)`), submit,
@@ -473,40 +584,78 @@ The three-pass walk is a deliberate trade-off:
 
 ### Migration boundaries
 
-Phase B is not a single atomic switch — too much surface. The
-spec proposes a phased rollout sequenced for **bee
-unblocking first**, leaving non-bee-faulting paths on the
-SubmitGroup machinery while the FrameBuilder lands:
+Phase B is not a single atomic switch — too much surface to
+land in one task arc. The spec proposes a phased rollout that
+is **bee-safe from sub-phase B.1**, not just bee-safe at B.5.
+Two invariants make the mixed-paths state correct:
+
+**Invariant M1 — non-ported paint ops force SubmitGroup
+`cap = 1`.** During B.1–B.4 the SubmitGroup is reconfigured to
+single-CB-per-`vkQueueSubmit2` for the duration of the
+rollout. Phase A's bee captures showed cap=1 boots MATE clean
+on bee (`status.md` § "2026-05-23 bee MATE-load freeze" —
+the `cap=1` row); the freeze begins at the first regular
+cap≥2 group. B.1 sets `set_max_size(1)` at platform open and
+keeps it there until B.5 deletes SubmitGroup entirely. The
+SubmitGroup machinery effectively becomes the
+pre-Phase-A per-op submit cadence for the duration of the
+sub-phase rollout; the frame builder handles the ported ops
+in one CB per frame. Bee survives B.1.
+
+**Invariant M2 — non-ported paint ops close the open frame
+first.** Before any non-ported entry point records its own
+CB, the engine calls `frame.close_into_cb(FrameCloseReason::
+NonPortedPaintOp)`. This guarantees (a) the non-ported op
+reads a committed `current_layout` (the open frame's layout
+overlay has been written back to `storage.current_layout`),
+(b) drawable `last_render_ticket` values reflect submitted
+work, not append-time placeholders, (c) submit order between
+the frame builder and the non-ported op matches X11
+chronological order. Without M2, the non-ported op would see
+stale `current_layout` and race against the deferred frame on
+the GPU. M2 retires when the last non-ported entry point
+moves into the frame builder at B.4 close.
+
+**Sub-phases:**
 
 - **Sub-phase B.1 — FrameBuilder skeleton + `composite_glyphs`.**
   Build the FrameBuilder behind a feature gate
-  (`YSERVER_FRAME_BUILDER=on`). Port `composite_glyphs` first;
-  every other paint op stays on SubmitGroup. Composite glyphs
-  is the bee fault site; landing this alone is the bee fix.
-  Telemetry split into `frame_builder_*` vs
-  `submit_group_*` counters so the two paths report
-  independently.
+  (`YSERVER_FRAME_BUILDER=on`). Set SubmitGroup `max_size=1`
+  (M1). Port `composite_glyphs` first; every other paint op
+  stays on SubmitGroup with M2's flush-first discipline.
+  Composite glyphs is the bee fault site, so landing this
+  alone — in combination with M1's cap=1 on remaining paths
+  — eliminates every multi-CB submit shape from the
+  frame-on-bee workload. B.1 IS the bee fix. Telemetry split
+  into `frame_builder_*` vs `submit_group_*` counters so the
+  two paths report independently. **B.1 acceptance: bee MATE
+  drag survives, telemetry confirms `submit_group_size_max =
+  1` throughout.**
 - **Sub-phase B.2 — port the top three by submit budget.**
   `render_composite` + `render_fill` + `composite_glyphs`
   cover 75 % of submits per the bee 2026-05-23 capture
   (`yserver-mate.submit.tsv` § "Submit-source ranking from the
   bee 2026-05-23 capture" in
   `2026-05-23-frame-builder-submit-rate-design.md`). After
-  B.2 the bulk of MATE-drag work is in the frame builder.
+  B.2 the bulk of MATE-drag work is in the frame builder; M1
+  + M2 still keep the unported tail bee-safe.
 - **Sub-phase B.3 — port the remaining paint ops.** `cow_copy_area`
   + `copy_area` + `put_image` + `render_traps_or_tris` +
   `glyph_upload` (the standalone CB path, distinct from
   glyph-uploads-inside-composite_glyphs). After B.3 every paint
-  op lives in the frame builder.
+  op lives in the frame builder; M2's "close frame on non-
+  ported op" trigger should never fire from production code
+  paths (only from test paths that exercise the legacy code).
 - **Sub-phase B.4 — scene compose joins the frame.** Compose's
   CB merges into the frame CB; the load-bearing flush in
   `maybe_composite` becomes `frame.close_with_compose(...)`.
 - **Sub-phase B.5 — delete SubmitGroup.** With every entry
   point on the frame builder and compose folded in, the Phase A
   machinery (`submit_group.rs`, `pending_group_ops`, the
-  per-class `pending_cow_batch` / `pending_render_batch` paths)
-  retires. `last_render_ticket` on drawables becomes "the
-  frame ticket from the frame that last touched this drawable".
+  per-class `pending_cow_batch` / `pending_render_batch` paths,
+  Invariants M1 + M2) retires. `last_render_ticket` on
+  drawables becomes "the frame ticket from the frame that
+  last touched this drawable".
 
 Each sub-phase is its own implementation plan with its own
 codex review round; this spec covers only the *design*
@@ -596,9 +745,10 @@ Unit tests:
 - `frame_builder_atlas_insert_deferred_until_close_success` —
   failed frame leaves `V2GlyphAtlas::lookup` returning None for
   the would-be-inserted key.
-- `frame_builder_multi_output_one_cb_two_render_passes` —
-  dual-output close produces one CB with two render passes
-  and two signal semaphores.
+- `frame_builder_multi_output_one_cb_two_rendering_instances` —
+  dual-output close produces one CB with two
+  `cmd_begin_rendering` / `cmd_end_rendering` pairs and two
+  signal semaphores.
 - `frame_builder_timeout_closes_frame_without_compose`.
 - `frame_builder_pin_ceiling_force_closes_and_logs_once`.
 - `frame_builder_get_image_closes_open_frame_before_wait`.
@@ -662,11 +812,19 @@ that the design can't predict:
    reintroduce the multi-CB shape and is therefore unlikely
    to be acceptable).
 5. **CompletionSemaphore export ordering.** Today's per-output
-   `vkGetSemaphoreFdKHR(SYNC_FD)` happens before `vkQueueSubmit2`
-   (with the `IMPORT_PAYLOAD` flag dance). The plan validates
-   that the same dance works with N signal semaphores in one
-   submit; spec assumes yes but the plan needs to assert via a
-   pass-through round.
+   compose calls `vkQueueSubmit2` first and then
+   `bo.export_signaled_fd()` (`scene.rs:2385-2398`) — submit-
+   then-export, NOT export-before-submit. Phase B preserves the
+   same ordering: one `vkQueueSubmit2` per frame with N signal
+   semaphores, then N `export_signaled_fd` calls (one per
+   ready output) feeding `submit_flip_with_fences`. The plan
+   validates that batched signal-then-export works correctly
+   under one submit (semaphore signal payload visible to the
+   matching `vkGetSemaphoreFdKHR(SYNC_FD)` call); spec assumes
+   yes but the plan needs an explicit pass-through test.
+   Separately, the COW `PresentCompletionSignal` semaphore
+   used for CompleteNotify uses the same submit-then-export
+   shape; see § "Frame close triggers" trigger #1b.
 6. **Telemetry overlap window.** B.1–B.4 has two paint paths
    reporting submit-rate counters simultaneously. The plan
    defines a clear sum (`paint_submits = submit_group_paint_
