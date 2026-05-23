@@ -1,0 +1,725 @@
+# Frame-builder Phase B — design
+
+**Status:** draft. Captured 2026-05-24 from the Phase A close-out
+(`feature/frame-builder-submit-rate` merged on 2026-05-24) plus the
+2026-05-23 bee MATE-load freeze data captured under Phase A.
+Supersedes the "Phase B — deferred op-list FrameScheduler (sketched,
+not detailed)" section in
+`docs/superpowers/specs/2026-05-23-frame-builder-submit-rate-design.md`.
+
+**Framing:** Phase A collapsed *consecutive* `vkQueueSubmit2` calls
+into one ioctl with N CBs. Phase B collapses the *per-op CB* model
+itself: one open frame records every paint primitive into a compact
+op list, frame-close replays the list into ONE primary CB, and the
+KMS handoff submits exactly one CB per frame per queue.
+
+**Load-bearing design goal:** *one scanout opportunity consumes one
+recorded frame's worth of X11 work, in one VkCommandBuffer, in one
+vkQueueSubmit2 call per affected queue.* Phase A relaxed the per-op
+submit; Phase B relaxes the per-op CB. The discipline that controls
+*how* GPU work is recorded changes — the data model (Drawable /
+storage / scene graph) stays.
+
+**Phase B is also the fix path for the bee RDNA2/RADV MATE-load
+freeze** that blocked Phase A's bee close: see § "Bee fault →
+Phase B disposition" below.
+
+## Why this exists
+
+Phase A's bee/iMac/yoga/fuji captures show three independent
+limits in the post-Phase-A submit shape:
+
+1. **bee (Ryzen 9 6900HX / RDNA2 / RADV / Arch Mesa-current):**
+   any cap ≥ 2 reproduces a RADV GPUVM TCP protection fault
+   (`GCVM_L2_PROTECTION_FAULT_STATUS=0x701031`,
+   `ERROR_DEVICE_LOST`, longest op `op133 (RENDER) at ~1.98 s`)
+   during a `composite_glyphs` burst on MATE load. Three green
+   analogues (yoga / Adreno-Turnip, iMac / Polaris-RADV, fuji /
+   Intel-ANV) on the same `189e8dd` commit triangulate the cause
+   to RDNA2 RADV codepaths × Arch Mesa-current. The Phase A
+   "abandoned submit-shape experiment" — reshape one
+   `VkSubmitInfo2{N CBs}` → one `vkQueueSubmit2{N submits × 1 CB}`
+   — moved the threshold but still froze, so the fault is the
+   *multi-CB execution shape within a single queue submission*,
+   not the `VkSubmitInfo2` packing detail. The only structural
+   way out is one primary CB per submit; that is Phase B's
+   shape.
+2. **iMac 19,2 (Polaris / GCN4 / RADV / Ubuntu Mesa):** Phase A
+   `max_size`-flush share 50–55 % of all flushes — cap=16 is too
+   low for AMD's batch shape on this workload. Phase B's "frame"
+   is the natural unit, not a numeric cap.
+3. **Universal (every platform):** `submit_group_size_max_in_window
+   > cap` telemetry anomaly on yoga + iMac + fuji. A real
+   telemetry-or-cap-check defect that Phase A inherited and
+   bracketed. Phase B's frame-CB removes the per-op-class
+   batching machinery entirely; the anomaly's cause goes with it.
+
+Phase B closes the remaining gap to Xorg/wlroots (~1–5
+submits/frame) by structurally removing the per-op CB.
+
+## Bee fault → Phase B disposition
+
+The bee fault is the load-bearing failure mode driving Phase B's
+sequencing. Captured separately because the spec needs an
+explicit rebuttal "Phase B fixes bee" so codex review can audit
+the chain.
+
+**Observation chain (from `docs/status.md`
+§ "2026-05-23 bee MATE-load freeze"):**
+
+- `cap=1` (every paint op flushes immediately): MATE loads,
+  yserver survives a full drag session. This is Phase-A-with-
+  zero-batching; equivalent to the pre-Phase-A per-op submit
+  cadence except for the wrapper.
+- `cap=2`: RADV GPUVM TCP protection fault during MATE load.
+  First regular multi-CB submit-group shape.
+- Reshaping `flush_submit_group` from one `VkSubmitInfo2`
+  containing N CBs → one `vkQueueSubmit2` containing N
+  `VkSubmitInfo2{1 CB}` substructures: `cap=16` reaches the
+  MATE desktop, but freezes inside a `composite_glyphs` burst
+  later with the same RADV GPUVM fault.
+
+**Disposition.** The fault triggers on *multiple command-buffers
+executing within one queue submission*. Whether that's
+packaged as N `CommandBufferSubmitInfo`s inside one
+`VkSubmitInfo2`, or as N `VkSubmitInfo2{1 CB}` inside one
+`vkQueueSubmit2`, RDNA2 RADV faults the same way on this
+workload. Three green analogues running the same code on
+non-RDNA2 hardware (or RDNA2 with older Mesa, modulo the iMac
+Polaris distinction) rule out a yserver-side barrier bug — a
+genuine yserver-side missing barrier would fault iMac too.
+
+Phase B's structural answer: every queue submission contains
+exactly ONE primary CB. The frame-CB consolidates all paint +
+glyph upload + scene-compose work into that single CB, separated
+by full pipeline barriers between ops. Multi-output emits N
+render passes inside that one CB (see § "Multi-output topology")
+rather than N CBs. This removes the failure mode without needing
+to characterise the underlying RADV/firmware bug.
+
+**Phase B exit criterion for bee:** boot MATE, drag for 30 s,
+no `ERROR_DEVICE_LOST`, no GPUVM faults. The same telemetry
+gate the other three platforms passed under Phase A.
+
+## Phase B architecture
+
+### Frame lifecycle
+
+A `FrameBuilder` is the new top-level abstraction on
+`RenderEngine`. It has three states:
+
+```
+   Closed  ─open_for_paint────▶  OpenForPaint  ─close_into_cb────▶  Closed
+     ▲                              │  │
+     │                              │  └─attach_compose──▶  ClosingWithCompose
+     │                              │                              │
+     └────────────close_into_cb─────┘                              │
+     ▲                                                             │
+     └────────────close_into_cb────────────────────────────────────┘
+```
+
+- **Closed** (idle). No allocations. The hot path for X11
+  workloads that don't drive paint (event-only requests, idle).
+- **OpenForPaint.** A paint entry point (`render_composite`,
+  `composite_glyphs`, `render_fill_rectangles`, `cow_copy_area`,
+  `put_image`, `render_traps_or_tris`) detected no open frame
+  and opened one. The frame owns a fresh `FenceTicket` (the
+  *frame ticket*) and accumulates `RecordedOp`s, pinned
+  resources, and a per-drawable layout overlay. Subsequent paint
+  ops append into the open frame instead of submitting their
+  own CB.
+- **ClosingWithCompose.** Scene-compose joined the open frame.
+  Triggered by `maybe_composite` when it observes
+  `scene_structure_dirty && has_output_ready_for_submit() &&
+  frame.is_open()`. Compose appends its own `RecordedOp::Compose`
+  entries (one per ready output) onto the same op list, then
+  the frame closes into a single primary CB that contains paint
+  draws + barriers + N compose render passes, submits once
+  with `KMS_FB_IN_FENCE_FD` exported per output, and signals
+  the frame ticket.
+
+The Closed → OpenForPaint transition is *lazy* — a request
+handler that never touches the paint path never allocates a
+frame. The OpenForPaint → ClosingWithCompose transition is
+driven by the existing `maybe_composite` tick; idle no-pageflip
+frames close via the timeout trigger (see § "Frame close
+triggers").
+
+### Op representation — symbolic recording with append-time pinning
+
+Spec § Phase B open question 1. The choice is between
+*symbolic* (store params, resolve resources at close) and
+*prepared* (snapshot resources at append). Phase B uses a
+**hybrid**: a compact `RecordedOp` enum carries only the
+*parameters* of each op (rects, colours, glyph keys, pipeline
+choices) plus typed handles into the frame's pin set
+(`PinnedImageViewIdx`, `PinnedDescriptorSetIdx`,
+`PinnedStagingIdx`). Append-time **pins the resources** into
+the frame's pin set (Arc clones into `FrameBuilder.pinned_*`
+vectors) so a later op or close-time replay cannot observe a
+freed view/descriptor/buffer. Close-time replay reads the op
+params, looks up the pinned handles, and records the Vulkan
+commands.
+
+```rust
+#[derive(Debug)]
+pub(crate) enum RecordedOp {
+    RenderComposite(RecordedRenderComposite),
+    CompositeGlyphs(RecordedCompositeGlyphs),
+    RenderFill(RecordedRenderFill),
+    RenderTraps(RecordedRenderTraps),
+    CowCopyArea(RecordedCowCopyArea),
+    CopyArea(RecordedCopyArea),
+    PutImage(RecordedPutImage),
+    GlyphUpload(RecordedGlyphUpload),
+    LayoutTransition(RecordedLayoutTransition),
+    Compose(RecordedCompose),       // per-output entry
+}
+```
+
+Each variant's payload includes (a) the parameters needed to
+record the Vulkan commands at close time, (b) the indices into
+the frame's pin vectors for any heap resource the replay needs,
+and (c) the destination/source `DrawableId`s for layout overlay
+lookups. Variants are intentionally `#[repr(default)]`-shaped
+(no special packing); the op list churn is per-frame at MATE
+drag rates, but `#[repr(C, packed)]` micro-opts wait for the
+Phase B perf pass that runs *after* the structural change lands
+(spec § Phase B open question 1 — "rerun the size profile after
+the structure is in tree, not before").
+
+**Why symbolic with pinning, not pure-symbolic or pure-prepared:**
+
+- Pure-symbolic ("look up the descriptor set at close") risks
+  the descriptor set being freed between append and close. The
+  DescriptorPoolRing (Stage 5 Task 4 layer 1) already gates
+  recycle on the frame ticket via Phase A's
+  `descriptor_ring_does_not_reset_in_use_group` discipline; the
+  same Arc-clone-into-frame pattern keeps individual descriptor
+  *sets* live across the frame open window.
+- Pure-prepared ("record the Vulkan command into a secondary CB
+  at append") needs CB pool ownership, layout state, and barrier
+  insertion at append time — defeating the deferred-recording
+  simplification and reintroducing the multi-CB shape that the
+  bee fault demands we structurally remove.
+- Hybrid: parameters are tiny (a few hundred bytes/op worst
+  case), pins are Arc clones (one refcount bump per pinned
+  resource per op), close-time replay is a single primary CB
+  recorded straight-through. The pinning surface is bounded
+  per-frame (capped by `max_pinned_resources_per_frame` —
+  fail-the-frame guard, not silent growth).
+
+### Glyph upload — speculative atlas overlay
+
+Spec § Phase B open question 2. `composite_glyphs` is the bee
+fault site; getting glyph upload right is load-bearing.
+
+Today (`v2/glyph_atlas.rs:283-294`): `pack` advances the shelf
+packer and returns a slot; `insert_entry` commits the slot into
+the cache; `record_upload` records the upload commands into the
+caller's CB. The three steps happen sequentially in
+`composite_glyphs`, and the upload CB submits *before* the
+draw CB.
+
+Phase B:
+
+- **Pack stays monotonic.** Shelf advance is not transactional.
+  A failed frame leaks the packed slot (the cache entry is
+  never committed, so the next pack of the same glyph allocates
+  a fresh slot). Atlas is 4096² R8 = ~14k glyph budget;
+  per-frame leak rate is bounded by the rare-failure regime.
+  Worth the simplicity over a tentative-shelf overlay; the
+  spec calls this out so reviewers don't ask.
+- **Cache insert is transactional.** `pack`-and-record happens
+  during op append: the frame builder writes a `RecordedOp::
+  GlyphUpload { atlas_xy, atlas_layout_in_frame, staging_pin_idx,
+  glyph_key, atlas_entry }` and DOES NOT call
+  `insert_entry`. On frame-close success the
+  builder iterates `pending_glyph_inserts` and commits each
+  into `V2GlyphAtlas::insert_entry`. On frame failure the
+  pending list drops — the slot is leaked-but-not-cached, so
+  next paint re-packs.
+- **Upload and draw share one CB.** The glyph upload commands
+  (layout transition + `vkCmdCopyBufferToImage` + back-transition
+  to `SHADER_READ_ONLY_OPTIMAL`) record into the frame CB BEFORE
+  the `composite_glyphs` draw commands that reference the
+  uploaded slot, with a full `PipelineBarrier2` between them
+  (no inter-CB sync needed; this is the bee fix). The frame's
+  layout overlay tracks the atlas image's "in-frame" layout
+  state the same way it tracks drawable layouts (§ "Transactional
+  layout state").
+- **One frame, many glyph misses.** A glyph-heavy MATE drag may
+  miss N glyphs in one frame. All N uploads + barriers + draws
+  record into the same frame CB; one submit. Spec target for
+  this case: a MATE drag frame with 10–20 glyph misses runs
+  in ≤ 1 submit/frame versus Phase A's 10–20 submits/frame.
+
+### Transactional layout state
+
+Spec § Phase B open question 3. Today
+`Drawable::record_layout_transition` (`store.rs:506`) mutates
+`storage.current_layout` BEFORE the GPU executes the barrier;
+the CPU tracker is single-source-of-truth for what the *next*
+op's barrier old-layout should be. Phase B defers the GPU
+barrier to close, so the tracker must shift in two places to
+stay correct:
+
+1. **FrameLayoutTable.** A `HashMap<DrawableId,
+   LayoutOverlayEntry>` on the FrameBuilder. Each entry holds
+   `(pre_frame_layout, current_in_frame_layout)`. The first
+   `record_layout_transition` for a drawable during the open
+   frame snapshots its `storage.current_layout` into
+   `pre_frame_layout`, sets `current_in_frame_layout` to the
+   target, and appends a `RecordedOp::LayoutTransition` to the
+   op list. Subsequent transitions on the same drawable update
+   only `current_in_frame_layout` (and append a new
+   `LayoutTransition` op with the up-to-date pre-old-layout).
+2. **Commit on success.** Frame-close-success walks the overlay
+   and writes `current_in_frame_layout` back into each drawable's
+   `storage.current_layout`. The store is now consistent with
+   what the GPU executed.
+3. **Rollback on failure.** Frame-close-failure walks the overlay
+   and writes `pre_frame_layout` back. The store is restored to
+   its open-frame-start state. **Combined with the Phase A
+   choice** (`renderer_failed` is fatal-after-failure), rollback
+   only needs to leave the layouts in a non-corrupting state
+   long enough for the next entry-point's `renderer_failed`
+   short-circuit to fire; subsequent paint ops never run.
+   Phase B can still attempt full restoration as a "best-effort"
+   so that *diagnostic* paths (`get_image` readbacks during
+   shutdown) don't read mid-mutation values, but
+   correctness depends only on `renderer_failed`. The atlas
+   image's layout follows the same pattern: an
+   `atlas_pre_frame_layout` field on the FrameBuilder snapshots
+   `V2GlyphAtlas::current_layout` on first glyph-upload-in-frame,
+   and the commit/rollback step mirrors `current_in_frame`/
+   `pre_frame` semantics.
+
+**Why an overlay, not direct mutation:** the CPU tracker is also
+read by non-paint code paths (the existing `current_layout`
+reads in `engine.rs` ops that don't open a frame — though there
+should be none of those by the end of Phase B). The overlay is
+queried via `frame.current_layout_for(drawable_id)` which falls
+back to `storage.current_layout` when the drawable isn't in the
+overlay; any code path that pre-dates Phase B and reads
+`storage.current_layout` directly continues to see correct
+data because the open-frame's overlay hasn't committed yet —
+its mutations have not actually executed on the GPU.
+
+### Multi-output topology — one CB, N render passes, N semaphores
+
+Spec § Phase B open question 4. The frame builder must support
+multi-output (silence's dual 2560×1440, future > 2-output
+configs) without reintroducing the multi-CB submit shape that
+bee faults on.
+
+**Phase B picks option (a) from the spec sketch**: one primary
+CB containing N back-to-back render passes (one per ready
+output's scanout BO), signaling N binary semaphores at the end
+of the CB. Each pageflip ack-semaphore acquires its
+output-specific scanout BO via `KMS_FB_IN_FENCE_FD`. Single-
+output reduces to N=1 trivially.
+
+Reasoning vs the spec-sketched alternative (b) — N CBs in one
+`vkQueueSubmit2`:
+
+- (b) is the multi-CB-per-submit shape; the bee fault rules it
+  out. (Phase A's "abandoned experiment" reshaping into "N
+  one-CB submits inside one queue_submit2" demonstrated the
+  fault survives this packaging.)
+- (a) requires the primary CB to know all N output scanout BOs
+  at record time. The frame builder learns the BO assignments
+  at frame-close from `scene.tick`'s output-readiness sweep
+  (the existing logic in `scene.rs:1517 build_scene`); the
+  paint half of the frame doesn't depend on BO selection.
+- (a) trades render pass switching inside one CB for
+  CB-switching inside one submit. Render-pass switching is
+  cheaper than CB switching on every implementation tested
+  (no allocator overhead, just `vkCmdEndRenderPass2` +
+  `vkCmdBeginRenderPass2` with the next per-output target).
+
+**Per-output semaphores:** today `record_compose_v2` exports a
+`KMS_FB_IN_FENCE_FD` per output. Phase B's close emits N
+`vk::SemaphoreSubmitInfo` signal-entries on the single CB's
+submit, each exported as an FD for the matching output's
+pageflip. The fence ticket signals once all N render passes
+complete.
+
+### Frame close triggers
+
+Spec § Phase B open question 5. The open frame must close at
+deterministic points; otherwise resource pinning grows
+unbounded and paint never reaches the GPU.
+
+**Triggers, in order of "should be the common case":**
+
+1. **`maybe_composite` ready-output sweep** (the dominant path).
+   `scene_structure_dirty && has_output_ready_for_submit() &&
+   frame.is_open()` triggers `close_into_cb` with attached
+   compose. Paint + compose land in one CB, one submit. This is
+   the design's normal "one frame ⇒ one submit" path.
+2. **`get_image` sync-barrier** (inherited from Phase A § flush
+   trigger 1). `get_image` is the only `ticket.wait()` site
+   after Phase A's Task 15 cleanup. Phase B routes get_image
+   through `close_into_cb_for_sync_wait` which closes the open
+   frame, submits the CB, and waits on the frame ticket before
+   recording its readback CB. The readback itself stays a
+   one-shot small CB outside the frame builder — its lifetime
+   matches today's `get_image` bypass path under Phase A.
+3. **Timeout** (idle / no-pageflip case). A frame that's been
+   open for > T ms without a ready output forces a close to
+   release pinned resources. Default T = 16 ms (one vblank at
+   60 Hz). Configurable via env knob
+   `YSERVER_FRAME_BUILDER_TIMEOUT_MS` (default 16) for hardware
+   triage. The timeout closes the frame without compose
+   (compose runs at the next `maybe_composite` tick that
+   observes a ready output).
+4. **Shutdown.** `KmsBackendV2::shutdown` closes any open frame
+   before tearing down platform state. Mirrors Phase A's
+   `Shutdown` flush reason.
+5. **Pin-set ceiling.** `max_pinned_resources_per_frame` =
+   1024 (initial guess, retune from telemetry). Catches a
+   pathological glyph-storm or self-aliasing-readback loop that
+   would otherwise exhaust descriptor pool / staging pools
+   between vblanks. Reaching the ceiling forces a close and
+   logs `frame_builder: pin set ceiling at {n}` once.
+
+**Pageflip retire** is *not* a Phase B close trigger by itself:
+the open frame's lifetime is `open paint → close on compose-or-
+timeout`, and the next frame opens fresh on the next paint.
+Pageflip retire signals output BO availability for the *next*
+frame's compose; it does not interact with an open paint-only
+frame.
+
+### Frame-wide resource pinning
+
+Spec § Phase B open question 6. Task 6.1 solved Arc-pinning for
+xshmfence/syncobj specifically; Phase B generalises.
+
+**Pin set shape:** `FrameBuilder` carries six typed
+`Vec<Arc<...>>` fields, one per resource class. Each
+`RecordedOp` variant records indices into these vectors instead
+of strong references; the vector entries hold the Arc clones
+that keep the resources live across the open-frame window.
+
+```rust
+pub(crate) struct FramePinSet {
+    image_views: Vec<Arc<OwnedImageView>>,
+    descriptor_sets: Vec<Arc<OwnedDescriptorSet>>,
+    staging_buffers: Vec<Arc<StagingBuffer>>,
+    atlas_pages: Vec<Arc<AtlasPageHandle>>,
+    sync_objects: Vec<Arc<OwnedSyncObject>>,
+    scratch_resources: Vec<Arc<ScratchHandle>>,
+}
+```
+
+(Existing concrete types: `Owned*` wrappers may need adding for
+items that today are raw vk handles. The implementation plan
+sizes that churn against the existing pool ring lifetimes — see
+§ "Migration boundaries".)
+
+**Lifetime contract:** frame-close-success moves the pin set
+into a `FrameSubmittedRecord` parked alongside the frame
+ticket; on ticket-signal (CPU side, retirement sweep) the pin
+set drops and Arcs decrement, returning resources to their
+pools. Frame-close-failure drops the pin set immediately
+(CBs never executed, resources never read).
+
+**Retention math:** Phase A's worst-case retention was `16 ×
+worst-op footprint`. Phase B's worst-case is *one frame's*
+footprint — bounded by `max_pinned_resources_per_frame` and the
+per-frame paint count. For a MATE drag frame with ~55 paints
+(today's bee average), the per-frame retention is roughly
+equal to Phase A's max group at the cap, modulo the larger
+pin set vs Phase A's per-op `SubmittedOp` set. Phase B keeps
+Phase A's `active_staging_bytes` /
+`active_descriptor_pool_count` telemetry and adds a new
+`active_pinned_resources` gauge.
+
+### CB recording at close
+
+`close_into_cb` runs a deterministic three-pass walk of the
+op list:
+
+1. **Resource pass.** Iterate ops to build the consolidated
+   barrier list (read/write sets per drawable, atlas image
+   layout transitions, staging buffer barriers). No Vulkan
+   commands recorded yet; the pass produces a
+   `Vec<vk::DependencyInfo>` that interleaves with the op
+   draws.
+2. **Record pass.** Issue `vkBeginCommandBuffer`, then for each
+   op emit (a) any layout transitions logged for that
+   drawable's first-touch-in-frame, (b) the op's draw or
+   transfer commands via the existing per-op recorders
+   refactored to take a `&CbRecorder` instead of submitting,
+   and (c) any layout transitions for the *next* op that
+   require a separate barrier. Compose ops emit
+   `vkCmdBeginRenderPass2` per output target.
+3. **Finalise pass.** End the CB, build the
+   `VkSubmitInfo2` with N signal semaphores (one per compose
+   target, exported via `vkGetSemaphoreFdKHR(SYNC_FD)`), submit,
+   stash the frame ticket on a `pending_frames` queue parallel
+   to today's `submitted` queue, and (on success) commit the
+   layout overlay + atlas pending inserts.
+
+The three-pass walk is a deliberate trade-off:
+
+- Single pass would need backward-references ("this op needs the
+  prior op's layout barrier"). Easier to get wrong; harder to
+  audit.
+- Pass 1 is pure CPU-side data flow; pass 2 is pure
+  CB-recording; pass 3 is submit + bookkeeping. Each pass has
+  one job, simplifying review and unit tests.
+
+### Migration boundaries
+
+Phase B is not a single atomic switch — too much surface. The
+spec proposes a phased rollout sequenced for **bee
+unblocking first**, leaving non-bee-faulting paths on the
+SubmitGroup machinery while the FrameBuilder lands:
+
+- **Sub-phase B.1 — FrameBuilder skeleton + `composite_glyphs`.**
+  Build the FrameBuilder behind a feature gate
+  (`YSERVER_FRAME_BUILDER=on`). Port `composite_glyphs` first;
+  every other paint op stays on SubmitGroup. Composite glyphs
+  is the bee fault site; landing this alone is the bee fix.
+  Telemetry split into `frame_builder_*` vs
+  `submit_group_*` counters so the two paths report
+  independently.
+- **Sub-phase B.2 — port the top three by submit budget.**
+  `render_composite` + `render_fill` + `composite_glyphs`
+  cover 75 % of submits per the bee 2026-05-23 capture
+  (`yserver-mate.submit.tsv` § "Submit-source ranking from the
+  bee 2026-05-23 capture" in
+  `2026-05-23-frame-builder-submit-rate-design.md`). After
+  B.2 the bulk of MATE-drag work is in the frame builder.
+- **Sub-phase B.3 — port the remaining paint ops.** `cow_copy_area`
+  + `copy_area` + `put_image` + `render_traps_or_tris` +
+  `glyph_upload` (the standalone CB path, distinct from
+  glyph-uploads-inside-composite_glyphs). After B.3 every paint
+  op lives in the frame builder.
+- **Sub-phase B.4 — scene compose joins the frame.** Compose's
+  CB merges into the frame CB; the load-bearing flush in
+  `maybe_composite` becomes `frame.close_with_compose(...)`.
+- **Sub-phase B.5 — delete SubmitGroup.** With every entry
+  point on the frame builder and compose folded in, the Phase A
+  machinery (`submit_group.rs`, `pending_group_ops`, the
+  per-class `pending_cow_batch` / `pending_render_batch` paths)
+  retires. `last_render_ticket` on drawables becomes "the
+  frame ticket from the frame that last touched this drawable".
+
+Each sub-phase is its own implementation plan with its own
+codex review round; this spec covers only the *design*
+shared across them.
+
+### Error handling and rollback
+
+Phase A made `renderer_failed` fatal-on-submit-failure for
+drawable-visible state. Phase B inherits the same discipline
+but expands the rollback surface:
+
+- **Op list.** Dropped immediately on `vkBeginCommandBuffer`
+  or `vkQueueSubmit2` failure. CBs that the platform CB
+  recorder reached but failed to finalise free via the existing
+  `OpsCommandPool::free` path (the same surface Phase A used).
+- **Pin set.** Dropped on failure (the CB never executed; no
+  GPU reads outstanding).
+- **Layout overlay.** Best-effort restored to
+  `pre_frame_layout` per drawable. If restoration itself fails,
+  set `renderer_failed` and stop — subsequent entries
+  short-circuit on the existing Phase A gate.
+- **Atlas pending inserts.** Dropped (uncommitted; the cached
+  glyph pixel addresses were never read).
+- **`pending_present_completions`.** Inherits Phase A § "COW
+  PRESENT-completion-failure force-fire" — semaphore-attached
+  PRESENT completions on the failed frame fire via the existing
+  `PendingPresentBatch::Ready` path BEFORE the Err propagates,
+  so CompleteNotify clients don't hang.
+- **`pending_frames` queue.** Failed frames never park here;
+  successful-then-GPU-failed frames are out of scope (a frame
+  that submits successfully but the device losses afterwards
+  is a separate "device-lost teardown" path in `KmsBackendV2`,
+  unchanged by this spec).
+
+**Why `renderer_failed` fatal is acceptable for Phase B.** The
+expected failure mode is the bee-style RDNA2 GPUVM fault
+(`ERROR_DEVICE_LOST` on submit), at which point the device is
+hosed and the only correct response is teardown anyway. Partial
+recovery from a submitted-frame failure is not a goal of this
+spec.
+
+## Telemetry
+
+Phase B introduces a parallel telemetry counter set so the
+sub-phase rollout can compare frame-builder vs SubmitGroup
+paths side by side. All counters report at the existing
+`v2_telemetry:` per-second granularity.
+
+- `frame_builder_opens/s`, `frame_builder_closes/s` (lifetime
+  counts of paint-driven open + close-into-cb cycles).
+- `frame_builder_close_reason` (lifetime counts:
+  `MaybeComposite`, `SyncWait`, `Timeout`, `Shutdown`,
+  `PinCeiling`).
+- `frame_builder_ops_per_frame_avg/max/histogram`. Histogram
+  buckets `1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-127, 128+`.
+- `frame_builder_active_pins` (gauge — current pin set size
+  on the open frame; reported as 0 when closed).
+- `frame_builder_active_pins_high_water` (gauge — peak across
+  the run).
+- `frame_builder_aborts/s` (lifetime — failed submits).
+- `frame_builder_glyph_uploads_per_frame_avg/max` —
+  load-bearing for the bee-fault narrative; pinned to show
+  composite_glyphs collapses to ≤ 1 submit/frame.
+- Phase A counters (`submit_group_size_avg`, `_max`,
+  `_flush_reason_*`, `_aborts`) remain wired during B.1–B.4.
+  On B.5 they retire alongside the SubmitGroup struct.
+
+**Quantitative target:** `queue_submit2/s` on bee MATE drag at
+the end of B.4 in the 200–400/s band (≈ 3–7 submits/frame at
+60 Hz), down from Phase A's 900–1500/s target. Xorg+glamor
+sustains the same workload at ~60–300/s (1–5 submits/frame).
+
+## Acceptance tests
+
+Unit tests:
+
+- `frame_builder_lazy_open_does_not_allocate_when_no_paint`.
+- `frame_builder_op_append_pins_descriptor_set` — appending an
+  op records its descriptor handle in the pin set; the original
+  Arc can drop without affecting the pinned clone.
+- `frame_builder_layout_overlay_first_touch_snapshots_pre_frame`.
+- `frame_builder_layout_overlay_commit_writes_back_on_close`.
+- `frame_builder_layout_overlay_rollback_restores_pre_frame`.
+- `frame_builder_glyph_upload_records_before_draw_in_same_cb`
+  — assert the recorded op order via a `peek_ops` introspection
+  parallel to Phase A's `peek_entries`.
+- `frame_builder_atlas_insert_deferred_until_close_success` —
+  failed frame leaves `V2GlyphAtlas::lookup` returning None for
+  the would-be-inserted key.
+- `frame_builder_multi_output_one_cb_two_render_passes` —
+  dual-output close produces one CB with two render passes
+  and two signal semaphores.
+- `frame_builder_timeout_closes_frame_without_compose`.
+- `frame_builder_pin_ceiling_force_closes_and_logs_once`.
+- `frame_builder_get_image_closes_open_frame_before_wait`.
+
+Integration tests (`tests/v2_acceptance.rs`):
+
+- `v2_frame_builder_composite_glyphs_one_submit` — 32-glyph
+  composite_glyphs call produces exactly one `vkQueueSubmit2`
+  (was 2 under Phase A: upload + draw).
+- `v2_frame_builder_render_composite_collapses_to_one_per_frame`
+  — three back-to-back `render_composite` calls across a tick
+  produce exactly one `vkQueueSubmit2`.
+- `v2_frame_builder_renderer_failed_on_submit_failure` —
+  injected submit failure marks `renderer_failed` and rolls the
+  layout overlay back to `pre_frame`.
+- `v2_frame_builder_mixed_sequence_smoke` — realistic ordering
+  (paint → glyph_upload-in-composite → paint → compose) produces
+  exactly one `vkQueueSubmit2`.
+
+Hardware gates (run by the user, not the agent):
+
+- **bee MATE-load survival** — boot MATE with `cap` removed
+  (env knob retired), drag for 30 s, expect zero
+  `ERROR_DEVICE_LOST` and zero GPUVM faults. This is the bee
+  closure gate, replacing Phase A's "deferred to Phase B" note.
+- **yoga / iMac / fuji regression check** — same MATE drag,
+  expect `queue_submit2/s` ≤ Phase A's measured peak (no regressions).
+  Phase B doesn't have to *improve* any specific platform; it
+  has to (a) fix bee, (b) not regress the other three.
+- **silence dual-output regression check** — dual 2560×1440
+  MATE drag at silence (i9 13900k / rx580 / RADV), expect both
+  outputs compose correctly under the one-CB-N-render-passes
+  topology. Catches multi-output rendering bugs before they
+  hit users.
+
+## Open questions for the implementation plan
+
+These are deliberately punted from the design to the plan,
+because the implementation will surface answers from the code
+that the design can't predict:
+
+1. **Op variant sizing.** `RecordedOp` enum size is bounded by
+   its largest variant. The plan profiles `mem::size_of::
+   <RecordedOp>()` after the first variant lands and decides
+   between `Box`-ing large variants vs accepting padding waste.
+2. **Owned-handle wrapper churn.** `OwnedImageView`,
+   `OwnedDescriptorSet`, `OwnedSyncObject`, `OwnedScratch`,
+   `OwnedStaging`, `OwnedAtlasPage` — which already exist as
+   strong types, and which need wrapping. Plan inventories
+   existing `Arc<...>` sites in `engine.rs` and chooses minimal
+   refactor scope.
+3. **Frame-builder feature gate retirement timing.** Plan decides
+   whether to flip the default mid-rollout (start at
+   B.2 close?) or only at B.5 close. The feature gate exists
+   so the rollout can ship behind it; the question is
+   when to remove the gate, not whether to have one.
+4. **Compose's existing dst_readback / mask_scratch paths.**
+   These are not paint primitives in the X11 sense but they
+   record CBs today. The plan decides whether they fold into
+   the frame CB at B.4 or stay separate (the latter would
+   reintroduce the multi-CB shape and is therefore unlikely
+   to be acceptable).
+5. **CompletionSemaphore export ordering.** Today's per-output
+   `vkGetSemaphoreFdKHR(SYNC_FD)` happens before `vkQueueSubmit2`
+   (with the `IMPORT_PAYLOAD` flag dance). The plan validates
+   that the same dance works with N signal semaphores in one
+   submit; spec assumes yes but the plan needs to assert via a
+   pass-through round.
+6. **Telemetry overlap window.** B.1–B.4 has two paint paths
+   reporting submit-rate counters simultaneously. The plan
+   defines a clear sum (`paint_submits = submit_group_paint_
+   submits + frame_builder_paint_submits`) so dashboards
+   show consistent totals during the rollout.
+
+## Out of scope (intentional)
+
+- **Per-CB timeline-semaphore retirement** (Phase A's Model
+  A2). Frame ticket = one fence per frame; timeline
+  semaphores would be an optimisation for sub-frame retirement
+  that buys nothing structural.
+- **Direct scanout for fullscreen GL clients (wlroots-style).**
+  Out of scope per the Phase A spec's same exclusion; revisit
+  after Phase B if there's appetite.
+- **Plane composition (cursor + scene on different planes).**
+  Same reasoning; the hw-cursor work already covers the cursor
+  plane case; future plane work is a separate spec.
+- **Refactoring v1.** Same as Phase A; v1 stays in tree until
+  its deletion gates pass.
+- **Multi-queue async transfer.** Stage 5 § Task 6 deferred
+  decision. The frame CB is a graphics-queue submit; if
+  profiling justifies an async-transfer split later, it's a
+  follow-up spec.
+- **bee RDNA2 RADV bug characterisation.** Phase B fixes bee
+  *structurally* (removes the multi-CB-per-submit shape);
+  filing the actual RADV/firmware bug is a separate task
+  (and out of yserver's repo).
+
+## References
+
+- Phase A spec:
+  `docs/superpowers/specs/2026-05-23-frame-builder-submit-rate-design.md`
+- Phase A plan:
+  `docs/superpowers/plans/2026-05-23-frame-builder-submit-rate-phase-a.md`
+- Phase A close-out (status doc):
+  `docs/status.md` § "Phase A — CLOSED 2026-05-24".
+- bee 2026-05-23 freeze capture:
+  `docs/status.md` § "2026-05-23 bee MATE-load freeze (KNOWN,
+  deferred to Phase B)".
+- Multi-platform Phase A captures (yoga / iMac / fuji / nvidia):
+  `docs/status.md` § Phase A capture entries dated 2026-05-23.
+- Submit-source ranking baseline:
+  `2026-05-23-frame-builder-submit-rate-design.md` § "Submit-
+  source ranking from the bee 2026-05-23 capture".
+- v2 layout-tracker single source of truth:
+  `crates/yserver/src/kms/v2/store.rs:506`
+  (`Drawable::record_layout_transition`).
+- v2 glyph atlas pack / insert split:
+  `crates/yserver/src/kms/v2/glyph_atlas.rs:283-294`.
+- v2 compose entry:
+  `crates/yserver/src/kms/v2/backend.rs:4574` (`maybe_composite`).
+- v2 scene build entry:
+  `crates/yserver/src/kms/v2/scene.rs:1517` (`build_scene`).
+- Task 6.1 Arc-pinning precedent:
+  `docs/superpowers/specs/2026-05-23-deferred-present-completion-design.md`.
