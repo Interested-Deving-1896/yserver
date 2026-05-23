@@ -5442,7 +5442,7 @@ fn build_path_selector_inputs<'a>(
     }
 }
 
-pub(crate) fn fire_present_completion_events(
+pub fn fire_present_completion_events(
     state: &mut ServerState,
     event: &crate::backend::CompletedPresentEvent,
 ) {

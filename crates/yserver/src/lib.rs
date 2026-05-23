@@ -296,6 +296,14 @@ pub fn run() -> io::Result<()> {
     if let Err(e) = backend.disable_output() {
         log::warn!("yserver: disable_output failed: {e}");
     }
+    // Stage 5 Task 6.1: fan out any PRESENT completions deferred past
+    // shutdown drain — events must reach clients before we tear down
+    // the socket.
+    for entry in backend.take_shutdown_present_events() {
+        yserver_core::core_loop::process_request::fire_present_completion_events(
+            &mut state, &entry,
+        );
+    }
 
     let _ = fs::remove_file(&socket_path);
     log::info!("yserver: master released, exiting");

@@ -144,4 +144,16 @@ impl KmsBackendKind {
             Self::V2(b) => b.disable_output(),
         }
     }
+
+    /// Stage 5 Task 6.1: pick up any PRESENT completions that were
+    /// queued past shutdown. Delegates per backend variant; v1
+    /// returns an empty Vec (no deferred-completion mechanism).
+    pub fn take_shutdown_present_events(
+        &mut self,
+    ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
+        match self {
+            Self::V1(_) => Vec::new(),
+            Self::V2(b) => b.take_shutdown_present_events(),
+        }
+    }
 }

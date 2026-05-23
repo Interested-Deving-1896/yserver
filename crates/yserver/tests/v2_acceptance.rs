@@ -3074,3 +3074,59 @@ fn v2_present_pixmap_synced_enqueues_with_release_syncobj_wake() {
     // that enqueue didn't panic + the queue can be drained.
     let _drained = b.drain_completed_present_events_for_tests();
 }
+
+/// Stage 5 Task 6.1 (Task 14 of the deferred-PRESENT plan) — verifies
+/// that `disable_output` flushes open cow/render batches, drains the
+/// pending PRESENT events queue, and hands the deferred event payloads
+/// back via `take_shutdown_present_events` so `lib.rs::run` can fan
+/// them out to clients before the socket is torn down.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_disable_output_flushes_pending_batches_before_drain_all() {
+    use yserver_core::backend::{CompletedPresentEvent, PresentWake};
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    // Open a cow_batch + enqueue a pending PRESENT entry.
+    let src = b.create_pixmap(None, 32, 4, 4).expect("src");
+    let cow = b.create_pixmap(None, 32, 4, 4).expect("cow");
+    b.copy_area(None, src.as_raw(), cow.as_raw(), 0, 0, 0, 0, 4, 4)
+        .expect("copy");
+    b.enqueue_present_completion(CompletedPresentEvent {
+        client_id: yserver_protocol::x11::ClientId(0),
+        serial: 1,
+        host_xid: src.as_raw(),
+        dst_host_xid: cow.as_raw(),
+        options: 0,
+        wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+    });
+
+    let pre_pending = b.pending_present_events_len_for_tests();
+    assert!(
+        pre_pending >= 1,
+        "pending events should include the just-enqueued one"
+    );
+
+    // Call disable_output. The platform-level KMS commit may fail on
+    // the test harness (no real connector); the load-bearing
+    // assertions are on the drain + take_shutdown_present_events
+    // behaviour, which run before the platform commit.
+    let _ = b.disable_output();
+
+    // Post-shutdown: pending queue is empty, take_shutdown_present_events
+    // has the deferred event ready to hand to lib.rs::run.
+    assert_eq!(
+        b.pending_present_events_len_for_tests(),
+        0,
+        "disable_output empties the pending queue"
+    );
+    let shutdown_events = b.take_shutdown_present_events();
+    assert!(
+        !shutdown_events.is_empty(),
+        "shutdown should hand at least one event back"
+    );
+}

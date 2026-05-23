@@ -237,6 +237,14 @@ pub struct KmsBackendV2 {
     pub(crate) pending_present_events:
         std::collections::VecDeque<crate::kms::v2::present_completion::PendingPresentEntry>,
 
+    /// Stage 5 Task 6.1: shutdown-time accumulator for PRESENT
+    /// completions that need to be drained past `disable_output`
+    /// and handed to `lib.rs::run` for client fan-out before the
+    /// socket is torn down. Populated only by `disable_output`;
+    /// drained by `take_shutdown_present_events`.
+    pub(crate) pending_completed_events_on_shutdown:
+        Vec<yserver_core::backend::CompletedPresentEvent>,
+
     /// Stage 5 Phase A — canonical cursor xid → immutable record map.
     /// Inserted by `create_cursor` / `create_glyph_cursor` /
     /// `render_create_cursor`; read by `define_cursor` /
@@ -477,6 +485,7 @@ impl KmsBackendV2 {
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             pending_present_events: std::collections::VecDeque::new(),
+            pending_completed_events_on_shutdown: Vec::new(),
             cursor_records: HashMap::new(),
             cursor_pixmaps: HashMap::new(),
             next_cursor_version: 1,
@@ -1000,6 +1009,7 @@ impl KmsBackendV2 {
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             pending_present_events: std::collections::VecDeque::new(),
+            pending_completed_events_on_shutdown: Vec::new(),
             cursor_records: HashMap::new(),
             cursor_pixmaps: HashMap::new(),
             next_cursor_version: 1,
@@ -1634,6 +1644,15 @@ impl KmsBackendV2 {
         self.platform.renderer_failed = v;
     }
 
+    /// Stage 5 Task 6.1: pick up any PRESENT completions that were
+    /// queued past `disable_output` so the caller (lib.rs::run) can
+    /// fan them out to clients before tearing down the socket.
+    pub fn take_shutdown_present_events(
+        &mut self,
+    ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
+        std::mem::take(&mut self.pending_completed_events_on_shutdown)
+    }
+
     /// Stage 5 Task 6.1 — algorithm body for `Backend::
     /// drain_completed_present_events`. Walks the front of
     /// `pending_present_events`, popping entries whose `fence_fd` is
@@ -1784,6 +1803,23 @@ impl KmsBackendV2 {
     /// Propagates the first per-output `drm::modeset::disable_output`
     /// failure; subsequent outputs still attempted.
     pub fn disable_output(&mut self) -> io::Result<()> {
+        // Stage 5 Task 6.1: explicitly flush open cow/render batches
+        // before drain_all walks the submitted queue. drain_all only
+        // waits on already-submitted CBs; an open pending batch
+        // wouldn't be there yet.
+        if let Err(e) = self
+            .engine
+            .flush_cow_batch(&mut self.store, &mut self.platform)
+        {
+            log::warn!("v2 disable_output: flush_cow_batch failed: {e:?}");
+        }
+        if let Err(e) = self
+            .engine
+            .flush_render_batch(&mut self.store, &mut self.platform)
+        {
+            log::warn!("v2 disable_output: flush_render_batch failed: {e:?}");
+        }
+
         // Drain in-flight paint + compose submits before the
         // platform's `device_wait_idle` + pool destruction so
         // each subsystem's book-keeping reclaims its handles
@@ -1791,6 +1827,29 @@ impl KmsBackendV2 {
         self.engine.drain_all(&self.platform);
         self.sync_descriptor_pool_telemetry();
         self.scene.drain_all(&mut self.platform);
+
+        // Stage 5 Task 6.1: drain the pending PRESENT events queue
+        // unconditionally. After drain_all every cow_batch ticket is
+        // signaled or the renderer failed; first pop the ready
+        // entries via drain_completed_present_events_impl (which
+        // closes per-entry FDs + fires Arc wake signals), then
+        // force-fire any remaining unsignaled entries by closing
+        // their FDs and accumulating the event payloads. All
+        // accumulated events go to `pending_completed_events_on_shutdown`
+        // for the caller (lib.rs::run) to fan out to clients before
+        // the socket is torn down.
+        let completed = self.drain_completed_present_events_impl();
+        self.pending_completed_events_on_shutdown.extend(completed);
+        use std::os::fd::AsFd;
+        while let Some(entry) = self.pending_present_events.pop_front() {
+            if let Some(fd) = entry.fence_fd.as_ref()
+                && let Err(e) = self.platform.present_completion_epfd.delete(fd.as_fd())
+            {
+                log::warn!("v2 disable_output: epoll_ctl DEL: {e}");
+            }
+            self.pending_completed_events_on_shutdown.push(entry.event);
+        }
+
         // Flush the submit trace after the drains record their
         // final events, before platform teardown — a VkDevice
         // destroy can hang on some drivers (msm/Renoir) and
