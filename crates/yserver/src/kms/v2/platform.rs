@@ -84,11 +84,12 @@ use crate::{
 /// Backend; Backend: Send). The single-threaded core invariant
 /// means there's no real cross-thread access; the `Arc` is
 /// paying a trivial atomic for type-system uniformity.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct FenceTicket {
     inner: Arc<FenceTicketInner>,
 }
 
+#[derive(Debug)]
 struct FenceTicketInner {
     fence: vk::Fence,
     /// Set on the first `poll_signaled` that observes

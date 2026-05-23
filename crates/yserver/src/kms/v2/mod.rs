@@ -17,6 +17,7 @@ pub(crate) mod platform;
 pub(crate) mod present_completion;
 pub(crate) mod scene;
 pub(crate) mod store;
+pub(crate) mod submit_group;
 pub(crate) mod submit_trace;
 pub(crate) mod telemetry;
 
