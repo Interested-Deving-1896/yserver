@@ -2352,6 +2352,17 @@ impl RenderEngine {
         inner.cow_flush_records.push(coalesced_count);
         // `inner` borrow released after this block. Free to call self.* below.
 
+        // TODO(T3-carryover): no regression test covers the
+        // `has_completion_signal == true` branch below. The intended test
+        // (`flush_cow_batch_with_present_completion_flushes_before_export`)
+        // needs `install_synthetic_cow_for_tests` +
+        // `attach_synthetic_present_completion_to_cow_for_tests` helpers
+        // which don't exist yet. Without coverage, the
+        // VUID-VkFenceGetFdInfoKHR-handleType-01457 hazard
+        // (semaphore signal-op must be queued before
+        // vkGetSemaphoreFdKHR) is verified end-to-end on bee MATE
+        // captures only. Add the synthetic helpers + the test before
+        // Phase B's frame builder lands.
         let has_completion_signal = !present_completions.is_empty();
         if has_completion_signal {
             // Phase A Step 8: semaphore-bearing COW batch must flush
@@ -10029,23 +10040,30 @@ mod tests {
     // ── Task 3 Phase A regression tests ─────────────────────────
 
     /// With max_size=1 (default), every paint op auto-flushes
-    /// immediately. Two ops → two vkQueueSubmit2 calls.
-    /// No shared fence reuse across ops (VUID-vkQueueSubmit2-fence-04894
-    /// safety).
+    /// immediately. No shared fence reuse across ops
+    /// (VUID-vkQueueSubmit2-fence-04894 safety).
     #[test]
     #[ignore = "lavapipe vk"]
     fn begin_op_cb_with_max_size_one_does_not_reuse_fence() {
-        let Some(mut p) = try_for_tests_with_vk() else {
-            return;
+        let mut p = match try_for_tests_with_vk() {
+            Some(p) => p,
+            None => return,
         };
-        assert_eq!(p.submit_group_max_size_for_tests(), 1);
+        assert_eq!(p.submit_group_max_size_for_tests(), 1, "T3 baseline cap");
         let mut store = DrawableStore::new();
         let mut engine = RenderEngine::new(&p).expect("engine");
 
-        let initial = p.queue_submit2_count_for_tests();
         let id = engine
             .create_pixmap(&mut store, &mut p, 0xfaff_0001, 16, 16, 32)
             .expect("create");
+        // create_pixmap itself does not submit GPU work; group stays
+        // empty (no CB appended yet).
+        assert!(
+            !p.submit_group_is_open(),
+            "group closed after create_pixmap auto-flush"
+        );
+        assert_eq!(p.submit_group_size(), 0, "no CBs pending");
+
         engine
             .fill_rect(
                 &mut store,
@@ -10061,13 +10079,18 @@ mod tests {
                 [1.0, 0.0, 0.0, 1.0],
             )
             .expect("fill");
-        let after = p.queue_submit2_count_for_tests();
-        assert_eq!(after - initial, 1, "max_size=1: one fill → one submit");
-        assert!(!p.submit_group_is_open(), "group closed after auto-flush");
+        // cap=1: fill_rect auto-flushed immediately.
+        assert!(
+            !p.submit_group_is_open(),
+            "group closed after fill_rect auto-flush"
+        );
+        assert_eq!(p.submit_group_size(), 0, "no CBs pending");
+        // Parked queue also empty: the SubmittedOp graduated to
+        // `submitted` via the engine's flush_submit_group wrapper.
         assert_eq!(
             engine.pending_group_ops_count_for_tests(),
             0,
-            "pending_group_ops drained after auto-flush"
+            "max_size=1 drains parked ops every op",
         );
         engine.drain_all(&mut p);
     }
