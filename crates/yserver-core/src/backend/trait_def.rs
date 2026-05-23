@@ -126,6 +126,41 @@ impl PresentCaps {
     }
 }
 
+/// Stage 5 Task 6.1: payload of a deferred PRESENT completion
+/// returned by [`Backend::drain_completed_present_events`]. Carries
+/// everything the main loop needs to fan out `IdleNotify` +
+/// `CompleteNotify { mode: Copy }` events plus trigger the X11
+/// resource-id-keyed wake objects (xshmfence / DRM syncobj). The
+/// backend has already signalled the underlying primitive via the
+/// `Arc`-pinned handle before returning this struct.
+#[derive(Debug, Clone)]
+pub struct CompletedPresentEvent {
+    pub client_id: yserver_protocol::x11::ClientId,
+    pub serial: u32,
+    pub host_xid: u32,
+    pub dst_host_xid: u32,
+    pub options: u32,
+    pub wake: PresentWake,
+}
+
+/// Per-PRESENT-path wake target. Surfaces the original
+/// PRESENT::Pixmap (xshmfence-driven) vs PRESENT::PixmapSynced
+/// (DRM syncobj timeline) distinction back to the loop. The xids
+/// in each variant are for X11-protocol bookkeeping
+/// (`state.sync_fences[xid].triggered = true`) only — the actual
+/// signal call against the underlying primitive happens inside the
+/// backend at drain time.
+#[derive(Debug, Clone, Copy)]
+pub enum PresentWake {
+    Pixmap {
+        idle_fence_xid: u32,
+    },
+    PixmapSynced {
+        release_syncobj: u32,
+        release_value: u64,
+    },
+}
+
 #[cfg(test)]
 mod present_caps_tests {
     use super::PresentCaps;
@@ -1384,6 +1419,26 @@ pub trait Backend: Send {
         PresentCaps::default()
     }
 
+    /// Stage 5 Task 6.1: enqueue a deferred PRESENT completion. The
+    /// backend captures the cow_batch fence ticket + an Arc-pinned
+    /// clone of the wake primitive, and returns immediately. The
+    /// drain hook later fires the wake signal + the event payload.
+    /// Default impl is no-op so non-v2 backends opt out.
+    fn enqueue_present_completion(&mut self, _event: CompletedPresentEvent) {
+        // no-op
+    }
+
+    /// Stage 5 Task 6.1: drain entries whose cow_batch fence has
+    /// signalled. The backend internally fires the xshmfence /
+    /// syncobj signal via the Arc-pinned handle before returning
+    /// the events. Caller is responsible for X11 event fan-out +
+    /// `state.sync_fences` bookkeeping based on the returned
+    /// `PresentWake` variant. Default impl returns empty so non-v2
+    /// backends opt out.
+    fn drain_completed_present_events(&mut self) -> Vec<CompletedPresentEvent> {
+        Vec::new()
+    }
+
     // ──────────────────────────────────────────────────────────────
     // Other extensions
     // ──────────────────────────────────────────────────────────────
@@ -1489,3 +1544,33 @@ const _: fn() = || {
     assert_send_sync::<std::sync::Arc<std::sync::Mutex<dyn Backend>>>();
     let _ = assert_obj_safe;
 };
+
+#[cfg(test)]
+mod present_completion_trait_tests {
+    use super::*;
+
+    // Use the existing RecordingBackend to verify default trait impls
+    // compile + behave as expected.
+
+    #[test]
+    fn default_drain_completed_present_events_returns_empty() {
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        let events = backend.drain_completed_present_events();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn default_enqueue_present_completion_is_noop() {
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        backend.enqueue_present_completion(CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(0),
+            serial: 1,
+            host_xid: 0,
+            dst_host_xid: 0,
+            options: 0,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+        });
+        // No drain triggered; default impl swallows.
+        assert!(backend.drain_completed_present_events().is_empty());
+    }
+}
