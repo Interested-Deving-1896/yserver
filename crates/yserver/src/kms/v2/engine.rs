@@ -10553,4 +10553,73 @@ mod tests {
 
         engine.drain_all(&mut p);
     }
+
+    // ── Task 7 Phase A regression tests ─────────────────────────
+
+    /// Phase A T7: pageflip retire flushes the SubmitGroup.  A paint
+    /// CB buffered at cap=16 (no auto-flush) must be drained when the
+    /// simulate_page_flip_complete_for_tests wrapper fires — the same
+    /// `flush_submit_group(PageflipRetire)` call that
+    /// `on_page_flip_ready` issues at the frame boundary.
+    #[test]
+    #[ignore = "lavapipe vk"]
+    fn submit_group_flushes_on_pageflip_retire() {
+        let mut b = match super::super::backend::KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        // Cap=16 production default. Park a paint CB by issuing fill_rect
+        // without an intervening flush.
+        let dst = b
+            .engine
+            .create_pixmap(&mut b.store, &mut b.platform, 0xb00b, 4, 4, 32)
+            .unwrap();
+        // Drain setup CBs so the group starts empty.
+        b.engine_flush_submit_group_for_tests().unwrap();
+        assert!(
+            !b.platform_submit_group_is_open_for_tests(),
+            "setup drained"
+        );
+
+        b.engine
+            .fill_rect(
+                &mut b.store,
+                &mut b.platform,
+                dst,
+                ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D::default(),
+                    extent: ash::vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                [0.0, 0.0, 0.0, 1.0],
+            )
+            .unwrap();
+        assert!(
+            b.platform_submit_group_is_open_for_tests(),
+            "paint buffered"
+        );
+        assert_eq!(b.platform_submit_group_size_for_tests(), 1);
+
+        // Simulate the pageflip-complete hook firing.
+        b.simulate_page_flip_complete_for_tests()
+            .expect("simulate_page_flip_complete_for_tests");
+
+        assert!(
+            !b.platform_submit_group_is_open_for_tests(),
+            "pageflip retire flushed group"
+        );
+        assert_eq!(b.platform_submit_group_size_for_tests(), 0);
+        assert_eq!(
+            b.engine_pending_group_ops_count_for_tests(),
+            0,
+            "parked op graduated"
+        );
+
+        b.engine.drain_all(&mut b.platform);
+    }
 }

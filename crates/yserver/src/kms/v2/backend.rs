@@ -1680,6 +1680,21 @@ impl KmsBackendV2 {
         self.platform.submit_group_is_open()
     }
 
+    /// Phase A T7: simulate the pageflip-retire frame-boundary flush
+    /// without going through `on_page_flip_ready` (which calls
+    /// `drain_page_flip_events` and would error on the test fixture's
+    /// `/dev/null` DRM device). Invokes exactly the same
+    /// `flush_submit_group(PageflipRetire)` call that the real handler
+    /// issues so tests can assert the frame-boundary flush invariant.
+    pub fn simulate_page_flip_complete_for_tests(&mut self) -> Result<(), ash::vk::Result> {
+        self.engine
+            .flush_submit_group(
+                &mut self.platform,
+                crate::kms::v2::submit_group::FlushReason::PageflipRetire,
+            )
+            .map(|_| ())
+    }
+
     /// Stage 5 Task 6.1: pick up any PRESENT completions that were
     /// queued past `disable_output` so the caller (lib.rs::run) can
     /// fan them out to clients before tearing down the socket.
@@ -4399,6 +4414,18 @@ impl Backend for KmsBackendV2 {
         self.engine.poll_retired(&self.platform);
         self.store.poll_pending_retire(&mut self.platform);
         self.sync_descriptor_pool_telemetry();
+        // Phase A T7: pageflip retire is a frame boundary — flush
+        // the SubmitGroup so an idle next tick (no
+        // scene_structure_dirty) does not leave paint CBs buffered
+        // until the next compose. Drive through the engine wrapper
+        // so parked pending_group_ops commit to `submitted`
+        // atomically.
+        if let Err(e) = self.engine.flush_submit_group(
+            &mut self.platform,
+            crate::kms::v2::submit_group::FlushReason::PageflipRetire,
+        ) {
+            log::warn!("v2 on_page_flip_ready: flush_submit_group failed: {e:?}");
+        }
     }
 
     fn mark_dirty(&mut self) {
