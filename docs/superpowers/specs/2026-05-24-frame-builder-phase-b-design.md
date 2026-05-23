@@ -466,6 +466,53 @@ signal-entries on the single CB's submit, calls
 attaches each SYNC_FD to its output's pageflip. The fence
 ticket signals once all N rendering instances complete.
 
+**Per-output partial-failure handling.** A multi-output close
+can still fail per-output at `submit_flip_with_fences` even
+when the shared GPU submit succeeded, exactly as today
+(`scene.rs:1347-1404`). Each output's pageflip is an
+independent kernel atomic-commit:
+
+- **Shared submit succeeded, output `i` flip succeeded.**
+  Standard path. Output `i`'s `pending_ack` parks under the
+  shared frame ticket; on pageflip-event the ack retires and
+  releases output `i`'s pool slot.
+- **Shared submit succeeded, output `i` flip failed
+  (IO error path).** Mirrors today's "9b" branch:
+  `platform.invalidate_bo(output_idx_i, token_i.bo_idx)`,
+  record `missed_pageflip`, push
+  `FailedSubmitBo { bo_idx: token_i.bo_idx, pool_slot:
+  slot_i, ticket: frame_ticket.clone() }` onto output `i`'s
+  `state.failed_submit_bos`, set
+  `next_submit_retry_at`, fold the output's repaint forward
+  via `pending_repaint_after_failed_submit`. Successful
+  outputs in the same close are unaffected — they proceed
+  through their normal pending_ack path. **The shared frame
+  ticket is the gate for all parked resources** (failed and
+  successful outputs share it); per-output bookkeeping is
+  what's independent. The plan must walk every output's
+  failure-handling state on close and dispatch per-output.
+- **Shared submit failed (any output 9a branch equivalent).**
+  No output's BO was actually written. All outputs' pool
+  slots release via `pool_ring.release(slot)`; all outputs'
+  scanout BOs go through `platform.recycle_failed_submit_bo`.
+  Frame-builder `renderer_failed` discipline fires (the failed
+  shared submit IS the frame-close failure path).
+
+**Why one shared frame ticket for all outputs is safe under
+partial failure.** Today each output had its own compose
+fence; partial failure parked only the failed output's BO
+against its own fence. Under Phase B, all outputs share the
+same fence (the frame ticket), so successful outputs'
+pending_ack and failed outputs' `FailedSubmitBo` both hold
+clones of the same ticket. Resource retirement
+(scanout BO recycle, pool slot release) on the failed
+outputs simply waits for the same shared fence as the
+successful outputs — slightly more pessimistic than today
+(failed-output BO can't recycle until ALL outputs' work
+retires), but correct. **No new failure mode is
+introduced;** partial failure is just routed through one
+shared ticket instead of per-output tickets.
+
 ### Frame close triggers
 
 Spec § Phase B open question 5. The open frame must close at
@@ -573,36 +620,90 @@ pub(crate) struct FramePinSet {
 
 **Mechanism 2 — Generation-watermark resources.** Things
 already tracked by a monotonic generation counter:
-descriptor sets via `DescriptorPoolRing` (`engine.rs:553` /
-`engine.rs:686`); scratch images / `DstReadback` /
-`src_alias_readback` / solid color scratch / `mask_scratch`
-via their per-engine high-water counters. These pin via a
+**descriptor sets only**, via `DescriptorPoolRing`
+(`engine.rs:553` / `engine.rs:686`). These pin via a
 *watermark snapshot*, not an Arc clone:
 
 ```rust
 pub(crate) struct FrameWatermarks {
     descriptor_pool_gen: u64,
-    // Other generation counters added as their owners exist.
 }
 ```
 
-The frame builder, at every op append that touches a
-generation-tracked resource, calls
-`acquire_for_frame(&mut frame.watermarks)` on the ring/pool;
-the ring captures `acquire_generation` as a high-water value
-on the frame. Retirement (frame ticket signal) is the gate at
-which `DescriptorPoolRing::release_up_to` can recycle pools
-whose generation is ≤ the watermark. This mirrors Phase A's
+The frame builder, at every op append that acquires a
+descriptor set, calls `acquire_for_frame(&mut frame
+.watermarks)` on the ring; the ring captures
+`acquire_generation` as a high-water value on the frame.
+Retirement (frame ticket signal) is the gate at which
+`DescriptorPoolRing::release_up_to` can recycle pools whose
+generation is ≤ the watermark. This mirrors Phase A's
 `descriptor_ring_does_not_reset_in_use_group` invariant — but
 the unit shifts from "the SubmitGroup's shared ticket" to
 "the frame's ticket".
 
-**Equivalence with Phase A.** Phase A held the same two
-mechanisms implicitly: `SubmittedOp` Arc'd its staging /
-scratch / atlas_ticket refs; `DescriptorPoolRing` already
-gated recycle on `acquire_generation` watermark. Phase B keeps
-both mechanisms; what changes is the lifetime *unit* (frame
-vs op/batch) and the explicit naming.
+**Mechanism 3 — Singleton scratch resources via Arc-wrap.**
+`DstReadback` (`engine.rs:509`), `src_alias_readback`
+(`engine.rs:520`), `mask_scratch` (`engine.rs:536`),
+`white_mask_image` (`engine.rs:505`), `solid_color_scratch`,
+and the trap-pipeline coverage scratch are *singleton
+mutable handles* on `EngineInner`, not generation-tracked
+pools. A `u64` watermark cannot pin them: growth replaces the
+handle entirely (`dst_readback.rs:107-145` returns the old
+image/view as a `BatchResource`; v2 currently drops it on
+the floor — known retired-resource leak called out at
+`engine.rs:529-535`). Phase B's structural fix is to wrap each
+scratch as `Arc<dyn ScratchHandle>` on `EngineInner`:
+
+```rust
+pub(crate) struct EngineInner {
+    dst_readback: Arc<DstReadback>,
+    src_alias_readback: Arc<DstReadback>,
+    mask_scratch: Arc<MaskScratch>,
+    white_mask_image: Arc<SolidColorImage>,
+    // …
+}
+```
+
+(`#[allow(clippy::type_complexity)]` where the Arcs sit
+behind generic ScratchHandle traits; the plan picks the exact
+trait shape.)
+
+At op-append, the frame's pin set clones the appropriate
+Arc into a typed `scratch_resources: Vec<Arc<dyn
+ScratchHandle>>` (or per-kind sub-vectors for clarity).
+**Growth** (e.g. `DstReadback::ensure_image_size_returning_
+old`) swaps the engine's singleton Arc to a new instance and
+drops the engine's strong ref to the old one; the open
+frame's pinned clone keeps the old Arc alive until the frame
+ticket signals; on signal, the old Arc drops and its
+`Drop` impl returns memory to the platform. This collapses
+the existing retired-resource leak as a side effect of the
+fix. **Layout state for scratch images** is then tracked
+either inside `Arc<DstReadback>` itself (each instance owns
+its layout state across the open frame) or via the
+FrameLayoutTable using a synthetic `DrawableId` per
+scratch instance — the plan picks the cheaper option, but
+the spec mandates that scratch layout state is per-Arc-
+instance, not per-singleton-slot, so growth doesn't strand
+the prior instance's layout state.
+
+**Why mechanism 3 instead of "promote scratch into a pool".**
+Pool-shape works for descriptor sets because acquire/release
+is per-call; scratch is per-engine-singleton with growth as
+the only mutation. Pool refactoring is out of scope for this
+spec; Arc-wrap + retire-on-fence is the minimal change.
+
+**Equivalence with Phase A.** Phase A held mechanisms 1 + 2
+implicitly: `SubmittedOp` Arc'd its staging / atlas_ticket
+refs (mechanism 1); `DescriptorPoolRing` already gated
+recycle on `acquire_generation` watermark (mechanism 2).
+Mechanism 3 (Arc-wrapping the singleton scratch handles) is
+new to Phase B — Phase A masked the underlying retired-
+resource leak because per-op submits retired scratch
+references via the per-op `SubmittedOp` Arc structure, but
+that path doesn't survive the deferred-frame window where a
+growth event can strand the prior singleton. Phase B keeps
+mechanisms 1 + 2 as they are; mechanism 3 is the new piece.
 
 **Lifetime contract:** frame-close-success moves the pin set
 + watermarks into a `FrameSubmittedRecord` parked alongside
