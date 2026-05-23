@@ -188,6 +188,25 @@ vulkan-check-venus:
         --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true" \
         -- bash -c 'vulkaninfo --summary 2>&1 | head -80'
 
+# Stage 5 Task 6.1 regression gate: brings up yserver headless in
+# vng with Venus passthrough + zink, runs glxgears for 30 s, and
+# captures the deferred-PRESENT-completion telemetry. Compares
+# against the master baseline: branch should show
+# `cpu_fence_wait_ns/s = 0`; master shows 78–93 ms/s in synchronous
+# fence waits.
+#
+# Catches the kind of bug `147ee98` fixed (client-vs-host xid
+# mismatch in the fan-out path) that wouldn't surface until a GL
+# client first hit PRESENT on real hardware.
+#
+# Run: `just yserver-defpresent-vng-smoke`
+# Artifacts: yserver-vng.log, glxgears-vng.log, yserver-vng.submit.tsv.
+yserver-defpresent-vng-smoke:
+    cargo build --release --bin yserver
+    vng -r {{KERNEL}} --disable-microvm --rw \
+        --qemu-opts="-display egl-headless,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1280,yres=720 -device virtio-tablet-pci -device virtio-keyboard-pci" \
+        -- bash tools/vng-defpresent-smoke.sh
+
 # Bring up yserver + fvwm3 + xterm in one QEMU window. The WM starts
 # before xterm so the terminal gets framed. Logs to yserver.log on the
 # host side via the shared cwd. Override resolution with `mode=WxH`.

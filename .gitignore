@@ -5,6 +5,10 @@ target/
 *.log
 !docs/assets/*.log
 *.strace
+# Stage 5 Task 6.1 vng smoke captures (large, regenerable via
+# `just yserver-defpresent-vng-smoke`).
+yserver-vng*.submit.tsv
+*.submit.tsv
 
 # Worktrees
 .worktrees/
