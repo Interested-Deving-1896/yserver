@@ -2531,6 +2531,61 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
     `render_composite=20171`, `render_fill=17973`, `composite_glyphs=8993`).
     Task 6.1 lands as-is.
 
+    **nvidia hardware capture 2026-05-23** (NVIDIA proprietary
+    driver, single output DP-2 @ 2560x1440, MATE session ~39 s).
+    **Captured pre-Phase-A** (Stage 5 baseline; no `submit_group_*`
+    counters in this run). First yserver-v2 run on NVIDIA proprietary;
+    bootstraps clean (`driver_id=NVIDIA_PROPRIETARY`, scanout
+    modifier=0x0 linear fallback — proprietary userspace doesn't
+    expose modifier-friendly tilings, same shape as the rx580 RADV
+    fallback noted in the silence 2026-05-22 capture). HW cursor
+    plane up (64x64 ARGB8888), first pageflip immediate, no v2 gaps
+    logged, no `not yet implemented` warns. 38 telemetry buckets:
+      - `paint_submits/s` avg 1,641 peak 3,156;
+        `queue_submit2/s` avg 1,702 peak 3,216. Same submit-rate
+        ceiling as bee's 2026-05-23 post-Task-6.1 capture (peak
+        3,304) on a similar single-output mate-session workload —
+        confirms the bee finding that the ceiling is universal
+        once coalescing is on, not RADV-specific.
+      - `composite_submits/s` avg 55 peak 61, `frame_present_count/s`
+        tracks 1:1; `missed_pageflips/s = 0` across all buckets.
+        Display path solid.
+      - `cpu_fence_wait_ns/s = 0` everywhere — Task 6.1 deferred-
+        PRESENT semaphore-batch design holds on NVIDIA. No
+        synchronous waits introduced by the export-fd path.
+      - `descriptor_pool_creates/s` 2 across the whole run (warmup
+        only); `descriptor_pool_resets/s` avg 4.7 peak 8. Ring
+        recycles as designed.
+      - Cow coalescing: `cow_batches_flushed/s` avg 70 peak 111;
+        `cow_copies_coalesced/s` avg 536 peak 937 (avg
+        `copies/batch ≈ 7.7`, peak 8.4). Render coalescing:
+        `render_batches_flushed/s` avg 410 peak 749;
+        `render_composites_coalesced/s` avg 543 peak 889 (avg
+        `composites/batch ≈ 1.3`).
+      - `storage_allocations/s` avg 495 peak 881 (single output;
+        bigger than bee, smaller than dual-output silence — same
+        pattern, full-output redirected backings missing the
+        ≤128px PixmapPool bucket cap). Task 5 territory.
+      - From the submit trace (`yserver-mate.submit.tsv`, 64 k
+        rows): copy_area avg_batch 4.3 peak 26 — half of all
+        copy_areas target id=39 (the COW); render_traps avg_batch
+        19.6 peak 60; composite_glyphs avg_batch 12.0 peak 27;
+        **`render_fill` avg_batch 1.27** — largest unexploited
+        coalesce surface (22 k rows, batch ≈ 1), confirms the bee
+        Task 3 followup target.
+      - **Damage-saturation bug reproduces:** `damage_fraction =
+        1.000` in 3 of 38 buckets, ≥0.98 in ~10 more,
+        `full_redraw_fallback/s = 0` in 37/38. Same
+        `pick_repaint_region` correctness gap silence first
+        surfaced 2026-05-22 — now seen on a third hardware class.
+      - Client-side: nvidia-libGL DRI3 doesn't bind (`glx: failed
+        to create dri3 screen / failed to load driver: nvidia-drm`
+        in `mate.log`). yserver's Stage 4d.3 DRI3 backfill exports
+        fences/syncobjs correctly but the NVIDIA proprietary
+        userspace GLX wants its own kernel hooks. mate-session-
+        check-accelerated falls back to llvmpipe / skips GL —
+        does not block the session.
+
     **2026-05-23 bee wrapper-overhead baseline (Phase A T3.5 + T3.6
     landed):** `queue_submit2/s` peak **2457** (pre-Phase-A peak was
     3304; ~25 % lower already, likely workload variance + the
