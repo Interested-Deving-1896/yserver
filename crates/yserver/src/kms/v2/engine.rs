@@ -6458,6 +6458,57 @@ mod tests {
             .map_err(|_| RenderError::NoVk)
     }
 
+    /// Task 4 test helper: drive N `render_composite` (OP_OVER,
+    /// `src` → `dst`, no mask) calls, one per `(x_off, y_off, w, h)`
+    /// tuple. All calls share the same dst+src so the render-batch
+    /// coalescer can aggregate them into a single CB.
+    ///
+    /// Panics if any call returns an error.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn drive_render_composite_same_key_for_tests(
+        engine: &mut RenderEngine,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        dst: DrawableId,
+        src: DrawableId,
+        rects: &[(i32, i32, u32, u32)],
+    ) {
+        const OP_OVER: u8 = 3;
+        for &(x_off, y_off, w, h) in rects {
+            let composite_rect = [crate::kms::vk::ops::render::CompositeRect {
+                src_x: x_off,
+                src_y: y_off,
+                mask_x: 0,
+                mask_y: 0,
+                dst_x: x_off,
+                dst_y: y_off,
+                width: w,
+                height: h,
+            }];
+            engine
+                .render_composite(
+                    store,
+                    platform,
+                    OP_OVER,
+                    ResolvedSource::Drawable(src),
+                    ResolvedSource::None,
+                    dst,
+                    &composite_rect,
+                    None,
+                    Repeat::None,
+                    Repeat::None,
+                    None,
+                    None,
+                    false,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("render_composite");
+        }
+    }
+
     #[test]
     #[ignore = "needs live Vulkan ICD"]
     fn depth32_put_image_get_image_round_trip() {
@@ -10104,7 +10155,10 @@ mod tests {
             Some(p) => p,
             None => return,
         };
-        assert_eq!(p.submit_group_max_size_for_tests(), 1, "T3 baseline cap");
+        // Explicitly set cap=1 so this test exercises cap=1 semantics
+        // regardless of the production default (Task 4 raised it to 16).
+        p.submit_group_set_max_size_for_tests(1);
+        assert_eq!(p.submit_group_max_size_for_tests(), 1, "cap=1 override");
         let mut store = DrawableStore::new();
         let mut engine = RenderEngine::new(&p).expect("engine");
 
@@ -10203,5 +10257,116 @@ mod tests {
             in_flight_before,
             "submitted queue must not grow"
         );
+    }
+
+    // ── Task 4 Phase A regression tests ─────────────────────────
+
+    /// With cap=16, three consecutive `render_composite` calls on
+    /// the same dst+src coalesce into ONE CB in the render batch.
+    /// After `flush_render_batch`, the SubmitGroup holds size=1 (one
+    /// CB, not three). An explicit `flush_submit_group(SceneCompose)`
+    /// drains it atomically: size→0, group closed, no parked ops.
+    #[test]
+    #[ignore = "lavapipe vk"]
+    fn submit_group_collapses_three_consecutive_render_composites_to_one_submit() {
+        let mut p = match try_for_tests_with_vk() {
+            Some(p) => p,
+            None => return,
+        };
+        assert_eq!(
+            p.submit_group_max_size_for_tests(),
+            16,
+            "T4 raised cap to 16"
+        );
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&p).expect("engine");
+
+        let dst = engine
+            .create_pixmap(&mut store, &mut p, 0xface_0001, 16, 16, 32)
+            .expect("dst");
+        let src = engine
+            .create_pixmap(&mut store, &mut p, 0xface_0002, 16, 16, 32)
+            .expect("src");
+
+        // Drain any CBs buffered by create_pixmap (e.g. layout transitions).
+        // With cap=16 the group may be open but not yet submitted.
+        engine
+            .flush_submit_group(&mut p, super::super::submit_group::FlushReason::SyncBoundary)
+            .expect("setup flush");
+        assert!(!p.submit_group_is_open(), "setup drained");
+
+        // Fill src with red so render_composite has valid pixel data.
+        engine
+            .fill_rect(
+                &mut store,
+                &mut p,
+                src,
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 16,
+                        height: 16,
+                    },
+                },
+                decode_x11_pixel_bgra(0xFF_FF_00_00),
+            )
+            .expect("fill src");
+        // Drain the fill CB before the batch assertions below.
+        engine
+            .flush_submit_group(&mut p, super::super::submit_group::FlushReason::SyncBoundary)
+            .expect("pre-composite flush");
+        assert!(!p.submit_group_is_open(), "pre-composite drained");
+
+        // Drive 3 render_composites onto the same dst+src — the
+        // render_batch coalescer should aggregate them into one CB.
+        drive_render_composite_same_key_for_tests(
+            &mut engine,
+            &mut store,
+            &mut p,
+            dst,
+            src,
+            &[(0, 0, 4, 4), (4, 0, 4, 4), (8, 0, 4, 4)],
+        );
+
+        // The batch is still pending — flush_render_batch has NOT been
+        // called yet, so nothing landed in the SubmitGroup.
+        assert_eq!(
+            engine
+                .inner
+                .as_ref()
+                .unwrap()
+                .pending_render_batch
+                .as_ref()
+                .map(|b| b.coalesced_count),
+            Some(3),
+            "three composites should coalesce in the render batch"
+        );
+
+        // Force the render_batch to flush its single coalesced CB into
+        // the SubmitGroup (does NOT submit yet — group still buffers).
+        engine
+            .flush_render_batch(&mut store, &mut p)
+            .expect("flush_render_batch ok");
+
+        // Three composites coalesced to ONE CB sitting in the group.
+        assert_eq!(p.submit_group_size(), 1, "render-batch coalesced to one CB");
+        assert!(
+            p.submit_group_is_open(),
+            "group still open before explicit flush"
+        );
+
+        // Explicit flush — drains the group atomically.
+        engine
+            .flush_submit_group(&mut p, super::super::submit_group::FlushReason::SceneCompose)
+            .expect("flush ok");
+        assert_eq!(p.submit_group_size(), 0, "group drained");
+        assert!(!p.submit_group_is_open(), "group closed");
+        assert_eq!(
+            engine.pending_group_ops_count_for_tests(),
+            0,
+            "parked ops graduated to submitted",
+        );
+
+        engine.drain_all(&mut p);
     }
 }

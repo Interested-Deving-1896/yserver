@@ -50,15 +50,15 @@ pub(crate) struct SubmitGroup {
 
 impl SubmitGroup {
     pub(crate) fn new() -> Self {
-        // Default 1: every append flushes immediately. The cap bumps
-        // to 16 in Task 4 alongside the load-bearing flush triggers
-        // (scene compose, PRESENT signal, get_image, pageflip
-        // retire). Until then, single-CB-per-flush keeps the suite
-        // bit-identical to today's per-op submit cadence.
+        // Default 16: paint CBs accumulate until a load-bearing
+        // flush trigger (scene compose, PRESENT signal, get_image,
+        // pageflip retire) or the cap is hit. Task 4 raised this
+        // from 1 → 16 alongside the scene-compose flush in
+        // `maybe_composite`.
         Self {
             entries: Vec::new(),
             ticket: None,
-            max_size: 1,
+            max_size: 16,
         }
     }
 
@@ -131,12 +131,12 @@ mod tests {
     }
 
     #[test]
-    fn fresh_group_is_empty_and_closed_with_default_max_size_one() {
+    fn fresh_group_is_empty_and_closed_with_default_max_size_sixteen() {
         let g = SubmitGroup::new();
         assert!(!g.is_open());
         assert_eq!(g.size(), 0);
-        // Default 1: production cap bump lives in Task 4.
-        assert_eq!(g.max_size(), 1);
+        // Task 4 raised default from 1 → 16.
+        assert_eq!(g.max_size(), 16);
     }
 
     #[test]

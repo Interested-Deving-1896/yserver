@@ -4431,6 +4431,18 @@ impl Backend for KmsBackendV2 {
             {
                 log::warn!("v2 maybe_composite: flush_render_batch failed: {e:?}");
             }
+            // Phase A Task 4: flush the SubmitGroup so scene.tick
+            // observes all paint CBs already submitted to the queue.
+            // Compose stays on its own dedicated `vkQueueSubmit2`
+            // (record_compose_v2) — only the buffered paint group is
+            // flushed here. Drive through the engine wrapper so
+            // parked `pending_group_ops` commit too.
+            if let Err(e) = self.engine.flush_submit_group(
+                &mut self.platform,
+                crate::kms::v2::submit_group::FlushReason::SceneCompose,
+            ) {
+                log::warn!("v2 maybe_composite: flush_submit_group failed: {e:?}");
+            }
         }
         let result = if !can_submit_scene {
             Ok(())
