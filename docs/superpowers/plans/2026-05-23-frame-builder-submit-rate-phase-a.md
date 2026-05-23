@@ -1,5 +1,18 @@
 # Frame-builder Submit-Rate Phase A Implementation Plan
 
+> **Status: CLOSED 2026-05-24.** All 15 tasks landed across 27 commits
+> on `feature/frame-builder-submit-rate` (`d1cd19d` … `394bf7b`).
+> Validated green on yoga (Adreno/Turnip), iMac 19,2 (Polaris/GCN4/RADV),
+> and fuji (Intel/ANV). Bee (RDNA2/RADV/Arch Mesa-current) MATE-load
+> freezes with a RADV GPUVM TCP protection fault at any `cap ≥ 2`;
+> three green analogues triangulate the cause to the RDNA2 RADV path
+> × Arch Mesa-current — accepted as a known issue, **deferred to
+> Phase B** (per-frame deferred op-list recording removes the cap=N-CB
+> submit shape bee's stack faults on). The plan's per-task checkboxes
+> were not maintained during execution; see status.md
+> § "Phase A — CLOSED 2026-05-24" for the final disposition and the
+> per-platform capture detail.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Collapse consecutive `vkQueueSubmit2` calls into batched multi-CB

@@ -2711,8 +2711,8 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         (Intel/ANV). The remaining shared variable between green
         and frozen is RDNA2 RADV path × Arch Mesa-current.
 
-    **2026-05-23 bee MATE-load freeze (UNRESOLVED, blocks Phase A
-    T15 close):** with full Phase A in tree at `189e8dd`, yserver
+    **2026-05-23 bee MATE-load freeze (KNOWN, deferred to Phase B):**
+    with full Phase A in tree at `189e8dd`, yserver
     loads MATE and then freezes on bee (Ryzen 9 6900HX / RDNA2,
     Arch Linux). Follow-up logs captured on 2026-05-24 show this is
     not an event-loop deadlock: RADV reports a GPUVM TCP protection
@@ -2754,6 +2754,41 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         env knob useful as a hardware diagnostic, but the fix path is
         the later real frame-builder phase, not more SubmitGroup
         tuning.
+
+    **Phase A — CLOSED 2026-05-24.** Plan
+    `docs/superpowers/plans/2026-05-23-frame-builder-submit-rate-phase-a.md`
+    landed in 27 commits on `feature/frame-builder-submit-rate`
+    (`d1cd19d` … `394bf7b`). All 15 plan tasks implemented; the only
+    open items are deferred to Phase B by design, not by execution gap:
+      - **Hardware validation:** three of four hardware classes green
+        on `189e8dd` (yoga / Adreno / Turnip; iMac 19,2 / Polaris /
+        GCN4 / RADV; fuji / Intel / ANV). `queue_submit2/s` peak
+        collapses match the spec target band (900-1500/s) on Intel
+        and approach it on the AMD/Adreno analogues; `cpu_fence_wait`
+        steady-state ~0 except `get_image` bursts; `submit_group_aborts`
+        = 0; no panics, no `renderer_failed`.
+      - **bee (Ryzen 9 6900HX / RDNA2 / RADV / Arch Mesa-current):**
+        MATE-load RADV GPUVM TCP protection fault → `ERROR_DEVICE_LOST`.
+        Reproduces at `cap=2` (first multi-CB submit shape); not a
+        high-cap tuning cliff. Three green analogues triangulated the
+        hypothesis space to RDNA2 RADV path × Arch Mesa-current.
+        **Accepted as a known issue; Phase B is the fix path** —
+        per-frame deferred op-list recording removes the cap=N-CB
+        submit shape that bee's RADV/RDNA2 stack faults on.
+      - **Carried forward to Phase B telemetry/tuning** (not Phase A
+        blockers):
+          - AMD `max_size`-flush share 50-55 % on iMac vs 17-20 % on
+            Intel/Adreno — cap=16 is too low for AMD's batch shape;
+            Phase B's frame-CB makes per-frame the natural unit.
+          - `submit_group_size_max_in_window > cap` telemetry anomaly
+            reproduces on yoga + iMac + fuji — real telemetry-or-cap-
+            check defect; survives Phase A but is non-blocking.
+      - **Followups intentionally punted to Phase B** (per spec
+        § Out of scope): op-list frame builder, multi-output frame
+        CB, glyph-upload deferred recording, transactional layout
+        state, frame-wide resource pinning, idle/no-pageflip trigger
+        model. See `2026-05-23-frame-builder-submit-rate-design.md`
+        § "Phase B" for the design sketch.
 
 ### v1 deletion gates (post-Stage-4, see Risk 4 in the spec)
 
