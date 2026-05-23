@@ -368,6 +368,12 @@ pub(crate) struct PageFlipRetirement {
 // PlatformBackend
 // ────────────────────────────────────────────────────────────────
 
+/// Stage 5 Task 6.1: epoll event-data token for the backend's
+/// wakeup_eventfd. Per-entry sync_file FDs use the entry's index
+/// (or a serial) as their token instead, distinguishing them from
+/// the wakeup_eventfd.
+pub(crate) const WAKEUP_EVENTFD_TOKEN: u64 = u64::MAX;
+
 /// v2's real DRM/Vk/libinput owner. Replaces the flat field set
 /// that Stage 1b's `KmsBackendV2` carried.
 pub(crate) struct PlatformBackend {
@@ -381,6 +387,18 @@ pub(crate) struct PlatformBackend {
 
     // Input side
     input_ctx: Option<crate::input::SendContext>,
+
+    /// Stage 5 Task 6.1: inner epoll FD aggregating per-entry
+    /// sync_file FDs for deferred PRESENT completion. Exposed via
+    /// `poll_fds()` under `BackendFdKind::PresentCompletion`. Spec
+    /// `2026-05-23-deferred-present-completion-design.md`.
+    pub(crate) present_completion_epfd: nix::sys::epoll::Epoll,
+
+    /// Stage 5 Task 6.1: eventfd used to wake the main loop when an
+    /// already-signaled fence is enqueued (vkGetFenceFdKHR returned
+    /// -1) or any other force-wake condition arises. Registered with
+    /// `present_completion_epfd` at init under `WAKEUP_EVENTFD_TOKEN`.
+    pub(crate) wakeup_eventfd: nix::sys::eventfd::EventFd,
 
     // Vulkan side. `Option` only to support test fixtures that
     // skip Vk init (`for_tests`). Production `open_with_commit`
@@ -552,6 +570,28 @@ impl PlatformBackend {
                 }
             };
 
+        // Stage 5 Task 6.1: backend-internal epoll FD + wakeup
+        // eventfd for deferred PRESENT completion. The eventfd lives
+        // inside the epfd under `WAKEUP_EVENTFD_TOKEN`; per-entry
+        // sync_file FDs join the epfd later via the enqueue path.
+        let present_completion_epfd =
+            nix::sys::epoll::Epoll::new(nix::sys::epoll::EpollCreateFlags::EPOLL_CLOEXEC)
+                .map_err(|e| io::Error::other(format!("epoll_create1: {e}")))?;
+        let wakeup_eventfd = nix::sys::eventfd::EventFd::from_value_and_flags(
+            0,
+            nix::sys::eventfd::EfdFlags::EFD_CLOEXEC | nix::sys::eventfd::EfdFlags::EFD_NONBLOCK,
+        )
+        .map_err(|e| io::Error::other(format!("eventfd: {e}")))?;
+        present_completion_epfd
+            .add(
+                &wakeup_eventfd,
+                nix::sys::epoll::EpollEvent::new(
+                    nix::sys::epoll::EpollFlags::EPOLLIN,
+                    WAKEUP_EVENTFD_TOKEN,
+                ),
+            )
+            .map_err(|e| io::Error::other(format!("epoll_ctl ADD wakeup_eventfd: {e}")))?;
+
         log::info!(
             "v2 PlatformBackend: ready — {} outputs, fb {}x{}, {} scanout pools live",
             layouts.len(),
@@ -568,6 +608,8 @@ impl PlatformBackend {
             fb_w,
             fb_h,
             input_ctx,
+            present_completion_epfd,
+            wakeup_eventfd,
             vk: Some(vk),
             ops_command_pool: Some(ops_command_pool),
             fence_pool: Some(fence_pool),
@@ -587,6 +629,23 @@ impl PlatformBackend {
     /// existing shape from Stage 1b.
     #[doc(hidden)]
     pub(crate) fn for_tests() -> Self {
+        let present_completion_epfd =
+            nix::sys::epoll::Epoll::new(nix::sys::epoll::EpollCreateFlags::EPOLL_CLOEXEC)
+                .expect("test epoll");
+        let wakeup_eventfd = nix::sys::eventfd::EventFd::from_value_and_flags(
+            0,
+            nix::sys::eventfd::EfdFlags::EFD_CLOEXEC | nix::sys::eventfd::EfdFlags::EFD_NONBLOCK,
+        )
+        .expect("test eventfd");
+        present_completion_epfd
+            .add(
+                &wakeup_eventfd,
+                nix::sys::epoll::EpollEvent::new(
+                    nix::sys::epoll::EpollFlags::EPOLLIN,
+                    WAKEUP_EVENTFD_TOKEN,
+                ),
+            )
+            .expect("test epoll_ctl");
         Self {
             device: Arc::new(drm::Device::for_tests().expect("test drm device")),
             render_node_fd: None,
@@ -625,6 +684,8 @@ impl PlatformBackend {
             fb_w: 800,
             fb_h: 600,
             input_ctx: None,
+            present_completion_epfd,
+            wakeup_eventfd,
             vk: None,
             ops_command_pool: None,
             fence_pool: None,
@@ -863,11 +924,17 @@ impl PlatformBackend {
     }
 
     pub(crate) fn poll_fds(&self) -> Vec<(RawFd, BackendFdKind)> {
-        let mut fds = Vec::with_capacity(2);
+        let mut fds = Vec::with_capacity(3);
         if let Some(ctx) = self.input_ctx.as_ref() {
             fds.push((ctx.fd(), BackendFdKind::Libinput));
         }
         fds.push((self.device.as_fd().as_raw_fd(), BackendFdKind::Drm));
+        // Stage 5 Task 6.1: stable inner epfd for deferred PRESENT
+        // completion. Always present.
+        fds.push((
+            self.present_completion_epfd.0.as_raw_fd(),
+            BackendFdKind::PresentCompletion,
+        ));
         fds
     }
 
@@ -1528,4 +1595,29 @@ mod tests {
     // Calling it on a never-submitted fence hangs lavapipe. Coverage of
     // this method comes via the v2_acceptance suite's enqueue/drain
     // path, where the fence is bound to a submitted cow_batch.
+
+    #[test]
+    fn present_completion_epfd_present_at_init_and_poll_fds() {
+        // Use the headless fixture — production VkContext init isn't
+        // required to exercise the inner-epoll FD.
+        let p = PlatformBackend::for_tests();
+        let fds = p.poll_fds();
+        let present_kind = yserver_core::backend::BackendFdKind::PresentCompletion;
+        assert!(
+            fds.iter().any(|(_, k)| *k == present_kind),
+            "platform.poll_fds() must report a PresentCompletion FD"
+        );
+        // The FD should be stable: a second call returns the same raw value.
+        let raw1 = fds.iter().find(|(_, k)| *k == present_kind).unwrap().0;
+        let raw2 = p
+            .poll_fds()
+            .iter()
+            .find(|(_, k)| *k == present_kind)
+            .unwrap()
+            .0;
+        assert_eq!(
+            raw1, raw2,
+            "the inner epfd is stable across poll_fds() calls"
+        );
+    }
 }
