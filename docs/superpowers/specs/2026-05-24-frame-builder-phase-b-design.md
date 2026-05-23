@@ -1100,6 +1100,15 @@ that the design can't predict:
    defines a clear sum (`paint_submits = submit_group_paint_
    submits + frame_builder_paint_submits`) so dashboards
    show consistent totals during the rollout.
+7. **Partial-failure retry wake-up wiring.** The schedulability
+   predicate (`any_output_has_pending_failed_submit_or_retry`)
+   gates whether `maybe_composite` is *eligible* to run; the
+   existing `Scene::earliest_retry_deadline` /
+   `next_wakeup` machinery (`backend.rs:4549-4558`) controls
+   *when*. The plan must wire both sides together explicitly
+   in one task — predicate-only or wake-up-only is
+   insufficient. Codex round-6 flagged this as the residual
+   implementation-level risk after the design itself cleared.
 
 ## Out of scope (intentional)
 
