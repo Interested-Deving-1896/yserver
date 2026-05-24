@@ -143,6 +143,14 @@ pub(crate) struct V2GlyphAtlas {
     /// `TRANSFER_DST_OPTIMAL` and back. Mutated by
     /// [`Self::record_upload`].
     current_layout: vk::ImageLayout,
+    /// Stage 5 / Phase B.1: the `FenceTicket` of the most recent frame
+    /// that touched the atlas image (uploaded a glyph or sampled it
+    /// in a draw). `None` until the first frame-close-success.
+    /// Destruction at backend shutdown waits on this ticket the same
+    /// way `DrawableStore::poll_pending_retire` gates drawable
+    /// destruction (engine drains `pending_frames` first; this field
+    /// is the fallback for any path that bypasses the queue).
+    last_render_ticket: Option<super::platform::FenceTicket>,
 }
 
 unsafe impl Send for V2GlyphAtlas {}
@@ -256,6 +264,7 @@ impl V2GlyphAtlas {
             memory,
             packer: ShelfPacker::new(extent),
             current_layout: vk::ImageLayout::UNDEFINED,
+            last_render_ticket: None,
         })
     }
 
@@ -291,6 +300,33 @@ impl V2GlyphAtlas {
     /// Commit a packed slot into the lookup cache.
     pub(crate) fn insert_entry(&mut self, key: GlyphKey, entry: AtlasEntry) {
         self.packer.insert_entry(key, entry);
+    }
+
+    pub(crate) fn set_last_render_ticket(&mut self, ticket: super::platform::FenceTicket) {
+        self.last_render_ticket = Some(ticket);
+    }
+
+    pub(crate) fn clear_last_render_ticket(&mut self) {
+        self.last_render_ticket = None;
+    }
+
+    pub(crate) fn last_render_ticket(&self) -> Option<&super::platform::FenceTicket> {
+        self.last_render_ticket.as_ref()
+    }
+
+    /// Read-only view of the tracked atlas layout. Used by the
+    /// FrameBuilder's append-time first-touch snapshot (Task 15)
+    /// and the close-time commit/rollback (Task 12).
+    pub(crate) fn current_layout(&self) -> vk::ImageLayout {
+        self.current_layout
+    }
+
+    /// Mutator used by the FrameBuilder's close-success commit
+    /// (sanity write-back) and close-failure rollback (restore
+    /// pre_frame_layout). Not used by `record_upload`, which mutates
+    /// the field directly through `&mut self`.
+    pub(crate) fn set_current_layout(&mut self, layout: vk::ImageLayout) {
+        self.current_layout = layout;
     }
 
     /// Record barriers + `vkCmdCopyBufferToImage` into `cb` that
