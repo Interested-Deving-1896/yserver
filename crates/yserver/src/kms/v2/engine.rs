@@ -223,7 +223,9 @@ struct SubmittedOp {
     /// dropping it earlier would race the GPU's TRANSFER_READ.
     staging: Option<Arc<StagingBuffer>>,
     /// Per-op scratch image (only for `copy_area` self-overlap
-    /// path). Destroyed only after the fence signals.
+    /// path). Destroyed only after the fence signals. This is a
+    /// concrete RAII type for the legacy path and is unrelated to
+    /// the B.2 `retired_resources` Vec below; the two coexist.
     scratch: Option<ScratchImage>,
     /// Stage 3a: cloned `atlas_last_upload_ticket` snapshot.
     /// Atlas-sampling ops (text runs, RENDER glyphs in Stage 3d)
@@ -240,6 +242,47 @@ struct SubmittedOp {
     /// <= op.generation` move back to Free. Spec
     /// `2026-05-21-descriptor-pool-ring-design.md`.
     generation: u64,
+    /// Phase B.2 Mechanism 3: retired scratch `BatchResource`s
+    /// attached to this op via
+    /// `RenderEngineInner::adopt_retired_resource_for_gpu_retirement`
+    /// case (b) — the newest in-flight fence owner. Drained and
+    /// released (via explicit `BatchResource::release(&vk)`, NOT
+    /// `Drop`) at retirement in `poll_retired` / `drain_all`.
+    ///
+    /// Parallel to the concrete `scratch: Option<ScratchImage>`
+    /// slot above. Empty for ops that did not adopt a retired
+    /// resource — which is the common case under B.2 (`ensure_*_old`
+    /// returns `Ok(None)` when no grow fires).
+    retired_resources: Vec<Box<dyn crate::kms::scheduler::paint_batch::BatchResource>>,
+}
+
+impl SubmittedOp {
+    /// Phase B.2 Mechanism 3 helper: attach a retired
+    /// `BatchResource` to this op. Called via
+    /// `RenderEngineInner::adopt_retired_resource_for_gpu_retirement`
+    /// case (b) when `submitted.back` is the newest fence owner.
+    #[allow(
+        dead_code,
+        reason = "B.2 Task 1: case (b) of adopt_retired_resource_for_gpu_retirement \
+                  feeds this. The helper is wired in this commit; the first call \
+                  site from a real grow event lands once the _legacy paths route \
+                  their ensure_returning_old returns through the engine helper."
+    )]
+    fn append_retired_scratch(
+        &mut self,
+        boxed: Box<dyn crate::kms::scheduler::paint_batch::BatchResource>,
+    ) {
+        self.retired_resources.push(boxed);
+    }
+
+    /// Phase B.2 Mechanism 3 helper: drain the per-op retired
+    /// `BatchResource`s for release at retirement. Caller calls
+    /// `release(&vk)` per Box.
+    fn drain_retired_scratch(
+        &mut self,
+    ) -> std::vec::Drain<'_, Box<dyn crate::kms::scheduler::paint_batch::BatchResource>> {
+        self.retired_resources.drain(..)
+    }
 }
 
 /// One-shot device-local image used by `copy_area`'s same-image
@@ -639,6 +682,78 @@ struct RenderEngineInner {
     frame_builder_timeout: std::time::Duration,
 }
 
+impl RenderEngineInner {
+    /// Phase B.2 Mechanism 3: route a retired scratch
+    /// `BatchResource` (returned by
+    /// [`crate::kms::vk::dst_readback::DstReadback::ensure_returning_old`]
+    /// or
+    /// [`crate::kms::vk::mask_scratch::MaskScratch::ensure_image_size_returning_old`]
+    /// on a grow) to the right fence-gated owner.
+    ///
+    /// **Crucially:** `BatchResource::release(self: Box<Self>, &VkContext)`
+    /// is explicit (see
+    /// `crates/yserver/src/kms/scheduler/paint_batch.rs:146-147`).
+    /// The trait does NOT implement `Drop` for Vk-handle teardown;
+    /// dropping a `Box<dyn BatchResource>` without calling
+    /// [`release`](crate::kms::scheduler::paint_batch::BatchResource::release)
+    /// would LEAK the underlying Vk handles. Every retirement path
+    /// MUST call `boxed.release(&inner.vk)` explicitly.
+    ///
+    /// Ownership cases (in order of precedence):
+    /// - (a) Open frame's [`FramePinSet::retired_resources`]
+    ///   (`self.frame_builder.open.as_mut().unwrap().pins`). The pin
+    ///   set rides the frame's `FenceTicket`; the
+    ///   `pending_frames` retire walk in
+    ///   [`RenderEngine::poll_retired`] /
+    ///   [`RenderEngine::drain_all`] releases each entry once the
+    ///   ticket signals. Under B.2's grow-before-open rule (Phase
+    ///   9A — to land in a later Task), this case is rarely hit
+    ///   because every grow forces a close-reopen before any
+    ///   in-frame op runs. Wiring it now keeps the helper complete
+    ///   for B.3+ when mid-frame retire becomes possible.
+    /// - (b) Newest [`SubmittedOp`] on `self.submitted`. After
+    ///   `close_open_frame` succeeds the just-closed frame's CB has
+    ///   appended one `SubmittedOp` carrying the frame's ticket;
+    ///   attaching the retired Box here rides that fence. For
+    ///   legacy callers (per-op submits), `submitted.back` is
+    ///   likewise the newest fence owner. Using `submitted.back`
+    ///   instead of `pending_frames.back` guarantees we pick the
+    ///   NEWEST in-flight ticket (legacy SubmittedOps queued AFTER
+    ///   a frame close are newer than the frame's record).
+    /// - (c) Explicit release if both `frame_builder.open` is None
+    ///   AND `submitted` is empty. Safe because no in-flight CB
+    ///   can still be sampling the retired backing.
+    ///
+    /// `None` input is a no-op (the common case: no grow fired).
+    #[allow(
+        dead_code,
+        reason = "B.2 Task 1: helper lands now so the SubmittedOp + FramePinSet \
+                  extensions compile. The _legacy ensure_returning_old call sites \
+                  will be re-wired to call this helper in this same commit; the \
+                  open-frame case (a) is exercised once Phase 9A's grow-before-open \
+                  path lands in a later Task."
+    )]
+    pub(crate) fn adopt_retired_resource_for_gpu_retirement(
+        &mut self,
+        retired: Option<Box<dyn crate::kms::scheduler::paint_batch::BatchResource>>,
+    ) {
+        let Some(boxed) = retired else { return };
+        // (a) Open frame — adopt into its pin set.
+        if let Some(open) = self.frame_builder.open.as_mut() {
+            open.pins.adopt_retired(boxed);
+            return;
+        }
+        // (b) Newest in-flight SubmittedOp — append to its
+        //     retired_resources; the op's fence retires it.
+        if let Some(submitted) = self.submitted.back_mut() {
+            submitted.append_retired_scratch(boxed);
+            return;
+        }
+        // (c) Nothing in flight — safe to release immediately.
+        boxed.release(&self.vk);
+    }
+}
+
 impl RenderEngine {
     /// Production constructor. Borrows the platform's `VkContext`
     /// (cloned `Arc`); CB allocation goes through the platform's
@@ -736,6 +851,14 @@ impl RenderEngine {
             }
             // staging drops at end of scope → destroys Vk handles.
             drop(op.staging.take());
+            // Phase B.2 Mechanism 3: release retired BatchResources
+            // attached via adopt_retired_resource_for_gpu_retirement
+            // case (b). BatchResource::release is explicit (no Drop);
+            // dropping the Box without this call would LEAK Vk handles
+            // (see paint_batch.rs:147).
+            for r in op.drain_retired_scratch() {
+                r.release(&inner.vk);
+            }
             // Stage 5 Task 4 layer 1: signal the descriptor pool
             // ring that everything up to and including this op's
             // generation has retired. Pools whose high_water_
@@ -750,8 +873,21 @@ impl RenderEngine {
             if !front.ticket.poll_signaled(&inner.vk) {
                 break;
             }
+            let mut record = inner.pending_frames.pop_front().expect("non-empty");
+            // Phase B.2 Mechanism 3 (defensive): release retired
+            // BatchResources attached via case (a) of
+            // adopt_retired_resource_for_gpu_retirement. Under B.2
+            // this Vec is structurally empty — the grow-before-open
+            // rule routes all retires through submitted.back — but
+            // explicit release here keeps the invariant honest for
+            // B.3+ when mid-frame retire becomes possible. Without
+            // it, Vk handles inside the Boxes would leak (no Drop on
+            // BatchResource; see paint_batch.rs:147).
+            for r in record.pins.retired_resources.drain(..) {
+                r.release(&inner.vk);
+            }
             // The Arcs inside the record drop here, releasing pinned resources.
-            let _ = inner.pending_frames.pop_front().expect("non-empty");
+            drop(record);
         }
     }
 
@@ -824,14 +960,27 @@ impl RenderEngine {
                 device.free_command_buffers(pool, &[op.cb]);
             }
             drop(op.staging.take());
+            // Phase B.2 Mechanism 3: explicit release of retired
+            // BatchResources attached via case (b). See
+            // poll_retired for the rationale (BatchResource has no
+            // Drop — paint_batch.rs:147).
+            for r in op.drain_retired_scratch() {
+                r.release(&inner.vk);
+            }
             inner.descriptor_pool_ring.release_up_to(op.generation);
         }
         // Phase B.1: drain in-flight frame pins. wait() ensures Vk-side
         // completion before the Arc<StagingBuffer> drops would otherwise
         // race with GPU reads. Off-hot-path; one wait per pending frame
         // is fine at shutdown.
-        while let Some(record) = inner.pending_frames.pop_front() {
+        while let Some(mut record) = inner.pending_frames.pop_front() {
             let _ = record.ticket.wait(&inner.vk);
+            // Phase B.2 Mechanism 3 (defensive): release retired
+            // BatchResources attached via case (a). See poll_retired
+            // for the rationale.
+            for r in record.pins.retired_resources.drain(..) {
+                r.release(&inner.vk);
+            }
             // Record drops; pins drop; Arcs decrement.
             drop(record);
         }
@@ -958,6 +1107,14 @@ impl RenderEngine {
                         open_frame.layouts.atlas,
                         open_frame.atlas_prev_ticket_snapshot.clone(),
                     );
+                    // Phase B.2 Mechanism 3 (defensive): release any
+                    // retired BatchResources attached to the open
+                    // frame's pin set. Structurally empty under B.2's
+                    // grow-before-open rule, but BatchResource has no
+                    // Drop (paint_batch.rs:147); preserved for B.3+.
+                    for r in open_frame.pins.retired_resources.drain(..) {
+                        r.release(&inner_post.vk);
+                    }
                     if inner_post.pending_frame_close_events.len() < 1024 {
                         inner_post.pending_frame_close_events.push(
                             super::frame_builder::FrameCloseEvent {
@@ -1008,16 +1165,22 @@ impl RenderEngine {
                 open_frame.layouts.atlas,
                 open_frame.atlas_prev_ticket_snapshot.clone(),
             );
+            // Phase B.2 Mechanism 3 (defensive): release any retired
+            // BatchResources attached to the open frame's pin set.
+            // See path 1 above for rationale.
+            for r in open_frame.pins.retired_resources.drain(..) {
+                r.release(&inner_post.vk);
+            }
             if inner_post.pending_frame_close_events.len() < 1024 {
-                inner_post.pending_frame_close_events.push(
-                    super::frame_builder::FrameCloseEvent {
+                inner_post
+                    .pending_frame_close_events
+                    .push(super::frame_builder::FrameCloseEvent {
                         reason,
                         ops_in_frame: open_frame.ops.len(),
                         glyph_uploads_in_frame: open_frame.glyph_uploads_in_frame,
                         pin_count: open_frame.pins.len(),
                         aborted: true,
-                    },
-                );
+                    });
             }
             inner_post.frame_builder.complete_close_failure();
             return Err(e);
@@ -1044,16 +1207,22 @@ impl RenderEngine {
                 open_frame.layouts.atlas,
                 open_frame.atlas_prev_ticket_snapshot.clone(),
             );
+            // Phase B.2 Mechanism 3 (defensive): release any retired
+            // BatchResources attached to the open frame's pin set.
+            // See path 1 above for rationale.
+            for r in open_frame.pins.retired_resources.drain(..) {
+                r.release(&inner_post.vk);
+            }
             if inner_post.pending_frame_close_events.len() < 1024 {
-                inner_post.pending_frame_close_events.push(
-                    super::frame_builder::FrameCloseEvent {
+                inner_post
+                    .pending_frame_close_events
+                    .push(super::frame_builder::FrameCloseEvent {
                         reason,
                         ops_in_frame: open_frame.ops.len(),
                         glyph_uploads_in_frame: open_frame.glyph_uploads_in_frame,
                         pin_count: open_frame.pins.len(),
                         aborted: true,
-                    },
-                );
+                    });
             }
             inner_post.frame_builder.complete_close_failure();
             return Err(e);
@@ -1071,6 +1240,7 @@ impl RenderEngine {
                 scratch: None,
                 atlas_ticket: None,
                 generation,
+                retired_resources: Vec::new(),
             });
         }
 
@@ -1131,6 +1301,12 @@ impl RenderEngine {
                 let pin_count = open_frame.pins.len();
                 let inner = self.inner.as_mut().expect("inner");
                 rollback_atlas(inner, atlas_overlay, atlas_prev);
+                // Phase B.2 Mechanism 3 (defensive): release any
+                // retired BatchResources attached to the open frame's
+                // pin set. See path 1 above for rationale.
+                for r in open_frame.pins.retired_resources.drain(..) {
+                    r.release(&inner.vk);
+                }
                 if inner.pending_frame_close_events.len() < 1024 {
                     inner
                         .pending_frame_close_events
@@ -1836,6 +2012,7 @@ impl RenderEngine {
             scratch: None,
             atlas_ticket: None,
             generation,
+            retired_resources: Vec::new(),
         });
         // `inner` borrow released. Auto-flush.
         self.maybe_auto_flush_submit_group(platform)?;
@@ -2123,6 +2300,7 @@ impl RenderEngine {
             scratch: None,
             atlas_ticket: None,
             generation,
+            retired_resources: Vec::new(),
         });
         // `inner` borrow released. Auto-flush.
         self.maybe_auto_flush_submit_group(platform)?;
@@ -2353,6 +2531,7 @@ impl RenderEngine {
                 scratch: Some(scratch),
                 atlas_ticket: None,
                 generation,
+                retired_resources: Vec::new(),
             });
             // `inner` borrow released. Auto-flush.
             self.maybe_auto_flush_submit_group(platform)?;
@@ -2455,6 +2634,7 @@ impl RenderEngine {
             scratch: None,
             atlas_ticket: None,
             generation,
+            retired_resources: Vec::new(),
         });
         // `inner` borrow released. Auto-flush.
         self.maybe_auto_flush_submit_group(platform)?;
@@ -2912,6 +3092,7 @@ impl RenderEngine {
             scratch: None,
             atlas_ticket: None,
             generation,
+            retired_resources: Vec::new(),
         });
         inner.cow_flush_records.push(coalesced_count);
         // `inner` borrow released after this block. Free to call self.* below.
@@ -3497,6 +3678,7 @@ impl RenderEngine {
             scratch: None,
             atlas_ticket: None,
             generation,
+            retired_resources: Vec::new(),
         });
         inner.render_flush_records.push(RenderFlushRecord {
             dst: batch.key.dst,
@@ -3676,6 +3858,7 @@ impl RenderEngine {
             scratch: None,
             atlas_ticket: None,
             generation,
+            retired_resources: Vec::new(),
         });
         // `inner` borrow released. Auto-flush.
         self.maybe_auto_flush_submit_group(platform)?;
@@ -3846,6 +4029,7 @@ impl RenderEngine {
             scratch: None,
             atlas_ticket: None,
             generation,
+            retired_resources: Vec::new(),
         });
 
         Ok(out)
@@ -4067,6 +4251,7 @@ impl RenderEngine {
                         scratch: None,
                         atlas_ticket: None,
                         generation,
+                        retired_resources: Vec::new(),
                     });
                     inner.atlas_last_upload_ticket = Some(ticket);
                     let e = AtlasEntry {
@@ -4178,6 +4363,7 @@ impl RenderEngine {
             scratch: None,
             atlas_ticket,
             generation,
+            retired_resources: Vec::new(),
         });
         // `inner` borrow released. Auto-flush.
         self.maybe_auto_flush_submit_group(platform)?;
@@ -4419,6 +4605,7 @@ impl RenderEngine {
                         scratch: None,
                         atlas_ticket: None,
                         generation,
+                        retired_resources: Vec::new(),
                     });
                     inner.atlas_last_upload_ticket = Some(ticket);
                     let e = AtlasEntry {
@@ -4560,6 +4747,7 @@ impl RenderEngine {
             scratch: None,
             atlas_ticket,
             generation,
+            retired_resources: Vec::new(),
         });
         // `inner` borrow released. Auto-flush.
         self.maybe_auto_flush_submit_group(platform)?;
@@ -5285,12 +5473,21 @@ impl RenderEngine {
         // can't happen mid-call). `record_copy_from` runs inside
         // the per-op CB later — this is just the resource ensure.
         let src_alias_view = if self_alias_used {
+            // B.2 Mechanism 3: ensure_returning_old may return a
+            // retired Box<dyn BatchResource> on grow; route it via
+            // the engine helper instead of dropping (the historical
+            // leak). Scope the mutable borrow tightly so the helper
+            // can re-borrow `inner` mutably.
+            let retired = {
+                let rb = inner.src_alias_readback.as_mut().expect("ensured");
+                rb.ensure_returning_old(dst_format, dst_extent.width, dst_extent.height)
+                    .map_err(|e| {
+                        log::warn!("v2 render_composite: src_alias_readback ensure failed: {e:?}");
+                        RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+                    })?
+            };
+            inner.adopt_retired_resource_for_gpu_retirement(retired);
             let rb = inner.src_alias_readback.as_mut().expect("ensured");
-            rb.ensure_returning_old(dst_format, dst_extent.width, dst_extent.height)
-                .map_err(|e| {
-                    log::warn!("v2 render_composite: src_alias_readback ensure failed: {e:?}");
-                    RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
-                })?;
             match rb.view(dst_format, dst_has_alpha) {
                 Ok(Some(v)) => Some(v),
                 Ok(None) => {
@@ -5474,13 +5671,23 @@ impl RenderEngine {
 
         // dst_readback for Disjoint/Conjoint: ensure the scratch
         // exists at dst's extent + format.
+        //
+        // B.2 Mechanism 3: route the retired Box<dyn BatchResource>
+        // (returned by ensure_returning_old on grow) via the engine
+        // helper instead of dropping it. Scope the mutable borrow of
+        // inner.dst_readback tightly so the helper can re-borrow
+        // `inner` mutably.
         let dst_readback_view = if needs_dst_readback {
+            let retired = {
+                let rb = inner.dst_readback.as_mut().expect("ensured");
+                rb.ensure_returning_old(dst_format, dst_extent.width, dst_extent.height)
+                    .map_err(|e| {
+                        log::warn!("v2 render_composite: dst readback ensure failed: {e:?}");
+                        RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+                    })?
+            };
+            inner.adopt_retired_resource_for_gpu_retirement(retired);
             let rb = inner.dst_readback.as_mut().expect("ensured");
-            rb.ensure_returning_old(dst_format, dst_extent.width, dst_extent.height)
-                .map_err(|e| {
-                    log::warn!("v2 render_composite: dst readback ensure failed: {e:?}");
-                    RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
-                })?;
             match rb.view(dst_format, dst_has_alpha) {
                 Ok(Some(v)) => v,
                 Ok(None) => {
@@ -5722,6 +5929,7 @@ impl RenderEngine {
             scratch: None,
             atlas_ticket: None,
             generation,
+            retired_resources: Vec::new(),
         });
         // `inner` borrow released. Auto-flush.
         self.maybe_auto_flush_submit_group(platform)?;
@@ -5919,11 +6127,14 @@ impl RenderEngine {
             );
         }
 
-        // Grow the mask scratch to at least the trap bbox. The
-        // retired old image is currently dropped on the floor (see
-        // RenderEngineInner.mask_scratch doc note); same shape as
-        // dst_readback's grow semantics.
-        let _retired_mask = {
+        // Grow the mask scratch to at least the trap bbox.
+        //
+        // B.2 Mechanism 3: route the retired Box<dyn BatchResource>
+        // (returned by ensure_image_size_returning_old on grow) via
+        // the engine helper instead of dropping it on the floor (the
+        // historical leak called out in the RenderEngineInner
+        // .mask_scratch doc comment).
+        let retired_mask = {
             let scratch = inner.mask_scratch.as_mut().expect("ensured");
             scratch
                 .ensure_image_size_returning_old(bbox_w, bbox_h)
@@ -5932,6 +6143,7 @@ impl RenderEngine {
                     RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
                 })?
         };
+        inner.adopt_retired_resource_for_gpu_retirement(retired_mask);
         let mask_image = inner.mask_scratch.as_ref().expect("ensured").image();
         // Two distinct views on mask_scratch: the IDENTITY-swizzle
         // `attachment_view` for the rasterize-side write (Vulkan
@@ -6030,13 +6242,22 @@ impl RenderEngine {
             .as_ref()
             .expect("ensured")
             .image_view();
+        // B.2 Mechanism 3: route the retired Box<dyn BatchResource>
+        // (returned by ensure_returning_old on grow) via the engine
+        // helper instead of dropping it. Scope the mutable borrow of
+        // inner.dst_readback tightly so the helper can re-borrow
+        // `inner` mutably.
         let dst_readback_view = if needs_dst_readback {
+            let retired = {
+                let rb = inner.dst_readback.as_mut().expect("ensured");
+                rb.ensure_returning_old(dst_format, dst_extent.width, dst_extent.height)
+                    .map_err(|e| {
+                        log::warn!("v2 render_traps_or_tris: dst readback ensure: {e:?}");
+                        RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+                    })?
+            };
+            inner.adopt_retired_resource_for_gpu_retirement(retired);
             let rb = inner.dst_readback.as_mut().expect("ensured");
-            rb.ensure_returning_old(dst_format, dst_extent.width, dst_extent.height)
-                .map_err(|e| {
-                    log::warn!("v2 render_traps_or_tris: dst readback ensure: {e:?}");
-                    RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
-                })?;
             match rb.view(dst_format, dst_has_alpha) {
                 Ok(Some(v)) => v,
                 Ok(None) | Err(_) => return Ok(stats),
@@ -6389,6 +6610,7 @@ impl RenderEngine {
             scratch: None,
             atlas_ticket: None,
             generation,
+            retired_resources: Vec::new(),
         });
         // `inner` borrow released. Auto-flush.
         self.maybe_auto_flush_submit_group(platform)?;
@@ -6847,8 +7069,22 @@ impl Drop for RenderEngine {
         // can't access the platform's pool any more, but it can
         // wait on each fence so `StagingBuffer`'s drop is safe.
         if let Some(inner) = self.inner.as_mut() {
-            for op in inner.submitted.drain(..) {
-                let _ = op.ticket.wait(&inner.vk);
+            // Collect VkContext clone up front so we can release
+            // BatchResources without borrow conflicts against the
+            // submitted/pending_frames iteration below.
+            let vk = Arc::clone(&inner.vk);
+            for mut op in inner.submitted.drain(..) {
+                let _ = op.ticket.wait(&vk);
+                // Phase B.2 Mechanism 3: explicit release of any
+                // retired BatchResources attached to this op. Drop
+                // would LEAK the underlying Vk handles
+                // (BatchResource::release is `self: Box<Self>` —
+                // paint_batch.rs:147). Must run BEFORE moving
+                // `op.staging` out (the iterator hands us a `mut op`
+                // and `drain_retired_scratch` requires `&mut op`).
+                for r in op.drain_retired_scratch() {
+                    r.release(&vk);
+                }
                 // staging drops here.
                 drop(op.staging);
                 // CB handles leak — caller should have invoked
@@ -6857,8 +7093,14 @@ impl Drop for RenderEngine {
                 // implicitly frees all its CBs (Vulkan spec).
                 let _ = op.cb;
             }
-            for record in inner.pending_frames.drain(..) {
-                let _ = record.ticket.wait(&inner.vk);
+            for mut record in inner.pending_frames.drain(..) {
+                let _ = record.ticket.wait(&vk);
+                // Phase B.2 Mechanism 3 (defensive): release any
+                // retired BatchResources attached to the frame's
+                // pin set. See submitted loop above for rationale.
+                for r in record.pins.retired_resources.drain(..) {
+                    r.release(&vk);
+                }
                 drop(record); // pins (Arcs) decrement here
             }
         }

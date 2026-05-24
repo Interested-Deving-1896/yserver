@@ -155,6 +155,26 @@ impl MaskScratch {
         self.current_layout = layout;
     }
 
+    /// Phase B.2 Task 9 peek: would
+    /// `ensure_image_size_returning_old(w, h)` grow the scratch?
+    /// Returns `true` when the existing extent already satisfies the
+    /// request (no grow needed), `false` when a grow would fire. The
+    /// Task 9 caller uses this BEFORE `ensure_image_size_returning_old`
+    /// to decide whether to force a close-reopen (so the
+    /// just-submitted frame's recorded views target the same scratch
+    /// instance the close-time emit will sample). Peek-only — does NOT
+    /// mutate.
+    ///
+    /// MaskScratch is R8 only, so no format arg.
+    #[allow(
+        dead_code,
+        reason = "B.2 Task 9 peek-before-grow predicate; first call site lands \
+                  with the close-before-grow path in a later Task."
+    )]
+    pub fn fits(&self, width: u32, height: u32) -> bool {
+        self.extent.width >= width && self.extent.height >= height
+    }
+
     /// 5-T5: ensure the scratch image is at least `(width, height)`
     /// pixels, reallocating if smaller. Returns `Ok(None)` if no grow
     /// was needed (scratch unchanged). On grow, allocates the new

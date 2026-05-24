@@ -109,6 +109,12 @@ pub struct Bucket {
     pub(crate) frame_builder_close_reason_timeout: u64,
     pub(crate) frame_builder_close_reason_shutdown: u64,
     pub(crate) frame_builder_close_reason_pin_ceiling: u64,
+    /// Phase B.2 Mechanism 3: bumped when a scratch grow forces a
+    /// close-reopen so the just-submitted frame's recorded views
+    /// target the same scratch instance the close-time emit will
+    /// sample. Expected to stay low (most paints don't grow); a
+    /// rising rate indicates oversized scratches or workload churn.
+    pub(crate) frame_builder_close_reason_scratch_grow: u64,
     /// Sum of `ops_in_frame` across all closes in the window.
     pub(crate) frame_builder_ops_per_frame_total: u64,
     /// Max `ops_in_frame` seen in the current bucket window.
@@ -359,7 +365,8 @@ impl Telemetry {
              ops/frame_avg={fb_ops_avg:.1} max={} hist={:?} \
              glyph_uploads/frame_avg={fb_glyph_avg:.1} max={} active_pins_hw={} \
              close_reasons[scene_compose={} non_ported={} legacy_sc={} \
-             present_completion={} sync_wait={} timeout={} shutdown={} pin_ceiling={}]",
+             present_completion={} sync_wait={} timeout={} shutdown={} pin_ceiling={} \
+             scratch_grow={}]",
             b.frame_builder_opens,
             b.frame_builder_closes,
             b.frame_builder_aborts,
@@ -375,6 +382,7 @@ impl Telemetry {
             b.frame_builder_close_reason_timeout,
             b.frame_builder_close_reason_shutdown,
             b.frame_builder_close_reason_pin_ceiling,
+            b.frame_builder_close_reason_scratch_grow,
         );
         self.bucket = Bucket::default();
         self.last_emit = now;
@@ -666,6 +674,10 @@ impl Telemetry {
             R::PinCeiling => (
                 &mut self.bucket.frame_builder_close_reason_pin_ceiling,
                 &mut self.lifetime.frame_builder_close_reason_pin_ceiling,
+            ),
+            R::ScratchGrow => (
+                &mut self.bucket.frame_builder_close_reason_scratch_grow,
+                &mut self.lifetime.frame_builder_close_reason_scratch_grow,
             ),
         };
         *b += 1;

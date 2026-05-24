@@ -51,6 +51,18 @@ pub(crate) enum CloseReason {
     Shutdown,
     /// `max_pinned_resources_per_frame` ceiling hit (1024 default).
     PinCeiling,
+    /// Phase B.2 Mechanism 3 (Pitfall 4): a growable scratch image would
+    /// be replaced while the open frame has prior ops that recorded
+    /// views into the old image. Close first so the old backing rides
+    /// the just-submitted frame fence (via `submitted.back`) — see
+    /// `adopt_retired_resource_for_gpu_retirement` in `engine.rs`.
+    #[allow(
+        dead_code,
+        reason = "B.2 Phase 9A close-before-grow path; wired in a later Task. \
+                  Variant lands now so the exhaustive close-reason test \
+                  enumerates it and downstream code can match it."
+    )]
+    ScratchGrow,
 }
 
 /// `FrameBuilder` lifecycle. `Closed` is the hot path for X11 traffic
@@ -253,7 +265,10 @@ impl FrameBuilder {
 
     /// `#[cfg(test)]` peek at the op list in append order.
     #[cfg(test)]
-    #[allow(dead_code, reason = "scaffolded integration tests; activates when wired in B.2+")]
+    #[allow(
+        dead_code,
+        reason = "scaffolded integration tests; activates when wired in B.2+"
+    )]
     pub(crate) fn peek_ops(&self) -> Option<&[RecordedOp]> {
         self.open.as_ref().map(|o| o.ops.as_slice())
     }
@@ -266,7 +281,10 @@ impl FrameBuilder {
 
     /// `#[cfg(test)]` pin count.
     #[cfg(test)]
-    #[allow(dead_code, reason = "scaffolded integration tests; activates when wired in B.2+")]
+    #[allow(
+        dead_code,
+        reason = "scaffolded integration tests; activates when wired in B.2+"
+    )]
     pub(crate) fn pin_count(&self) -> usize {
         self.open.as_ref().map_or(0, |o| o.pins.len())
     }
@@ -324,7 +342,7 @@ mod state_tests {
     }
 
     #[test]
-    fn close_reason_has_eight_variants_for_b1() {
+    fn close_reason_has_nine_variants_for_b2() {
         fn _exhaustive(r: CloseReason) -> &'static str {
             match r {
                 CloseReason::SceneCompose => "scene_compose",
@@ -335,9 +353,11 @@ mod state_tests {
                 CloseReason::Timeout => "timeout",
                 CloseReason::Shutdown => "shutdown",
                 CloseReason::PinCeiling => "pin_ceiling",
+                CloseReason::ScratchGrow => "scratch_grow",
             }
         }
         assert_eq!(_exhaustive(CloseReason::SceneCompose), "scene_compose");
+        assert_eq!(_exhaustive(CloseReason::ScratchGrow), "scratch_grow");
     }
 }
 
@@ -448,11 +468,32 @@ use std::sync::Arc;
 
 /// Resource pins held alive across a frame. Mechanism 1 of spec
 /// § "Frame-wide resource pinning". B.1 only pins `StagingBuffer`
-/// clones (one per glyph upload). B.2 will extend with sync objects,
-/// semaphores, and Mechanism 3 Arc'd scratch handles.
+/// clones (one per glyph upload). B.2 extends with sync objects,
+/// semaphores, and Mechanism 3 retired scratch `BatchResource`s.
+///
+/// `Debug` is implemented manually in Task 2 (extending the derived
+/// shape with a `retired_resources_count` field) because
+/// `Box<dyn BatchResource>` already requires `Debug` per the trait
+/// definition, so derive works for now and Task 2 swaps in the manual
+/// impl alongside the unit tests.
 #[derive(Debug, Default)]
 pub(crate) struct FramePinSet {
     pub(crate) staging_buffers: Vec<Arc<super::engine::StagingBuffer>>,
+    /// Phase B.2 Mechanism 3: retired scratch images adopted into this
+    /// frame's pin set via
+    /// `RenderEngineInner::adopt_retired_resource_for_gpu_retirement`.
+    /// Released explicitly (NOT via `Drop` — `BatchResource::release`
+    /// is `self: Box<Self>`, see `paint_batch.rs:147`) by the
+    /// `pending_frames` retire walk in `poll_retired` / `drain_all`,
+    /// and by the close-failure rollback in `close_open_frame`.
+    ///
+    /// Under B.2's grow-before-open rule (Phase 9A, Task 9), this Vec
+    /// is structurally empty at close time — every scratch growth
+    /// happens BEFORE any new frame opens, so the retired Box rides
+    /// `submitted.back` instead. The field is wired now so the
+    /// helper compiles; B.3+ may populate it when mid-frame retire
+    /// becomes possible.
+    pub(crate) retired_resources: Vec<Box<dyn crate::kms::scheduler::paint_batch::BatchResource>>,
 }
 
 impl FramePinSet {
@@ -467,6 +508,25 @@ impl FramePinSet {
         let idx = u32::try_from(self.staging_buffers.len()).expect("< u32::MAX pins");
         self.staging_buffers.push(staging);
         PinnedStagingIdx(idx)
+    }
+
+    /// Phase B.2 Mechanism 3: attach a retired scratch `BatchResource`
+    /// to this open frame's pin set. Released via explicit
+    /// `boxed.release(&vk)` at frame retirement (see the
+    /// `pending_frames` walk in `poll_retired` + `drain_all`). Never
+    /// drops the Box without calling release — `BatchResource` has no
+    /// `Drop`-based teardown (`paint_batch.rs:147`).
+    #[allow(
+        dead_code,
+        reason = "B.2 Task 1: helper case (a) — open-frame adopt. Wired by \
+                  adopt_retired_resource_for_gpu_retirement; populated when \
+                  Phase 9A's mid-frame grow path lands (B.3+)."
+    )]
+    pub(crate) fn adopt_retired(
+        &mut self,
+        boxed: Box<dyn crate::kms::scheduler::paint_batch::BatchResource>,
+    ) {
+        self.retired_resources.push(boxed);
     }
 
     pub(crate) fn len(&self) -> usize {

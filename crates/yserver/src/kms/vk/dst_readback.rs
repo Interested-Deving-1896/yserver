@@ -96,6 +96,29 @@ impl DstReadback {
         }
     }
 
+    /// Phase B.2 Task 9 peek: would `ensure_returning_old(format, w, h)`
+    /// grow the per-format slot? Returns `true` when the existing slot
+    /// already satisfies the requested extent (no grow needed), `false`
+    /// when the slot is absent / too small / the format is
+    /// unsupported. The Task 9 caller uses this BEFORE
+    /// `ensure_returning_old` to decide whether to force a close-reopen
+    /// (so the just-submitted frame's recorded views target the same
+    /// scratch instance the close-time emit will sample). Peek-only —
+    /// does NOT mutate.
+    #[allow(
+        dead_code,
+        reason = "B.2 Task 9 peek-before-grow predicate; first call site lands \
+                  with the close-before-grow path in a later Task."
+    )]
+    pub fn fits(&self, format: vk::Format, width: u32, height: u32) -> bool {
+        let slot = match format {
+            vk::Format::B8G8R8A8_UNORM => self.bgra.as_ref(),
+            vk::Format::R8_UNORM => self.r8.as_ref(),
+            _ => return false,
+        };
+        slot.is_some_and(|s| s.extent.width >= width && s.extent.height >= height)
+    }
+
     /// 5-T4: like the pre-Phase-5 `ensure` but returns the old
     /// per-format image wrapped as a `BatchResource` for the caller
     /// to defer-release through the scheduler. Returns `Ok(None)`
