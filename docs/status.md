@@ -89,6 +89,14 @@ Cross-cutting bugs and followups that don't fit a stage live in
   under the now-`[x]` Stage 4 sections.
 - **Next live work**: Stage 5 — make v2 fast. Plan at
   `docs/superpowers/plans/2026-05-20-stage-5-make-v2-fast.md`.
+  Phase A closed 2026-05-24; Phase B sub-phase B.1 implemented +
+  bee MATE-load freeze closed on 2026-05-24
+  (`feature/frame-builder-submit-rate`, HEAD `bd628c8`). B.1 did
+  not improve drag smoothness — that's by design and tracks to
+  B.2 (port `render_composite` + `render_fill`, the ~60 % of
+  submits still on the per-op-per-`vkQueueSubmit2` path under
+  cap=1). yoga / iMac / fuji / silence-dual-output regression
+  gates still pending.
 
 ---
 
@@ -2883,20 +2891,48 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         `cargo clippy -- -W clippy::pedantic` clean on the B.1
         surface (pre-existing warnings outside B.1 left alone for
         independent cleanup).
-      - **Hardware gates** (user-driven, pending):
-        - **bee MATE-load survival** — boot MATE with default
-          `YSERVER_FRAME_BUILDER=on`, drag for 30 s, expect zero
-          `ERROR_DEVICE_LOST` and zero RADV GPUVM faults. Same
-          telemetry + submit-trace harness as the 2026-05-23
-          capture; compare composite_glyphs submit rate.
-        - **yoga / iMac / fuji regression check** — same MATE drag,
-          expect no new `ERROR_DEVICE_LOST` and `queue_submit2/s`
-          ≤ Phase A peak. Non-glyph paint ops on these platforms
-          regress temporarily (cap=1) and recover at B.5.
-        - **silence dual-output regression check** — confirm both
-          outputs present correctly via the existing per-output
-          compose path (B.1 doesn't fold compose; single-output
-          is the only flavor exercised).
+      - **Hardware gates:**
+        - **bee MATE-load survival — PASS 2026-05-24** (capture
+          `yserver-hw-mate.log` + `yserver-mate.submit.tsv` at
+          22:25). Boot MATE with default `YSERVER_FRAME_BUILDER=on`,
+          drag for ~43 s, clean Ctrl-Alt-Backspace zap. Zero
+          `ERROR_DEVICE_LOST`, zero RADV GPUVM faults, zero panics.
+          Compare with the May 23 master-bee capture
+          (`yserver-hw-mate-master-bee.log`) on the same hardware:
+          RADV GPUVM fault at `0x8001040a0000` /
+          `GCVM_L2_PROTECTION_FAULT_STATUS=0x601031` ~5 s into MATE
+          load (the documented "2026-05-23 bee MATE-load freeze").
+          B.1 telemetry confirms the structural fix: frame builder
+          opens/closes matched (`aborts=0` throughout),
+          `submit_group_size_max_in_window=1` every sample (M1
+          enforced), composite_glyphs bursts collapse into single
+          frames (peak `glyph_uploads/frame_max=27` in one frame —
+          the same `composite_glyphs` shape that faulted master-bee
+          now records as one frame CB and one submit). The bee
+          freeze is closed.
+        - **bee MATE-load smoothness — NOT YET** (same capture).
+          Peak `queue_submit2/s=2341` during MATE drag, above the
+          pre-Phase-A 8ca552a baseline (1880/s) that was already
+          laggy. Submit-source ranking from the May 24 submit-trace:
+          render_fill 22885 + render_composite 21854 (~60 %) +
+          put_image 8082 + copy_area 7591 are all unported, every
+          one of them its own `vkQueueSubmit2` ioctl under cap=1.
+          composite_glyphs (8606, 11.6 %) IS collapsing through the
+          frame builder. User-side feel: ~1 s initial-drag hitch
+          (cold atlas intern + descriptor-pool grow + 14.7 MB
+          staging high-water in the first burst), then runs but
+          never smooth. Matches the spec's explicit design: B.1 is
+          the freeze fix; B.2 (porting render_composite +
+          render_fill) is the smoothness fix.
+        - **yoga / iMac / fuji regression check — pending.** Same
+          MATE drag, expect no new `ERROR_DEVICE_LOST` and
+          `queue_submit2/s` ≤ Phase A peak. Non-glyph paint ops on
+          these platforms regress temporarily (cap=1) and recover
+          at B.5.
+        - **silence dual-output regression check — pending.**
+          Confirm both outputs present correctly via the existing
+          per-output compose path (B.1 doesn't fold compose;
+          single-output is the only flavor exercised).
 
     **Open follow-ups:**
       - Two integration tests (`v2_frame_builder_renderer_failed_on_submit_failure`,
