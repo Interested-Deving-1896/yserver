@@ -9464,6 +9464,17 @@ impl Backend for KmsBackendV2 {
         {
             log::warn!("v2 enqueue_present_completion: flush_render_batch failed: {e:?}");
         }
+        // Phase B.1 close trigger 1b: close any open frame before the
+        // signal-only submit so the semaphore-export's SYNC_FD captures a
+        // queued signal-op for ANY paint work that came through the frame
+        // builder. Same hazard as Task 6.1 (VUID-VkFenceGetFdInfoKHR-handleType-01457).
+        if let Err(e) = self.engine.close_open_frame(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::v2::frame_builder::CloseReason::PresentCompletionSignal,
+        ) {
+            log::warn!("v2 enqueue_present_completion: close_open_frame failed: {e:?}");
+        }
         if let Err(e) = self.engine.flush_submit_group(
             &mut self.platform,
             crate::kms::v2::submit_group::FlushReason::PresentCompletionSignal,
