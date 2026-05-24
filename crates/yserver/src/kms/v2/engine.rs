@@ -855,6 +855,53 @@ impl RenderEngineInner {
         };
         self.descriptor_pool_ring.acquire_set(layout, generation)
     }
+
+    /// Phase B.2 Task 4 (USER-codex U-R6.F1 — LOAD-BEARING):
+    /// overlay-as-source-of-truth read accessor for the layout of
+    /// `id` from the perspective of the next in-frame paint op.
+    ///
+    /// - When a frame is open: consults the `FrameLayoutTable`. If the
+    ///   drawable has been first-touched in-frame, returns its
+    ///   `current_in_frame_layout`. Otherwise falls back to
+    ///   `Drawable::storage.current_layout` (the pre-frame value).
+    /// - When no frame is open: returns `Drawable::storage.current_layout`
+    ///   directly (legacy per-op path; storage is the source of truth).
+    ///
+    /// Storage fallback: a drawable that isn't in `store` resolves to
+    /// `UNDEFINED` — matches `Storage::for_tests_null`'s default and
+    /// is the only sensible answer for a missing entry; callers that
+    /// dereference the result for a barrier source must have already
+    /// validated the id.
+    ///
+    /// Open-frame paint-op ports (Tasks 11-13) MUST use this accessor
+    /// to read the dst/src/mask drawable's old_layout when emitting
+    /// barriers — see Pitfall 5 in
+    /// `docs/superpowers/plans/2026-05-24-frame-builder-phase-b2.md`.
+    /// Reading `storage.current_layout` directly during recording
+    /// returns a STALE value (storage is deliberately not mutated
+    /// during recording so failed frames roll back via overlay drop).
+    #[allow(
+        dead_code,
+        reason = "B.2 Task 4: helper lands now; Tasks 11+ rewire the open-frame \
+                  render_composite path to call this accessor instead of \
+                  reading storage directly."
+    )]
+    pub(crate) fn current_layout_for_drawable(
+        &self,
+        store: &DrawableStore,
+        id: DrawableId,
+    ) -> vk::ImageLayout {
+        let storage_fallback = store
+            .get(id)
+            .map(|d| d.storage.current_layout)
+            .unwrap_or(vk::ImageLayout::UNDEFINED);
+        if let Some(open) = self.frame_builder.open.as_ref() {
+            open.layouts
+                .current_layout_for_drawable(id, storage_fallback)
+        } else {
+            storage_fallback
+        }
+    }
 }
 
 impl RenderEngine {
@@ -1374,6 +1421,7 @@ impl RenderEngine {
                         });
                     commit_close_success(
                         inner,
+                        store,
                         std::mem::take(&mut open_frame.layouts),
                         std::mem::take(&mut open_frame.touched),
                         std::mem::take(&mut open_frame.pending_glyph_inserts),
@@ -7481,25 +7529,63 @@ fn emit_recorded_op_into_cb(
     }
 }
 
-/// Phase B.1 Task 12: commit recorder-side state to engine + atlas
-/// after `flush_submit_group` returned Ok.
+/// Phase B.1 Task 12 / Phase B.2 Task 4: commit recorder-side state
+/// to engine + atlas + drawable store after `flush_submit_group`
+/// returned Ok.
 ///
-/// - Drawable layout commit: no-op — the recorder already wrote
-///   `Drawable::storage.current_layout` directly at append time.
-/// - Touched-drawable `last_render_ticket` commit: no-op — the
+/// - **Drawable layout commit** (B.2 LOAD-BEARING, USER-codex U-R6.F1):
+///   walk the `FrameLayoutTable::drawables` overlay and write each
+///   entry's `current_in_frame_layout` back to
+///   `Drawable::storage.current_layout`. The recorded ops' barriers
+///   transitioned the GPU image to this layout; storage was
+///   deliberately NOT mutated during recording so failed frames can
+///   drop the overlay without rolling back. On success, storage MUST
+///   catch up — otherwise subsequent ops (legacy or post-B.4 ported)
+///   emit barriers from stale `old_layout` values, producing a
+///   Vulkan validation hazard / corrupt sampled image / device loss.
+///   Under B.1's recorder (which mutates storage in-place during
+///   emit) the overlay is structurally empty for the porting paths,
+///   so this loop is a no-op on B.1 frames — the harm shape only
+///   shows up once a B.2 port (Task 11+) routes its layout updates
+///   exclusively through the overlay.
+/// - **Touched-drawable `last_render_ticket` commit:** no-op — the
 ///   recorder already called `store.touch_render_fence` at append.
-/// - Glyph cache inserts: drained here onto the atlas.
-/// - Atlas last_render_ticket: stamped with the closed frame's ticket.
+/// - **Atlas layout commit:** the B.1 recorder mutates
+///   `V2GlyphAtlas::current_layout` in place during composite_glyphs,
+///   so the atlas overlay is structurally empty on B.1 frames.
+///   Reserved as a no-op-friendly write for Task 11 (when ported ops
+///   read the atlas layout via overlay too). Idempotent against the
+///   B.1 path because B.1's recorder leaves the overlay entry's
+///   `current_in_frame_layout` equal to the atlas's actual
+///   post-frame layout in the rare case it touches both.
+/// - **Glyph cache inserts:** drained here onto the atlas.
+/// - **Atlas last_render_ticket:** stamped with the closed frame's
+///   ticket.
 fn commit_close_success(
     inner: &mut RenderEngineInner,
+    store: &mut DrawableStore,
     layouts: super::frame_builder::FrameLayoutTable,
     touched: super::frame_builder::TouchedDrawables,
     pending: super::frame_builder::PendingGlyphInserts,
     frame_ticket: &FenceTicket,
 ) {
-    let _ = layouts;
     let _ = touched;
+    // Drawables: commit overlay → storage. Empty on B.1 frames; the
+    // load-bearing write is reserved for B.2 Task 11+ ports that
+    // route their layout updates exclusively through the overlay.
+    for (id, entry) in layouts.drawables {
+        if let Some(d) = store.get_mut(id) {
+            d.storage.current_layout = entry.current_in_frame_layout;
+        }
+    }
     if let Some(atlas) = inner.glyph_atlas.as_mut() {
+        // Atlas: commit overlay → atlas.current_layout. Structurally
+        // empty under B.1's recorder (which mutates the atlas
+        // layout in place during emit). Reserved for Task 11+ when
+        // the ported path consults the overlay-resolved layout.
+        if let Some(entry) = layouts.atlas {
+            atlas.set_current_layout(entry.current_in_frame_layout);
+        }
         for (key, entry) in pending.entries {
             atlas.insert_entry(key, entry);
         }
@@ -12992,5 +13078,169 @@ mod tests {
             .expect("second flush after pageflip retire must not panic");
 
         b.engine.drain_all(&mut b.platform);
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // Phase B.2 Task 4: overlay-as-source-of-truth read accessor
+    // + commit_close_success overlay → storage write-back.
+    // ────────────────────────────────────────────────────────────
+
+    /// `RenderEngineInner::current_layout_for_drawable` returns the
+    /// overlay's `current_in_frame_layout` once the drawable has been
+    /// first-touched and updated in-frame; falls back to
+    /// `storage.current_layout` when no frame is open / drawable
+    /// untouched.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn current_layout_for_drawable_reads_overlay_when_first_touched() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let id = engine
+            .create_pixmap(&mut store, &mut platform, 0x4f00_0001, 8, 8, 32)
+            .expect("create");
+
+        // Storage seeded with UNDEFINED by `allocate_drawable_storage`.
+        // Pre-condition (no frame open): wrapper returns the storage
+        // value directly.
+        {
+            let inner = engine.inner.as_ref().expect("inner");
+            assert_eq!(
+                inner.current_layout_for_drawable(&store, id),
+                vk::ImageLayout::UNDEFINED,
+                "no frame open + UNDEFINED storage → wrapper returns UNDEFINED",
+            );
+        }
+
+        // Open a frame and first-touch the drawable, then update its
+        // in-frame layout to COLOR_ATTACHMENT_OPTIMAL — same shape a
+        // ported `render_composite` will use at op-append time.
+        let ticket = platform
+            .submit_group_ticket_or_open()
+            .expect("submit_group_ticket_or_open");
+        engine.open_frame_for_paint_for_tests(ticket);
+        {
+            let inner = engine.inner.as_mut().expect("inner");
+            let open = inner.frame_builder.open.as_mut().expect("open");
+            open.layouts
+                .first_touch_drawable(id, vk::ImageLayout::UNDEFINED);
+            open.layouts
+                .set_drawable_in_frame(id, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        }
+
+        // Wrapper now consults the overlay — must see the in-frame
+        // value, NOT the (still UNDEFINED) storage value.
+        {
+            let inner = engine.inner.as_ref().expect("inner");
+            assert_eq!(
+                inner.current_layout_for_drawable(&store, id),
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                "frame open + drawable first-touched → wrapper returns overlay's \
+                 current_in_frame_layout (overlay-as-source-of-truth invariant)",
+            );
+        }
+        // Storage unchanged during recording.
+        assert_eq!(
+            store.get(id).expect("drawable").storage.current_layout,
+            vk::ImageLayout::UNDEFINED,
+            "storage NOT mutated during recording (B.2 invariant)",
+        );
+
+        // Untouched second drawable in the same open frame falls
+        // through to its storage layout.
+        let id2 = engine
+            .create_pixmap(&mut store, &mut platform, 0x4f00_0002, 8, 8, 32)
+            .expect("create #2");
+        {
+            let inner = engine.inner.as_ref().expect("inner");
+            assert_eq!(
+                inner.current_layout_for_drawable(&store, id2),
+                vk::ImageLayout::UNDEFINED,
+                "untouched drawable in open frame → wrapper falls back to storage",
+            );
+        }
+
+        // Close the frame cleanly so drop-time invariants hold.
+        engine
+            .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
+            .expect("close");
+        engine.drain_all(&mut platform);
+    }
+
+    /// `commit_close_success` writes each touched drawable's
+    /// `current_in_frame_layout` back to `storage.current_layout`
+    /// (USER-codex U-R6.F1 — LOAD-BEARING).
+    ///
+    /// Without this commit, a B.2 frame ports that route layout
+    /// transitions exclusively through the overlay would leave
+    /// `Drawable::storage.current_layout` stale after submit — the
+    /// next op (legacy or ported) would emit a barrier from the wrong
+    /// `old_layout`, corrupting / device-losing on the next render.
+    ///
+    /// This unit test substitutes for the integration test sketched
+    /// in the plan (Step 6) which depends on Task 5's
+    /// `set_frame_builder_render_composite_enabled_for_tests` gate +
+    /// Task 8's `render_composite_via_frame_builder` body — neither
+    /// has landed yet. The substitute exercises the commit path
+    /// directly: seed the overlay manually, drive the close, assert
+    /// storage caught up.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn commit_close_success_writes_overlay_into_storage() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let id = engine
+            .create_pixmap(&mut store, &mut platform, 0x4f01_0001, 8, 8, 32)
+            .expect("create");
+        // Storage starts UNDEFINED.
+        assert_eq!(
+            store.get(id).expect("drawable").storage.current_layout,
+            vk::ImageLayout::UNDEFINED,
+        );
+
+        // Open a frame, seed the overlay as a ported op would: first
+        // touch records the pre-frame layout, then `set_*_in_frame`
+        // captures the post-op exit layout. (For `render_composite`,
+        // that's SHADER_READ_ONLY_OPTIMAL per Pitfall 6.)
+        let ticket = platform
+            .submit_group_ticket_or_open()
+            .expect("submit_group_ticket_or_open");
+        engine.open_frame_for_paint_for_tests(ticket);
+        {
+            let inner = engine.inner.as_mut().expect("inner");
+            let open = inner.frame_builder.open.as_mut().expect("open");
+            open.layouts
+                .first_touch_drawable(id, vk::ImageLayout::UNDEFINED);
+            open.layouts
+                .set_drawable_in_frame(id, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        }
+        // While the frame is open, storage MUST NOT have moved.
+        assert_eq!(
+            store.get(id).expect("drawable").storage.current_layout,
+            vk::ImageLayout::UNDEFINED,
+            "storage unchanged during recording (B.2 invariant)",
+        );
+
+        // Close on success — frame has no recorded ops, so the
+        // empty CB submits cleanly and `commit_close_success` runs.
+        engine
+            .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
+            .expect("close");
+
+        // Storage MUST have caught up to the overlay's in-frame value.
+        assert_eq!(
+            store.get(id).expect("drawable").storage.current_layout,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            "commit_close_success wrote overlay → storage \
+             (USER-codex U-R6.F1 LOAD-BEARING invariant)",
+        );
+        engine.drain_all(&mut platform);
     }
 }
