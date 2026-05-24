@@ -683,10 +683,14 @@ impl RenderEngine {
                 pending_frame_close_events: Vec::new(),
                 frame_seq: 0,
                 frame_builder: super::frame_builder::FrameBuilder::new(),
+                // Phase B.1 Task 24: default ON. This is the commit
+                // that activates the bee MATE-load fix in production.
+                // Set `YSERVER_FRAME_BUILDER=off` (or `0`/`false`/`no`)
+                // to opt out as a kill-switch.
                 frame_builder_enabled: std::env::var_os("YSERVER_FRAME_BUILDER")
                     .as_deref()
                     .and_then(|s| s.to_str())
-                    .is_some_and(|s| matches!(s, "1" | "on" | "true" | "yes")),
+                    .map_or(true, |s| !matches!(s, "0" | "off" | "false" | "no")),
                 frame_builder_timeout:
                     super::frame_builder::FrameBuilder::timeout_from_env_default_16ms(),
             }),
