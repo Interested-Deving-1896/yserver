@@ -28,6 +28,7 @@ pub(crate) enum CloseReason {
     /// `maybe_composite` saw a ready output + dirty scene; the frame
     /// closes paint-only (compose stays separate in B.1 — folded into
     /// the frame at B.4).
+    #[allow(dead_code, reason = "B.4 — compose joins frame; reserved variant")]
     SceneCompose,
     /// Invariant M2: a non-ported paint op is about to record its own
     /// CB; close the frame first so the non-ported op sees committed
@@ -91,6 +92,11 @@ pub(crate) enum CloseOutcome {
     /// Frame closed and submitted (one CB through SubmitGroup
     /// auto-flush). Carries the frame ticket the caller will record
     /// for retirement.
+    #[allow(
+        dead_code,
+        reason = "return-value structure for the engine close path; B.2+ may consume \
+                  fields; callers currently match on the variant without reading fields"
+    )]
     Submitted {
         frame_seq: u64,
         op_count: usize,
@@ -114,6 +120,7 @@ impl FrameBuilder {
         }
     }
 
+    #[allow(dead_code, reason = "test/diagnostic introspection; B.2+ may consume")]
     pub(crate) fn state(&self) -> FrameState {
         self.state
     }
@@ -130,6 +137,10 @@ impl FrameBuilder {
         self.lifetime_closes
     }
 
+    #[allow(
+        dead_code,
+        reason = "test-only ceiling tuning helper; production reads max_pinned_resources_per_frame"
+    )]
     pub(crate) fn set_max_pinned_resources_per_frame(&mut self, n: usize) {
         self.max_pinned_resources_per_frame = n.max(1);
     }
@@ -207,6 +218,11 @@ impl FrameBuilder {
     /// True if the next append would push the pin set past the
     /// per-frame ceiling. Caller checks this and forces a close
     /// (`reason = PinCeiling`) BEFORE the new op's append.
+    #[allow(
+        dead_code,
+        reason = "B.2+ — currently inlined per-glyph in composite_glyphs_via_frame_builder; \
+                  preserved for B.2+ ports that need the helper form"
+    )]
     pub(crate) fn would_exceed_pin_ceiling(&self, new_pins: usize) -> bool {
         match self.open.as_ref() {
             None => false, // no frame open → nothing to exceed
@@ -237,6 +253,7 @@ impl FrameBuilder {
 
     /// `#[cfg(test)]` peek at the op list in append order.
     #[cfg(test)]
+    #[allow(dead_code, reason = "scaffolded integration tests; activates when wired in B.2+")]
     pub(crate) fn peek_ops(&self) -> Option<&[RecordedOp]> {
         self.open.as_ref().map(|o| o.ops.as_slice())
     }
@@ -249,6 +266,7 @@ impl FrameBuilder {
 
     /// `#[cfg(test)]` pin count.
     #[cfg(test)]
+    #[allow(dead_code, reason = "scaffolded integration tests; activates when wired in B.2+")]
     pub(crate) fn pin_count(&self) -> usize {
         self.open.as_ref().map_or(0, |o| o.pins.len())
     }
@@ -362,6 +380,11 @@ pub(crate) struct RecordedCompositeGlyphs {
     /// time (today's `composite_glyphs` already computes the same
     /// bbox at engine.rs:3913-3922) so close-time doesn't have to
     /// re-walk the glyph list.
+    #[allow(
+        dead_code,
+        reason = "B.2+ reserved slot for ops that carry close-time-committed damage; \
+                  B.1 mutates damage at append time via store.damage()"
+    )]
     pub(crate) damage_rect: Option<vk::Rect2D>,
 }
 
@@ -378,7 +401,17 @@ pub(crate) struct RecordedGlyphUpload {
     /// becomes hit-able by this key after the frame ticket signals,
     /// but the cache entry is committed in the engine on close-success
     /// — the spec's "transactional cache insert" discipline).
+    #[allow(
+        dead_code,
+        reason = "B.2+ — replay-side cache commit. B.1 uses PendingGlyphInserts \
+                  for the canonical cache-commit path."
+    )]
     pub(crate) insert_key: GlyphKey,
+    #[allow(
+        dead_code,
+        reason = "B.2+ — replay-side cache commit. B.1 uses PendingGlyphInserts \
+                  for the canonical cache-commit path."
+    )]
     pub(crate) insert_entry: AtlasEntry,
 }
 
@@ -403,6 +436,11 @@ pub(crate) struct RecordedLayoutTransition {
 pub(crate) enum RecordedOp {
     CompositeGlyphs(RecordedCompositeGlyphs),
     GlyphUpload(RecordedGlyphUpload),
+    #[allow(
+        dead_code,
+        reason = "B.2+ — ports that emit explicit cross-frame layout transitions; \
+                  composite_glyphs in B.1 mutates layouts via the recorder's internal barriers"
+    )]
     LayoutTransition(RecordedLayoutTransition),
 }
 
@@ -435,6 +473,7 @@ impl FramePinSet {
         self.staging_buffers.len()
     }
 
+    #[allow(dead_code, reason = "introspection / B.2+ telemetry")]
     pub(crate) fn is_empty(&self) -> bool {
         self.staging_buffers.is_empty()
     }
@@ -549,6 +588,11 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LayoutOverlayEntry {
     pub(crate) pre_frame_layout: vk::ImageLayout,
+    #[allow(
+        dead_code,
+        reason = "B.2+ — when the overlay becomes source-of-truth and the recorder \
+                  reads the in-frame layout instead of mutating storage directly"
+    )]
     pub(crate) current_in_frame_layout: vk::ImageLayout,
 }
 
@@ -587,6 +631,10 @@ impl FrameLayoutTable {
         });
     }
 
+    #[allow(
+        dead_code,
+        reason = "B.2+ — overlay-as-source-of-truth path; B.1 recorder mutates storage directly"
+    )]
     pub(crate) fn set_drawable_in_frame(&mut self, id: DrawableId, layout: vk::ImageLayout) {
         if let Some(entry) = self.drawables.get_mut(&id) {
             entry.current_in_frame_layout = layout;
@@ -608,6 +656,10 @@ impl FrameLayoutTable {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "B.2+ — overlay-as-source-of-truth path; B.1 record_upload mutates atlas directly"
+    )]
     pub(crate) fn set_atlas_in_frame(&mut self, layout: vk::ImageLayout) {
         match self.atlas.as_mut() {
             Some(entry) => entry.current_in_frame_layout = layout,
@@ -620,6 +672,10 @@ impl FrameLayoutTable {
     /// `storage_fallback` (the caller passes
     /// `drawable.storage.current_layout` if the drawable isn't in
     /// the overlay yet).
+    #[allow(
+        dead_code,
+        reason = "B.2+ — overlay-as-source-of-truth path; B.1 recorder reads storage directly"
+    )]
     pub(crate) fn current_layout_for_drawable(
         &self,
         id: DrawableId,
@@ -721,10 +777,12 @@ impl TouchedDrawables {
         self.snapshots.entry(id).or_insert(prior_ticket);
     }
 
+    #[allow(dead_code, reason = "introspection / B.2+ telemetry")]
     pub(crate) fn len(&self) -> usize {
         self.snapshots.len()
     }
 
+    #[allow(dead_code, reason = "introspection / B.2+ telemetry")]
     pub(crate) fn is_empty(&self) -> bool {
         self.snapshots.is_empty()
     }
@@ -775,10 +833,12 @@ impl PendingGlyphInserts {
         self.entries.push((key, entry));
     }
 
+    #[allow(dead_code, reason = "introspection / B.2+ telemetry")]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[allow(dead_code, reason = "introspection / B.2+ telemetry")]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -925,9 +985,19 @@ mod lifecycle_tests {
 #[derive(Debug)]
 pub(crate) struct FrameSubmittedRecord {
     pub(crate) ticket: FenceTicket,
+    #[allow(
+        dead_code,
+        reason = "Drop-only ownership: the FramePinSet keeps Arc<StagingBuffer> alive \
+                  until the frame ticket signals (poll_retired drops the record). \
+                  Never explicitly read."
+    )]
     pub(crate) pins: FramePinSet,
     /// Lifetime count snapshot — telemetry uses this to attribute the
     /// retirement to the closing frame.
+    #[allow(
+        dead_code,
+        reason = "B.2+ telemetry attribution; B.1 doesn't consume the per-record sequence number"
+    )]
     pub(crate) frame_seq: u64,
 }
 
