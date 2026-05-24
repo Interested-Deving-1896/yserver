@@ -244,6 +244,56 @@ pub(crate) enum RecordedOp {
     LayoutTransition(RecordedLayoutTransition),
 }
 
+use std::sync::Arc;
+
+/// Resource pins held alive across a frame. Mechanism 1 of spec
+/// § "Frame-wide resource pinning". B.1 only pins `StagingBuffer`
+/// clones (one per glyph upload). B.2 will extend with sync objects,
+/// semaphores, and Mechanism 3 Arc'd scratch handles.
+#[derive(Debug, Default)]
+pub(crate) struct FramePinSet {
+    pub(crate) staging_buffers: Vec<Arc<super::engine::StagingBuffer>>,
+}
+
+impl FramePinSet {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn pin_staging(
+        &mut self,
+        staging: Arc<super::engine::StagingBuffer>,
+    ) -> PinnedStagingIdx {
+        let idx = u32::try_from(self.staging_buffers.len()).expect("< u32::MAX pins");
+        self.staging_buffers.push(staging);
+        PinnedStagingIdx(idx)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.staging_buffers.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.staging_buffers.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    // No-Vk pin tests can't construct a real StagingBuffer (it owns Vk
+    // handles). Pin tests here verify the bookkeeping; integration
+    // tests in v2_acceptance.rs verify the real-Vk path.
+
+    #[test]
+    fn fresh_pin_set_is_empty() {
+        let p = FramePinSet::new();
+        assert_eq!(p.len(), 0);
+        assert!(p.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod op_tests {
     use super::*;

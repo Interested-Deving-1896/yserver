@@ -221,7 +221,7 @@ struct SubmittedOp {
     /// Per-op staging buffer (only for `put_image` and Stage 3a
     /// glyph upload). Destroyed only after the fence signals;
     /// dropping it earlier would race the GPU's TRANSFER_READ.
-    staging: Option<StagingBuffer>,
+    staging: Option<Arc<StagingBuffer>>,
     /// Per-op scratch image (only for `copy_area` self-overlap
     /// path). Destroyed only after the fence signals.
     scratch: Option<ScratchImage>,
@@ -272,7 +272,7 @@ impl Drop for ScratchImage {
 
 /// One-shot host-visible buffer used for `put_image` upload or
 /// `get_image` readback. Destroyed on drop.
-struct StagingBuffer {
+pub(crate) struct StagingBuffer {
     vk: Arc<VkContext>,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -280,10 +280,22 @@ struct StagingBuffer {
     size: u64,
 }
 
+impl std::fmt::Debug for StagingBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagingBuffer")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
 // SAFETY: the v2 backend's single-threaded core invariant keeps
 // `StagingBuffer` pinned to the backend thread; `NonNull<u8>` is
-// only sound to Send under that invariant.
+// only sound to Send/Sync under that invariant. Sync is additionally
+// required so Arc<StagingBuffer> satisfies Send (Arc<T>: Send requires
+// T: Send + Sync). Shared access is never exercised in practice — all
+// callers hold either a unique `Arc` or have already retired the op.
 unsafe impl Send for StagingBuffer {}
+unsafe impl Sync for StagingBuffer {}
 
 impl StagingBuffer {
     fn new(vk: Arc<VkContext>, size: u64) -> Result<Self, vk::Result> {
@@ -3123,7 +3135,7 @@ impl RenderEngine {
             return Ok(());
         }
 
-        let staging = StagingBuffer::new(inner.vk.clone(), staging_size.max(1))?;
+        let staging = Arc::new(StagingBuffer::new(inner.vk.clone(), staging_size.max(1))?);
         // Convert src_bytes → staging according to (depth, dst_format).
         let (sx, sy) = src_origin_in_input;
         unpack_to_staging(
@@ -3269,7 +3281,7 @@ impl RenderEngine {
             return Ok(Vec::new());
         }
         let staging_size = u64::from(copy_w) * u64::from(copy_h) * u64::from(storage_bpp);
-        let staging = StagingBuffer::new(inner.vk.clone(), staging_size.max(1))?;
+        let staging = Arc::new(StagingBuffer::new(inner.vk.clone(), staging_size.max(1))?);
 
         let (cb, ticket) = begin_op_cb(inner, platform)?;
         let device = &inner.vk.device;
@@ -3534,7 +3546,7 @@ impl RenderEngine {
                     // Each upload owns its own staging slice for the
                     // CB's lifetime (Stage 3 plan §"Cross-cutting" §3).
                     let upload_bytes = (w_u as u64) * (h_u as u64);
-                    let staging = StagingBuffer::new(Arc::clone(&inner.vk), upload_bytes.max(1))?;
+                    let staging = Arc::new(StagingBuffer::new(Arc::clone(&inner.vk), upload_bytes.max(1))?);
                     // SAFETY: staging.size ≥ upload_bytes ≥ pixels.len()
                     // (per the pre-condition that PreparedGlyph.pixels
                     // is row-major w×h). mapped is host-coherent.
@@ -3849,7 +3861,7 @@ impl RenderEngine {
                     }
                     stats.atlas_interns += 1;
                     let upload_bytes = u64::from(g.w) * u64::from(g.h);
-                    let staging = StagingBuffer::new(Arc::clone(&inner.vk), upload_bytes.max(1))?;
+                    let staging = Arc::new(StagingBuffer::new(Arc::clone(&inner.vk), upload_bytes.max(1))?);
                     let copy_len = (g.w as usize) * (g.h as usize);
                     let src_slice = if g.pixels.len() >= copy_len {
                         &g.pixels[..copy_len]
@@ -5309,7 +5321,7 @@ impl RenderEngine {
         inner.pending_group_ops.push(SubmittedOp {
             cb,
             ticket,
-            staging: Some(instance_buf),
+            staging: Some(Arc::new(instance_buf)),
             scratch: None,
             atlas_ticket: None,
             generation,
