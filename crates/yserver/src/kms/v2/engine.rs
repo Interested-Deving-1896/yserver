@@ -751,6 +751,27 @@ impl RenderEngine {
         }
     }
 
+    /// Phase B.1: production-side shutdown. Closes any open frame
+    /// first, then defers to `drain_all` for the existing
+    /// SubmitGroup + submitted-queue + pending_frames drain.
+    ///
+    /// Test call sites that construct a fresh engine/platform/store
+    /// and never open a frame can keep using `drain_all` directly.
+    pub(crate) fn shutdown(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+    ) {
+        if let Err(e) = self.close_open_frame(
+            store,
+            platform,
+            super::frame_builder::CloseReason::Shutdown,
+        ) {
+            log::warn!("v2 shutdown: close_open_frame failed: {e:?}");
+        }
+        self.drain_all(platform);
+    }
+
     /// Drain every in-flight submit, waiting on the deepest
     /// ticket. Called at shutdown to ensure all CB / staging
     /// resources are reclaimed before pool destruction.
