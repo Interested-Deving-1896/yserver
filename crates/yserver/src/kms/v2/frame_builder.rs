@@ -76,6 +76,9 @@ pub(crate) struct FrameBuilder {
     lifetime_opens: u64,
     lifetime_closes: u64,
     max_pinned_resources_per_frame: usize,
+    /// Phase B.1 Task 20: latch so the pin-set ceiling log emits
+    /// once per process lifetime rather than on every trip.
+    pin_ceiling_warned: bool,
 }
 
 /// Frame-close outcome surfaced to the engine. `Submitted` carries
@@ -107,6 +110,7 @@ impl FrameBuilder {
             lifetime_opens: 0,
             lifetime_closes: 0,
             max_pinned_resources_per_frame: 1024,
+            pin_ceiling_warned: false,
         }
     }
 
@@ -132,6 +136,16 @@ impl FrameBuilder {
 
     pub(crate) fn max_pinned_resources_per_frame(&self) -> usize {
         self.max_pinned_resources_per_frame
+    }
+
+    /// Phase B.1 Task 20: log a pin-ceiling-hit warning, but only the
+    /// first time per process lifetime. Subsequent calls are no-ops.
+    /// `n` is the breaching pin count for the log message.
+    pub(crate) fn note_pin_ceiling_hit_once(&mut self, n: usize) {
+        if !self.pin_ceiling_warned {
+            log::warn!("frame_builder: pin set ceiling at {n} — forcing close");
+            self.pin_ceiling_warned = true;
+        }
     }
 
     /// Open a new frame, acquiring the shared `FenceTicket` from

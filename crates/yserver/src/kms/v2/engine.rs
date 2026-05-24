@@ -4720,13 +4720,10 @@ impl RenderEngine {
         let needs_close_reopen = pending_pins_before_call + prospective_misses > ceiling;
         if needs_close_reopen {
             // Force a close+reopen NOW (pre-allocation). Log the
-            // ceiling hit once per process (inline — no
-            // `note_pin_ceiling_hit_once` helper on FrameBuilder).
-            log::warn!(
-                "v2 composite_glyphs (frame_builder): pin-ceiling pre-check tripped \
-                 ({pending_pins_before_call} pinned + {prospective_misses} prospective > \
-                 {ceiling}); forcing close+reopen"
-            );
+            // ceiling hit once per process via note_pin_ceiling_hit_once.
+            inner
+                .frame_builder
+                .note_pin_ceiling_hit_once(pending_pins_before_call + prospective_misses);
             // Release the inner borrow before calling close_open_frame
             // (which itself reborrows self). Conventional cue without
             // invoking `drop()` on a reference.
