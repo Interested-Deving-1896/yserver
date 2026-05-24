@@ -48,6 +48,14 @@ impl DrawableId {
     pub(crate) fn as_u64(self) -> u64 {
         self.0
     }
+
+    /// Test-only constructor. Production callers must allocate via
+    /// `DrawableStore::allocate(...)` so the store's bookkeeping stays
+    /// consistent.
+    #[cfg(test)]
+    pub(crate) fn for_tests(raw: u64) -> Self {
+        Self(raw)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

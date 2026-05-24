@@ -165,3 +165,169 @@ mod state_tests {
 
 // The rest of this module — RecordedOp, FramePinSet, FrameLayoutTable,
 // FrameSubmittedRecord — lands in subsequent tasks.
+
+use ash::vk;
+
+use super::glyph_atlas::{AtlasEntry, GlyphKey};
+use super::store::DrawableId;
+
+/// Index into `OpenFrame::pins.staging_buffers`. Saved on `RecordedOp`
+/// payloads so close-time replay can fetch the right pinned buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PinnedStagingIdx(pub(crate) u32);
+
+/// A glyph to draw at frame-close time. Mirrors the in-tree
+/// `TextGlyph` struct (`crate::kms::vk::ops::text::TextGlyph`); we hold
+/// our own copy here so the recorded op is independent of the live
+/// `TextGlyph` type (which the recorder consumes by reference).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecordedTextGlyph {
+    pub(crate) atlas_x: u32,
+    pub(crate) atlas_y: u32,
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+    pub(crate) dst_x: i32,
+    pub(crate) dst_y: i32,
+}
+
+#[derive(Debug)]
+pub(crate) struct RecordedCompositeGlyphs {
+    pub(crate) dst_id: DrawableId,
+    pub(crate) foreground_rgba: [f32; 4],
+    pub(crate) glyphs: Vec<RecordedTextGlyph>,
+    pub(crate) clip_scissors: Vec<vk::Rect2D>,
+    /// Damage rect to commit on close-success. Pre-computed at append
+    /// time (today's `composite_glyphs` already computes the same
+    /// bbox at engine.rs:3913-3922) so close-time doesn't have to
+    /// re-walk the glyph list.
+    pub(crate) damage_rect: Option<vk::Rect2D>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RecordedGlyphUpload {
+    /// Pin index into the frame's staging-buffer pin vector. Replay
+    /// reads the buffer handle from the pinned Arc.
+    pub(crate) staging_pin_idx: PinnedStagingIdx,
+    pub(crate) atlas_x: u32,
+    pub(crate) atlas_y: u32,
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+    /// Cache-insert pair to commit on close-success (atlas's lookup
+    /// becomes hit-able by this key after the frame ticket signals,
+    /// but the cache entry is committed in the engine on close-success
+    /// — the spec's "transactional cache insert" discipline).
+    pub(crate) insert_key: GlyphKey,
+    pub(crate) insert_entry: AtlasEntry,
+}
+
+/// Reserved for future ops that need an explicit cross-frame layout
+/// transition. `composite_glyphs` doesn't emit any in B.1 (the text
+/// pipeline's recorder embeds its own barriers via the per-call
+/// `StorageTextTarget` adapter), but the variant exists so the
+/// recorder skeleton in Task 11 can match exhaustively and B.2 can
+/// fold ported `render_composite` / `render_fill` paths in without
+/// touching this enum's variant set.
+#[derive(Debug)]
+pub(crate) struct RecordedLayoutTransition {
+    pub(crate) drawable_id: DrawableId,
+    pub(crate) src_stage: vk::PipelineStageFlags2,
+    pub(crate) src_access: vk::AccessFlags2,
+    pub(crate) dst_stage: vk::PipelineStageFlags2,
+    pub(crate) dst_access: vk::AccessFlags2,
+    pub(crate) target_layout: vk::ImageLayout,
+}
+
+#[derive(Debug)]
+pub(crate) enum RecordedOp {
+    CompositeGlyphs(RecordedCompositeGlyphs),
+    GlyphUpload(RecordedGlyphUpload),
+    LayoutTransition(RecordedLayoutTransition),
+}
+
+#[cfg(test)]
+mod op_tests {
+    use super::*;
+
+    #[test]
+    fn recorded_op_size_is_under_256_bytes() {
+        assert!(
+            std::mem::size_of::<RecordedOp>() <= 256,
+            "RecordedOp is {} bytes — exceeds 256-byte budget",
+            std::mem::size_of::<RecordedOp>()
+        );
+    }
+
+    #[test]
+    fn recorded_composite_glyphs_carries_dst_glyph_list_and_clip() {
+        let glyph = RecordedTextGlyph {
+            atlas_x: 10,
+            atlas_y: 20,
+            w: 8,
+            h: 16,
+            dst_x: 100,
+            dst_y: 200,
+        };
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: 640,
+                height: 480,
+            },
+        };
+        let op = RecordedCompositeGlyphs {
+            dst_id: DrawableId::for_tests(1),
+            foreground_rgba: [1.0, 0.0, 0.0, 1.0],
+            glyphs: vec![glyph],
+            clip_scissors: vec![scissor],
+            damage_rect: Some(vk::Rect2D {
+                offset: vk::Offset2D { x: 100, y: 200 },
+                extent: vk::Extent2D {
+                    width: 8,
+                    height: 16,
+                },
+            }),
+        };
+
+        assert_eq!(op.dst_id, DrawableId::for_tests(1));
+        assert_eq!(op.foreground_rgba, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(op.glyphs.len(), 1);
+        assert_eq!(op.glyphs[0].atlas_x, 10);
+        assert_eq!(op.glyphs[0].dst_x, 100);
+        assert_eq!(op.clip_scissors.len(), 1);
+        assert!(op.damage_rect.is_some());
+    }
+
+    #[test]
+    fn recorded_glyph_upload_carries_staging_index_and_pending_insert() {
+        let key = GlyphKey {
+            font_xid: 1234,
+            codepoint: 65,
+        };
+        let entry = AtlasEntry {
+            atlas_x: 0,
+            atlas_y: 32,
+            w: 8,
+            h: 16,
+            pen_left: 0,
+            pen_top: 14,
+        };
+        let op = RecordedGlyphUpload {
+            staging_pin_idx: PinnedStagingIdx(3),
+            atlas_x: 0,
+            atlas_y: 32,
+            w: 8,
+            h: 16,
+            insert_key: key,
+            insert_entry: entry,
+        };
+
+        assert_eq!(op.staging_pin_idx, PinnedStagingIdx(3));
+        assert_eq!(op.atlas_x, 0);
+        assert_eq!(op.atlas_y, 32);
+        assert_eq!(op.w, 8);
+        assert_eq!(op.h, 16);
+        assert_eq!(op.insert_key.font_xid, 1234);
+        assert_eq!(op.insert_key.codepoint, 65);
+        assert_eq!(op.insert_entry.pen_top, 14);
+    }
+}
