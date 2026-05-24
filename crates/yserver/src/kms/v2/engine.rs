@@ -3600,6 +3600,15 @@ impl RenderEngine {
         // prior submits including any pending COW batch.
         self.flush_cow_batch(store, platform)?;
         self.flush_render_batch(store, platform)?;
+        // Phase B.1 close trigger 2: close any open frame before the
+        // readback's ticket.wait(). The frame's CB must submit before the
+        // readback CB records; without this, the readback would race the
+        // deferred frame.
+        self.close_open_frame(
+            store,
+            platform,
+            super::frame_builder::CloseReason::SyncWait,
+        )?;
         // Phase A: drain any buffered paint group BEFORE allocating the
         // readback CB. This ensures prior paint ops are queued/submitted
         // so the readback observes them. Distinct from the second
