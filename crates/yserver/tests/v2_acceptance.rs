@@ -3542,7 +3542,7 @@ fn submit_group_mixed_sequence_smoke_exact_submit_count() {
 }
 
 /// Phase B.1 Task 10 — Invariant M1: `SubmitGroup::new()` defaults
-/// to max_size=1 for the duration of the B.1–B.4 sub-phase rollout.
+/// to `max_size=1` for the duration of the B.1–B.4 sub-phase rollout.
 /// This test pins the regression so that any future accidental revert
 /// of the default is caught before it reaches a review.
 #[test]
@@ -3562,16 +3562,16 @@ fn v2_platform_open_pins_submit_group_max_size_to_one() {
     );
 }
 
-/// Phase B.1 Task 15 acceptance scaffold: with the FrameBuilder gate
+/// Phase B.1 Task 15 acceptance scaffold: with the `FrameBuilder` gate
 /// flipped ON, a `render_composite_glyphs` call that interns N unique
 /// glyphs should NOT submit per-glyph + final-draw CBs. Instead, the
 /// engine should record all of them in the open frame and defer the
 /// actual `vkQueueSubmit2` until a close trigger fires (M2 via the
 /// next non-ported paint op, M3 via `maybe_composite`, timeout,
-/// sync_wait, or shutdown).
+/// `sync_wait`, or shutdown).
 ///
 /// The load-bearing assertion here is the DISPATCH ROUTING invariant:
-/// after the composite_glyphs call returns,
+/// after the `composite_glyphs` call returns,
 /// `frame_builder_is_open_for_tests` must be true and
 /// `frame_seq` must NOT have advanced (no close happened yet).
 ///
@@ -3583,6 +3583,7 @@ fn v2_platform_open_pins_submit_group_max_size_to_one() {
 /// and `maybe_composite` early-returns without closing the frame).
 #[test]
 #[ignore = "needs live Vulkan ICD"]
+#[allow(clippy::similar_names)]
 fn v2_frame_builder_composite_glyphs_one_submit() {
     let mut b = match KmsBackendV2::for_tests_with_vk() {
         Ok(b) => b,
@@ -3691,9 +3692,9 @@ fn v2_frame_builder_composite_glyphs_one_submit() {
 /// Phase B.1 Task 22: forced submit failure rolls back overlays.
 ///
 /// SCAFFOLDED — needs full test-side glyph fabrication + helpers
-/// (composite_glyphs_for_tests, synth_n_unique_glyphs, force_next_submit_failure,
-/// drawable_current_layout_for_tests, drawable_last_render_ticket_for_tests,
-/// renderer_failed_for_tests, glyph_atlas_lookup_for_tests).
+/// (`composite_glyphs_for_tests`, `synth_n_unique_glyphs`, `force_next_submit_failure`,
+/// `drawable_current_layout_for_tests`, `drawable_last_render_ticket_for_tests`,
+/// `renderer_failed_for_tests`, `glyph_atlas_lookup_for_tests`).
 ///
 /// Intent: trip the close-failure path inside `RenderEngine::close_open_frame`
 /// (via Phase A's `force_next_submit_failure_for_integration_tests` latch),
@@ -3702,7 +3703,7 @@ fn v2_frame_builder_composite_glyphs_one_submit() {
 /// - dst drawable's `last_render_ticket` restored to pre-frame value.
 /// - dst drawable's `storage.current_layout` restored to pre-frame value.
 /// - The atlas cache does NOT contain the glyph keys we would have inserted
-///   (pending_glyph_inserts dropped on failure).
+///   (`pending_glyph_inserts` dropped on failure).
 ///
 /// The structural correctness is verified by spec review of Task 12's
 /// 4 error-path rollbacks + Task 15's first-touch overlay snapshots.
@@ -3722,9 +3723,9 @@ fn v2_frame_builder_renderer_failed_on_submit_failure() {
 /// `frame_builder_is_open_for_tests` (last one exists from Task 15).
 ///
 /// Intent: exercise the M2 close-on-non-ported-paint path:
-/// 1. fill_rect (non-ported) → SubmitGroup cap=1 → 1 submit, no frame.
-/// 2. composite_glyphs (ported) → opens the frame, no submit yet.
-/// 3. fill_rect again → M2 closes the frame (1 submit) + fill_rect submits (1 submit) = 2.
+/// 1. `fill_rect` (non-ported) → `SubmitGroup` cap=1 → 1 submit, no frame.
+/// 2. `composite_glyphs` (ported) → opens the frame, no submit yet.
+/// 3. `fill_rect` again → M2 closes the frame (1 submit) + `fill_rect` submits (1 submit) = 2.
 ///
 /// Asserts the submit count delta sequence: 0 → 1 → 1 → 3.
 ///

@@ -724,6 +724,10 @@ impl TouchedDrawables {
     pub(crate) fn len(&self) -> usize {
         self.snapshots.len()
     }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.snapshots.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -773,6 +777,10 @@ impl PendingGlyphInserts {
 
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 

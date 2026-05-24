@@ -109,20 +109,20 @@ pub struct Bucket {
     pub(crate) frame_builder_close_reason_timeout: u64,
     pub(crate) frame_builder_close_reason_shutdown: u64,
     pub(crate) frame_builder_close_reason_pin_ceiling: u64,
-    /// Sum of ops_in_frame across all closes in the window.
+    /// Sum of `ops_in_frame` across all closes in the window.
     pub(crate) frame_builder_ops_per_frame_total: u64,
-    /// Max ops_in_frame seen in the current bucket window.
+    /// Max `ops_in_frame` seen in the current bucket window.
     pub(crate) frame_builder_ops_per_frame_max_in_window: u64,
     /// Ops-per-frame histogram. Buckets: [0..=1, 2..=3, 4..=7, 8..=15,
     /// 16..=31, 32..=63, 64..=127, 128+].
     pub(crate) frame_builder_ops_per_frame_hist: [u64; 8],
-    /// High-water mark of pin_count seen across all closes.
+    /// High-water mark of `pin_count` seen across all closes.
     pub(crate) frame_builder_active_pins_high_water: u64,
     /// Number of frame closes that followed a Vk error (abort path).
     pub(crate) frame_builder_aborts: u64,
-    /// Sum of glyph_uploads_in_frame across all closes in the window.
+    /// Sum of `glyph_uploads_in_frame` across all closes in the window.
     pub(crate) frame_builder_glyph_uploads_per_frame_total: u64,
-    /// Max glyph_uploads_in_frame seen in the current bucket window.
+    /// Max `glyph_uploads_in_frame` seen in the current bucket window.
     pub(crate) frame_builder_glyph_uploads_per_frame_max_in_window: u64,
     // ── Phase A: SubmitGroup size + flush-reason histogram ───────
     /// Number of SubmitGroup flushes that actually submitted at
@@ -587,6 +587,7 @@ impl Telemetry {
         ops_in_frame: usize,
         glyph_uploads_in_frame: u32,
     ) {
+        use super::frame_builder::CloseReason as R;
         self.bucket.frame_builder_closes += 1;
         self.lifetime.frame_builder_closes += 1;
         let ops = u64::try_from(ops_in_frame).unwrap_or(u64::MAX);
@@ -613,13 +614,22 @@ impl Telemetry {
         let uploads = u64::from(glyph_uploads_in_frame);
         self.bucket.frame_builder_glyph_uploads_per_frame_total += uploads;
         self.lifetime.frame_builder_glyph_uploads_per_frame_total += uploads;
-        if uploads > self.bucket.frame_builder_glyph_uploads_per_frame_max_in_window {
-            self.bucket.frame_builder_glyph_uploads_per_frame_max_in_window = uploads;
+        if uploads
+            > self
+                .bucket
+                .frame_builder_glyph_uploads_per_frame_max_in_window
+        {
+            self.bucket
+                .frame_builder_glyph_uploads_per_frame_max_in_window = uploads;
         }
-        if uploads > self.lifetime.frame_builder_glyph_uploads_per_frame_max_in_window {
-            self.lifetime.frame_builder_glyph_uploads_per_frame_max_in_window = uploads;
+        if uploads
+            > self
+                .lifetime
+                .frame_builder_glyph_uploads_per_frame_max_in_window
+        {
+            self.lifetime
+                .frame_builder_glyph_uploads_per_frame_max_in_window = uploads;
         }
-        use super::frame_builder::CloseReason as R;
         let (b, l) = match reason {
             R::SceneCompose => (
                 &mut self.bucket.frame_builder_close_reason_scene_compose,

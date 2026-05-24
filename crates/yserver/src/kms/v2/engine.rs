@@ -690,7 +690,7 @@ impl RenderEngine {
                 frame_builder_enabled: std::env::var_os("YSERVER_FRAME_BUILDER")
                     .as_deref()
                     .and_then(|s| s.to_str())
-                    .map_or(true, |s| !matches!(s, "0" | "off" | "false" | "no")),
+                    .is_none_or(|s| !matches!(s, "0" | "off" | "false" | "no")),
                 frame_builder_timeout:
                     super::frame_builder::FrameBuilder::timeout_from_env_default_16ms(),
             }),
@@ -757,20 +757,14 @@ impl RenderEngine {
 
     /// Phase B.1: production-side shutdown. Closes any open frame
     /// first, then defers to `drain_all` for the existing
-    /// SubmitGroup + submitted-queue + pending_frames drain.
+    /// `SubmitGroup` + submitted-queue + `pending_frames` drain.
     ///
     /// Test call sites that construct a fresh engine/platform/store
     /// and never open a frame can keep using `drain_all` directly.
-    pub(crate) fn shutdown(
-        &mut self,
-        store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
-    ) {
-        if let Err(e) = self.close_open_frame(
-            store,
-            platform,
-            super::frame_builder::CloseReason::Shutdown,
-        ) {
+    pub(crate) fn shutdown(&mut self, store: &mut DrawableStore, platform: &mut PlatformBackend) {
+        if let Err(e) =
+            self.close_open_frame(store, platform, super::frame_builder::CloseReason::Shutdown)
+        {
             log::warn!("v2 shutdown: close_open_frame failed: {e:?}");
         }
         self.drain_all(platform);
@@ -899,7 +893,7 @@ impl RenderEngine {
         Ok(())
     }
 
-    /// Phase B.1 Task 21: drain queued FrameCloseEvents for telemetry.
+    /// Phase B.1 Task 21: drain queued `FrameCloseEvent`s for telemetry.
     /// Returns empty when no events queued (or when engine is stubbed).
     pub(crate) fn drain_frame_close_events(
         &mut self,
@@ -912,12 +906,13 @@ impl RenderEngine {
 
     /// Phase B.1 Task 12: close the open frame (if any) for `reason`,
     /// replay its op list into ONE primary CB, submit through the
-    /// SubmitGroup (cap=1 → one vkQueueSubmit2), and ONLY THEN park
+    /// `SubmitGroup` (cap=1 → one vkQueueSubmit2), and ONLY THEN park
     /// the pin set onto `pending_frames` + commit overlays. On any
-    /// failure before submit-success, the local OpenFrame drops
+    /// failure before submit-success, the local `OpenFrame` drops
     /// (pins evaporate, overlays evaporate); rollback writes
     /// `pre_frame_layout` values back to storage where the recorder
     /// already mutated them.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn close_open_frame(
         &mut self,
         store: &mut DrawableStore,
@@ -926,9 +921,8 @@ impl RenderEngine {
     ) -> Result<super::frame_builder::CloseOutcome, RenderError> {
         // Take the open frame from the FrameBuilder.
         let (mut open_frame, frame_seq) = {
-            let inner = match self.inner.as_mut() {
-                Some(i) => i,
-                None => return Ok(super::frame_builder::CloseOutcome::AlreadyClosed),
+            let Some(inner) = self.inner.as_mut() else {
+                return Ok(super::frame_builder::CloseOutcome::AlreadyClosed);
             };
             let Some(open_frame_box) = inner.frame_builder.take_open_for_close(reason) else {
                 return Ok(super::frame_builder::CloseOutcome::AlreadyClosed);
@@ -1147,24 +1141,21 @@ impl RenderEngine {
 
     /// Phase B.1 close trigger 4: close the open frame if its open
     /// duration has exceeded the cached timeout. No-op if no frame
-    /// open or below threshold. Called by maybe_composite at the
+    /// open or below threshold. Called by `maybe_composite` at the
     /// top of every tick.
     pub(crate) fn close_open_frame_if_timed_out(
         &mut self,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
     ) -> Result<(), RenderError> {
-        let timed_out = self.inner.as_ref().is_some_and(|i| {
-            i.frame_builder.open_for_at_least(i.frame_builder_timeout)
-        });
+        let timed_out = self
+            .inner
+            .as_ref()
+            .is_some_and(|i| i.frame_builder.open_for_at_least(i.frame_builder_timeout));
         if !timed_out {
             return Ok(());
         }
-        match self.close_open_frame(
-            store,
-            platform,
-            super::frame_builder::CloseReason::Timeout,
-        )? {
+        match self.close_open_frame(store, platform, super::frame_builder::CloseReason::Timeout)? {
             super::frame_builder::CloseOutcome::Submitted { .. }
             | super::frame_builder::CloseOutcome::AlreadyClosed => Ok(()),
         }
@@ -1201,14 +1192,14 @@ impl RenderEngine {
     }
 
     /// Phase B.1 Task 15: test introspection — lifetime count of
-    /// FrameBuilder closes.
+    /// `FrameBuilder` closes.
     pub(crate) fn frame_builder_lifetime_closes(&self) -> u64 {
         self.inner
             .as_ref()
             .map_or(0, |i| i.frame_builder.lifetime_closes())
     }
 
-    /// Phase B.1 Task 21: monotonic count of all FrameBuilder opens
+    /// Phase B.1 Task 21: monotonic count of all `FrameBuilder` opens
     /// since init. Delta-tracked by `KmsBackendV2::drain_frame_builder_telemetry`
     /// to emit one `record_frame_builder_open` per new open.
     pub(crate) fn frame_builder_lifetime_opens(&self) -> u64 {
@@ -1217,7 +1208,7 @@ impl RenderEngine {
             .map_or(0, |i| i.frame_builder.lifetime_opens())
     }
 
-    /// Phase B.1 Task 15: test introspection — monotonic frame_seq
+    /// Phase B.1 Task 15: test introspection — monotonic `frame_seq`
     /// counter. Bumped by `close_open_frame` on every successful close.
     pub(crate) fn engine_frame_seq(&self) -> u64 {
         self.inner.as_ref().map_or(0, |i| i.frame_seq)
@@ -3669,11 +3660,7 @@ impl RenderEngine {
         // readback's ticket.wait(). The frame's CB must submit before the
         // readback CB records; without this, the readback would race the
         // deferred frame.
-        self.close_open_frame(
-            store,
-            platform,
-            super::frame_builder::CloseReason::SyncWait,
-        )?;
+        self.close_open_frame(store, platform, super::frame_builder::CloseReason::SyncWait)?;
         // Phase A: drain any buffered paint group BEFORE allocating the
         // readback CB. This ensures prior paint ops are queued/submitted
         // so the readback observes them. Distinct from the second

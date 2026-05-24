@@ -1605,8 +1605,8 @@ impl KmsBackendV2 {
 
     /// Phase B.1 Task 21: drain queued `FrameCloseEvent`s into the
     /// per-second telemetry. Called from every site that drives a
-    /// frame close (maybe_composite, enqueue_present_completion,
-    /// get_image, shutdown/disable_output, render_composite_glyphs).
+    /// frame close (`maybe_composite`, `enqueue_present_completion`,
+    /// `get_image`, `shutdown`/`disable_output`, `render_composite_glyphs`).
     ///
     /// Opens are delta-tracked via `last_drained_fb_opens` — the
     /// drain emits one `record_frame_builder_open` for each new open
@@ -1710,7 +1710,7 @@ impl KmsBackendV2 {
         self.engine.pending_group_ops_count_for_tests()
     }
 
-    /// Phase B.1 Task 15: flip the engine's frame_builder gate at
+    /// Phase B.1 Task 15: flip the engine's `frame_builder` gate at
     /// runtime. Production reads `YSERVER_FRAME_BUILDER` env var at
     /// engine construction; tests flip via this wrapper.
     pub fn set_frame_builder_enabled_for_tests(&mut self, enabled: bool) {
@@ -1734,7 +1734,7 @@ impl KmsBackendV2 {
         let _ = self.maybe_composite();
     }
 
-    /// Phase B.1 Task 15: engine's monotonic frame_seq counter.
+    /// Phase B.1 Task 15: engine's monotonic `frame_seq` counter.
     /// Bumped by `close_open_frame` on every successful close.
     pub fn engine_frame_seq_for_tests(&self) -> u64 {
         self.engine.engine_frame_seq()
@@ -4658,10 +4658,10 @@ impl Backend for KmsBackendV2 {
         // Phase B.1 close trigger 4: if a frame has been open past the
         // timeout (16 ms default), force a close to release pinned
         // resources. No-op if no frame open or below threshold.
-        if let Err(e) = self.engine.close_open_frame_if_timed_out(
-            &mut self.store,
-            &mut self.platform,
-        ) {
+        if let Err(e) = self
+            .engine
+            .close_open_frame_if_timed_out(&mut self.store, &mut self.platform)
+        {
             log::warn!("v2 maybe_composite: timeout close failed: {e:?}");
         }
         // One main-loop tick = one frame_id. Submit events
@@ -6871,32 +6871,35 @@ impl Backend for KmsBackendV2 {
             },
         };
         let start = std::time::Instant::now();
-        let result = match self
-            .engine
-            .get_image(&mut self.store, &mut self.platform, target.id, rect, depth)
-        {
-            Ok(pixel_bytes) => {
-                let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                self.telemetry.record_one_shot_submit();
-                self.telemetry.record_fence_wait(ns);
-                self.trace_simple(SubmitKind::GetImage, target.id, 1);
-                // X11 GetImage reply: 32-byte header + pixel rows.
-                // The handler in `process_request.rs:handle_get_image`
-                // patches `sequence` at [2..4] and `visual` at [8..12];
-                // the rest of the header (depth, reply length in u32
-                // units, padding) is the backend's job. Mirrors v1's
-                // `KmsBackend::get_image` (kms/backend.rs:10400) — when
-                // this returns just the pixel slice (no header), the
-                // handler corrupts the first 32 bytes by writing into
-                // them, and clients reading depth/length/sequence from
-                // the wire see garbage.
-                Ok(Some(wrap_get_image_reply(depth, pixel_bytes)))
-            }
-            Err(e) => {
-                log::warn!("v2 get_image: engine.get_image failed for xid {host_xid:#x}: {e:?}",);
-                Ok(None)
-            }
-        };
+        let result =
+            match self
+                .engine
+                .get_image(&mut self.store, &mut self.platform, target.id, rect, depth)
+            {
+                Ok(pixel_bytes) => {
+                    let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    self.telemetry.record_one_shot_submit();
+                    self.telemetry.record_fence_wait(ns);
+                    self.trace_simple(SubmitKind::GetImage, target.id, 1);
+                    // X11 GetImage reply: 32-byte header + pixel rows.
+                    // The handler in `process_request.rs:handle_get_image`
+                    // patches `sequence` at [2..4] and `visual` at [8..12];
+                    // the rest of the header (depth, reply length in u32
+                    // units, padding) is the backend's job. Mirrors v1's
+                    // `KmsBackend::get_image` (kms/backend.rs:10400) — when
+                    // this returns just the pixel slice (no header), the
+                    // handler corrupts the first 32 bytes by writing into
+                    // them, and clients reading depth/length/sequence from
+                    // the wire see garbage.
+                    Ok(Some(wrap_get_image_reply(depth, pixel_bytes)))
+                }
+                Err(e) => {
+                    log::warn!(
+                        "v2 get_image: engine.get_image failed for xid {host_xid:#x}: {e:?}",
+                    );
+                    Ok(None)
+                }
+            };
         // Phase B.1 Task 21: engine.get_image calls close_open_frame
         // (SyncWait reason) before blocking on the fence; drain the
         // resulting close event into telemetry.
