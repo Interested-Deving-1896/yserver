@@ -3561,3 +3561,129 @@ fn v2_platform_open_pins_submit_group_max_size_to_one() {
         "Phase B Invariant M1: SubmitGroup max_size must be 1 in B.1–B.4"
     );
 }
+
+/// Phase B.1 Task 15 acceptance scaffold: with the FrameBuilder gate
+/// flipped ON, a `render_composite_glyphs` call that interns N unique
+/// glyphs should NOT submit per-glyph + final-draw CBs. Instead, the
+/// engine should record all of them in the open frame and defer the
+/// actual `vkQueueSubmit2` until a close trigger fires (M2 via the
+/// next non-ported paint op, M3 via `maybe_composite`, timeout,
+/// sync_wait, or shutdown).
+///
+/// The load-bearing assertion here is the DISPATCH ROUTING invariant:
+/// after the composite_glyphs call returns,
+/// `frame_builder_is_open_for_tests` must be true and
+/// `frame_seq` must NOT have advanced (no close happened yet).
+///
+/// The full "exactly ONE `vkQueueSubmit2` for N uploads + 1 draw"
+/// quantitative target is covered by Task 23's mixed-sequence smoke,
+/// which drives a real M3 close via the scene-compose loop. TODO
+/// (Task 23): extend this test once `tick_maybe_composite_for_tests`
+/// has a scene set up to actually fire M3 (today the scene is empty
+/// and `maybe_composite` early-returns without closing the frame).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_composite_glyphs_one_submit() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    // Drain any setup CBs so we start from a clean baseline.
+    b.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+
+    // Flip the FrameBuilder gate ON for the duration of this test.
+    b.set_frame_builder_enabled_for_tests(true);
+
+    // Build a small dst pixmap + SolidFill source + glyphset with one
+    // 4×4 A8 glyph, mirroring the structure used by
+    // `v2_composite_glyphs_clip_intersects_picture`.
+    let dst_pix = b.create_pixmap(None, 32, 8, 4).expect("create_pixmap");
+    let dst_xid = dst_pix.as_raw();
+    let src_pic = b
+        .render_create_solid_fill(None, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+        .expect("solid_fill")
+        .expect("Some(PictureHandle)");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("render_create_picture")
+        .expect("Some(PictureHandle)");
+    let gs = b
+        .render_create_glyphset(None, yserver_protocol::x11::RENDER_FMT_A8)
+        .expect("glyphset")
+        .expect("Some");
+
+    let mut add_body: Vec<u8> = Vec::new();
+    add_body.extend_from_slice(&1_u32.to_le_bytes()); // n
+    add_body.extend_from_slice(&1_u32.to_le_bytes()); // id = 1
+    add_body.extend_from_slice(&u16::to_le_bytes(4)); // width
+    add_body.extend_from_slice(&u16::to_le_bytes(4)); // height
+    add_body.extend_from_slice(&i16::to_le_bytes(0)); // x bearing
+    add_body.extend_from_slice(&i16::to_le_bytes(0)); // y bearing
+    add_body.extend_from_slice(&i16::to_le_bytes(4)); // x_off
+    add_body.extend_from_slice(&i16::to_le_bytes(0)); // y_off
+    add_body.extend_from_slice(&[0xFFu8; 16]); // pixels: 4×4 all opaque
+    b.render_add_glyphs(None, gs.as_raw(), &add_body)
+        .expect("add_glyphs");
+
+    // Drain again to drop the cow zero-fill / glyphset side-effects
+    // that may have lingered before we flipped the gate on.
+    b.engine_flush_submit_group_for_tests()
+        .expect("post-setup drain");
+
+    let frame_seq_before = b.engine_frame_seq_for_tests();
+
+    // CompositeGlyphs8 items: one element with count=2 glyphs id=1.
+    let mut items: Vec<u8> = Vec::new();
+    items.extend_from_slice(&[2u8, 0, 0, 0]); // count + pad
+    items.extend_from_slice(&i16::to_le_bytes(0)); // dx
+    items.extend_from_slice(&i16::to_le_bytes(0)); // dy
+    items.extend_from_slice(&[1u8, 1, 0, 0]); // 2 ids + pad
+
+    b.render_composite_glyphs(
+        None,
+        23, // CompositeGlyphs8
+        3,  // Over
+        src_pic.as_raw(),
+        dst_pic.as_raw(),
+        0,
+        gs.as_raw(),
+        0,
+        0,
+        &items,
+        0,
+        0,
+    )
+    .expect("render_composite_glyphs");
+
+    // Dispatch-routing invariant: with the gate flipped ON, the engine
+    // routed through composite_glyphs_via_frame_builder, opened a
+    // frame, and deferred its submits. No close has fired yet, so
+    // frame_seq must not have advanced.
+    assert!(
+        b.frame_builder_is_open_for_tests(),
+        "frame builder must be open after composite_glyphs with gate ON"
+    );
+    assert_eq!(
+        b.engine_frame_seq_for_tests(),
+        frame_seq_before,
+        "no close should have fired yet (deferred submission)"
+    );
+
+    // Sanity: dst_xid is alive (i.e. we didn't crash mid-paint).
+    assert!(
+        b.store_drawable_exists_for_tests(dst_xid),
+        "dst pixmap must still exist after the deferred-submit cycle"
+    );
+
+    // TODO Task 23: drive a real M3 close via `scene.tick` and then
+    // assert `engine_frame_seq_for_tests() - frame_seq_before == 1`
+    // plus a delta of exactly one `vkQueueSubmit2` for the frame's
+    // (N uploads + 1 draw) CB. Today's `tick_maybe_composite_for_tests`
+    // early-returns without firing M3 because the scene's dirty bit
+    // isn't set in this minimal test fixture.
+}

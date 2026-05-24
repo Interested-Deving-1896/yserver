@@ -1667,6 +1667,36 @@ impl KmsBackendV2 {
         self.engine.pending_group_ops_count_for_tests()
     }
 
+    /// Phase B.1 Task 15: flip the engine's frame_builder gate at
+    /// runtime. Production reads `YSERVER_FRAME_BUILDER` env var at
+    /// engine construction; tests flip via this wrapper.
+    pub fn set_frame_builder_enabled_for_tests(&mut self, enabled: bool) {
+        self.engine.set_frame_builder_enabled(enabled);
+    }
+
+    /// Phase B.1 Task 15: is the frame builder currently open?
+    pub fn frame_builder_is_open_for_tests(&self) -> bool {
+        self.engine.frame_builder_is_open()
+    }
+
+    /// Phase B.1 Task 15: lifetime closes counter snapshot.
+    pub fn frame_builder_lifetime_closes_for_tests(&self) -> u64 {
+        self.engine.frame_builder_lifetime_closes()
+    }
+
+    /// Phase B.1 Task 15: drive one `maybe_composite` tick. Used by
+    /// integration tests that need to trigger an M3 close without
+    /// going through a full backend tick.
+    pub fn tick_maybe_composite_for_tests(&mut self) {
+        let _ = self.maybe_composite();
+    }
+
+    /// Phase B.1 Task 15: engine's monotonic frame_seq counter.
+    /// Bumped by `close_open_frame` on every successful close.
+    pub fn engine_frame_seq_for_tests(&self) -> u64 {
+        self.engine.engine_frame_seq()
+    }
+
     /// Phase A T6: size of the current SubmitGroup (number of CBs
     /// buffered and not yet submitted to the Vulkan queue).
     /// Exposed for v2_acceptance regression tests.

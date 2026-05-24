@@ -629,6 +629,10 @@ struct RenderEngineInner {
     /// engine can drive open/close from its existing paint entry
     /// points (Tasks 12-20 wire the transitions).
     frame_builder: super::frame_builder::FrameBuilder,
+    /// Phase B.1: runtime gate for the FrameBuilder composite_glyphs
+    /// path. Default OFF until Task 24 flips it ON. Tests override via
+    /// `set_frame_builder_enabled`.
+    frame_builder_enabled: bool,
 }
 
 impl RenderEngine {
@@ -675,6 +679,10 @@ impl RenderEngine {
                 pending_frame_close_events: Vec::new(),
                 frame_seq: 0,
                 frame_builder: super::frame_builder::FrameBuilder::new(),
+                frame_builder_enabled: std::env::var_os("YSERVER_FRAME_BUILDER")
+                    .as_deref()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| matches!(s, "1" | "on" | "true" | "yes")),
             }),
         })
     }
@@ -1117,6 +1125,37 @@ impl RenderEngine {
     /// backend wrapper exposed to v2_acceptance integration tests.
     pub(crate) fn pending_group_ops_count_for_tests(&self) -> usize {
         self.inner.as_ref().map_or(0, |i| i.pending_group_ops.len())
+    }
+
+    /// Phase B.1 Task 15: runtime override for tests. Production reads
+    /// `YSERVER_FRAME_BUILDER` env var at engine construction; tests
+    /// flip via this method.
+    pub(crate) fn set_frame_builder_enabled(&mut self, enabled: bool) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.frame_builder_enabled = enabled;
+        }
+    }
+
+    /// Phase B.1 Task 15: test introspection — is the frame builder
+    /// currently open?
+    pub(crate) fn frame_builder_is_open(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|i| i.frame_builder.is_open())
+    }
+
+    /// Phase B.1 Task 15: test introspection — lifetime count of
+    /// FrameBuilder closes.
+    pub(crate) fn frame_builder_lifetime_closes(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .map_or(0, |i| i.frame_builder.lifetime_closes())
+    }
+
+    /// Phase B.1 Task 15: test introspection — monotonic frame_seq
+    /// counter. Bumped by `close_open_frame` on every successful close.
+    pub(crate) fn engine_frame_seq(&self) -> u64 {
+        self.inner.as_ref().map_or(0, |i| i.frame_seq)
     }
 
     /// Phase A T9: CB handles of ops parked in `pending_group_ops`
@@ -4073,6 +4112,45 @@ impl RenderEngine {
         glyphs: &[CompositeGlyphInput<'_>],
         clip_rects: Option<&[Rectangle16]>,
     ) -> Result<ImageTextStats, RenderError> {
+        // Phase B.1 Task 15: branch on the runtime gate. Production
+        // reads `YSERVER_FRAME_BUILDER` env var at engine construction;
+        // tests flip via `set_frame_builder_enabled`. The legacy path
+        // is the pre-existing per-op-submit implementation moved into
+        // composite_glyphs_legacy; B.5 deletes it together with
+        // SubmitGroup.
+        if self.inner.as_ref().is_some_and(|i| i.frame_builder_enabled) {
+            self.composite_glyphs_via_frame_builder(
+                store,
+                platform,
+                dst_id,
+                foreground_rgba,
+                glyphs,
+                clip_rects,
+            )
+        } else {
+            self.composite_glyphs_legacy(
+                store,
+                platform,
+                dst_id,
+                foreground_rgba,
+                glyphs,
+                clip_rects,
+            )
+        }
+    }
+
+    /// Phase B.1 Task 15: legacy per-op-submit composite_glyphs body.
+    /// Identical to the pre-Task-15 implementation. Retired together
+    /// with `SubmitGroup` at the end of sub-phase B.5 (Task 25).
+    fn composite_glyphs_legacy(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        dst_id: DrawableId,
+        foreground_rgba: [f32; 4],
+        glyphs: &[CompositeGlyphInput<'_>],
+        clip_rects: Option<&[Rectangle16]>,
+    ) -> Result<ImageTextStats, RenderError> {
         let mut stats = ImageTextStats::default();
         if glyphs.is_empty() {
             return Ok(stats);
@@ -4369,6 +4447,544 @@ impl RenderEngine {
         // `inner` borrow released. Auto-flush.
         self.maybe_auto_flush_submit_group(platform)?;
 
+        Ok(stats)
+    }
+
+    /// Phase B.1 Task 15: FrameBuilder-routed composite_glyphs.
+    /// Defers per-glyph upload submits + the final draw submit into a
+    /// single open frame; the frame closes via M2/M3/timeout/sync_wait/
+    /// shutdown and submits all recorded ops as ONE `vkQueueSubmit2`.
+    ///
+    /// Codex-round walkthroughs preserved here:
+    /// - R1 finding 2: flush cow/render batches FIRST so any
+    ///   pre-existing batch CBs land chronologically before the
+    ///   frame's draws.
+    /// - R1 finding 3: snapshot dst pre_frame_layout in the
+    ///   `FrameLayoutTable` overlay so rollback_pre_submit can write
+    ///   it back on close failure.
+    /// - R3 finding 2: count UNIQUE prospective misses in a pre-pass
+    ///   to avoid premature close+reopen on a call with repeated
+    ///   uncached keys.
+    /// - R3 finding 2a: after close+reopen, recompute
+    ///   pending_pins_before_call (pins reset to zero on reopen).
+    /// - R4: pin-ceiling per-glyph check BEFORE `pack()` so dropped
+    ///   glyphs don't leak shelf slots.
+    /// - R5: pre-validate pixel length BEFORE `pack()` so malformed
+    ///   input doesn't leak a slot either.
+    /// - Damage mutation at append time — spec § "Damage accumulation"
+    ///   mandates it (the client's request was already accepted).
+    fn composite_glyphs_via_frame_builder(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        dst_id: DrawableId,
+        foreground_rgba: [f32; 4],
+        glyphs: &[CompositeGlyphInput<'_>],
+        clip_rects: Option<&[Rectangle16]>,
+    ) -> Result<ImageTextStats, RenderError> {
+        let mut stats = ImageTextStats::default();
+        if glyphs.is_empty() {
+            return Ok(stats);
+        }
+
+        // (0) Flush pre-existing cow/render batches before opening the
+        //     frame. Codex R1 finding 2: a pre-opened cow batch's CBs
+        //     must submit BEFORE the frame's draws (chronological X11
+        //     order). With M2 wired on every non-ported paint op,
+        //     batches normally close before a frame opens — but the
+        //     frame stays OPEN across composite_glyphs calls, so a
+        //     sequence like `cow_copy_area → composite_glyphs` would
+        //     see the cow batch pending; flush it here defensively.
+        self.flush_cow_batch(store, platform)?;
+        self.flush_render_batch(store, platform)?;
+
+        // (1) Resolve dst format gating — identical to legacy.
+        let inner = match self.inner.as_mut() {
+            Some(i) => i,
+            None => return Err(RenderError::NoVk),
+        };
+        if platform.renderer_failed {
+            return Err(RenderError::RendererFailed);
+        }
+        let (dst_extent, dst_format) = {
+            let d = store
+                .get(dst_id)
+                .ok_or(RenderError::UnknownDrawable(dst_id))?;
+            (d.storage.extent, d.storage.format)
+        };
+        if dst_format != vk::Format::B8G8R8A8_UNORM {
+            log::warn!(
+                "v2 composite_glyphs (frame_builder): dst xid={:?} has format {:?}; \
+                 text pipeline only supports B8G8R8A8_UNORM — dropping run",
+                store.get(dst_id).map(|d| d.xid),
+                dst_format,
+            );
+            return Ok(stats);
+        }
+
+        // (2) Lazy-init atlas + text pipeline — identical to legacy.
+        if inner.glyph_atlas.is_none() {
+            match V2GlyphAtlas::new(Arc::clone(&inner.vk)) {
+                Ok(a) => inner.glyph_atlas = Some(a),
+                Err(e) => {
+                    log::error!(
+                        "v2 composite_glyphs (frame_builder): V2GlyphAtlas::new failed: {e:?}"
+                    );
+                    return Err(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED));
+                }
+            }
+        }
+        if inner.text_pipeline.is_none() {
+            let atlas_view = inner.glyph_atlas.as_ref().expect("just built").image_view();
+            match TextPipeline::new(
+                Arc::clone(&inner.vk),
+                vk::Format::B8G8R8A8_UNORM,
+                atlas_view,
+            ) {
+                Ok(p) => inner.text_pipeline = Some(p),
+                Err(e) => {
+                    log::error!(
+                        "v2 composite_glyphs (frame_builder): TextPipeline::new failed: {e:?}"
+                    );
+                    return Err(RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED));
+                }
+            }
+        }
+
+        // (3) Open the frame if not open. `submit_group_ticket_or_open`
+        //     either returns the existing shared ticket (if a sibling
+        //     op already opened the group) or opens a fresh one.
+        if !inner.frame_builder.is_open() {
+            // Release the inner borrow before calling the platform
+            // method which doesn't need it.
+            let _ = inner;
+            let ticket = platform.submit_group_ticket_or_open()?;
+            let inner = self.inner.as_mut().expect("inner");
+            inner.frame_builder.open_for_paint(ticket);
+        }
+        let inner = self.inner.as_mut().expect("inner");
+
+        // (4) Ticket-touch dst + snapshot prior ticket (first-touch
+        //     only) + FIRST-TOUCH dst layout overlay (codex R1 finding
+        //     3 fix — the overlay's pre_frame_layout is what
+        //     `rollback_pre_submit` writes back on close-failure).
+        let frame_ticket = inner
+            .frame_builder
+            .open
+            .as_ref()
+            .expect("just opened")
+            .ticket
+            .clone();
+        let prior_dst_ticket = store.get(dst_id).and_then(|d| d.last_render_ticket.clone());
+        let dst_pre_frame_layout = store
+            .get(dst_id)
+            .map(|d| d.storage.current_layout)
+            .unwrap_or(vk::ImageLayout::UNDEFINED);
+        {
+            let open = inner.frame_builder.open.as_mut().expect("just opened");
+            open.touched.first_touch(dst_id, prior_dst_ticket);
+            open.layouts
+                .first_touch_drawable(dst_id, dst_pre_frame_layout);
+        }
+        store.touch_render_fence(dst_id, frame_ticket.clone());
+
+        // (5) Snapshot atlas prev ticket + atlas layout (first-touch
+        //     only). The atlas snapshot is the rollback target if the
+        //     close fails AFTER any upload op recorded; record_upload
+        //     mutates `V2GlyphAtlas::current_layout` in place.
+        {
+            let atlas_pre_ticket: Option<FenceTicket> = inner
+                .glyph_atlas
+                .as_ref()
+                .and_then(|a| a.last_render_ticket().cloned());
+            let atlas_pre_layout: vk::ImageLayout = inner
+                .glyph_atlas
+                .as_ref()
+                .map(super::glyph_atlas::V2GlyphAtlas::current_layout)
+                .unwrap_or(vk::ImageLayout::UNDEFINED);
+            let open = inner.frame_builder.open.as_mut().expect("open");
+            if open.atlas_prev_ticket_snapshot.is_none() {
+                open.atlas_prev_ticket_snapshot = Some(atlas_pre_ticket);
+                open.layouts.first_touch_atlas(atlas_pre_layout);
+            }
+        }
+
+        // (6a) PRE-PASS — count UNIQUE atlas misses without packing or
+        //      allocating. Codex R3 finding 2: a call with repeated
+        //      uncached keys would otherwise count N misses where one
+        //      upload suffices, triggering premature close+reopens.
+        //      Dedupe keys against (a) the committed atlas, (b) the
+        //      frame's already-queued pending_glyph_inserts, (c)
+        //      prior misses in THIS pre-pass.
+        let pending_pins_before_call = inner
+            .frame_builder
+            .open
+            .as_ref()
+            .map(|o| o.pins.len())
+            .unwrap_or(0);
+        let ceiling = inner.frame_builder.max_pinned_resources_per_frame();
+        let mut prospective_miss_keys: HashSet<GlyphKey> = HashSet::new();
+        for g in glyphs {
+            let key = GlyphKey {
+                font_xid: g.gs_xid,
+                codepoint: g.glyph_id,
+            };
+            if g.w == 0 || g.h == 0 {
+                continue;
+            }
+            // (a) committed atlas hit?
+            if inner
+                .glyph_atlas
+                .as_ref()
+                .expect("init")
+                .lookup(key)
+                .is_some()
+            {
+                continue;
+            }
+            // (b) pending insert already queued in the open frame?
+            let pending_hit = inner.frame_builder.open.as_ref().is_some_and(|o| {
+                o.pending_glyph_inserts
+                    .entries
+                    .iter()
+                    .any(|(k, _)| *k == key)
+            });
+            if pending_hit {
+                continue;
+            }
+            // (c) duplicate within this call?
+            prospective_miss_keys.insert(key);
+        }
+        let prospective_misses = prospective_miss_keys.len();
+        let needs_close_reopen = pending_pins_before_call + prospective_misses > ceiling;
+        if needs_close_reopen {
+            // Force a close+reopen NOW (pre-allocation). Log the
+            // ceiling hit once per process (inline — no
+            // `note_pin_ceiling_hit_once` helper on FrameBuilder).
+            log::warn!(
+                "v2 composite_glyphs (frame_builder): pin-ceiling pre-check tripped \
+                 ({pending_pins_before_call} pinned + {prospective_misses} prospective > \
+                 {ceiling}); forcing close+reopen"
+            );
+            // Release the inner borrow before calling close_open_frame
+            // (which itself reborrows self). Conventional cue without
+            // invoking `drop()` on a reference.
+            let _ = inner;
+            self.close_open_frame(
+                store,
+                platform,
+                super::frame_builder::CloseReason::PinCeiling,
+            )?;
+            // Re-open a fresh frame.
+            let new_ticket = platform.submit_group_ticket_or_open()?;
+            let inner = self.inner.as_mut().expect("inner");
+            inner.frame_builder.open_for_paint(new_ticket);
+            let frame_ticket_reopened = inner
+                .frame_builder
+                .open
+                .as_ref()
+                .expect("just opened")
+                .ticket
+                .clone();
+            let dst_pre_layout_reopened = store
+                .get(dst_id)
+                .map(|d| d.storage.current_layout)
+                .unwrap_or(vk::ImageLayout::UNDEFINED);
+            let atlas_pre_layout_reopened = inner
+                .glyph_atlas
+                .as_ref()
+                .map(super::glyph_atlas::V2GlyphAtlas::current_layout)
+                .unwrap_or(vk::ImageLayout::UNDEFINED);
+            let atlas_pre_ticket_reopened = inner
+                .glyph_atlas
+                .as_ref()
+                .and_then(|a| a.last_render_ticket().cloned());
+            let prior_dst_reopened = store.get(dst_id).and_then(|d| d.last_render_ticket.clone());
+            {
+                let open = inner.frame_builder.open.as_mut().expect("open");
+                open.touched.first_touch(dst_id, prior_dst_reopened);
+                open.layouts
+                    .first_touch_drawable(dst_id, dst_pre_layout_reopened);
+                open.atlas_prev_ticket_snapshot = Some(atlas_pre_ticket_reopened);
+                open.layouts.first_touch_atlas(atlas_pre_layout_reopened);
+            }
+            store.touch_render_fence(dst_id, frame_ticket_reopened);
+            // If the SINGLE call still exceeds the ceiling — drop
+            // excess glyphs. The spec accepts atlas-slot leakage in
+            // the rare-failure regime; we extend that to "pathological
+            // single call".
+            if prospective_misses > ceiling {
+                log::warn!(
+                    "v2 composite_glyphs (frame_builder): single call requested {} \
+                     atlas misses but per-frame ceiling is {}; will drop excess",
+                    prospective_misses,
+                    ceiling,
+                );
+            }
+        }
+        // Re-acquire `inner` for the per-glyph walk below. (Whether or
+        // not we closed-and-reopened, the `inner` borrow was scoped.)
+        let inner = self.inner.as_mut().expect("inner");
+        // Recompute pending_pins_before_call AFTER any close+reopen.
+        // On reopen, pins start at zero; without the recompute, the
+        // per-glyph guard below would use the stale pre-close value
+        // and prematurely drop glyphs (codex R3 finding 2a).
+        let pending_pins_before_call = inner
+            .frame_builder
+            .open
+            .as_ref()
+            .map(|o| o.pins.len())
+            .unwrap_or(0);
+
+        // (6b) Per-glyph walk — actually allocate staging + pack atlas
+        //      slots for each miss. Deduplicate against (a) committed
+        //      atlas, (b) pending_glyph_inserts in the open frame,
+        //      (c) new_uploads already collected in this walk. Stop
+        //      allocating once the ceiling is hit (drop excess glyphs).
+        let mut glyphs_to_draw: Vec<super::frame_builder::RecordedTextGlyph> =
+            Vec::with_capacity(glyphs.len());
+        let mut new_uploads: Vec<(GlyphKey, AtlasEntry, Arc<StagingBuffer>)> = Vec::new();
+        let mut new_zero_inserts: Vec<(GlyphKey, AtlasEntry)> = Vec::new();
+        let mut damage_min_x = i32::MAX;
+        let mut damage_min_y = i32::MAX;
+        let mut damage_max_x = i32::MIN;
+        let mut damage_max_y = i32::MIN;
+        for g in glyphs {
+            let key = GlyphKey {
+                font_xid: g.gs_xid,
+                codepoint: g.glyph_id,
+            };
+            // (a) committed atlas hit?
+            let committed_hit = inner.glyph_atlas.as_ref().expect("init").lookup(key);
+            // (b) pending-insert hit in the open frame?
+            let pending_hit = inner.frame_builder.open.as_ref().and_then(|o| {
+                o.pending_glyph_inserts
+                    .entries
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, e)| *e)
+            });
+            // (c) new-uploads dedupe (same call earlier)?
+            let dedupe_hit = new_uploads
+                .iter()
+                .find(|(k, _, _)| *k == key)
+                .map(|(_, e, _)| *e);
+            let entry = if let Some(hit) = committed_hit.or(pending_hit).or(dedupe_hit) {
+                hit
+            } else {
+                // Zero-size glyphs use a degenerate entry; no atlas
+                // slot is consumed (the legacy path packs them anyway
+                // but the returned slot is unused; we skip pack here
+                // to avoid wasting one row on the packer).
+                if g.w == 0 || g.h == 0 {
+                    let e = AtlasEntry {
+                        atlas_x: 0,
+                        atlas_y: 0,
+                        w: 0,
+                        h: 0,
+                        pen_left: 0,
+                        pen_top: 0,
+                    };
+                    new_zero_inserts.push((key, e));
+                    continue;
+                }
+                // Pin-ceiling enforcement: check BEFORE calling
+                // `pack()` so dropped glyphs don't leak atlas slots
+                // (codex R4: pack consumes a shelf advance regardless
+                // of whether the glyph ends up uploaded).
+                if new_uploads.len() + 1 + pending_pins_before_call > ceiling {
+                    stats.glyphs_dropped += 1;
+                    continue;
+                }
+                // Pre-validate pixels length BEFORE pack() to avoid
+                // leaking a packed slot on malformed input (codex R5).
+                let copy_len = (g.w as usize) * (g.h as usize);
+                if g.pixels.len() < copy_len {
+                    log::warn!(
+                        "v2 composite_glyphs (frame_builder): glyph pixels {} < {}; \
+                         dropping pre-pack",
+                        g.pixels.len(),
+                        copy_len,
+                    );
+                    stats.glyphs_dropped += 1;
+                    continue;
+                }
+                let Some((atlas_x, atlas_y)) =
+                    inner.glyph_atlas.as_mut().expect("init").pack(g.w, g.h)
+                else {
+                    inner.glyph_atlas.as_mut().expect("init").note_full_once();
+                    stats.glyphs_dropped += 1;
+                    continue;
+                };
+                stats.atlas_interns += 1;
+                let upload_bytes = u64::from(g.w) * u64::from(g.h);
+                let staging = Arc::new(StagingBuffer::new(
+                    Arc::clone(&inner.vk),
+                    upload_bytes.max(1),
+                )?);
+                let src_slice = &g.pixels[..copy_len];
+                // SAFETY: staging is HOST_COHERENT, mapped for at
+                // least `upload_bytes` bytes (clamped to 1 below);
+                // `src_slice.len() == copy_len <= upload_bytes`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        src_slice.as_ptr(),
+                        staging.mapped.as_ptr(),
+                        copy_len,
+                    );
+                }
+                let new_entry = AtlasEntry {
+                    atlas_x,
+                    atlas_y,
+                    w: g.w,
+                    h: g.h,
+                    pen_left: 0,
+                    pen_top: 0,
+                };
+                new_uploads.push((key, new_entry, staging));
+                stats.glyph_uploads += 1;
+                new_entry
+            };
+            if entry.w == 0 || entry.h == 0 {
+                continue;
+            }
+            damage_min_x = damage_min_x.min(g.dst_x);
+            damage_min_y = damage_min_y.min(g.dst_y);
+            #[allow(clippy::cast_possible_wrap)]
+            let max_x = g.dst_x.saturating_add(entry.w as i32);
+            #[allow(clippy::cast_possible_wrap)]
+            let max_y = g.dst_y.saturating_add(entry.h as i32);
+            damage_max_x = damage_max_x.max(max_x);
+            damage_max_y = damage_max_y.max(max_y);
+            glyphs_to_draw.push(super::frame_builder::RecordedTextGlyph {
+                atlas_x: entry.atlas_x,
+                atlas_y: entry.atlas_y,
+                w: entry.w,
+                h: entry.h,
+                dst_x: g.dst_x,
+                dst_y: g.dst_y,
+            });
+        }
+
+        if glyphs_to_draw.is_empty() && new_uploads.is_empty() && new_zero_inserts.is_empty() {
+            return Ok(stats);
+        }
+
+        // (6c) Commit new uploads + zero-inserts + glyph_uploads
+        //      counter. Pin-ceiling enforcement happened in pre-pass +
+        //      per-glyph drop above; we know
+        //      new_uploads.len() ≤ ceiling - pending.
+        {
+            let open = inner.frame_builder.open.as_mut().expect("open");
+            for (key, entry, staging) in new_uploads.drain(..) {
+                let staging_pin_idx = open.pins.pin_staging(Arc::clone(&staging));
+                open.ops.push(super::frame_builder::RecordedOp::GlyphUpload(
+                    super::frame_builder::RecordedGlyphUpload {
+                        staging_pin_idx,
+                        atlas_x: entry.atlas_x,
+                        atlas_y: entry.atlas_y,
+                        w: entry.w,
+                        h: entry.h,
+                        insert_key: key,
+                        insert_entry: entry,
+                    },
+                ));
+                open.pending_glyph_inserts.push(key, entry);
+                open.glyph_uploads_in_frame = open.glyph_uploads_in_frame.saturating_add(1);
+            }
+            for (key, entry) in new_zero_inserts.drain(..) {
+                open.pending_glyph_inserts.push(key, entry);
+            }
+        }
+
+        if glyphs_to_draw.is_empty() {
+            return Ok(stats);
+        }
+
+        // (7) Build the clip scissor list — identical to legacy.
+        let clip_scissors: Vec<vk::Rect2D> = match clip_rects {
+            None => vec![vk::Rect2D {
+                offset: vk::Offset2D::default(),
+                extent: dst_extent,
+            }],
+            Some(cr) => {
+                let mut out = Vec::with_capacity(cr.len());
+                for r in cr {
+                    if r.width == 0 || r.height == 0 {
+                        continue;
+                    }
+                    let x0 = i32::from(r.x).max(0);
+                    let y0 = i32::from(r.y).max(0);
+                    let x1 = (i32::from(r.x) + i32::from(r.width))
+                        .min(i32::try_from(dst_extent.width).unwrap_or(i32::MAX));
+                    let y1 = (i32::from(r.y) + i32::from(r.height))
+                        .min(i32::try_from(dst_extent.height).unwrap_or(i32::MAX));
+                    if x1 <= x0 || y1 <= y0 {
+                        continue;
+                    }
+                    out.push(vk::Rect2D {
+                        offset: vk::Offset2D { x: x0, y: y0 },
+                        extent: vk::Extent2D {
+                            #[allow(clippy::cast_sign_loss)]
+                            width: (x1 - x0) as u32,
+                            #[allow(clippy::cast_sign_loss)]
+                            height: (y1 - y0) as u32,
+                        },
+                    });
+                }
+                if out.is_empty() {
+                    return Ok(stats);
+                }
+                out
+            }
+        };
+
+        // (8) Append-time damage mutation. Spec § "Damage accumulation"
+        //     mandates append-time mutation (the X11 client's request
+        //     already happened the moment the server accepted it;
+        //     DamageNotify fires on acceptance, before GPU work).
+        //     Frame failure does NOT roll damage back — restoration
+        //     would lose a DamageNotify the client has already been
+        //     told about.
+        if damage_max_x > damage_min_x && damage_max_y > damage_min_y {
+            let dx = damage_min_x.max(0);
+            let dy = damage_min_y.max(0);
+            let w = u32::try_from(damage_max_x - dx).unwrap_or(0);
+            let h = u32::try_from(damage_max_y - dy).unwrap_or(0);
+            if w > 0 && h > 0 {
+                store.damage(
+                    dst_id,
+                    clamp_rect(
+                        vk::Rect2D {
+                            offset: vk::Offset2D { x: dx, y: dy },
+                            extent: vk::Extent2D {
+                                width: w,
+                                height: h,
+                            },
+                        },
+                        dst_extent,
+                    ),
+                );
+            }
+        }
+
+        // (9) Append the draw op. No damage_rect carried — damage was
+        //     already mutated at append time above.
+        inner.frame_builder.open.as_mut().expect("open").ops.push(
+            super::frame_builder::RecordedOp::CompositeGlyphs(
+                super::frame_builder::RecordedCompositeGlyphs {
+                    dst_id,
+                    foreground_rgba,
+                    glyphs: glyphs_to_draw,
+                    clip_scissors,
+                    damage_rect: None,
+                },
+            ),
+        );
+
+        // (10) Do NOT auto-close. Frame closes via M2 (next non-ported
+        //      op), M3 (maybe_composite), timeout, sync_wait, or
+        //      shutdown.
         Ok(stats)
     }
 

@@ -67,7 +67,10 @@ pub(crate) enum FrameState {
 #[derive(Debug)]
 pub(crate) struct FrameBuilder {
     state: FrameState,
-    open: Option<Box<OpenFrame>>,
+    /// Phase B.1 Task 15: pub(crate) so ported paint ops in engine.rs
+    /// can append `RecordedOp`s + pins + overlays without indirecting
+    /// through helper methods for every field touch.
+    pub(crate) open: Option<Box<OpenFrame>>,
     lifetime_opens: u64,
     lifetime_closes: u64,
     max_pinned_resources_per_frame: usize,
