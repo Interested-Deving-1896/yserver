@@ -222,11 +222,14 @@ struct SubmittedOp {
     /// glyph upload). Destroyed only after the fence signals;
     /// dropping it earlier would race the GPU's TRANSFER_READ.
     staging: Option<Arc<StagingBuffer>>,
-    /// Per-op scratch image (only for `copy_area` self-overlap
-    /// path). Destroyed only after the fence signals. This is a
-    /// concrete RAII type for the legacy path and is unrelated to
-    /// the B.2 `retired_resources` Vec below; the two coexist.
-    scratch: Option<ScratchImage>,
+    /// Phase B.3 (N8): per-op self-overlap scratch images. Renamed from
+    /// `Option<ScratchImage>` to `Vec<ScratchImage>` so the frame builder
+    /// close-path walk over `open_frame.ops` can `std::mem::take` every
+    /// `RecordedCopyArea::self_overlap_scratch` into one batch's
+    /// `SubmittedOp`. Legacy `copy_area` self-overlap path (engine.rs:2937)
+    /// transiently pushes a single-element Vec until that body is rewritten
+    /// in Task 2.
+    scratch: Vec<ScratchImage>,
     /// Stage 3a: cloned `atlas_last_upload_ticket` snapshot.
     /// Atlas-sampling ops (text runs, RENDER glyphs in Stage 3d)
     /// stash the engine's then-current upload ticket here so the
@@ -288,7 +291,7 @@ impl SubmittedOp {
 /// One-shot device-local image used by `copy_area`'s same-image
 /// overlap path (Stage 2d). Destroyed only after the owning op's
 /// fence signals.
-struct ScratchImage {
+pub(crate) struct ScratchImage {
     vk: Arc<VkContext>,
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -296,6 +299,14 @@ struct ScratchImage {
     /// by `active_resource_bytes` to account for active scratch
     /// memory without querying the driver.
     size_bytes: u64,
+}
+
+impl std::fmt::Debug for ScratchImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScratchImage")
+            .field("size_bytes", &self.size_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ScratchImage {
@@ -1445,6 +1456,22 @@ impl RenderEngine {
             return Err(e);
         }
 
+        // Phase B.3 (N8): collect every self-overlap scratch from the recorded
+        // ops into a local Vec — the SubmittedOp will own them through fence
+        // retire. std::mem::take leaves the ops in place with `None` for the
+        // scratch slot (idempotent if the op never carried one). Done BEFORE
+        // flush_submit_group so close-failure drops the local on the stack
+        // (ScratchImage::Drop destroys Vk handles cleanly — no fence ticket
+        // exists yet at this point).
+        let frame_scratches: Vec<ScratchImage> = open_frame
+            .ops
+            .iter_mut()
+            .filter_map(|op| match op {
+                super::frame_builder::RecordedOp::CopyArea(ca) => ca.self_overlap_scratch.take(),
+                _ => None,
+            })
+            .collect();
+
         // Park a SubmittedOp into pending_group_ops.
         //
         // Phase B.2 Mechanism 2: consume the frame's captured-at-open
@@ -1460,7 +1487,7 @@ impl RenderEngine {
                 cb,
                 ticket: frame_ticket.clone(),
                 staging: None,
-                scratch: None,
+                scratch: frame_scratches, // NEW (B.3 N8)
                 atlas_ticket: None,
                 generation,
                 retired_resources: Vec::new(),
@@ -1622,6 +1649,17 @@ impl RenderEngine {
     /// backend wrapper exposed to v2_acceptance integration tests.
     pub(crate) fn pending_group_ops_count_for_tests(&self) -> usize {
         self.inner.as_ref().map_or(0, |i| i.pending_group_ops.len())
+    }
+
+    /// Phase B.3 (N8) test helper: scratch vec length of the most recently
+    /// submitted op. Used by `b3_close_path_scratch_walk_yields_empty_for_no_copy_area_frames`
+    /// integration test to verify the close-path walk's Vec<ScratchImage>.
+    #[cfg(test)]
+    pub(crate) fn most_recent_submitted_op_scratch_len_for_tests(&self) -> usize {
+        self.inner
+            .as_ref()
+            .and_then(|i| i.pending_group_ops.last().or_else(|| i.submitted.back()))
+            .map_or(0, |op| op.scratch.len())
     }
 
     /// Phase B.1 Task 15: runtime override for tests. Production reads
@@ -1866,12 +1904,12 @@ impl RenderEngine {
         let scratch_submitted: u64 = inner
             .submitted
             .iter()
-            .map(|op| op.scratch.as_ref().map_or(0, |s| s.size_bytes()))
+            .map(|op| op.scratch.iter().map(|s| s.size_bytes()).sum::<u64>())
             .sum();
         let scratch_parked: u64 = inner
             .pending_group_ops
             .iter()
-            .map(|op| op.scratch.as_ref().map_or(0, |s| s.size_bytes()))
+            .map(|op| op.scratch.iter().map(|s| s.size_bytes()).sum::<u64>())
             .sum();
         (
             staging_submitted + staging_parked,
@@ -2419,7 +2457,7 @@ impl RenderEngine {
             cb,
             ticket,
             staging: None,
-            scratch: None,
+            scratch: Vec::new(),
             atlas_ticket: None,
             generation,
             retired_resources: Vec::new(),
@@ -2707,7 +2745,7 @@ impl RenderEngine {
             cb,
             ticket,
             staging: None,
-            scratch: None,
+            scratch: Vec::new(),
             atlas_ticket: None,
             generation,
             retired_resources: Vec::new(),
@@ -2938,7 +2976,7 @@ impl RenderEngine {
                 cb,
                 ticket,
                 staging: None,
-                scratch: Some(scratch),
+                scratch: vec![scratch],
                 atlas_ticket: None,
                 generation,
                 retired_resources: Vec::new(),
@@ -3041,7 +3079,7 @@ impl RenderEngine {
             cb,
             ticket,
             staging: None,
-            scratch: None,
+            scratch: Vec::new(),
             atlas_ticket: None,
             generation,
             retired_resources: Vec::new(),
@@ -3499,7 +3537,7 @@ impl RenderEngine {
             cb: batch.cb,
             ticket: batch.ticket,
             staging: None,
-            scratch: None,
+            scratch: Vec::new(),
             atlas_ticket: None,
             generation,
             retired_resources: Vec::new(),
@@ -4085,7 +4123,7 @@ impl RenderEngine {
             cb: batch.cb,
             ticket: batch.ticket,
             staging: None,
-            scratch: None,
+            scratch: Vec::new(),
             atlas_ticket: None,
             generation,
             retired_resources: Vec::new(),
@@ -4265,7 +4303,7 @@ impl RenderEngine {
             cb,
             ticket,
             staging: Some(staging),
-            scratch: None,
+            scratch: Vec::new(),
             atlas_ticket: None,
             generation,
             retired_resources: Vec::new(),
@@ -4436,7 +4474,7 @@ impl RenderEngine {
             cb,
             ticket,
             staging: Some(staging),
-            scratch: None,
+            scratch: Vec::new(),
             atlas_ticket: None,
             generation,
             retired_resources: Vec::new(),
@@ -4658,7 +4696,7 @@ impl RenderEngine {
                         cb,
                         ticket: ticket.clone(),
                         staging: Some(staging),
-                        scratch: None,
+                        scratch: Vec::new(),
                         atlas_ticket: None,
                         generation,
                         retired_resources: Vec::new(),
@@ -4770,7 +4808,7 @@ impl RenderEngine {
             cb,
             ticket,
             staging: None,
-            scratch: None,
+            scratch: Vec::new(),
             atlas_ticket,
             generation,
             retired_resources: Vec::new(),
@@ -5012,7 +5050,7 @@ impl RenderEngine {
                         cb,
                         ticket: ticket.clone(),
                         staging: Some(staging),
-                        scratch: None,
+                        scratch: Vec::new(),
                         atlas_ticket: None,
                         generation,
                         retired_resources: Vec::new(),
@@ -5154,7 +5192,7 @@ impl RenderEngine {
             cb,
             ticket,
             staging: None,
-            scratch: None,
+            scratch: Vec::new(),
             atlas_ticket,
             generation,
             retired_resources: Vec::new(),
@@ -6394,7 +6432,7 @@ impl RenderEngine {
             cb,
             ticket,
             staging: None,
-            scratch: None,
+            scratch: Vec::new(),
             atlas_ticket: None,
             generation,
             retired_resources: Vec::new(),
@@ -7771,7 +7809,7 @@ impl RenderEngine {
             cb,
             ticket,
             staging: Some(Arc::new(instance_buf)),
-            scratch: None,
+            scratch: Vec::new(),
             atlas_ticket: None,
             generation,
             retired_resources: Vec::new(),
@@ -8504,6 +8542,19 @@ fn emit_recorded_op_into_cb(
             Ok(())
         }
         Op::RenderComposite(rc) => emit_recorded_render_composite_into_cb(inner, cb, pins, rc),
+        // Phase B.3 stubs — implemented per-op in Phases 2-5.
+        Op::CopyArea(_) => unimplemented!("Phase B.3 Task 2: emit_recorded_copy_area_into_cb"),
+        Op::PutImage(_) => unimplemented!("Phase B.3 Task 6: emit_recorded_put_image_into_cb"),
+        Op::FillRect(_) => unimplemented!("Phase B.3 Task 8: emit_recorded_fill_rect_into_cb"),
+        Op::LogicFill(_) => {
+            unimplemented!("Phase B.3 Task 10: emit_recorded_logic_fill_into_cb")
+        }
+        Op::ImageText(_) => {
+            unimplemented!("Phase B.3 Task 14: emit_recorded_image_text_into_cb")
+        }
+        Op::RenderTrapsOrTris(_) => {
+            unimplemented!("Phase B.3 Task 12: emit_recorded_render_traps_or_tris_into_cb")
+        }
     }
 }
 

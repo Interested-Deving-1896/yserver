@@ -16,6 +16,7 @@ use crate::kms::v2::platform::{FenceTicket, PresentCompletionSignal};
 /// One deferred PRESENT completion payload. The drain fires the
 /// wake signal via `wake_pin` + returns the `event` payload to the
 /// main loop.
+#[derive(Debug)]
 pub(crate) struct PendingPresentEntry {
     /// Lifetime pin on the underlying wake primitive. Survives a
     /// mid-flight `XFixesDestroyFence` / `FreeSyncobj`.
@@ -53,6 +54,7 @@ pub(crate) struct PendingPresentBatch {
 /// Wake-target lifetime pin variants. The drain dispatches signal
 /// via the held `Arc` regardless of whether the X11 resource id is
 /// still in the registry.
+#[derive(Debug)]
 pub(crate) enum PinnedWake {
     Pixmap(Arc<dyn XshmfenceHandle>),
     PixmapSynced {

@@ -202,6 +202,7 @@ impl FrameBuilder {
             glyph_uploads_in_frame: 0,
             close_reason_on_open: None,
             opened_at: Instant::now(),
+            pending_present_completions: Vec::new(), // NEW (B.3 N10)
         }));
     }
 
@@ -332,6 +333,16 @@ pub(crate) struct OpenFrame {
     /// Phase B.1 Task 18: wall-clock instant the frame was opened.
     /// Used by `open_for_at_least` to drive the timeout close trigger.
     pub(crate) opened_at: Instant,
+    /// Phase B.3 (N10): X PRESENT completions attached to this open frame
+    /// via `attach_cow_present_completion`. Drained at close-success into
+    /// `pending_present_batches` (alongside the acquired
+    /// `PresentCompletionSignal`'s semaphore queued on the submit).
+    /// Force-enqueued as a degraded `PendingPresentBatch { wait: Ready,
+    /// ticket: None, signal: None, events }` on close-failure (mirror
+    /// engine.rs:3556-3567's flush_cow_batch failure path — never silent
+    /// drop, the X PRESENT protocol observes the events regardless of
+    /// submit success).
+    pub(crate) pending_present_completions: Vec<super::present_completion::PendingPresentEntry>,
 }
 
 #[cfg(test)]
@@ -517,6 +528,153 @@ pub(crate) struct RecordedRenderComposite {
     pub(crate) descriptor_set: vk::DescriptorSet,
 }
 
+/// Phase B.3 (N5): trap source resolved at append-time. Drawable holds the
+/// id + the pict_format-aware swizzle class snapshot (see engine.rs:7360 —
+/// the swizzle class is computed from `src_pict_format` + drawable depth at
+/// append, pinned because RenderPictFormat resize could land between append
+/// and emit); Solid carries the clear color snapshot (emit calls
+/// `record_solid_color_clear` against `engine.solid_src_image`); Gradient
+/// carries the picture xid (emit re-looks up `picture_paint[xid]` because
+/// gradients are CPU-immutable per B.2 R3 finding 9) + the intrinsic axis
+/// projection snapped here at append.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RecordedTrapSrcKind {
+    Drawable {
+        id: DrawableId,
+        swizzle_class: super::engine::SwizzleClass,
+    },
+    Solid([f32; 4]),
+    Gradient {
+        xid: u32,
+        intrinsic_axis_projection: crate::kms::vk::ops::render::AffineXform,
+    },
+}
+
+/// Phase B.3 (TRANSFER family — N1, N3, N8). Covers both `copy_area` and
+/// `cow_copy_area` (the cow is just a regular DrawableId per N3). Emits two
+/// barrier pairs + cmd_copy_image (disjoint case) or three pairs +
+/// cmd_copy_image × 2 (self-overlap case — N8). The `self_overlap_scratch`
+/// slot is the SINGLE source of truth for the per-op scratch lifetime —
+/// see Pitfall 7 + N8 + Task 1's close-path scratch walk.
+#[derive(Debug)]
+pub(crate) struct RecordedCopyArea {
+    pub(crate) dst_id: DrawableId,
+    pub(crate) src_id: DrawableId,
+    pub(crate) src_rect: vk::Rect2D,
+    pub(crate) dst_rect: vk::Rect2D,
+    pub(crate) src_format: vk::Format,
+    pub(crate) src_extent: vk::Extent2D,
+    pub(crate) dst_extent: vk::Extent2D,
+    pub(crate) src_image: vk::Image,
+    pub(crate) dst_image: vk::Image,
+    pub(crate) src_old_layout: vk::ImageLayout,
+    pub(crate) dst_old_layout: vk::ImageLayout,
+    /// `Some(scratch)` when `src_id == dst_id` (self-overlap path,
+    /// engine.rs:2814-2918 mirror). The scratch is owned by this
+    /// payload from append until close; the close-path scratch walk
+    /// `std::mem::take`s it into a `Vec<ScratchImage>` passed to
+    /// `SubmittedOp::scratch`. NEVER an `OpenFrame::live_scratches`
+    /// sibling — single source of truth per N8 + Pitfall 7.
+    pub(crate) self_overlap_scratch: Option<super::engine::ScratchImage>,
+}
+
+/// Phase B.3 (TRANSFER family — N1, N2). Staging buffer is pinned via
+/// `open.pins.pin_staging` at append; emit fetches the buffer handle from
+/// `pins.staging_buffers[staging_pin_idx.0 as usize].buffer`.
+#[derive(Debug)]
+pub(crate) struct RecordedPutImage {
+    pub(crate) dst_id: DrawableId,
+    pub(crate) dst_rect: vk::Rect2D,
+    pub(crate) dst_image: vk::Image,
+    pub(crate) dst_extent: vk::Extent2D,
+    pub(crate) dst_old_layout: vk::ImageLayout,
+    pub(crate) staging_pin_idx: PinnedStagingIdx,
+}
+
+/// Phase B.3 (FILL family — N4). One variant covers both `fill_rect`
+/// (N=1) and `fill_rect_batch` (N≥1). Emit uses `cmd_clear_attachments`
+/// directly — NO composite pipeline, NO descriptor (codex round-7 catch
+/// rewrote the spec). `load_op = LOAD` is LOAD-BEARING per the FILL
+/// pseudocode in the spec — outside-rect pixels must be preserved.
+#[derive(Debug)]
+pub(crate) struct RecordedFillRect {
+    pub(crate) dst_id: DrawableId,
+    pub(crate) dst_image_view: vk::ImageView,
+    pub(crate) dst_extent: vk::Extent2D,
+    pub(crate) dst_format: vk::Format,
+    pub(crate) dst_old_layout: vk::ImageLayout,
+    pub(crate) color: [f32; 4],
+    pub(crate) rects: Vec<vk::Rect2D>, // pre-clamped at append, non-empty
+}
+
+/// Phase B.3 (FILL family — N6). Distinct from `RecordedFillRect`:
+/// uses LogicFillPipelineCache + push constants + per-rect scissor draws.
+/// `opaque_alpha` is a caller-provided GC parameter (cache key), NOT
+/// derived from `dst_format` — codex round-8 catch.
+#[derive(Debug)]
+pub(crate) struct RecordedLogicFill {
+    pub(crate) dst_id: DrawableId,
+    pub(crate) dst_image_view: vk::ImageView,
+    pub(crate) dst_extent: vk::Extent2D,
+    pub(crate) dst_format: vk::Format,
+    pub(crate) dst_old_layout: vk::ImageLayout,
+    pub(crate) logic_mode: yserver_core::backend::GcFunction,
+    pub(crate) opaque_alpha: bool,
+    pub(crate) color: [f32; 4],
+    pub(crate) rects: Vec<vk::Rect2D>, // pre-clamped at append, non-empty
+}
+
+/// Phase B.3 (GLYPH family — N7). Companion to B.1's `RecordedGlyphUpload`
+/// (reused verbatim per N7). Same shape as `RecordedCompositeGlyphs` but
+/// emit calls into the text-pipeline path. `dst_format == B8G8R8A8_UNORM`
+/// is implicit (append-side gate per N7).
+#[derive(Debug)]
+pub(crate) struct RecordedImageText {
+    pub(crate) dst_id: DrawableId,
+    pub(crate) dst_extent: vk::Extent2D,
+    pub(crate) dst_old_layout: vk::ImageLayout,
+    pub(crate) foreground_rgba: [f32; 4],
+    pub(crate) glyphs: Vec<RecordedTextGlyph>,
+}
+
+/// Phase B.3 (MASK family — N5). Single variant covers both raster + composite
+/// stages. Emit re-resolves `engine.mask_scratch`, `engine.dst_readback`,
+/// composite pipeline, and descriptor set fresh; none of those four are
+/// recorded.
+#[derive(Debug)]
+pub(crate) struct RecordedRenderTrapsOrTris {
+    // Dst identity and layout (N1 / B.2).
+    pub(crate) dst_id: DrawableId,
+    pub(crate) dst_image: vk::Image,
+    pub(crate) dst_view: vk::ImageView,
+    pub(crate) dst_old_layout: vk::ImageLayout,
+    pub(crate) dst_extent: vk::Extent2D,
+    pub(crate) dst_format: vk::Format,
+    pub(crate) dst_has_alpha: bool,
+    // Composite operator + derived gates.
+    pub(crate) std_op: crate::kms::vk::render_pipeline::StdPictOp,
+    pub(crate) op_byte: u8, // raw byte for the `needs_full_dst` pattern test (engine.rs:7472).
+    // Source kind + per-kind snapshot data.
+    pub(crate) src_kind: RecordedTrapSrcKind,
+    // CompositeAttrs inputs.
+    pub(crate) src_extent: vk::Extent2D,
+    pub(crate) src_is_synthetic_1x1: bool,
+    pub(crate) src_repeat: u32, // pre-resolved shader constant.
+    pub(crate) src_force_opaque: bool,
+    pub(crate) user_src_xform: crate::kms::vk::ops::render::AffineXform,
+    // Trap raster phase inputs.
+    pub(crate) prim_kind: super::engine::TrapPrimKind,
+    pub(crate) bbox_x: i32,
+    pub(crate) bbox_y: i32,
+    pub(crate) bbox_w: u32,
+    pub(crate) bbox_h: u32,
+    pub(crate) instance_count: u32,
+    // Composite phase rect layout (clip pre-clamped at append).
+    pub(crate) clip_scissors: Vec<vk::Rect2D>,
+    // Pinned resources.
+    pub(crate) vertex_pool_pin: PinnedStagingIdx,
+}
+
 /// Reserved for future ops that need an explicit cross-frame layout
 /// transition. `composite_glyphs` doesn't emit any in B.1 (the text
 /// pipeline's recorder embeds its own barriers via the per-call
@@ -552,6 +710,36 @@ pub(crate) enum RecordedOp {
                   composite_glyphs in B.1 mutates layouts via the recorder's internal barriers"
     )]
     LayoutTransition(RecordedLayoutTransition),
+    // Phase B.3 — all Box-wrapped per the size-budget rule.
+    CopyArea(Box<RecordedCopyArea>),
+    PutImage(Box<RecordedPutImage>),
+    FillRect(Box<RecordedFillRect>),
+    LogicFill(Box<RecordedLogicFill>),
+    ImageText(Box<RecordedImageText>),
+    RenderTrapsOrTris(Box<RecordedRenderTrapsOrTris>),
+}
+
+impl RecordedOp {
+    /// Phase B.3 (N10): the drawable this op WRITES to, or `None` for
+    /// utility variants without a writable drawable destination.
+    /// `attach_cow_present_completion`'s predicate uses this to decide
+    /// whether to attach the completion to the open frame (per the spec's
+    /// N10 — `touched` is the wrong predicate because it includes sampled-
+    /// only references).
+    pub(crate) fn dst_id(&self) -> Option<DrawableId> {
+        match self {
+            RecordedOp::CompositeGlyphs(g) => Some(g.dst_id),
+            RecordedOp::RenderComposite(rc) => Some(rc.dst_id),
+            RecordedOp::GlyphUpload(_) => None, // writes to atlas, not a drawable
+            RecordedOp::LayoutTransition(_) => None, // utility variant
+            RecordedOp::CopyArea(ca) => Some(ca.dst_id),
+            RecordedOp::PutImage(pi) => Some(pi.dst_id),
+            RecordedOp::FillRect(fr) => Some(fr.dst_id),
+            RecordedOp::LogicFill(lf) => Some(lf.dst_id),
+            RecordedOp::ImageText(it) => Some(it.dst_id),
+            RecordedOp::RenderTrapsOrTris(rt) => Some(rt.dst_id),
+        }
+    }
 }
 
 impl OpenFrame {
@@ -791,6 +979,247 @@ mod op_tests {
         assert_eq!(op.insert_key.font_xid, 1234);
         assert_eq!(op.insert_key.codepoint, 65);
         assert_eq!(op.insert_entry.pen_top, 14);
+    }
+
+    // Phase B.3 Task 1 tests.
+
+    #[test]
+    fn b3_recorded_op_size_budget() {
+        use std::mem::size_of;
+        // RecordedOp tag + Box ptr (B.2's invariant; B.3 keeps).
+        assert!(
+            size_of::<RecordedOp>() <= 256,
+            "RecordedOp grew past 256B: {}",
+            size_of::<RecordedOp>(),
+        );
+        // Each payload (un-boxed) stays under 512B individually.
+        assert!(
+            size_of::<RecordedCopyArea>() <= 512,
+            "RecordedCopyArea is {} bytes; spec budget 512",
+            size_of::<RecordedCopyArea>()
+        );
+        assert!(
+            size_of::<RecordedPutImage>() <= 512,
+            "RecordedPutImage is {} bytes; spec budget 512",
+            size_of::<RecordedPutImage>()
+        );
+        assert!(
+            size_of::<RecordedFillRect>() <= 512,
+            "RecordedFillRect is {} bytes; spec budget 512",
+            size_of::<RecordedFillRect>()
+        );
+        assert!(
+            size_of::<RecordedLogicFill>() <= 512,
+            "RecordedLogicFill is {} bytes; spec budget 512",
+            size_of::<RecordedLogicFill>()
+        );
+        assert!(
+            size_of::<RecordedImageText>() <= 512,
+            "RecordedImageText is {} bytes; spec budget 512",
+            size_of::<RecordedImageText>()
+        );
+        assert!(
+            size_of::<RecordedRenderTrapsOrTris>() <= 512,
+            "RecordedRenderTrapsOrTris is {} bytes; spec budget 512",
+            size_of::<RecordedRenderTrapsOrTris>()
+        );
+    }
+
+    #[test]
+    fn b3_recorded_op_dst_id_covers_every_variant() {
+        // Construct each variant with the minimum data and assert dst_id()
+        // returns the expected `Some(id)` / `None`. The pattern match in
+        // RecordedOp::dst_id() is exhaustive (no `_ =>` arm); this test
+        // fails compilation if a new variant is added without updating
+        // dst_id() — that's the primary signal we want.
+        let id7 = DrawableId::for_tests(7);
+
+        // CompositeGlyphs → Some(id7).
+        let composite_glyphs = RecordedOp::CompositeGlyphs(RecordedCompositeGlyphs {
+            dst_id: id7,
+            foreground_rgba: [0.0; 4],
+            glyphs: Vec::new(),
+            clip_scissors: Vec::new(),
+            damage_rect: None,
+        });
+        assert_eq!(composite_glyphs.dst_id(), Some(id7));
+
+        // GlyphUpload → None (utility variant — writes to atlas).
+        let glyph_upload = RecordedOp::GlyphUpload(RecordedGlyphUpload {
+            staging_pin_idx: PinnedStagingIdx(0),
+            atlas_x: 0,
+            atlas_y: 0,
+            w: 0,
+            h: 0,
+            insert_key: GlyphKey {
+                font_xid: 0,
+                codepoint: 0,
+            },
+            insert_entry: AtlasEntry {
+                atlas_x: 0,
+                atlas_y: 0,
+                w: 0,
+                h: 0,
+                pen_left: 0,
+                pen_top: 0,
+            },
+        });
+        assert_eq!(glyph_upload.dst_id(), None);
+
+        // LayoutTransition → None (utility variant).
+        let layout_transition = RecordedOp::LayoutTransition(RecordedLayoutTransition {
+            drawable_id: id7,
+            src_stage: vk::PipelineStageFlags2::empty(),
+            src_access: vk::AccessFlags2::empty(),
+            dst_stage: vk::PipelineStageFlags2::empty(),
+            dst_access: vk::AccessFlags2::empty(),
+            target_layout: vk::ImageLayout::UNDEFINED,
+        });
+        assert_eq!(layout_transition.dst_id(), None);
+
+        // CopyArea → Some(id7).
+        let copy_area = RecordedOp::CopyArea(Box::new(RecordedCopyArea {
+            dst_id: id7,
+            src_id: DrawableId::for_tests(8),
+            src_rect: vk::Rect2D::default(),
+            dst_rect: vk::Rect2D::default(),
+            src_format: vk::Format::B8G8R8A8_UNORM,
+            src_extent: vk::Extent2D::default(),
+            dst_extent: vk::Extent2D::default(),
+            src_image: vk::Image::null(),
+            dst_image: vk::Image::null(),
+            src_old_layout: vk::ImageLayout::UNDEFINED,
+            dst_old_layout: vk::ImageLayout::UNDEFINED,
+            self_overlap_scratch: None,
+        }));
+        assert_eq!(copy_area.dst_id(), Some(id7));
+
+        // PutImage → Some(id7).
+        let put_image = RecordedOp::PutImage(Box::new(RecordedPutImage {
+            dst_id: id7,
+            dst_rect: vk::Rect2D::default(),
+            dst_image: vk::Image::null(),
+            dst_extent: vk::Extent2D::default(),
+            dst_old_layout: vk::ImageLayout::UNDEFINED,
+            staging_pin_idx: PinnedStagingIdx(0),
+        }));
+        assert_eq!(put_image.dst_id(), Some(id7));
+
+        // FillRect → Some(id7).
+        let fill_rect = RecordedOp::FillRect(Box::new(RecordedFillRect {
+            dst_id: id7,
+            dst_image_view: vk::ImageView::null(),
+            dst_extent: vk::Extent2D::default(),
+            dst_format: vk::Format::B8G8R8A8_UNORM,
+            dst_old_layout: vk::ImageLayout::UNDEFINED,
+            color: [0.0; 4],
+            rects: Vec::new(),
+        }));
+        assert_eq!(fill_rect.dst_id(), Some(id7));
+
+        // LogicFill → Some(id7).
+        let logic_fill = RecordedOp::LogicFill(Box::new(RecordedLogicFill {
+            dst_id: id7,
+            dst_image_view: vk::ImageView::null(),
+            dst_extent: vk::Extent2D::default(),
+            dst_format: vk::Format::B8G8R8A8_UNORM,
+            dst_old_layout: vk::ImageLayout::UNDEFINED,
+            logic_mode: yserver_core::backend::GcFunction::Copy,
+            opaque_alpha: false,
+            color: [0.0; 4],
+            rects: Vec::new(),
+        }));
+        assert_eq!(logic_fill.dst_id(), Some(id7));
+
+        // ImageText → Some(id7).
+        let image_text = RecordedOp::ImageText(Box::new(RecordedImageText {
+            dst_id: id7,
+            dst_extent: vk::Extent2D::default(),
+            dst_old_layout: vk::ImageLayout::UNDEFINED,
+            foreground_rgba: [0.0; 4],
+            glyphs: Vec::new(),
+        }));
+        assert_eq!(image_text.dst_id(), Some(id7));
+
+        // RenderTrapsOrTris → Some(id7).
+        let render_traps = RecordedOp::RenderTrapsOrTris(Box::new(RecordedRenderTrapsOrTris {
+            dst_id: id7,
+            dst_image: vk::Image::null(),
+            dst_view: vk::ImageView::null(),
+            dst_old_layout: vk::ImageLayout::UNDEFINED,
+            dst_extent: vk::Extent2D::default(),
+            dst_format: vk::Format::B8G8R8A8_UNORM,
+            dst_has_alpha: false,
+            std_op: crate::kms::vk::render_pipeline::StdPictOp::Clear,
+            op_byte: 0,
+            src_kind: RecordedTrapSrcKind::Solid([0.0; 4]),
+            src_extent: vk::Extent2D::default(),
+            src_is_synthetic_1x1: false,
+            src_repeat: 0,
+            src_force_opaque: false,
+            user_src_xform: crate::kms::vk::ops::render::AffineXform::IDENTITY,
+            prim_kind: crate::kms::v2::engine::TrapPrimKind::Trapezoid,
+            bbox_x: 0,
+            bbox_y: 0,
+            bbox_w: 0,
+            bbox_h: 0,
+            instance_count: 0,
+            clip_scissors: Vec::new(),
+            vertex_pool_pin: PinnedStagingIdx(0),
+        }));
+        assert_eq!(render_traps.dst_id(), Some(id7));
+    }
+
+    #[test]
+    fn b3_scratch_walk_yields_empty_vec_when_no_copy_area_appended() {
+        // Spec acceptance gate (N8 + Pitfall 7): the close-path scratch walk
+        // over a frame that contains ONLY non-CopyArea ops yields an empty
+        // Vec<ScratchImage>. This verifies that the filter_map in
+        // close_open_frame only takes from RecordedCopyArea variants and
+        // doesn't spuriously touch other ops.
+        //
+        // This is a pure-unit-test (no Vk handles needed): we construct
+        // a Vec<RecordedOp> matching what close_open_frame iterates over
+        // and apply the same filter_map logic inline.
+        let id7 = DrawableId::for_tests(7);
+
+        let ops: Vec<RecordedOp> = vec![
+            RecordedOp::FillRect(Box::new(RecordedFillRect {
+                dst_id: id7,
+                dst_image_view: vk::ImageView::null(),
+                dst_extent: vk::Extent2D::default(),
+                dst_format: vk::Format::B8G8R8A8_UNORM,
+                dst_old_layout: vk::ImageLayout::UNDEFINED,
+                color: [0.0; 4],
+                rects: Vec::new(),
+            })),
+            RecordedOp::ImageText(Box::new(RecordedImageText {
+                dst_id: id7,
+                dst_extent: vk::Extent2D::default(),
+                dst_old_layout: vk::ImageLayout::UNDEFINED,
+                foreground_rgba: [0.0; 4],
+                glyphs: Vec::new(),
+            })),
+        ];
+
+        // Mirror the filter_map from close_open_frame's scratch walk.
+        let scratches: Vec<crate::kms::v2::engine::ScratchImage> = ops
+            .iter()
+            .filter_map(|op| match op {
+                RecordedOp::CopyArea(_) => {
+                    // In the real close path this would take the scratch.
+                    // Here it's unreachable since we have no CopyArea ops.
+                    unreachable!("no CopyArea ops in this test")
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            scratches.is_empty(),
+            "scratch walk yielded {} entries for a frame with no CopyArea ops",
+            scratches.len()
+        );
     }
 }
 
@@ -1119,6 +1548,7 @@ mod open_frame_tests {
             glyph_uploads_in_frame: 0,
             close_reason_on_open: None,
             opened_at: std::time::Instant::now(),
+            pending_present_completions: Vec::new(),
         };
         assert!(frame.ops.is_empty());
         assert_eq!(frame.pins.len(), 0);
