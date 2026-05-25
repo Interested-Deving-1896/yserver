@@ -4025,3 +4025,145 @@ fn v2_frame_builder_render_composite_collapses_two_in_one_frame() {
         "renderer_failed must remain false through the close-replay path",
     );
 }
+
+/// Phase B.2 Task 16: a realistic MATE-drag-like sequence — RENDER
+/// paints interleaved with text into the same dst — collapses into a
+/// single `vkQueueSubmit2` per frame.
+///
+/// Sequence:
+///   1. 3× `render_composite` (solid src into dst).
+///   2. `render_composite_glyphs` (one element of 2 ids into the same
+///      dst picture; the wire-level entry routes through
+///      `composite_glyphs_via_frame_builder` under the sub-gate).
+///   3. 2× `render_composite` (solid src into dst).
+///
+/// Then force-close the frame via the Timeout helper and assert the
+/// per-backend `submit_group_flushes` delta is exactly one. The
+/// per-backend counter (not the process-global `queue_submit2_count`)
+/// keeps the assertion parallel-safe across the test binary.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_mixed_render_and_glyphs_one_submit() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+    be.set_frame_builder_render_composite_enabled_for_tests(true);
+
+    // Build a real pixmap + dst picture so the wire-level
+    // `render_composite_glyphs` resolves dst through the picture map
+    // while `render_composite_for_tests` looks up the same drawable
+    // by its raw xid.
+    let dst_pix = be.create_pixmap(None, 32, 256, 256).expect("create_pixmap");
+    let dst_xid = dst_pix.as_raw();
+    let src_pic = be
+        .render_create_solid_fill(None, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+        .expect("solid_fill")
+        .expect("Some(PictureHandle)");
+    let dst_pic = be
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("render_create_picture")
+        .expect("Some(PictureHandle)");
+    let gs = be
+        .render_create_glyphset(None, yserver_protocol::x11::RENDER_FMT_A8)
+        .expect("glyphset")
+        .expect("Some");
+
+    // Register one 4×4 opaque-A8 glyph (id=1) on the glyphset. Mirrors
+    // the existing `v2_frame_builder_composite_glyphs_one_submit`
+    // fixture shape — smallest plausible run that exercises the
+    // atlas-intern → upload → text-draw path under the frame builder.
+    let mut add_body: Vec<u8> = Vec::new();
+    add_body.extend_from_slice(&1_u32.to_le_bytes()); // n
+    add_body.extend_from_slice(&1_u32.to_le_bytes()); // id = 1
+    add_body.extend_from_slice(&u16::to_le_bytes(4)); // width
+    add_body.extend_from_slice(&u16::to_le_bytes(4)); // height
+    add_body.extend_from_slice(&i16::to_le_bytes(0)); // x bearing
+    add_body.extend_from_slice(&i16::to_le_bytes(0)); // y bearing
+    add_body.extend_from_slice(&i16::to_le_bytes(4)); // x_off
+    add_body.extend_from_slice(&i16::to_le_bytes(0)); // y_off
+    add_body.extend_from_slice(&[0xFFu8; 16]); // 4×4 all opaque
+    be.render_add_glyphs(None, gs.as_raw(), &add_body)
+        .expect("add_glyphs");
+
+    // Drain setup CBs (cow zero-fill on pixmap, glyphset side-effects)
+    // BEFORE snapping the baseline.
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+    let pre = be.telemetry_submit_group_flushes_for_tests();
+
+    // 3× render_composite (solid src into dst).
+    let r1 = be.render_composite_for_tests(dst_xid, [1.0, 0.0, 0.0, 1.0], 256, 256);
+    let r2 = be.render_composite_for_tests(dst_xid, [0.0, 1.0, 0.0, 1.0], 256, 256);
+    let r3 = be.render_composite_for_tests(dst_xid, [0.0, 0.0, 1.0, 1.0], 256, 256);
+
+    // Then a CompositeGlyphs8 paint into the SAME dst (via dst_pic →
+    // resolves to dst's drawable; the frame builder collapses both
+    // paint shapes into the open frame).
+    //
+    // 4 glyph ids in one element (count=4, all id=1) — synth_4_glyphs:
+    // smallest run that exercises the multi-glyph append path.
+    let mut items: Vec<u8> = Vec::new();
+    items.extend_from_slice(&[4u8, 0, 0, 0]); // count + pad
+    items.extend_from_slice(&i16::to_le_bytes(0)); // dx
+    items.extend_from_slice(&i16::to_le_bytes(0)); // dy
+    items.extend_from_slice(&[1u8, 1, 1, 1]); // 4 ids
+    let g = be.render_composite_glyphs(
+        None,
+        23, // CompositeGlyphs8
+        3,  // PictOp::Over
+        src_pic.as_raw(),
+        dst_pic.as_raw(),
+        0,
+        gs.as_raw(),
+        0,
+        0,
+        &items,
+        0,
+        0,
+    );
+
+    // 2 more render_composite into the same dst.
+    let r4 = be.render_composite_for_tests(dst_xid, [1.0, 1.0, 0.0, 1.0], 256, 256);
+    let r5 = be.render_composite_for_tests(dst_xid, [1.0, 0.0, 1.0, 1.0], 256, 256);
+
+    // Force frame close via the Timeout helper (unconditional close).
+    let close_result = be.engine_close_open_frame_for_timeout_for_tests();
+
+    // Reset the process-level sub-gate IMMEDIATELY so a later panic
+    // doesn't contaminate neighbouring tests (Task 11 pattern).
+    be.set_frame_builder_render_composite_enabled_for_tests(false);
+
+    r1.expect("first render_composite_for_tests");
+    r2.expect("second render_composite_for_tests");
+    r3.expect("third render_composite_for_tests");
+    g.expect("render_composite_glyphs");
+    r4.expect("fourth render_composite_for_tests");
+    r5.expect("fifth render_composite_for_tests");
+    close_result.expect("engine_close_open_frame_for_timeout_for_tests");
+
+    let post = be.telemetry_submit_group_flushes_for_tests();
+    let delta = post - pre;
+    assert_eq!(
+        delta, 1,
+        "mixed render_composite + composite_glyphs in one frame → \
+         ONE flush_submit_group / vkQueueSubmit2 on close (got delta={delta})",
+    );
+
+    // Frame must be closed after the helper returns.
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after engine_close_open_frame_for_timeout_for_tests",
+    );
+
+    // Renderer must still be healthy.
+    assert!(
+        !be.platform_renderer_failed_for_tests(),
+        "renderer_failed must remain false through the close-replay path",
+    );
+}
+
