@@ -2540,6 +2540,98 @@ impl KmsBackendV2 {
             })
     }
 
+    /// B.3 Task 12 hotfix 2 — test-only: build a linear gradient LUT
+    /// and stash it under `grad_xid` in the engine's `picture_paint`
+    /// map. Uses a two-stop (black → white) 1-pixel gradient. Returns
+    /// `Err` on `NoVk` or GPU allocation failure.
+    pub fn engine_build_linear_gradient_for_tests(
+        &mut self,
+        grad_xid: u32,
+    ) -> Result<(), std::io::Error> {
+        use crate::kms::vk::gradient::Stop;
+        self.engine
+            .build_and_insert_linear_gradient(
+                &self.platform,
+                grad_xid,
+                (0, 0),
+                (64 << 16, 0),
+                &[
+                    Stop {
+                        pos: 0,
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 0xFFFF,
+                    },
+                    Stop {
+                        pos: 0x10000,
+                        r: 0xFFFF,
+                        g: 0xFFFF,
+                        b: 0xFFFF,
+                        a: 0xFFFF,
+                    },
+                ],
+            )
+            .map_err(|e| {
+                std::io::Error::other(format!("engine_build_linear_gradient_for_tests: {e:?}"))
+            })
+    }
+
+    /// B.3 Task 12 hotfix 2 — test-only: remove a gradient from the
+    /// engine's `picture_paint` map (mirrors `render_free_picture`'s
+    /// inner call to `picture_paint_remove`).
+    pub fn engine_picture_paint_remove_for_tests(&mut self, grad_xid: u32) {
+        self.engine.picture_paint_remove(grad_xid);
+    }
+
+    /// B.3 Task 12 hotfix 2 — test-only: drive
+    /// `engine.render_traps_or_tris` with a `ResolvedSource::Gradient`
+    /// src for the given `grad_xid`. Uses the same single-trapezoid
+    /// geometry as `engine_render_traps_or_tris_for_tests`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `dst_xid` doesn't resolve, the gradient is not
+    /// in `picture_paint`, or the engine call fails.
+    pub fn engine_render_traps_or_tris_gradient_for_tests(
+        &mut self,
+        dst_xid: u32,
+        grad_xid: u32,
+        bbox_w: u32,
+        bbox_h: u32,
+    ) -> Result<(), std::io::Error> {
+        let Some(dst_id) = self.store.lookup(dst_xid) else {
+            return Err(std::io::Error::other(format!(
+                "engine_render_traps_or_tris_gradient_for_tests: \
+                 dst xid 0x{dst_xid:x} not in store"
+            )));
+        };
+        let instance_data = [0u8; 32];
+        self.engine
+            .render_traps_or_tris(
+                &mut self.store,
+                &mut self.platform,
+                1, // PictOp_Src
+                super::engine::ResolvedSource::Gradient(grad_xid),
+                dst_id,
+                super::engine::TrapPrimKind::Trapezoid,
+                &instance_data,
+                1,
+                (0, 0, bbox_w, bbox_h),
+                None,
+                crate::kms::cpu_types::Repeat::Pad,
+                None,
+                0,
+                0,
+            )
+            .map(|_| ())
+            .map_err(|e| {
+                std::io::Error::other(format!(
+                    "engine_render_traps_or_tris_gradient_for_tests: {e:?}"
+                ))
+            })
+    }
+
     /// Phase B.3 Task 12 (N5): read the lifetime
     /// `frame_builder_close_reason_scratch_grow` counter after draining
     /// pending flush outcomes. Used by the cross-frame mask-grow integration

@@ -542,7 +542,7 @@ pub(crate) struct RecordedRenderComposite {
 /// carries the picture xid (emit re-looks up `picture_paint[xid]` because
 /// gradients are CPU-immutable per B.2 R3 finding 9) + the intrinsic axis
 /// projection snapped here at append.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[allow(
     dead_code,
     reason = "Phase B.3 Task 12 (render_traps_or_tris body rewrite) constructs these \
@@ -555,8 +555,12 @@ pub(crate) enum RecordedTrapSrcKind {
         swizzle_class: super::engine::SwizzleClass,
     },
     Solid([f32; 4]),
+    /// B.3 hotfix 2: holds a strong Arc clone of the gradient picture.
+    /// The clone keeps the Vk resources alive past `picture_paint_remove`
+    /// (which drops the engine's HashMap entry). At close time the clone
+    /// is moved into `pins.retired_resources` so it outlives the GPU CB.
     Gradient {
-        xid: u32,
+        picture: crate::kms::vk::gradient::GradientPicture,
         intrinsic_axis_projection: crate::kms::vk::ops::render::AffineXform,
     },
 }

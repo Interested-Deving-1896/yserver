@@ -1561,6 +1561,24 @@ impl RenderEngine {
                             events: drained_completions,
                         });
                     }
+                    // B.3 hotfix 2: adopt gradient Arc clones from every
+                    // RenderTrapsOrTris op into pins.retired_resources
+                    // BEFORE taking the pins. This keeps the GradientPicture
+                    // Arc alive in FrameSubmittedRecord until the GPU fence
+                    // fires — otherwise the recorded-op clone would drop with
+                    // open_frame at the end of this function while the GPU CB
+                    // is still in flight.
+                    for op in &open_frame.ops {
+                        if let super::frame_builder::RecordedOp::RenderTrapsOrTris(rt) = op
+                            && let super::frame_builder::RecordedTrapSrcKind::Gradient {
+                                ref picture,
+                                ..
+                            } = rt.src_kind
+                        {
+                            open_frame.pins.adopt_retired(Box::new(picture.clone())
+                                as Box<dyn crate::kms::scheduler::paint_batch::BatchResource>);
+                        }
+                    }
                     inner
                         .pending_frames
                         .push_back(super::frame_builder::FrameSubmittedRecord {
@@ -2015,27 +2033,24 @@ impl RenderEngine {
             .map_err(|_| RenderError::NoVk)
     }
 
-    /// Stage 3b + B.2 fix: drop any GPU-side state cached for
-    /// `host_pic`. `KmsBackendV2::render_free_picture` calls this
-    /// after removing the picture record from `KmsCore.pictures`.
+    /// Stage 3b + B.2 fix + B.3 hotfix 2: drop the engine's
+    /// `picture_paint` entry for `host_pic`. Called by
+    /// `KmsBackendV2::render_free_picture` after removing the picture
+    /// record from `KmsCore.pictures`.
     ///
-    /// **B.2 fix**: under sub-gate=ON, render_composite may have
-    /// recorded the gradient's view into a descriptor on an open
-    /// frame whose CB has not yet been submitted. Dropping the
-    /// `GradientPicture` synchronously here would destroy the Vk
-    /// image while still bound to a CB referenced from the open
-    /// frame builder — once the frame later closes + submits, the
-    /// GPU samples the freed image and TCP-faults. The fix routes
-    /// the boxed `GradientPicture` through
-    /// `adopt_retired_resource_for_gpu_retirement`, deferring the
-    /// release to the right fence: (a) open frame's pin set,
-    /// (b) submitted.back's SubmittedOp, or (c) immediate release
-    /// only if neither is in flight. `GradientPicture::release`
-    /// destroys the Vk handles; its `Drop` is a debug_assert.
+    /// **B.2 fix**: routes the `GradientPicture` through
+    /// `adopt_retired_resource_for_gpu_retirement`. The engine's
+    /// HashMap clone is an Arc clone; `BatchResource::release` drops
+    /// it (decrements the Arc). If a recorded deferred op holds
+    /// another clone (B.3 hotfix 2 path), the Vk handles stay alive
+    /// until BOTH clones drop — after the GPU fence fires.
     ///
-    /// `SolidFill` variants carry no Vk handles, so they fall
-    /// through the standard HashMap::remove drop with no fence
-    /// gating needed.
+    /// **B.3 hotfix 2**: `GradientPicture` is now `Arc`-backed; the
+    /// `picture_paint_remove` drop here is safe regardless of any
+    /// in-flight recorded ops holding their own clones.
+    ///
+    /// `SolidFill` variants carry no Vk handles — HashMap::remove
+    /// drop with no fence gating needed.
     pub(crate) fn picture_paint_remove(&mut self, host_pic: u32) {
         let Some(inner) = self.inner.as_mut() else {
             return;
@@ -5460,7 +5475,7 @@ impl RenderEngine {
                 }
                 ResolvedSource::Gradient(xid) => match inner.picture_paint.get(&xid) {
                     Some(PicturePaintState::Gradient(g)) => {
-                        src_picture_xform = Some(g.axis_projection);
+                        src_picture_xform = Some(g.axis_projection());
                         (g.image_view(), g.extent())
                     }
                     None => {
@@ -5515,7 +5530,7 @@ impl RenderEngine {
                 }
                 ResolvedSource::Gradient(xid) => match inner.picture_paint.get(&xid) {
                     Some(PicturePaintState::Gradient(g)) => {
-                        mask_picture_xform = Some(g.axis_projection);
+                        mask_picture_xform = Some(g.axis_projection());
                         (g.image_view(), g.extent())
                     }
                     None => {
@@ -6220,7 +6235,7 @@ impl RenderEngine {
                     let inner = self.inner.as_ref().expect("inner");
                     match inner.picture_paint.get(&xid) {
                         Some(PicturePaintState::Gradient(g)) => {
-                            src_picture_xform = Some(g.axis_projection);
+                            src_picture_xform = Some(g.axis_projection());
                             (g.image_view(), g.extent())
                         }
                         None => {
@@ -6298,7 +6313,7 @@ impl RenderEngine {
                     let inner = self.inner.as_ref().expect("inner");
                     match inner.picture_paint.get(&xid) {
                         Some(PicturePaintState::Gradient(g)) => {
-                            mask_picture_xform = Some(g.axis_projection);
+                            mask_picture_xform = Some(g.axis_projection());
                             (g.image_view(), g.extent())
                         }
                         None => {
@@ -6778,9 +6793,14 @@ impl RenderEngine {
                 }
                 ResolvedSource::Gradient(xid) => match inner.picture_paint.get(&xid) {
                     Some(PicturePaintState::Gradient(g)) => {
-                        let intrinsic_axis_projection = g.axis_projection;
+                        // B.3 hotfix 2: clone the Arc so the recorded op holds
+                        // a strong ref past picture_paint_remove. The clone is
+                        // moved to pins.retired_resources at close time so it
+                        // survives until the GPU fence fires.
+                        let picture = g.clone();
+                        let intrinsic_axis_projection = picture.axis_projection();
                         super::frame_builder::RecordedTrapSrcKind::Gradient {
-                            xid,
+                            picture,
                             intrinsic_axis_projection,
                         }
                     }
@@ -6813,15 +6833,9 @@ impl RenderEngine {
                 width: 1,
                 height: 1,
             },
-            super::frame_builder::RecordedTrapSrcKind::Gradient { xid, .. } => {
-                let inner = self.inner.as_ref().expect("inner");
-                match inner.picture_paint.get(xid) {
-                    Some(PicturePaintState::Gradient(g)) => g.extent(),
-                    None => vk::Extent2D {
-                        width: 1,
-                        height: 1,
-                    },
-                }
+            super::frame_builder::RecordedTrapSrcKind::Gradient { picture, .. } => {
+                // B.3 hotfix 2: extent is on the Arc clone; no HashMap lookup.
+                picture.extent()
             }
         };
         let src_is_synthetic_1x1 = matches!(
@@ -8613,18 +8627,14 @@ fn emit_recorded_render_traps_or_tris_into_cb(
             solid_src_view
         }
         super::frame_builder::RecordedTrapSrcKind::Gradient {
-            xid,
+            picture,
             intrinsic_axis_projection: _,
-        } => match inner.picture_paint.get(xid) {
-            Some(PicturePaintState::Gradient(g)) => g.image_view(),
-            None => {
-                log::warn!(
-                    "emit_recorded_render_traps_or_tris: gradient picture 0x{xid:x} \
-                         missing at emit — was present at append; skipping"
-                );
-                return Ok(());
-            }
-        },
+        } => {
+            // B.3 hotfix 2: the Arc clone guarantees liveness — no
+            // picture_paint lookup, no None branch. The "missing at
+            // emit" warn path is gone.
+            picture.image_view()
+        }
     };
 
     // ── (b) Resolve mask_scratch FRESH ──

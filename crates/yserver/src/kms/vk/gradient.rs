@@ -80,54 +80,80 @@ pub struct Stop {
     pub a: u16,
 }
 
-/// Evaluated gradient. Owns its `VkImage` + view + memory; also
-/// remembers the dst-pixel → image-pixel projection that turns a
-/// composite call into a regular textured draw.
+/// Shared-ownership inner resources for a [`GradientPicture`].
 ///
-/// **Lifetime contract (B.2 fix):** `GradientPicture` implements
-/// [`crate::kms::scheduler::paint_batch::BatchResource`]; the Vk
-/// handles are destroyed in `release(self: Box<Self>, &VkContext)`,
-/// NOT in `Drop`. The free path in
-/// `KmsBackendV2::render_free_picture` boxes the picture and routes
-/// it through `adopt_retired_resource_for_gpu_retirement` so the
-/// destruction defers to whichever fence is in flight (open frame's
-/// pin set, latest SubmittedOp, or immediate release if nothing is
-/// in flight). This prevents the B.2 use-after-free where the frame
-/// builder defers a CB submission past `RenderFreePicture` and the
-/// GPU samples freed memory. Drop is a debug-only assert.
-pub struct GradientPicture {
+/// **Lifetime contract (B.3 hotfix 2):** Vk handles are destroyed in
+/// this struct's `Drop`. `GradientPicture` is an
+/// `Arc<GradientPictureResources>` newtype so the picture can be
+/// cloned onto [`super::super::v2::frame_builder::RecordedTrapSrcKind::Gradient`]
+/// at append time. The engine's `picture_paint` map holds one clone;
+/// each recorded deferred op holds another. Both are routed through
+/// `adopt_retired_resource_for_gpu_retirement`; Vk handles are only
+/// destroyed when the LAST Arc clone drops after the GPU fence fires.
+struct GradientPictureResources {
     vk: Arc<VkContext>,
     image: vk::Image,
     view: vk::ImageView,
     memory: vk::DeviceMemory,
     extent: vk::Extent2D,
     /// dst-pixel → gradient-image-pixel affine.
-    pub axis_projection: AffineXform,
-    /// Set to `true` by `release`; Drop checks this to catch missed
-    /// adopt-to-fence routings (would otherwise silently leak Vk
-    /// handles AND risk a UAF if a CB still references them).
-    released: bool,
+    axis_projection: AffineXform,
 }
+
+// SAFETY: raw Vk handles are valid to send across threads under
+// single-threaded-engine + retire-path lock discipline.
+unsafe impl Send for GradientPictureResources {}
+unsafe impl Sync for GradientPictureResources {}
+
+impl Drop for GradientPictureResources {
+    fn drop(&mut self) {
+        // B.3 hotfix 2: safe because the last Arc clone only drops
+        // after the GPU fence has fired (engine's clone lives in
+        // pins.retired_resources; recorded-op clone is moved there at
+        // close). No CB references the view at this point.
+        unsafe {
+            self.vk.device.destroy_image_view(self.view, None);
+            self.vk.device.destroy_image(self.image, None);
+            self.vk.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// Evaluated gradient picture — shared-ownership handle wrapping
+/// `Arc<GradientPictureResources>`.
+///
+/// **B.3 hotfix 2:** `Clone` increments the inner Arc; the engine's
+/// `picture_paint` map and each deferred `RecordedTrapSrcKind::Gradient`
+/// both hold a clone. Both clones are routed through
+/// `adopt_retired_resource_for_gpu_retirement` so Vk handles outlive
+/// their last GPU use. Drop of the last clone triggers
+/// `GradientPictureResources::drop`, which destroys the Vk handles.
+#[derive(Clone)]
+pub struct GradientPicture(Arc<GradientPictureResources>);
 
 impl std::fmt::Debug for GradientPicture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GradientPicture")
-            .field("image", &self.image)
-            .field("view", &self.view)
-            .field("extent", &self.extent)
-            .field("axis_projection", &self.axis_projection)
-            .field("released", &self.released)
+            .field("image", &self.0.image)
+            .field("view", &self.0.view)
+            .field("extent", &self.0.extent)
+            .field("axis_projection", &self.0.axis_projection)
             .finish()
     }
 }
 
 impl GradientPicture {
     pub fn extent(&self) -> vk::Extent2D {
-        self.extent
+        self.0.extent
     }
 
     pub fn image_view(&self) -> vk::ImageView {
-        self.view
+        self.0.view
+    }
+
+    /// dst-pixel → gradient-image-pixel affine projection.
+    pub fn axis_projection(&self) -> AffineXform {
+        self.0.axis_projection
     }
 
     /// Create a linear gradient between `p1` and `p2` (both X11
@@ -180,18 +206,17 @@ impl GradientPicture {
         // the sample on that row to dodge any fp rounding into row 1.
         let row1 = [0.0, 0.0, 0.5, 0.0];
 
-        Ok(Self {
+        Ok(Self(Arc::new(GradientPictureResources {
             vk,
             image,
             view,
             memory,
-            released: false,
             extent: vk::Extent2D {
                 width: LUT_LEN,
                 height: 1,
             },
             axis_projection: AffineXform { row0, row1 },
-        })
+        })))
     }
 
     /// Create a radial gradient. `inner = (cx, cy, r)` and
@@ -259,65 +284,29 @@ impl GradientPicture {
         let row0 = [s, 0.0, -s * (ocx - or), 0.0];
         let row1 = [0.0, s, -s * (ocy - or), 0.0];
 
-        Ok(Self {
+        Ok(Self(Arc::new(GradientPictureResources {
             vk,
             image,
             view,
             memory,
-            released: false,
             extent: vk::Extent2D {
                 width: RADIAL_SIDE,
                 height: RADIAL_SIDE,
             },
             axis_projection: AffineXform { row0, row1 },
-        })
+        })))
     }
 }
 
 impl crate::kms::scheduler::paint_batch::BatchResource for GradientPicture {
-    fn release(mut self: Box<Self>, vk: &VkContext) {
-        // B.2 fix: Vk destruction lives here, NOT in Drop. The free
-        // path in `KmsBackendV2::render_free_picture` boxes the
-        // picture and routes it through
-        // `adopt_retired_resource_for_gpu_retirement` so this fires
-        // only after the in-flight fence (open frame's pin set, or
-        // submitted.back's SubmittedOp, or immediately if nothing is
-        // in flight) signals. By then, no CB references the view.
-        unsafe {
-            vk.device.destroy_image_view(self.view, None);
-            vk.device.destroy_image(self.image, None);
-            vk.device.free_memory(self.memory, None);
-        }
-        self.released = true;
-    }
-}
-
-impl Drop for GradientPicture {
-    fn drop(&mut self) {
-        // B.2 fix: catches missed routings. If this fires, the free
-        // path forgot to call BatchResource::release — the picture
-        // was dropped directly (HashMap::remove without routing
-        // through adopt_retired_resource_for_gpu_retirement). That
-        // would leak the Vk handles AND, more importantly, mask the
-        // very UAF the BatchResource pattern is meant to prevent.
-        debug_assert!(
-            self.released,
-            "GradientPicture dropped without release — caller forgot \
-             to route through adopt_retired_resource_for_gpu_retirement \
-             (B.2 UAF risk; see gradient.rs Lifetime contract)"
-        );
-        // In release builds, fall back to the prior queue_wait_idle +
-        // destroy so we still free the handles (preserves prior B.1
-        // behaviour at the cost of a one-frame stall). The
-        // debug_assert above will have caught the bug in CI.
-        if !self.released {
-            unsafe {
-                let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
-                self.vk.device.destroy_image_view(self.view, None);
-                self.vk.device.destroy_image(self.image, None);
-                self.vk.device.free_memory(self.memory, None);
-            }
-        }
+    fn release(self: Box<Self>, _vk: &VkContext) {
+        // B.3 hotfix 2: dropping the Box drops this Arc clone.
+        // If this was the last clone, GradientPictureResources::drop
+        // fires and destroys the Vk handles. If another clone
+        // (from a recorded op) is still alive, the handles remain
+        // live until that clone also drops after the CB retires.
+        // _vk is unused — destruction is in Drop, not here.
+        drop(self);
     }
 }
 

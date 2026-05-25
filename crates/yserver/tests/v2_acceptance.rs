@@ -5424,3 +5424,71 @@ fn v2_frame_builder_render_traps_or_tris_close_frame_does_not_panic_on_frame_gen
         "renderer_failed must remain false after hotfix-safe trap emit",
     );
 }
+
+/// Phase B.3 Task 12 hotfix 2: a client `FreePicture` between
+/// `render_traps_or_tris` append and frame close must NOT silently
+/// skip the gradient op ("missing at emit — was present at append").
+///
+/// Before the fix, `picture_paint_remove` destroyed the engine's
+/// `GradientPicture`; emit's `inner.picture_paint.get(xid)` returned
+/// `None` and the trap op was skipped — theme-gradient widgets on the
+/// MATE desktop went unrendered.
+///
+/// After the fix, the recorded op holds a strong `Arc` clone of the
+/// `GradientPicture`; `picture_paint_remove` only drops the engine's
+/// copy. The emit path reads directly from the Arc, which remains
+/// live until `FrameSubmittedRecord` retires after the GPU fence.
+///
+/// The assert is "no renderer_failed" — the frame must close cleanly
+/// without the abort-on-None defensive path firing.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_render_traps_or_tris_gradient_picture_freed_mid_frame_still_emits() {
+    let mut be = match yserver::kms::v2::KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate_test_pixmap_bgra");
+
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+
+    // Build a linear gradient LUT and record a trap op referencing it.
+    let grad_xid: u32 = 0xC0_FFEE;
+    be.engine_build_linear_gradient_for_tests(grad_xid)
+        .expect("build_linear_gradient");
+
+    be.engine_render_traps_or_tris_gradient_for_tests(dst, grad_xid, 32, 32)
+        .expect("render_traps_or_tris with gradient src");
+
+    assert!(
+        be.frame_builder_is_open_for_tests(),
+        "frame must be open after gradient render_traps_or_tris",
+    );
+
+    // Simulate the client sending FreePicture BEFORE the frame closes.
+    // This is the hotfix 2 scenario: picture_paint_remove was the bug site.
+    be.engine_picture_paint_remove_for_tests(grad_xid);
+
+    // Force-close. Before the fix this would log the "missing at emit"
+    // warn and silently skip the trap op. After the fix, the Arc clone
+    // keeps the GradientPicture alive through emit; no skip, no panic.
+    be.engine_close_open_frame_for_timeout_for_tests()
+        .expect("force-close after FreePicture must not abort");
+
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after force-close",
+    );
+    assert!(
+        !be.platform_renderer_failed_for_tests(),
+        "renderer_failed must remain false — gradient emit must not abort on freed picture",
+    );
+}

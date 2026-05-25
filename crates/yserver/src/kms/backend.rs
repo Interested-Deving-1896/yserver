@@ -4959,7 +4959,7 @@ impl KmsBackend {
                 };
                 src_view = gradient.image_view();
                 src_extent = gradient.extent();
-                src_picture_xform = Some(gradient.axis_projection);
+                src_picture_xform = Some(gradient.axis_projection());
             }
             RenderPic::None => return false,
         }
@@ -6205,7 +6205,7 @@ impl KmsBackend {
                 };
                 src_view = gradient.image_view();
                 src_extent = gradient.extent();
-                src_picture_xform = Some(gradient.axis_projection);
+                src_picture_xform = Some(gradient.axis_projection());
             }
             RenderPic::None => return false,
         }
@@ -6307,7 +6307,7 @@ impl KmsBackend {
                 };
                 mask_view = gradient.image_view();
                 mask_extent = gradient.extent();
-                mask_picture_xform = Some(gradient.axis_projection);
+                mask_picture_xform = Some(gradient.axis_projection());
             }
             RenderPic::None => {
                 mask_view = white_mask_view;
