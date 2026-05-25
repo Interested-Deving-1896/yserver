@@ -4348,3 +4348,77 @@ fn v2_frame_builder_render_composite_renderer_failed_on_submit_failure() {
         "frame must be closed after the close-walk fails",
     );
 }
+
+/// Phase B.3 Task 1 (N8 + Pitfall 7): a frame containing only non-CopyArea
+/// ops produces a `SubmittedOp` with an empty `scratch: Vec<ScratchImage>`.
+///
+/// Exercises the REAL close path (`close_open_frame` -> scratch walk ->
+/// `SubmittedOp` push) rather than just the filter_map mechanism in isolation:
+/// open a frame via a `render_composite` call (no scratch allocation), force-
+/// close via the Timeout helper, then inspect the most-recent submitted op's
+/// scratch len via the new accessor.
+///
+/// `RecordedRenderComposite` carries no `self_overlap_scratch`, so the walk
+/// should yield an empty Vec — the `SubmittedOp::scratch` field is initialized
+/// from `frame_scratches`, which collects only `RecordedCopyArea` self-overlap
+/// scratches. With zero CopyArea ops in the frame, the resulting Vec must be
+/// empty.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn b3_close_path_scratch_walk_yields_empty_for_no_copy_area_frames() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+    be.set_frame_builder_render_composite_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate_test_pixmap_bgra");
+
+    // Drain any baseline flush outcomes (setup CBs / cow zero-fill from
+    // pixmap allocation) so the test starts at a clean baseline.
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+
+    // One render_composite call — this opens the frame and appends a
+    // RecordedRenderComposite op. RenderComposite does NOT allocate any
+    // self-overlap scratch (that is specific to RecordedCopyArea).
+    let r = be.render_composite_for_tests(dst, [1.0, 0.0, 0.0, 1.0], 64, 64);
+
+    // Force frame close via the Timeout helper. This runs the close-walk:
+    //   1. iter_mut over open_frame.ops, std::mem::take each CopyArea's
+    //      self_overlap_scratch into a local Vec<ScratchImage> (empty here).
+    //   2. push a SubmittedOp with scratch = that local vec.
+    //   3. flush_submit_group -> vkQueueSubmit2 once.
+    let close_result = be.engine_close_open_frame_for_timeout_for_tests();
+
+    // Reset the sub-gate IMMEDIATELY (Task 11 pattern) so neighbouring tests
+    // in the same cargo-test binary are not routed through the frame-builder
+    // composite path.
+    be.set_frame_builder_render_composite_enabled_for_tests(false);
+
+    r.expect("render_composite_for_tests");
+    close_result.expect("engine_close_open_frame_for_timeout_for_tests");
+
+    // Frame must be closed after the helper returns.
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after engine_close_open_frame_for_timeout_for_tests",
+    );
+
+    // The just-submitted op must have an empty scratch Vec — no CopyArea
+    // ops were appended to the frame, so the close-path walk's filter_map
+    // collected zero entries. This proves close_open_frame correctly threads
+    // the `frame_scratches` local into `SubmittedOp::scratch` (B.3 N8).
+    let scratch_len = be.engine_most_recent_submitted_op_scratch_len_for_tests();
+    assert_eq!(
+        scratch_len, 0,
+        "frame with no CopyArea ops must produce SubmittedOp with empty scratch \
+         Vec (got len={scratch_len})",
+    );
+}

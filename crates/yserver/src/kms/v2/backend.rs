@@ -1728,6 +1728,14 @@ impl KmsBackendV2 {
         self.engine.pending_group_ops_count_for_tests()
     }
 
+    /// Phase B.3 (N8): scratch vec length of the most recently submitted op
+    /// in the engine. Used by `b3_close_path_scratch_walk_*` v2_acceptance
+    /// integration tests to verify the close-path walk threads the
+    /// `frame_scratches` local into `SubmittedOp::scratch`.
+    pub fn engine_most_recent_submitted_op_scratch_len_for_tests(&self) -> usize {
+        self.engine.most_recent_submitted_op_scratch_len_for_tests()
+    }
+
     /// Phase B.1 Task 15: flip the engine's `frame_builder` gate at
     /// runtime. Production reads `YSERVER_FRAME_BUILDER` env var at
     /// engine construction; tests flip via this wrapper.

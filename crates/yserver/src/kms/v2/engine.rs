@@ -1654,7 +1654,6 @@ impl RenderEngine {
     /// Phase B.3 (N8) test helper: scratch vec length of the most recently
     /// submitted op. Used by `b3_close_path_scratch_walk_yields_empty_for_no_copy_area_frames`
     /// integration test to verify the close-path walk's Vec<ScratchImage>.
-    #[cfg(test)]
     pub(crate) fn most_recent_submitted_op_scratch_len_for_tests(&self) -> usize {
         self.inner
             .as_ref()
