@@ -1094,13 +1094,15 @@ impl RenderEngine {
         // but guards against shutdown-time panics if the invariant is
         // violated (e.g. a future call site that forgets to close
         // batches first).
-        if let Some(inner) = self.inner.as_mut() {
-            if inner.pending_render_batch.take().is_some() {
-                log::warn!(
-                    "v2 drain_all: open render_batch dropped without flush \
-                     (caller must close batches before drain_all)"
-                );
-            }
+        if self
+            .inner
+            .as_mut()
+            .is_some_and(|i| i.pending_render_batch.take().is_some())
+        {
+            log::warn!(
+                "v2 drain_all: open render_batch dropped without flush \
+                 (caller must close batches before drain_all)"
+            );
         }
         // Flush any open SubmitGroup first; this commits parked ops
         // into `submitted` so the loop below sees the right set.
