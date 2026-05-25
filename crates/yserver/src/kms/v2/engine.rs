@@ -7568,6 +7568,15 @@ fn emit_recorded_op_into_cb(
             );
             Ok(())
         }
+        // B.2 Task 6: variant exists, but op-append (Task 11) and emit
+        // (Task 12) are not wired yet. The sub-gate
+        // `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE` is still default-OFF
+        // through the rest of B.2, so this arm is unreachable until
+        // Task 11 starts pushing the variant.
+        Op::RenderComposite(_) => unimplemented!(
+            "RecordedOp::RenderComposite emit lands in B.2 Task 12; \
+             Task 6 only lands the payload + variant"
+        ),
     }
 }
 

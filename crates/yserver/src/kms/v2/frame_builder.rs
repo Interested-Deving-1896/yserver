@@ -391,6 +391,7 @@ use super::{
     glyph_atlas::{AtlasEntry, GlyphKey},
     store::DrawableId,
 };
+use crate::kms::cpu_types::Rectangle16;
 
 /// Index into `OpenFrame::pins.staging_buffers`. Saved on `RecordedOp`
 /// payloads so close-time replay can fetch the right pinned buffer.
@@ -456,6 +457,62 @@ pub(crate) struct RecordedGlyphUpload {
     pub(crate) insert_entry: AtlasEntry,
 }
 
+/// Mirror of the inputs to `vk::ops::render::record_render_composite`,
+/// resolved into pinnable handles at append time. The op replay reads
+/// these fields + the frame's pin vectors via index, NOT by looking
+/// the resource up by id at emit-time.
+///
+/// View handles are stable for the life of the frame: Drawable views
+/// via the drawable view cache + ticket-touch, Solid / Gradient /
+/// scratch views via engine ownership or `submitted.back` pin per
+/// Phase 9A.
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "B.2 Task 6 lands the payload + enum variant; \
+              op-append (Task 11) and emit (Task 12) populate / consume the fields"
+)]
+pub(crate) struct RecordedRenderComposite {
+    pub(crate) op: u8,
+    pub(crate) dst_id: DrawableId,
+    pub(crate) dst_image: vk::Image,
+    pub(crate) dst_view: vk::ImageView,
+    pub(crate) dst_extent: vk::Extent2D,
+    pub(crate) dst_format: vk::Format,
+    pub(crate) dst_has_alpha: bool,
+    pub(crate) dst_old_layout: vk::ImageLayout,
+    /// Pre-resolved sample view (Drawable / Solid / Gradient src).
+    /// View handle's owning resource is kept alive by the frame's
+    /// `touched_drawables` ticket-touch (Drawable) or the engine's
+    /// long-lived ownership (Solid / Gradient).
+    pub(crate) src_view: vk::ImageView,
+    pub(crate) mask_view: vk::ImageView,
+    pub(crate) src_alias_view: Option<vk::ImageView>,
+    pub(crate) dst_readback_view: Option<vk::ImageView>,
+    /// USER-codex R11.F1+F2 — pre-built `CompositeAttrs` replay-ready.
+    /// Constructed at op-append time by resolving `src_repeat` to the
+    /// bare shader repeat constant (packing happens inside
+    /// `record_render_composite_draws`), `src_force_opaque` via the
+    /// legacy pict-format-aware helper, and the composed `src_xform`
+    /// (`picture_xform ∘ user_transform`) — same logic as `_legacy`'s
+    /// pre-call site.
+    pub(crate) attrs: crate::kms::vk::ops::render::CompositeAttrs,
+    /// Per-op solid clear inputs (Solid src / mask) —
+    /// `record_solid_color_clear` fires at emit-time against the
+    /// engine's `solid_src_image` / `solid_mask_image` before the
+    /// composite draws. `None` for non-Solid.
+    pub(crate) src_clear_color: Option<[f32; 4]>,
+    pub(crate) mask_clear_color: Option<[f32; 4]>,
+    /// Pipeline cache key inputs (not packed into `CompositeAttrs`
+    /// because the pipeline lookup happens at emit-time via
+    /// `RenderPipelineCache::get`).
+    pub(crate) mask_component_alpha: bool,
+    pub(crate) needs_dst_readback: bool,
+    pub(crate) rects: Box<[crate::kms::vk::ops::render::CompositeRect]>,
+    pub(crate) clip_rects: Option<Box<[Rectangle16]>>,
+    pub(crate) descriptor_set: vk::DescriptorSet,
+}
+
 /// Reserved for future ops that need an explicit cross-frame layout
 /// transition. `composite_glyphs` doesn't emit any in B.1 (the text
 /// pipeline's recorder embeds its own barriers via the per-call
@@ -477,6 +534,20 @@ pub(crate) struct RecordedLayoutTransition {
 pub(crate) enum RecordedOp {
     CompositeGlyphs(RecordedCompositeGlyphs),
     GlyphUpload(RecordedGlyphUpload),
+    /// `RecordedRenderComposite` is ~248B (mostly Vk handles +
+    /// `CompositeAttrs`); embedding it directly grows `RecordedOp`'s
+    /// largest variant past the 256B watch threshold (spec § "Op
+    /// variant sizing"). Boxing keeps the enum tag + ptr at 16B per
+    /// `RecordedOp` slot — the 0/1 alloc per emitted op is acceptable
+    /// vs the per-frame `Vec<RecordedOp>` padding cost the alternative
+    /// would impose.
+    #[allow(
+        dead_code,
+        reason = "B.2 Task 6 lands the variant; op-append (Task 11) and emit (Task 12) \
+                  exercise this path. Pre-Task 11 the frame builder only sees CompositeGlyphs / \
+                  GlyphUpload appends from the B.1 text-pipeline path."
+    )]
+    RenderComposite(Box<RecordedRenderComposite>),
     #[allow(
         dead_code,
         reason = "B.2+ — ports that emit explicit cross-frame layout transitions; \
@@ -609,6 +680,19 @@ mod op_tests {
             "RecordedOp is {} bytes — exceeds 256-byte budget",
             std::mem::size_of::<RecordedOp>()
         );
+    }
+
+    #[test]
+    fn recorded_render_composite_within_512b() {
+        let size = std::mem::size_of::<RecordedRenderComposite>();
+        assert!(
+            size <= 512,
+            "RecordedRenderComposite is {size} bytes; spec budget 512"
+        );
+        // Echo the measured size so a CI run shows the headroom we
+        // have against the 512B budget without forcing every PR
+        // through a `cargo expand` to find out.
+        eprintln!("RecordedRenderComposite size = {size} bytes");
     }
 
     #[test]

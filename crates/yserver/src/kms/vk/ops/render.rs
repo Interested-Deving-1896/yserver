@@ -65,6 +65,7 @@ impl CompositeTarget for DrawableImage {
 /// `mask_x`/`mask_y` are the source / mask space pixel offsets
 /// corresponding to `dst_x`/`dst_y`; the fragment shader applies the
 /// per-picture affine transform on top of those.
+#[derive(Debug, Clone, Copy)]
 pub struct CompositeRect {
     pub src_x: i32,
     pub src_y: i32,
@@ -107,6 +108,7 @@ pub fn pack_repeat_mode(repeat: i32, force_opaque: bool) -> i32 {
 }
 
 /// Per-Composite-call attribute bundle.
+#[derive(Debug, Clone, Copy)]
 pub struct CompositeAttrs {
     pub src_extent: ash::vk::Extent2D,
     pub mask_extent: ash::vk::Extent2D,
