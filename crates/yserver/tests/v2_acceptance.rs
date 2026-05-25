@@ -4932,6 +4932,261 @@ fn v2_frame_builder_logic_fill_collapses_two_in_one_frame() {
     );
 }
 
+// ── Phase B.3 Task 14: image_text frame-builder tests ────────────────────
+
+/// Phase B.3 Task 14 (N7) acceptance gate (collapse): two consecutive
+/// `image_text` calls in the same open frame produce exactly ONE
+/// `vkQueueSubmit2` (one `flush_submit_group` call).
+///
+/// Pre-B.3 each `image_text` call submitted its own CB batch independently.
+/// After B.3 the calls accumulate into the open frame and collapse to one
+/// submit on close.
+///
+/// Asserts:
+/// - Frame is still open after both `image_text` calls.
+/// - After force-close, `submit_group_flushes` delta is exactly 1.
+/// - `close_reason_non_ported` counter is unchanged (image_text no longer
+///   fires `CloseReason::NonPortedPaintOp`).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_image_text_collapses_two_in_one_frame() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate dst pixmap");
+
+    // Drain setup CBs so the counter snapshot starts clean.
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+    let pre_flushes = be.telemetry_submit_group_flushes_for_tests();
+    let pre_non_ported = be.telemetry_close_reason_non_ported_for_tests();
+
+    // Two calls with distinct glyphs (font 42, codepoints 0x41 + 0x42).
+    // Each glyph is 4×4 pixels of solid alpha.
+    be.engine_image_text_for_tests(dst, 42, [1.0, 1.0, 1.0, 1.0], &[(0x41, 0, 0, 4, 4)])
+        .expect("first image_text");
+
+    be.engine_image_text_for_tests(dst, 42, [1.0, 1.0, 1.0, 1.0], &[(0x42, 8, 0, 4, 4)])
+        .expect("second image_text");
+
+    // Both calls must have stayed in the open frame.
+    assert!(
+        be.frame_builder_is_open_for_tests(),
+        "open frame must survive two image_text calls (not closed by M2 path)"
+    );
+
+    // Force-close (one flush = one vkQueueSubmit2).
+    be.engine_close_open_frame_for_timeout_for_tests()
+        .expect("force-close");
+
+    let post_flushes = be.telemetry_submit_group_flushes_for_tests();
+    let post_non_ported = be.telemetry_close_reason_non_ported_for_tests();
+
+    assert_eq!(
+        post_flushes.saturating_sub(pre_flushes),
+        1,
+        "two image_text calls must collapse to ONE flush_submit_group call (got delta={})",
+        post_flushes.saturating_sub(pre_flushes),
+    );
+    assert_eq!(
+        post_non_ported.saturating_sub(pre_non_ported),
+        0,
+        "image_text must NOT fire CloseReason::NonPortedPaintOp (got delta={})",
+        post_non_ported.saturating_sub(pre_non_ported),
+    );
+
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after force-close",
+    );
+}
+
+/// Phase B.3 Task 14 (N7 atlas transactional discipline): force a close
+/// failure AFTER an `image_text` frame and assert that:
+/// - `renderer_failed` is set.
+/// - The drawable's `current_layout` is restored to its pre-frame value.
+/// - The frame is closed after the failure path runs.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_image_text_close_failure_rolls_back_atlas() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate dst pixmap");
+
+    // Snapshot the pre-frame layout (fresh pixmap → UNDEFINED).
+    let pre_layout = be.drawable_current_layout_for_tests(dst);
+
+    // Arm the next vkQueueSubmit2 to fail.
+    be.platform_force_next_submit_failure_for_tests();
+
+    // image_text records into the open frame without submitting yet.
+    let r = be.engine_image_text_for_tests(dst, 99, [1.0, 0.0, 0.0, 1.0], &[(0xAB, 4, 4, 4, 4)]);
+    let close_result = be.engine_close_open_frame_for_timeout_for_tests();
+
+    // The image_text call itself should succeed (records into the frame).
+    r.expect("engine_image_text_for_tests (records into open frame)");
+
+    // The close-walk must surface the submit error.
+    assert!(
+        close_result.is_err(),
+        "force-close must propagate the injected submit failure"
+    );
+    assert!(
+        be.platform_renderer_failed_for_tests(),
+        "injected submit failure must trip renderer_failed",
+    );
+    assert_eq!(
+        be.drawable_current_layout_for_tests(dst),
+        pre_layout,
+        "rollback_pre_submit must restore the drawable's pre-frame current_layout",
+    );
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after the close-walk fails",
+    );
+}
+
+/// Phase B.3 Task 14 (N7 LOAD-BEARING format gate): a non-BGRA8 target
+/// (R8_UNORM) drops the entire run WITHOUT touching the atlas.
+///
+/// The gate fires BEFORE any atlas first-touch / glyph upload / op append,
+/// so:
+/// - `stats.glyphs_dropped == 0` (run is dropped wholesale — no glyphs
+///   were individually processed).
+/// - The frame must still be open after the call (no frame was opened).
+/// - `submit_group_flushes` delta must be 0 (no submit happened).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_image_text_non_bgra8_target_drops_run() {
+    use yserver::kms::v2::KmsBackendV2;
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+
+    // Allocate an R8_UNORM (depth-8) pixmap — text pipeline requires
+    // B8G8R8A8_UNORM; this triggers the N7 format gate.
+    let dst_r8 = be
+        .create_pixmap(None, 32, 32, 8)
+        .expect("create_pixmap depth-8");
+    let dst_xid = dst_r8.as_raw();
+
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+    let pre_flushes = be.telemetry_submit_group_flushes_for_tests();
+
+    let (atlas_interns, _glyph_uploads, glyphs_dropped) = be
+        .engine_image_text_for_tests(dst_xid, 7, [1.0, 1.0, 1.0, 1.0], &[(0x41, 0, 0, 4, 4)])
+        .expect("image_text on R8 dst must return Ok (format gate drops silently)");
+
+    // The format gate fires BEFORE any glyph processing, so glyphs_dropped
+    // must be 0 (the run is dropped wholesale, not per-glyph).
+    assert_eq!(
+        glyphs_dropped, 0,
+        "format gate drops the run before per-glyph processing; glyphs_dropped must be 0"
+    );
+    assert_eq!(
+        atlas_interns, 0,
+        "no atlas interning should occur for a non-BGRA8 target",
+    );
+
+    // No frame should have been opened (gate fires before frame open).
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "no frame should be open after a format-gated drop",
+    );
+
+    let post_flushes = be.telemetry_submit_group_flushes_for_tests();
+    assert_eq!(
+        post_flushes.saturating_sub(pre_flushes),
+        0,
+        "format-gated drop must produce 0 flush calls (no submit)",
+    );
+}
+
+/// Phase B.3 Task 14 (N7 + N10): open a frame with an `image_text` op,
+/// attach a synthetic PRESENT completion, force-close, drain, and assert
+/// that the `CompletedPresentEvent` is delivered.
+///
+/// Mirrors `v2_frame_builder_cow_copy_area_delivers_present_completion`
+/// but uses `image_text` as the op and `attach_synthetic_present_completion_for_tests`
+/// (the generic variant that works on any drawable, not just the COW).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_image_text_delivers_present_completion() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate dst pixmap");
+
+    // Drain setup CBs.
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+
+    // image_text opens the frame and writes to dst.
+    be.engine_image_text_for_tests(dst, 11, [0.0, 1.0, 0.0, 1.0], &[(0x41, 0, 0, 4, 4)])
+        .expect("image_text");
+
+    assert!(
+        be.frame_builder_is_open_for_tests(),
+        "frame must be open after image_text call"
+    );
+
+    // Attach a synthetic PRESENT completion (N10 predicate fires because
+    // dst is written in the open frame).
+    let synthetic_serial = 0xB3_1E77_u32;
+    let attached = be.attach_synthetic_present_completion_for_tests(dst, synthetic_serial);
+    assert!(
+        attached,
+        "attach_synthetic_present_completion_for_tests must succeed \
+         (dst is written in the open frame)"
+    );
+
+    // Force-close the frame.
+    be.engine_close_open_frame_for_timeout_for_tests()
+        .expect("force-close");
+
+    // Drain any present batches (frame ticket retires immediately in lavapipe).
+    be.engine_drain_all_for_tests();
+
+    let events = be.drain_completed_present_events_for_tests();
+    assert!(
+        events.iter().any(|e| e.serial == synthetic_serial),
+        "synthetic PRESENT completion (serial=0x{synthetic_serial:x}) must be delivered \
+         after frame retires; got {} events: {events:?}",
+        events.len(),
+    );
+}
+
 // ── Phase B.3 Task 12: render_traps_or_tris frame-builder tests ──────────
 
 /// Phase B.3 Task 12 (N5): two \ calls with the same

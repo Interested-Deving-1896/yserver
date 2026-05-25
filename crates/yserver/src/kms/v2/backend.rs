@@ -2398,6 +2398,100 @@ impl KmsBackendV2 {
             .map_err(|e| std::io::Error::other(format!("engine_logic_fill_for_tests: {e:?}")))
     }
 
+    /// Phase B.3 Task 14 (N7): drive `engine.image_text` directly against the
+    /// store + platform using a DrawableId resolved from a host xid.
+    /// Constructs one non-zero glyph per entry in `glyphs`: each glyph is
+    /// `w × h` pixels of 0xFF alpha. `font_xid` keys the glyph atlas.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `dst_xid` doesn't resolve in the store, or if
+    /// the engine call fails.
+    #[allow(
+        dead_code,
+        reason = "used by v2_frame_builder_image_text_* integration tests"
+    )]
+    pub fn engine_image_text_for_tests(
+        &mut self,
+        dst_xid: u32,
+        font_xid: u32,
+        foreground_rgba: [f32; 4],
+        glyphs: &[(u32, i32, i32, u32, u32)], // (codepoint, dst_x, dst_y, w, h)
+    ) -> Result<(u32, u32, u32), std::io::Error> {
+        // Returns (atlas_interns, glyph_uploads, glyphs_dropped).
+        let Some(dst_id) = self.store.lookup(dst_xid) else {
+            return Err(std::io::Error::other(format!(
+                "engine_image_text_for_tests: dst xid 0x{dst_xid:x} not in store"
+            )));
+        };
+        let prepared: Vec<super::engine::PreparedGlyph> = glyphs
+            .iter()
+            .map(|&(codepoint, dst_x, dst_y, w, h)| {
+                let w_us = w as usize;
+                let h_us = h as usize;
+                let pixels = vec![0xFFu8; w_us * h_us];
+                super::engine::PreparedGlyph {
+                    codepoint,
+                    dst_x,
+                    dst_y,
+                    w: w_us,
+                    h: h_us,
+                    pixels,
+                }
+            })
+            .collect();
+        self.engine
+            .image_text(
+                &mut self.store,
+                &mut self.platform,
+                dst_id,
+                font_xid,
+                foreground_rgba,
+                &prepared,
+            )
+            .map(|s| (s.atlas_interns, s.glyph_uploads, s.glyphs_dropped))
+            .map_err(|e| std::io::Error::other(format!("engine_image_text_for_tests: {e:?}")))
+    }
+
+    /// Phase B.3 Task 14 (N7, N10): attach a synthetic PRESENT completion
+    /// to the open frame if the given `dst_xid` is written by any op in
+    /// the open frame. Mirrors `attach_synthetic_present_completion_to_cow_for_tests`
+    /// but works for any drawable (image_text dst, not just the COW).
+    ///
+    /// Returns `true` if attach succeeded, `false` if no open frame exists
+    /// or the drawable is not written in the open frame.
+    #[allow(
+        dead_code,
+        reason = "used by v2_frame_builder_image_text_delivers_present_completion"
+    )]
+    pub fn attach_synthetic_present_completion_for_tests(
+        &mut self,
+        dst_xid: u32,
+        synthetic_serial: u32,
+    ) -> bool {
+        use crate::kms::v2::present_completion::{PendingPresentEntry, PinnedWake};
+        use yserver_core::backend::{CompletedPresentEvent, PresentWake};
+        use yserver_protocol::x11::ClientId;
+
+        let Some(dst_id) = self.store.lookup(dst_xid) else {
+            return false;
+        };
+        let entry = PendingPresentEntry {
+            wake_pin: PinnedWake::None,
+            event: CompletedPresentEvent {
+                client_id: ClientId(0),
+                serial: synthetic_serial,
+                host_xid: 0,
+                dst_host_xid: 0,
+                options: 0,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            },
+        };
+        self.engine
+            .attach_cow_present_completion(dst_id, entry)
+            .is_ok()
+    }
+
     /// Phase B.3 Task 12 (N5): drive `engine.render_traps_or_tris` directly
     /// against the store + platform using a DrawableId resolved from a host xid.
     /// Uses a single-trapezoid solid-src op (PictOp 1 = Src, one trapezoid
