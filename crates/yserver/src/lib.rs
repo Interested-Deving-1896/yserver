@@ -326,19 +326,70 @@ fn resolve_drm_device() -> io::Result<String> {
     if let Ok(explicit) = std::env::var("YSERVER_DRM_DEVICE") {
         return Ok(explicit);
     }
-    let candidates = ["/dev/dri/card0", "/dev/dri/card1"];
-    let mut last_err: Option<io::Error> = None;
-    for path in candidates {
-        match drm::Device::open(path) {
-            Ok(_) => return Ok(path.to_string()),
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                last_err = Some(err);
+    // Split-driver systems expose a render-only card alongside the
+    // KMS card. On Asahi (M1 / M2): `asahi` GPU is card0 (render-only,
+    // MODE_GETRESOURCES → EOPNOTSUPP); `apple-drm` is card2 (KMS).
+    // On AMD/Intel hybrid laptops similar layouts occur. The pre-asahi
+    // resolver only probed card0/card1 and didn't distinguish render-
+    // only nodes, so it would pick a card whose first KMS ioctl then
+    // fails. Probe each /dev/dri/card* by attempting MODE_GETRESOURCES
+    // (drm-rs's `resource_handles`) and keep the first that succeeds.
+    use ::drm::control::Device as _;
+
+    let mut entries: Vec<PathBuf> = match fs::read_dir("/dev/dri") {
+        Ok(it) => it
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("card"))
+            })
+            .collect(),
+        Err(err) => {
+            return Err(io::Error::new(
+                err.kind(),
+                format!("read_dir(/dev/dri): {err}"),
+            ));
+        }
+    };
+    entries.sort();
+
+    let mut reasons: Vec<String> = Vec::new();
+    for path in entries {
+        let path_str = match path.to_str() {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let device = match drm::Device::open(&path_str) {
+            Ok(d) => d,
+            Err(err) => {
+                log::info!("yserver: skipping {path_str}: open failed: {err}");
+                reasons.push(format!("{path_str}: open failed: {err}"));
+                continue;
             }
-            Err(err) => return Err(err),
+        };
+        // Render-only drivers (asahi GPU, etc.) return EOPNOTSUPP here.
+        // Anything else (success or some other error) we trust — let the
+        // caller surface a downstream error rather than masking it.
+        match device.resource_handles() {
+            Ok(_) => return Ok(path_str),
+            Err(err) => {
+                log::info!("yserver: skipping {path_str}: not KMS-capable: {err}");
+                reasons.push(format!("{path_str}: not KMS-capable: {err}"));
+                // device drops here, releasing master.
+            }
         }
     }
-    Err(last_err
-        .unwrap_or_else(|| io::Error::new(ErrorKind::NotFound, "no DRM card devices found")))
+    Err(io::Error::other(format!(
+        "no KMS-capable DRM device found under /dev/dri. Tried:\n  {}\n\
+         Override with YSERVER_DRM_DEVICE=/dev/dri/cardN.",
+        if reasons.is_empty() {
+            "(no /dev/dri/card* entries)".to_string()
+        } else {
+            reasons.join("\n  ")
+        }
+    )))
 }
 
 fn block_termination_signals() -> io::Result<SignalFd> {
