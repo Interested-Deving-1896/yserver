@@ -191,7 +191,14 @@ emit_recorded_render_traps_or_tris_into_cb:
 
 **Mask scratch ownership (MEDIUM ownership fix, codex round-7).** The current/live `EngineInner::mask_scratch` is engine-owned mutable state used directly at emit time. The recorded variant does NOT pin mask_scratch — it MUST resolve `engine.mask_scratch` fresh inside `emit_recorded_render_traps_or_tris_into_cb`, taking the current `image()`, `attachment_view()`, `image_view()`, `extent()`, and `current_layout()` as inputs to the two stages. (An earlier draft of the spec carried a `mask_scratch_pin_idx` — that conflates "live scratch used by replay" with "old grown-away backing awaiting fence release". The two are different concepts.)
 
-Only the GROWN-AWAY old backing routes through `BatchResource`. When the mask-scratch peek-grow (Phase 9A) in `render_traps_or_tris` fires, `ensure_returning_old` returns a `Box<dyn BatchResource>` for the prior backing; that Box routes via `adopt_retired_resource_for_gpu_retirement` to either the closing frame's `SubmittedOp::retired_resources` (case b — newest in-flight fence owner) or `EngineInner::pending_retired_resources_for_next_submit` (case a) — same flow B.2 Task 1 wired. The current `mask_scratch` after grow stays as engine-owned state, used by all subsequent ops in this frame and beyond.
+**Post-emit CPU-layout writeback (LOAD-BEARING — codex round-10 catch).** After the composite phase's exit barrier transitions mask_scratch back to `SHADER_READ_ONLY_OPTIMAL`, the emit MUST call `engine.mask_scratch.as_mut().expect("ensured").set_current_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)` to advance the engine's CPU-tracked layout. The legacy path does this at engine.rs:7740-7749. Skipping the writeback leaves `mask_scratch.current_layout()` stale at `COLOR_ATTACHMENT_OPTIMAL` (or whatever pre-emit layout was), so the NEXT `render_traps_or_tris` op in the next frame's emit reads the wrong old_layout for its pre-barrier and builds a transition from the wrong source state — a VUID-class bug.
+
+Only the GROWN-AWAY old backing routes through `BatchResource`. When the mask-scratch peek-grow (Phase 9A) in `render_traps_or_tris` fires, `ensure_returning_old` returns a `Box<dyn BatchResource>` for the prior backing; that Box routes via `adopt_retired_resource_for_gpu_retirement` to one of three tiers (engine.rs:756-786) — same flow B.2 Task 1 wired:
+- **(a) Open frame present:** `open.pins.adopt_retired(boxed)` — the open frame's pin set carries it through close.
+- **(b) No open frame, in-flight SubmittedOp present:** `submitted.back_mut().append_retired_scratch(boxed)` — the newest in-flight fence owner adopts it.
+- **(c) Nothing in flight:** `boxed.release(&self.vk)` — immediate release.
+
+The current `mask_scratch` after grow stays as engine-owned state, used by all subsequent ops in this frame and beyond.
 
 **GLYPH family** — `image_text` only. NOT a mask-scratch op; structurally identical to B.1's `composite_glyphs_via_frame_builder`. Uses `V2GlyphAtlas` + `TextPipeline`, uploads glyph misses into the atlas via per-glyph staging buffers, then records a text-run draw against the atlas (engine.rs:4529, 4611, 4641, 4711). Recording shape mirrors B.1's `RecordedCompositeGlyphs` + `RecordedGlyphUpload` pair:
 
@@ -350,7 +357,7 @@ The `pending_render_batch` (engine.rs:3982's `flush_render_batch`) is *render_co
 
 ### N5 — render_traps_or_tris has its own pipeline + scratch
 
-Unlike fill_rect (which reuses render_composite's pipeline), render_traps_or_tris uses a dedicated `trap_pipeline` lazily initialized by `ensure_trap_assets` (engine.rs:2186) along with the `mask_scratch: Option<MaskScratch>` slot.
+Unlike fill_rect/fill_rect_batch (which use `cmd_clear_attachments` directly, not a shader pipeline at all — see the FILL family section), render_traps_or_tris uses a dedicated `trap_pipeline` for the raster stage and the composite pipeline for the composite stage (engine.rs:2186 `ensure_trap_assets`), along with the `mask_scratch: Option<MaskScratch>` slot.
 
 **Decision (final):** the rewritten `render_traps_or_tris` peek-grows the mask scratch (Phase 9A pattern from B.2 Task 9) and records the trap raster + composite as ONE recorded op. The variant `RecordedRenderTrapsOrTris` holds the append-time-stable inputs (trap pipeline keys, source identity, composite operator + clip + xforms + bbox, vertex pool pin) — full listing in **N5 RecordedRenderTrapsOrTris payload** below. Mask-scratch identity, dst_readback view, pipeline handle, and descriptor sets are NOT recorded — emit re-resolves all four fresh from engine state. The emit replays the two-stage CB.
 
@@ -360,7 +367,7 @@ The MASK family implementation MUST include an integration test exercising a mas
 
 Scenario:
 1. Op A: `render_traps_or_tris` with small mask extent → records into open frame F1 against mask_scratch instance M0.
-2. Op B: `render_traps_or_tris` with larger mask extent → Phase 9A peek detects the grow, calls `close_open_frame(... CloseReason::ScratchGrow)`, F1 closes + submits. Then `MaskScratch::ensure_image_size_returning_old` grows M0 → M1; the retired M0 routes through `adopt_retired_resource_for_gpu_retirement` to `submitted.back`'s pin set (case b — F1's just-pushed SubmittedOp).
+2. Op B: `render_traps_or_tris` with larger mask extent → Phase 9A peek detects the grow, calls `close_open_frame(... CloseReason::ScratchGrow)`, F1 closes + submits. Then `MaskScratch::ensure_image_size_returning_old` grows M0 → M1; the retired M0 routes through `adopt_retired_resource_for_gpu_retirement` to case (b) — `submitted.back_mut().append_retired_scratch(boxed)` (F1's just-pushed SubmittedOp's retired_resources).
 3. Op C: third `render_traps_or_tris` with the same large extent → records into a NEW frame F2 against M1.
 4. Force-close F2 via the test's timeout helper.
 
@@ -546,13 +553,13 @@ if target_format != vk::Format::B8G8R8A8_UNORM {
 }
 ```
 
-The gate fires BEFORE any atlas first-touch snapshot, any glyph upload, any op append — there is no rollback path needed because nothing was recorded. The recorded `RecordedImageText` variant implicitly carries the invariant `dst_format == B8G8R8A8_UNORM` (validated append-side). Phase 5's integration test SHOULD include a depth-32 (R8 / depth-1) target negative-test verifying the run is dropped without atlas mutation.
+The gate fires BEFORE any atlas first-touch snapshot, any glyph upload, any op append — there is no rollback path needed because nothing was recorded. The recorded `RecordedImageText` variant implicitly carries the invariant `dst_format == B8G8R8A8_UNORM` (validated append-side). Phase 5's integration test SHOULD include a non-BGRA8 target (depth-1 or R8) negative-test verifying the run is dropped without atlas mutation. (Depth-24 and depth-32 ARGB targets both map to `B8G8R8A8_UNORM` — those PASS the gate; codex round-10 caught a wording error in earlier drafts that said "depth-32 should drop".)
 
 ### N8 — Live concrete-scratch ownership model (single source of truth on RecordedCopyArea)
 
 (Surfaced by codex round-7, **unified by codex round-8 catch** of split-brain ownership.) The frame builder has two distinct pin lifetimes for non-drawable images:
 
-1. **B.2 BatchResource `retired_resources`** — Box<dyn BatchResource> slots for *grown-away old backings* (e.g., mask_scratch's previous extent after a peek-grow). The new backing replaces engine state, the old backing rides the closing frame's `SubmittedOp::retired_resources` (or `pending_retired_resources_for_next_submit`) to be released after the fence signals. Used for grow events.
+1. **B.2 BatchResource three-tier routing** — `Box<dyn BatchResource>` slots for *grown-away old backings* (e.g., mask_scratch's previous extent after a peek-grow). The new backing replaces engine state; the old backing routes via `adopt_retired_resource_for_gpu_retirement` (engine.rs:756-786) to one of three tiers: (a) open frame's `open.pins.adopt_retired`, (b) newest in-flight `submitted.back_mut().append_retired_scratch`, or (c) immediate `boxed.release(&vk)` if nothing in flight. Used for grow events.
 
 2. **LIVE concrete-scratch slot** (this invariant) — a per-op one-shot scratch image that the recorded op uses DURING its emit and that must remain addressable until the owning `SubmittedOp` retires. This is `copy_area`'s self-overlap scratch (engine.rs:225-229, 291-310, 2814-2918). Concrete RAII type (`ScratchImage` with `Drop` that calls `destroy_image` + `free_memory`), NOT a `Box<dyn BatchResource>`. Used for per-op temporary resources.
 
@@ -584,6 +591,25 @@ The earlier draft of this spec described an `OpenFrame::live_scratches` sibling 
 If `allocate_scratch_image` fails at step (3), nothing in the open frame has been touched — the body returns `Err(RenderError::Vk(...))` and the caller's existing renderer_failed handling closes the open frame on its terms (a non-recoverable error promotes to fatal-after-failure per B.2 M1). No partial-mutation rollback is needed because there was no partial mutation.
 
 **Why allocation-first.** Reversing the order (mutate first, then allocate) means a transient memory-pressure failure at allocation time leaves the frame mid-mutated: the dst and src have updated touched/layout snapshots, but no op was appended to match. The next op in the same frame would observe stale snapshots that disagree with the actual recorded ops; close-success commit-writeback would commit a layout that no recorded op transitioned to. This is exactly the bug class codex round-8 flagged.
+
+### N9 — Every B.3 body MUST flush pending cow + render batches at entry
+
+(Codex round-10 catch.) Every pre-B.3 paint body starts with `flush_cow_batch` + `flush_render_batch` calls to preserve chronological X11 order. The pending `pending_cow_batch` (`flush_cow_batch`, engine.rs:?) carries deferred cow `copy_area`s; the pending `pending_render_batch` (`flush_render_batch`, engine.rs:3982) carries deferred X RENDER composite_glyphs / render_composite batches. Both must submit BEFORE any subsequent paint op records its own CB — that's the same-queue-ordering correctness guarantee.
+
+Confirmed legacy call sites (mandatory mirror — codex audit):
+- `fill_rect_batch` — engine.rs:2286-2290
+- `logic_fill` — engine.rs:2509-2511
+- `copy_area` — engine.rs:2751-2753
+- `put_image` — engine.rs:4144-4146
+- `image_text` — engine.rs:4503-4505
+- `render_traps_or_tris` — engine.rs:7224-7226
+- B.1's `composite_glyphs_via_frame_builder` — engine.rs:5205-5214 (proves the frame-builder path also needs them, NOT just the legacy paths)
+
+**The rip-and-replace rewrite of each B.3 body MUST preserve both flush calls at the top.** Order: `flush_cow_batch` first, then `flush_render_batch`. Position: immediately after the existing renderer_failed / inner checks (or wherever the pre-B.3 body had them — replicate verbatim). Skipping this is a class of "mixed sequences replay in wrong order" bug — e.g., `cow_copy_area` (deferred into pending_cow_batch) followed by `copy_area` (B.3 frame-builder append) would record the second op's CB BEFORE the cow batch submits, violating X11 chronological order.
+
+The flush calls can themselves close an open frame (since `flush_render_batch` may submit a CB), so they precede the open-frame mutation just like `allocate_scratch_image` does in N8.
+
+`cow_copy_area` is structurally different: it ENQUEUES into `pending_cow_batch`, it does not flush it. The rewrite preserves that. The `flush_cow_batch` + `flush_render_batch` calls at the TOP of the rewrite apply to FOLLOW-ON ops; cow_copy_area's own enqueue happens after the flushes (clearing OTHER pending state) but before its append.
 
 ## Frame close triggers after B.3
 
@@ -623,7 +649,7 @@ After B.3 rip-and-replace:
 
 **For each of `copy_area`, `cow_copy_area`, `put_image`:**
 
-- **Body rewrite.** Replace the existing direct-submit body of `<op>` in-place. The new body: preflight (renderer_failed check, dst metadata resolve, src/dst overlay first_touch for any Drawable inputs, ticket-touch src+dst). For `put_image`, clone the staging Arc into `frame_builder.open.pins.staging_buffers` (per N2). For `copy_area`'s self-overlap subcase, allocate the scratch FIRST per N8's allocation-ordering rule. Then append `RecordedOp::<variant>` via `push_op_and_set_layouts`. Implement `emit_recorded_<op>_into_cb`: barriers + transfer + barriers-back per N1's mandated stage/access masks. Layout normalization to `SHADER_READ_ONLY_OPTIMAL` per N1.
+- **Body rewrite.** Replace the existing direct-submit body of `<op>` in-place. The new body, in order: (1) **`flush_cow_batch` + `flush_render_batch`** per N9 — mandatory mirror of the legacy ordering rule. (2) preflight (renderer_failed check, dst metadata resolve, src/dst overlay first_touch for any Drawable inputs, ticket-touch src+dst). (3) For `put_image`, clone the staging Arc into `frame_builder.open.pins.staging_buffers` (per N2). (4) For `copy_area`'s self-overlap subcase, allocate the scratch FIRST per N8's allocation-ordering rule. (5) Append `RecordedOp::<variant>` via `push_op_and_set_layouts`. (6) Implement `emit_recorded_<op>_into_cb`: barriers + transfer + barriers-back per N1's mandated stage/access masks. Layout normalization to `SHADER_READ_ONLY_OPTIMAL` per N1.
 - **Integration test.** Two-call collapse test (`v2_frame_builder_<op>_collapses_two_in_one_frame`) — assert two consecutive `<op>` calls in the same frame produce one SubmittedOp, not two.
 
 `cow_copy_area`'s body task uses the existing `current_layout_for_drawable(store, cow_id)` accessor — no special cow handling beyond resolving the cow Drawable from the dispatch (per N3).
@@ -642,7 +668,7 @@ The existing `close_open_frame_for_non_ported_op` call at the top of each legacy
 
 ### Phase 3 — FILL family (6 tasks: 2 per op × 3 ops)
 
-**For each of `fill_rect`, `fill_rect_batch`, `logic_fill`:** same 2-task shape — body rewrite + integration test.
+**For each of `fill_rect`, `fill_rect_batch`, `logic_fill`:** same 2-task shape — body rewrite + integration test. Each body rewrite MUST start with `flush_cow_batch` + `flush_render_batch` per N9 before any open-frame work.
 
 The recording shape diverges within the family (codex round-7 correction — earlier drafts routed fill_rect through the composite pipeline; that was wrong):
 
@@ -657,6 +683,7 @@ Three distinct emit sub-shapes inside FILL: cmd_clear_attachments (fill_rect/fil
 
 **For `render_traps_or_tris`:** same 2-task shape — body rewrite + integration test. The body's responsibilities (per the full N5 RecordedRenderTrapsOrTris payload listing) are:
 
+0. **Flush pre-existing batches** (per N9 — load-bearing X11 chronological-order invariant). Call `self.flush_cow_batch(store, platform)?` then `self.flush_render_batch(store, platform)?` BEFORE any open-frame work. Mirrors legacy at engine.rs:7224-7226 and B.1's composite_glyphs body at engine.rs:5205-5214.
 1. Preflight checks (renderer_failed, store.get(dst), `std_op = StdPictOp::from_u8(op)`, dst_format/dst_depth/dst_has_alpha, self-alias gate per engine.rs:7270-7273).
 2. Allocate the per-instance vertex buffer (`StagingBuffer::new_with_usage` for VERTEX_BUFFER usage). This is an allocation that may fail — done BEFORE any open-frame mutation, mirroring N8's allocation-first rule.
 3. **Peek-grow mask scratch** (Phase 9A from B.2 Task 9 — close-before-grow if frame has prior ops, then `ensure_image_size_returning_old` + `adopt_retired_resource_for_gpu_retirement` adopting the OLD backing as `BatchResource` per N8 case 1).
@@ -675,18 +702,19 @@ Emit replays the two-stage CB:
 - **Resolve mask_view + mask_extent + current_layout fresh** from `engine.mask_scratch` (per N5 mask scratch ownership).
 - **(a) Trap raster** — barrier mask → COLOR_ATTACHMENT, begin_rendering(bbox, load=CLEAR), bind trap/tri pipeline per `prim_kind`, bind vertex buffer, push `TrapDrawPushConsts`, set viewport+scissor (bbox), `cmd_draw(4, instance_count)`, end_rendering. Barrier mask → SHADER_READ_ONLY.
 - **(b) Composite phase** — derive `needs_dst_readback = std_op.needs_dst_readback()` and `needs_full_dst = matches!(recorded.op_byte, 0|1|5|6|7|10|13|16..=27|32..=43)` (engine.rs:7472 — uses the recorded raw `op_byte` field per N5 listing) at emit time. Optional `record_dst_readback_copy(dst)` + `dst_readback.view(dst_format, dst_has_alpha)` resolve when `needs_dst_readback`. Fresh pipeline lookup `render_pipelines.get(std_op, dst_format, dst_has_alpha, false)`. Fresh descriptor allocation via the frame_generation-tagged ring. Compute `(render_dst_x/y, render_w/h, mask_off_x/y)` from `needs_full_dst`. Compose `combined_src_xform = compose(gradient.intrinsic, user_src_xform)` when src is Gradient, else `user_src_xform`. Effective src_repeat = `REPEAT_PAD` when `src_is_synthetic_1x1`, else the recorded `src_repeat`. Build `CompositeAttrs { src_extent, mask_extent (fresh), src_repeat (effective), mask_repeat = REPEAT_NONE, src_force_opaque, mask_force_opaque = false, src_xform = combined, mask_xform = IDENTITY }`. Per-`clip_scissors` draw using the recorded `clip_scissors` slice. Standard composite close (dst → SHADER_READ_ONLY_OPTIMAL).
+- **(c) Post-emit CPU writeback** (codex round-10 catch — see N5 "Post-emit CPU-layout writeback") — after the composite-close barrier transitions mask_scratch back to SHADER_READ_ONLY_OPTIMAL, call `engine.mask_scratch.as_mut().expect("ensured").set_current_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)` to advance the CPU-tracked layout (mirror engine.rs:7740-7749). Skipping this leaves the NEXT trap op's pre-barrier reading a stale old_layout.
 
 Includes the cross-frame mask-scratch-grow integration test per N5 (3-op sequence `(small, large, large)` spanning frames F1 + F2 — the grow inherently triggers `close-before-grow` between op 1 and op 2, so F1 closes before the grow and F2 reopens against M1). Also includes a **solid-source-equivalence test** asserting that a Solid-src trap op replays with `record_solid_color_clear` writing the correct color before composite (catches the "stale 1×1 solid contents" replay bug codex round-7 flagged).
 
 ### Phase 5 — GLYPH family (2 tasks: image_text only)
 
-**For `image_text`:** same 2-task shape — body rewrite + integration test. Body lazily ensures the `V2GlyphAtlas` + `TextPipeline` (mirroring B.1's composite_glyphs body), packs glyph misses into the atlas with per-glyph staging-buffer pins via `open.pins.pin_staging`, appends `RecordedOp::GlyphUpload` variants per miss (B.1 variant — REUSED), then appends `RecordedOp::ImageText`.
+**For `image_text`:** same 2-task shape — body rewrite + integration test. Body STARTS with `flush_cow_batch` + `flush_render_batch` per N9 (matching legacy at engine.rs:4503-4505), then lazily ensures the `V2GlyphAtlas` + `TextPipeline` (mirroring B.1's composite_glyphs body), packs glyph misses into the atlas with per-glyph staging-buffer pins via `open.pins.pin_staging`, appends `RecordedOp::GlyphUpload` variants per miss (B.1 variant — REUSED), then appends `RecordedOp::ImageText`.
 
 Emit replays per N7: B.1's existing `Op::GlyphUpload` match arm in `emit_recorded_op_into_cb` (engine.rs:8425-8439, a match arm, NOT a separate function) handles the upload side; the new `Op::ImageText` arm in the same dispatch records the text-pipeline draw against the atlas, mirroring B.1's `Op::CompositeGlyphs` arm (engine.rs:8440-8478).
 
 Reuses B.1's atlas pin-ceiling logic — no new counter or invariant introduced beyond what B.1 already enforces for composite_glyphs.
 
-**Required target-format gate** (per N7's LOAD-BEARING addition, codex round-7 catch): `image_text`'s rewrite MUST early-return `Ok(stats)` when the dst format is not `vk::Format::B8G8R8A8_UNORM` (mirror engine.rs:4515-4526). The gate fires BEFORE any atlas first-touch snapshot, glyph upload, or op append — so no rollback is needed. Phase 5's body rewrite MUST include this gate; Phase 5's integration test MUST include a negative-test asserting a depth-1 or depth-32 target drops the run without atlas mutation (no `last_render_ticket` change, no staging pin added).
+**Required target-format gate** (per N7's LOAD-BEARING addition, codex round-7 catch): `image_text`'s rewrite MUST early-return `Ok(stats)` when the dst format is not `vk::Format::B8G8R8A8_UNORM` (mirror engine.rs:4515-4526). The gate fires BEFORE any atlas first-touch snapshot, glyph upload, or op append — so no rollback is needed. Phase 5's body rewrite MUST include this gate; Phase 5's integration test MUST include a negative-test asserting a NON-BGRA8 target (depth-1 or R8) drops the run without atlas mutation (no `last_render_ticket` change, no staging pin added). Depth-24 and depth-32 ARGB both alias to BGRA8 and PASS the gate — they are NOT negative-test targets (codex round-10 wording correction).
 
 **Required atlas transactional discipline** (per N7's LOAD-BEARING addition): `image_text`'s rewrite MUST call the same first-touch-atlas snapshot helper that `composite_glyphs_via_frame_builder` does (engine.rs:5314 style — snapshot `atlas_prev_ticket_snapshot` + `layouts.first_touch_atlas`). The existing `commit_close_success` (engine.rs:8780) and `rollback_atlas` (engine.rs:8838) paths handle the rest. Skipping the snapshot would leak a stale `last_render_ticket` on close failure — recreates a B.2-class transaction bug. Phase 5's integration test MUST exercise a close-failure path (e.g., via `platform_force_next_submit_failure_for_tests`) AND verify that the atlas's `last_render_ticket` rolls back to its pre-frame value.
 
