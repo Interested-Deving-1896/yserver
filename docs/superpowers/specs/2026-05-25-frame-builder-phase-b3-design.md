@@ -661,41 +661,84 @@ Deleting `pending_cow_batch` without migrating (2) would break PRESENT-completio
        Ok(())
    }
    ```
-   The body relies on a new helper `RecordedOp::dst_id(&self) -> Option<DrawableId>` returning the dst for write-variants and `None` for variants without a writable dst (e.g., GlyphUpload, future read-only variants). Match arms cover RecordedCopyArea (which covers both copy_area and cow_copy_area per N3), RecordedPutImage, RecordedFillRect, RecordedLogicFill, RecordedImageText, RecordedRenderTrapsOrTris — all return `Some(self.dst_id)`. GlyphUpload (B.1 reused variant) returns `None`. The backend (backend.rs:9904) call site is unchanged — the helper's signature is preserved; only the body changes.
+   The body relies on a new helper `RecordedOp::dst_id(&self) -> Option<DrawableId>` returning the dst for write-variants and `None` for utility variants without a writable dst. The match arms cover EVERY variant in the enum (frame_builder.rs:538 + the B.3 additions — codex round-15 catch on completeness):
 
-3. **Close-success transfer — mirror legacy precisely (codex round-14 MEDIUM #3).** In `close_open_frame`'s post-`flush_submit_group` `Ok(_)` path (around engine.rs:1474+), after the SubmittedOp is pushed but before commit_close_success runs: if `open_frame.pending_present_completions` is non-empty, build a `PendingPresentBatch` mirroring the legacy flush_cow_batch logic at engine.rs:3522-3556 EXACTLY. The actual API (per `crates/yserver/src/kms/v2/present_completion.rs:29-52`) is:
+   - `RecordedOp::CompositeGlyphs(g)` → `Some(g.dst_id)` — B.1 variant; writes to the dst drawable.
+   - `RecordedOp::RenderComposite(rc)` → `Some(rc.dst_id)` — B.2 variant; writes to the dst drawable.
+   - `RecordedOp::GlyphUpload(_)` → `None` — B.1 utility variant; writes to the atlas, not a drawable.
+   - `RecordedOp::LayoutTransition(_)` → `None` — B.2+ utility variant; not a paint op.
+   - `RecordedOp::CopyArea(ca)` → `Some(ca.dst_id)` — B.3 variant covering both copy_area and cow_copy_area.
+   - `RecordedOp::PutImage(pi)` → `Some(pi.dst_id)`.
+   - `RecordedOp::FillRect(fr)` → `Some(fr.dst_id)`.
+   - `RecordedOp::LogicFill(lf)` → `Some(lf.dst_id)`.
+   - `RecordedOp::ImageText(it)` → `Some(it.dst_id)`.
+   - `RecordedOp::RenderTrapsOrTris(rt)` → `Some(rt.dst_id)`.
 
-   - `PresentBatchWait::{Fd(OwnedFd), Ready, Poll}` — NOT `Semaphore { ... }` (an earlier draft of N10 used that wrong name).
+   The backend (backend.rs:9904) call site is unchanged — the helper's signature is preserved; only the body changes.
+
+3. **Close-success transfer — mirror legacy precisely INCLUDING signal-on-submit ordering (codex rounds 14+15).** The completion semaphore MUST be acquired BEFORE the frame submit and its `vk::Semaphore` MUST be threaded into the submit's signal-on-completion list — otherwise the exported sync_file fd will never fire (codex round-15 catch: the round-14 draft only handled post-flush_submit_group export work, which would create a semaphore that's never queued for signaling).
+
+   The actual API (per `crates/yserver/src/kms/v2/present_completion.rs:29-52`) is:
+   - `PresentBatchWait::{Fd(OwnedFd), Ready, Poll}`.
    - `PendingPresentBatch { wait, ticket: Option<FenceTicket>, signal: Option<PresentCompletionSignal>, events }`.
 
-   Pseudocode (mirror engine.rs:3534-3555):
+   Legacy `flush_cow_batch` order (engine.rs:3467-3554):
+   - 3467: `let completion_signal = if batch.present_completions.is_empty() { None } else { Some(platform.acquire_present_completion_signal()?) };`
+   - 3472: `let completion_semaphore = completion_signal.as_ref().map(|s| s.semaphore());`
+   - 3477: `end_and_submit_op_with_signal(inner, platform, cb, &batch.ticket, completion_semaphore)?;` — semaphore is attached to the SubmitGroup append at this point.
+   - 3522-3555: After `flush_submit_group` succeeds, export the sync_file fd from `completion_signal`, then build PendingPresentBatch with `wait/ticket/signal` and push.
+
+   B.3 close_open_frame MUST do the same order. The current close_open_frame at engine.rs:1408 calls `end_and_submit_op(inner, platform, cb, &frame_ticket)` (the no-signal wrapper at engine.rs:8404 which delegates to `end_and_submit_op_with_signal(..., None)`). The B.3 rewrite changes that to:
+
    ```
-   // Allocate completion signal + run a signal-only queue submit. Phase A Step 8:
-   // the export must be queued AFTER the frame's submit so the signal op exists
-   // before vkGetSemaphoreFdKHR.
-   let completion_signal: Option<PresentCompletionSignal> = allocate_present_completion_signal(...);
-   // flush_submit_group already ran successfully (we're in the Ok path); the
-   // SubmittedOp at submitted.back() carries the frame's ticket.
-   let (wait, signal) = match completion_signal {
-       Some(signal) => match signal.export_sync_file_fd() {
-           Ok(Some(fd)) => (PresentBatchWait::Fd(fd), Some(signal)),
-           Ok(None)     => (PresentBatchWait::Ready, Some(signal)),
-           Err(_e)      => (PresentBatchWait::Poll, Some(signal)),
-       },
-       None => (PresentBatchWait::Ready, None),
+   // BEFORE end_and_submit_op (engine.rs:~1405-1408):
+   let completion_signal: Option<PresentCompletionSignal> = if open_frame.pending_present_completions.is_empty() {
+       None
+   } else {
+       Some(platform.acquire_present_completion_signal()?)
    };
-   let ticket = inner.submitted.back().map(|op| op.ticket.clone());
-   inner.pending_present_batches.push(PendingPresentBatch {
-       wait,
-       ticket,
-       signal,
-       events: std::mem::take(&mut open_frame.pending_present_completions),
-   });
+   let completion_semaphore = completion_signal.as_ref().map(|s| s.semaphore());
+
+   // end_and_submit_op_with_signal threads the semaphore into the SubmitGroup
+   // append; the GPU submit will signal it on completion.
+   end_and_submit_op_with_signal(inner, platform, cb, &frame_ticket, completion_semaphore)?;
+
+   // ... pending_group_ops.push(SubmittedOp { ... }) as before ...
+
+   // Drive flush_submit_group as before.
+   let flush_outcome = self.flush_submit_group(platform, FlushReason::FrameBuilder);
+
+   match flush_outcome {
+       Ok(_) => {
+           // ... commit_close_success path ...
+           // NEW: drain pending_present_completions into PendingPresentBatch.
+           if !open_frame.pending_present_completions.is_empty() {
+               let (wait, signal) = match completion_signal {
+                   Some(signal) => match signal.export_sync_file_fd() {
+                       Ok(Some(fd)) => (PresentBatchWait::Fd(fd), Some(signal)),
+                       Ok(None)     => (PresentBatchWait::Ready, Some(signal)),
+                       Err(_e)      => (PresentBatchWait::Poll, Some(signal)),
+                   },
+                   None => unreachable!("non-empty completions but no signal allocated"),
+               };
+               let ticket = inner.submitted.back().map(|op| op.ticket.clone());
+               inner.pending_present_batches.push(PendingPresentBatch {
+                   wait,
+                   ticket,
+                   signal,
+                   events: std::mem::take(&mut open_frame.pending_present_completions),
+               });
+           }
+       }
+       Err(e) => { /* see step 4 — force-enqueue degraded batch */ }
+   }
    ```
 
    The `signal: Option<PresentCompletionSignal>` field MUST be stored on the PendingPresentBatch even when its sync_file fd has been exported — the backend explicitly keeps the semaphore alive until both the sync primitive is ready AND the batch ticket signals (backend.rs:2334). Destroying the semaphore earlier is a use-after-free hazard.
 
-4. **Close-failure semantics — force-enqueue, NOT silent drop (codex round-14 MEDIUM #2).** If `flush_submit_group` FAILS in `close_open_frame`, the legacy `flush_cow_batch` at engine.rs:3556-3567 does NOT silently drop the completions. It force-enqueues a degraded `PendingPresentBatch` with `wait: PresentBatchWait::Ready, ticket: None, signal: None, events: present_completions` and STILL returns Err. The X PRESENT protocol observes the events as delivered (with "Ready" wait), and the caller observes the Err for separate error handling. The B.3 close_open_frame's Err path MUST mirror this: take the open frame's pending_present_completions, build a `PendingPresentBatch { wait: Ready, ticket: None, signal: None, events: completions }`, push onto `pending_present_batches`, THEN return Err. Silent drop would be a protocol-visible regression.
+   If `acquire_present_completion_signal()?` fails BEFORE `end_and_submit_op_with_signal`, return Err and route the open frame through the existing CB-allocation-failure rollback path (same as if end_and_submit_op had failed): renderer_failed=true, rollback overlay/atlas/pins, complete_close_failure. The events drop with the open frame; the X PRESENT protocol observes them as never delivered, same outcome as a partial pre-submit failure pre-B.3.
+
+4. **Close-failure semantics — force-enqueue, NOT silent drop (codex round-14 MEDIUM #2).** If `flush_submit_group` FAILS (post-`end_and_submit_op_with_signal`), the legacy `flush_cow_batch` at engine.rs:3556-3567 does NOT silently drop the completions. It force-enqueues a degraded `PendingPresentBatch` with `wait: PresentBatchWait::Ready, ticket: None, signal: None, events: present_completions` and STILL returns Err. The X PRESENT protocol observes the events as delivered (with "Ready" wait), and the caller observes the Err for separate error handling. The B.3 close_open_frame's flush_submit_group-Err branch MUST mirror this: take the open frame's pending_present_completions, build a `PendingPresentBatch { wait: Ready, ticket: None, signal: None, events: completions }` (the `completion_signal` allocated in step 3 is dropped — it was queued on a submit that failed), push onto `pending_present_batches`, THEN return Err. Silent drop would be a protocol-visible regression. NOTE: this branch is reached only when `flush_submit_group` itself fails AFTER `end_and_submit_op_with_signal` succeeded; failures earlier in close_open_frame (CB allocation, end_and_submit_op_with_signal failure, acquire_present_completion_signal failure) route through the existing rollback path and DO drop the events — matching pre-B.3 behavior for the same failure modes (engine.rs:1410-1446's rollback path).
 
 5. **Test helper.** `has_pending_batches_for_tests` (engine.rs:1717-1722) currently checks `pending_cow_batch.is_some() || pending_render_batch.is_some()`. Replace with `frame_builder.open.is_some() || pending_render_batch.is_some()`. Behavioral meaning is preserved: "is there any in-flight work the frame builder hasn't committed yet?".
 
