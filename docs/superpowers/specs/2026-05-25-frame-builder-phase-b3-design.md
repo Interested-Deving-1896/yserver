@@ -10,8 +10,8 @@ After Phase B.2, the frame builder absorbs `render_composite` and `render_fill_r
 
 Phase B.3 ports the remaining 8 non-ported paths into the frame builder so they too accumulate into the open frame instead of submitting standalone CBs. After B.3:
 
-- M2 has zero call sites — the invariant is structurally retired, not just narrowed.
-- `frame_builder_close_reason_non_ported_paint_op` should fall to zero in the steady state.
+- M2 has only ONE remaining call site: the `render_composite_legacy` kill-switch path (engine.rs:5877), reachable when `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE=off`. With the kill-switch in its default ON position, that site is unreachable; if it ever fires it shows up in the `legacy=` per-source bucket (see §Per-source telemetry breakdown). B.5 deletes `render_composite_legacy` and the M2 close together.
+- `frame_builder_close_reason_non_ported_paint_op[legacy]` is the only non-zero source expected; the 8 paint sources should fall to zero in the steady state.
 - `submit_group_flushes_per_second` on the bee MATE workload should drop further; combined with B.2's ~75% absorption of submits, B.3 should push the residue toward 0 paint-induced flushes (only structural close triggers remain: scene compose, pin ceiling, scratch grow, present completion, sync wait, timeout, shutdown).
 
 ## Scope
@@ -111,16 +111,22 @@ The mask scratch lives in `EngineInner::mask_scratch` (already present), and its
 
 ```
 on append:
-  for each glyph miss: pack into atlas, pin staging buffer in open.pins.staging_buffers,
-                       append RecordedOp::GlyphUpload (B.1 variant — reused)
-  append RecordedOp::ImageText (new variant: dst + glyph list + atlas key + clip)
+  for each glyph miss: pack into atlas, pin staging buffer via open.pins.pin_staging,
+                       append RecordedOp::GlyphUpload (B.1 variant — reused verbatim)
+  append RecordedOp::ImageText (new variant: dst + glyphs normalized to
+                                {atlas_x, atlas_y, w, h, dst_x, dst_y} +
+                                foreground color)
 
 on emit (close-time replay):
-  GlyphUpload ops → cmd_copy_buffer_to_image into atlas slots
-  ImageText op → text-pipeline draw using atlas + glyph positions
+  GlyphUpload arm in emit_recorded_op_into_cb (engine.rs:8425-8439, B.1 code,
+                     match-arm not a separate fn) → cmd_copy_buffer_to_image
+                     into atlas slots
+  new ImageText arm in emit_recorded_op_into_cb → text-pipeline draw using
+                     atlas + per-glyph positions (mirrors B.1 CompositeGlyphs
+                     arm at engine.rs:8440-8478)
 ```
 
-Reuses B.1's `RecordedGlyphUpload` variant verbatim for the upload side; only the draw-side `RecordedImageText` is new. This is a different shape from MASK and warrants its own family.
+Reuses B.1's `RecordedGlyphUpload` variant verbatim for the upload side; only the draw-side `RecordedImageText` is new. Per-glyph atlas-cache lookup happens at append time inside `image_text_via_frame_builder` — the cache-insert key never reaches the recorded op, and the draw-side payload mirrors B.1's `RecordedCompositeGlyphs` shape (glyphs in atlas-coords already resolved at append, foreground color, dst metadata). NO atlas-key field, NO clip-state field on `RecordedImageText`.
 
 ## Op-variant catalog
 
@@ -129,8 +135,8 @@ Reuses B.1's `RecordedGlyphUpload` variant verbatim for the upload side; only th
 | `RecordedCopyArea(Box<RecordedCopyArea>)` | yes | TRANSFER | covers copy_area + cow_copy_area; payload carries `dst_id: DrawableId` (cow is a regular DrawableId per N3) + src_id + sub-rect + dst_old_layout |
 | `RecordedPutImage(Box<RecordedPutImage>)` | yes | TRANSFER | staging_pin_idx (B.1 `pin_staging` style) + dst_id + sub-rect + dst_old_layout |
 | `RecordedFillRect(Box<RecordedFillRect>)` | yes | FILL | op + color + rect-slice + clip + descriptor + dst_old_layout; covers fill_rect_batch as N≥1 rect-slice per N4 |
-| `RecordedLogicFill(Box<RecordedLogicFill>)` | yes | FILL | GC logic mode + color + rect-slice + clip + push-constant payload; NO descriptor — uses `LogicFillPipelineCache` directly per finding R2.3 |
-| `RecordedImageText(Box<RecordedImageText>)` | yes | GLYPH | text-run draw against `V2GlyphAtlas`; companion `RecordedOp::GlyphUpload` (B.1 variant — reused) carries per-glyph staging uploads |
+| `RecordedLogicFill(Box<RecordedLogicFill>)` | yes | FILL | GC logic mode + dst_format (cache key) + color + pre-clamped rect-slice + dst metadata + dst_old_layout; NO X RENDER picture-clip input, NO descriptor handle. Uses `LogicFillPipelineCache` directly per N6. |
+| `RecordedImageText(Box<RecordedImageText>)` | yes | GLYPH | dst metadata + dst_old_layout + foreground color + glyphs Vec<{atlas_x, atlas_y, w, h, dst_x, dst_y}> (same shape as B.1's RecordedCompositeGlyphs); NO atlas-key, NO clip. Companion `RecordedOp::GlyphUpload` (B.1 variant — reused) carries per-glyph staging uploads. |
 | `RecordedRenderTrapsOrTris(Box<RecordedRenderTrapsOrTris>)` | yes | MASK | trap/tri vertex pool + mask scratch view + dst (single variant covers both raster + composite stages per N5) |
 
 No `RecordedFillRectBatch` variant — `fill_rect_batch` produces one `RecordedFillRect` per call carrying the entire rect slice (N4 decision).
@@ -202,7 +208,7 @@ The `pending_render_batch` (engine.rs:3982's `flush_render_batch`) is *render_co
 
 ### N5 — render_traps_or_tris has its own pipeline + scratch
 
-Unlike fill_rect (which reuses render_composite's pipeline), render_traps_or_tris uses a dedicated `trap_pipeline` (engine.rs:2134's `ensure_trap_pipeline`) and the `mask_scratch: Option<MaskScratch>` slot.
+Unlike fill_rect (which reuses render_composite's pipeline), render_traps_or_tris uses a dedicated `trap_pipeline` lazily initialized by `ensure_trap_assets` (engine.rs:2186) along with the `mask_scratch: Option<MaskScratch>` slot.
 
 `render_traps_or_tris_via_frame_builder` peek-grows the mask scratch (Phase 9A pattern from B.2 Task 9), records the trap raster + composite as ONE recorded op (or two — TBD), and the emit replays the two-stage CB.
 
@@ -210,28 +216,67 @@ If recorded as one op, the variant holds both stages' inputs (trap pipeline para
 
 Decision: ONE op variant covering both stages. Simpler emit, no inter-op ordering constraints to enforce.
 
-The MASK family implementation MUST include an integration test exercising "two mask ops in the same frame followed by a mask scratch grow" — i.e., op N records with mask_scratch instance M0, op N+1 needs a larger mask_scratch and triggers Phase 9A's close-before-grow, then a third op records against M1. Validates that the per-frame mask_scratch view stays consistent through grow events.
+The MASK family implementation MUST include an integration test exercising a mask scratch grow across frame boundaries (codex R3.4 — the test must explicitly cross frames; Phase 9A's close-before-grow rule means "two mask ops then a grow" inherently spans 2 frames, not 1).
+
+Scenario:
+1. Op A: `render_traps_or_tris` with small mask extent → records into open frame F1 against mask_scratch instance M0.
+2. Op B: `render_traps_or_tris` with larger mask extent → Phase 9A peek detects the grow, calls `close_open_frame(... CloseReason::ScratchGrow)`, F1 closes + submits. Then `MaskScratch::ensure_image_size_returning_old` grows M0 → M1; the retired M0 routes through `adopt_retired_resource_for_gpu_retirement` to `submitted.back`'s pin set (case b — F1's just-pushed SubmittedOp).
+3. Op C: third `render_traps_or_tris` with the same large extent → records into a NEW frame F2 against M1.
+4. Force-close F2 via the test's timeout helper.
+
+Observables (asserted by the test):
+- `telemetry_submit_group_flushes_for_tests` delta = **2** (F1's close + F2's close).
+- `frame_builder_close_reason_scratch_grow` lifetime counter incremented by **exactly 1** between pre- and post-test snapshot. This needs a new `#[cfg(test)]` telemetry accessor mirroring the existing per-backend submit-flush accessor pattern at `tests/v2_acceptance.rs:3955-4014` and `telemetry.rs:606-718`.
+- Both F1 and F2 retire correctly (no leaked unsignaled FenceTicket); on F1's fence signal, M0 (the retired BatchResource) is released via `BatchResource::release`.
+
+The test reuses the existing scratch-grow infrastructure (BatchResource adoption, Phase 9A) — no new test helper beyond the `frame_builder_close_reason_scratch_grow` accessor.
 
 ### N6 — logic_fill uses its own pipeline cache (separate sub-shape inside FILL family)
 
 (Surfaced by codex round 2.) `logic_fill` doesn't share `fill_rect`'s recording shape. It uses `LogicFillPipelineCache` (engine.rs:2453, 2530) and records a logic-op render pass with push constants directly — NO descriptor set traffic (engine.rs:2593-2697).
 
-This means `logic_fill_via_frame_builder` and `emit_recorded_logic_fill_into_cb` are structurally distinct from the fill_rect path even though they're in the same FILL family. The recording shape:
+This means `logic_fill_via_frame_builder` and `emit_recorded_logic_fill_into_cb` are structurally distinct from the fill_rect path even though they're in the same FILL family. The recording shape (matching the live legacy path at engine.rs:2562-2697):
 
 ```
+on append (logic_fill_via_frame_builder):
+  ensure trap-style assets (or logic-fill assets)
+  clamp each rect to dst extent
+  pipeline = LogicFillPipelineCache::get(logic_mode, dst_format)
+  resolve dst_old_layout via current_layout_for_drawable
+  append RecordedOp::LogicFill { pipeline, color, rects-clamped, dst_id,
+                                 dst_image, dst_view, dst_extent, dst_old_layout }
+
 emit_recorded_logic_fill_into_cb:
-  cache.get(logic_mode, dst_format) → pipeline
-  pipeline_barrier2(dst → COLOR_ATTACHMENT_OPTIMAL)
+  // load-bearing barrier shape per engine.rs:2593-2618 — DO NOT collapse:
+  pipeline_barrier2(
+      src_stage    = ALL_COMMANDS,
+      src_access   = SHADER_SAMPLED_READ | TRANSFER_WRITE | COLOR_ATTACHMENT_WRITE,
+      dst_stage    = COLOR_ATTACHMENT_OUTPUT,
+      dst_access   = COLOR_ATTACHMENT_WRITE,
+      old_layout   = dst_old_layout,
+      new_layout   = COLOR_ATTACHMENT_OPTIMAL,
+  )
   cmd_begin_rendering(dst, load_op=LOAD)
   cmd_bind_pipeline(pipeline)
-  cmd_set_viewport / cmd_set_scissor per clip
-  cmd_push_constants(color + per-rect data)
-  cmd_draw per rect
+  cmd_set_viewport(once, dst extent)         // single viewport, NOT per rect
+  cmd_push_constants(color)
+  for each clamped rect:
+      cmd_set_scissor(rect)
+      cmd_draw(...)
   cmd_end_rendering
-  pipeline_barrier2(dst → SHADER_READ_ONLY_OPTIMAL)
+  pipeline_barrier2(
+      src_stage    = COLOR_ATTACHMENT_OUTPUT,
+      src_access   = COLOR_ATTACHMENT_WRITE,
+      dst_stage    = FRAGMENT_SHADER,
+      dst_access   = SHADER_SAMPLED_READ,
+      old_layout   = COLOR_ATTACHMENT_OPTIMAL,
+      new_layout   = SHADER_READ_ONLY_OPTIMAL,
+  )
 ```
 
-Same family for telemetry / gate purposes; distinct recorded variant + emit fn. The `RecordedLogicFill` payload carries the GC logic mode (cache key input), color, rect slice, clip, and dst metadata — but NO descriptor handle.
+Important: `logic_fill` has NO X RENDER picture-clip input — the clip-rect handling that fill_rect / fill_rect_batch use does not apply. The recording payload carries dst metadata + color + the pre-clamped rect slice + the pipeline cache key (logic_mode + dst_format). NO descriptor handle.
+
+Same family for telemetry / gate purposes; distinct recorded variant + emit fn.
 
 ### N7 — image_text is in the GLYPH family, NOT MASK
 
@@ -250,9 +295,11 @@ on append (image_text_via_frame_builder):
 
 on emit (close-time replay):
   GlyphUpload ops → cmd_copy_buffer_to_image into the atlas's mapped sub-region
-                    (B.1's existing emit_recorded_glyph_upload_into_cb)
+                    (existing B.1 `Op::GlyphUpload` match arm at engine.rs:8425-8439,
+                    a match arm in `emit_recorded_op_into_cb`, NOT a separate fn)
   ImageText op → text-pipeline draw against the atlas + glyph positions
-                 (new emit_recorded_image_text_into_cb)
+                 (new `Op::ImageText` match arm in the same dispatch, mirroring
+                 B.1's `Op::CompositeGlyphs` arm at engine.rs:8440-8478)
 ```
 
 Atlas-pin-ceiling logic from B.1 applies: the per-frame ceiling protects against unbounded staging-buffer accumulation. image_text's port reuses B.1's pin_ceiling counter; no new counter needed.
@@ -273,7 +320,7 @@ After B.3:
 - All other triggers unchanged.
 - Per-source non_ported breakdown (Task 1) provides empirical signal during the rollout.
 
-The B.3 wrap-up task (Phase 5, Task N-1) removes the `CloseReason::NonPortedPaintOp` variant once `close_open_frame_for_non_ported_op` itself is removed in B.5. For B.3, the variant stays (it still fires under family-gate=OFF for the corresponding ops).
+`CloseReason::NonPortedPaintOp` and the `close_open_frame_for_non_ported_op` helper both stay through all of B.3. They are still reachable under family-gate=OFF for any of the 8 ports, and under the B.2 kill-switch (off) for `render_composite_legacy`. B.5 deletes both when `render_composite_legacy` itself is removed.
 
 ## Per-source telemetry breakdown (Task 1)
 
@@ -309,15 +356,22 @@ pub(crate) enum NonPortedSource {
 
 Change `close_open_frame_for_non_ported_op` to take a `source: NonPortedSource` parameter. All 9 call sites pass the corresponding variant. The telemetry recorder fans out to the per-source bucket.
 
-Log line extension:
+Log line extension. To keep the existing `v2_telemetry:` line under ~120 columns (codex R3.6 — the existing line at `telemetry.rs:375-400` is already long; adding 9 inline fields pushes past readability), split into TWO log lines. The existing `v2_telemetry:` line keeps ONLY the aggregate `non_ported_total` in its `close_reasons[...]` block:
 
 ```
-close_reasons[... non_ported_total=N copy_area=N cow_copy=N put_image=N
-              fill_rect=N fill_batch=N logic_fill=N image_text=N traps_tris=N
-              legacy=N ...]
+v2_telemetry: ... close_reasons[scene_compose=N non_ported_total=N legacy_sc=N
+              present_completion=N sync_wait=N timeout=N shutdown=N
+              pin_ceiling=N scratch_grow=N]
 ```
 
-The aggregate `non_ported_total` is kept (= sum of the 9) for backward-compat with downstream analyzers.
+A NEW sibling line emits the per-source breakdown, with shortened field names in the `non_ported_sources` namespace:
+
+```
+v2_telemetry: non_ported_sources[copy=N cow_copy=N put_image=N
+              fill=N fill_batch=N logic=N image_text=N traps_tris=N legacy=N]
+```
+
+Field-name shortenings (the `non_ported_sources` namespace makes them unambiguous): `copy_area` → `copy`, `fill_rect` → `fill`, `logic_fill` → `logic`, `render_traps_or_tris` → `traps_tris`. The aggregate `non_ported_total` (= sum of the 9 sources) stays on the primary line for backward-compat with downstream analyzers.
 
 This task lands BEFORE the ports begin. A bee-side run with the breakdown reveals which sources actually dominate — guides per-op port priority and lets us measure progress after each family flips ON.
 
@@ -377,7 +431,7 @@ This task lands BEFORE the ports begin. A bee-side run with the breakdown reveal
 The recording shape diverges within the family (per N6):
 
 - `fill_rect` + `fill_rect_batch`: body uses the existing `RenderPipeline` cache + descriptor pool ring (same call sites as B.2 Task 11), with `src=solid_src_image`, `mask=white_mask_image`, `dst=white_mask_image` (no readback, no mask). Emit calls `record_solid_color_clear` for the solid_src and runs the standard composite open/draws/close triplet.
-- `logic_fill`: body uses `LogicFillPipelineCache` (engine.rs:2453) — distinct from the composite pipeline. The recorded payload carries GC logic mode + color + rect slice + clip + push-constant payload. Emit records a logic-op render pass with push constants directly; NO descriptor traffic. See N6 for the full shape.
+- `logic_fill`: body uses `LogicFillPipelineCache` (engine.rs:2453) — distinct from the composite pipeline. The recorded payload carries GC logic mode + dst_format + color + pre-clamped rect slice + dst metadata + dst_old_layout. Emit records a logic-op render pass with push constants directly; NO descriptor traffic, NO picture-clip input. See N6 for the full barrier shape.
 
 `fill_rect_batch`'s body records ONE `RecordedFillRect` per `fill_rect_batch` call carrying the entire rect slice (per N4). Multiple `fill_rect_batch` calls in one frame each become their own recorded op; the frame builder collapses across calls. The wrapper M2 close drops.
 
@@ -393,7 +447,7 @@ Includes the "two mask ops in one frame + mask scratch grow" integration test (p
 
 **For `image_text`:** the same 4-task shape. Body lazily ensures the `V2GlyphAtlas` + `TextPipeline` (mirroring B.1's composite_glyphs body), packs glyph misses into the atlas with per-glyph staging-buffer pins via `open.pins.pin_staging`, appends `RecordedOp::GlyphUpload` variants per miss (B.1 variant — REUSED), then appends `RecordedOp::ImageText`.
 
-Emit replays per N7: GlyphUpload ops use B.1's existing `emit_recorded_glyph_upload_into_cb`; the new `emit_recorded_image_text_into_cb` records the text-pipeline draw against the atlas.
+Emit replays per N7: B.1's existing `Op::GlyphUpload` match arm in `emit_recorded_op_into_cb` (engine.rs:8425-8439, a match arm, NOT a separate function) handles the upload side; the new `Op::ImageText` arm in the same dispatch records the text-pipeline draw against the atlas, mirroring B.1's `Op::CompositeGlyphs` arm (engine.rs:8440-8478).
 
 Reuses B.1's atlas pin-ceiling logic — no new counter or invariant introduced beyond what B.1 already enforces for composite_glyphs.
 
@@ -424,7 +478,7 @@ Reuses B.1's atlas pin-ceiling logic — no new counter or invariant introduced 
 
 ### Hardware gates (user-driven, after Task N)
 
-- **bee MATE-load** with all three families flipped ON:
+- **bee MATE-load** with all four families flipped ON:
   - `close_reasons[non_ported_total]/s` → ≤ 10 (vs ~900–1100 pre-B.3). Steady-state should approach zero; non-zero only from rare unported edge paths.
   - `submit_group_flushes/s` drop by 30–50% beyond B.2's ~75% absorption. Combined with B.2: target ~200–400 submits/s on bee MATE drag (the original Phase B spec target).
   - `ops/frame_avg` rises from B.2's ~1.7 to ~4–8 (more ops per frame as M2 stops fragmenting them).
@@ -441,7 +495,7 @@ These remain unresolved at design time and ride along to implementation:
 
 2. **`logic_fill` pipeline variants.** GC logic modes (Copy, And, Or, Xor, …) map to render pipeline variants. The existing `_legacy` path handles this; ensure the via_frame_builder path's pipeline cache lookup keys on the logic mode correctly.
 
-3. **`close_open_frame_for_non_ported_op` removal timing.** Phase 5 Task N-1 removes the dead call site in `render_composite_legacy`. The helper function itself stays until B.5 (where `render_composite_legacy` is removed). Optionally: rename the helper to `close_open_frame_legacy_kill_switch_path` to clarify its scope shrinks under B.3.
+3. **`close_open_frame_for_non_ported_op` removal timing.** Both the helper and its `render_composite_legacy` call site (engine.rs:5877) stay through B.3 — the legacy path needs the close any time the B.2 kill-switch is OFF, even after B.3 family gates are ON (codex round-2 R2.1). B.5 removes the legacy body, the helper, and `CloseReason::NonPortedPaintOp` together.
 
 ## Risk register
 
