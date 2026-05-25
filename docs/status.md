@@ -3148,15 +3148,53 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         PRESENT), structural `frame_builder/s` 60–164 (60 Hz scene
         compose + sundry).
 
-    **Bee hardware-smoke gate (NOT YET — pending capture):**
-      - `close_reasons[non_ported]/s` → ≤ 10 (vs ~900–1100 pre-B.3).
-      - `submit_group_flushes/s` drop by 30–50 % beyond B.2's ~75 %
-        absorption. Combined with B.2: target ~200–400 submits/s on
-        bee MATE drag (Phase B end-state target).
-      - `ops/frame_avg` rises from B.2's ~1.7 to ~4–8 (yoga overshoots
-        this — bee is the real reference; this number will be
-        recalibrated against the bee capture).
-      - `frame_builder_aborts/s = 0`.
+    **Bee hardware-smoke capture (2026-05-26) — PASS (after the
+    78f71fe layout-overlay fix):**
+      - `close_reasons[non_ported]/s` = **0** across the entire run
+        (target ≤ 10 vs ~900–1100 pre-B.3). ✓ exceeded.
+      - `submit_group_flushes/s` = **113–557, mostly 180–510 under
+        drag** (target ~200–400). ✓ in range. ~4× reduction vs the
+        spec's ~2300/s pre-B.3 estimate; combined with B.2's ~75 %
+        absorption this matches the spec's 30–50 % additional drop
+        target.
+      - `frame_builder_aborts/s` = **0** (target 0). ✓
+      - **Lag-free**: bee MATE-drag is smooth for the first time
+        across Phase A / B.1 / B.2 / B.3 — the smoothness fix the
+        whole phase was chasing. The dominant remaining CPU cost is
+        `cpu_fence_wait_ns/s` 60M–220M (60–220 ms/s) tied to
+        `sync_wait/s` 56–124 — bee MATE applets doing get_image
+        readbacks. Orthogonal to frame-builder rate; would be the
+        next target.
+      - `ops/frame_avg` = **19–47, peaks 47 under drag** (target
+        ~4–8). Same spec undercount as yoga. Peak single frame
+        absorbed 252 ops; still well under the 1024 pin ceiling.
+        `avg_compose_cb_record_ns` stays 100K–300K (0.1–0.3 ms per
+        close) — record-time bounded.
+      - Other surviving close reasons (informational): `legacy_sc/s`
+        ~50 (kill-switch-off scene compose), `sync_wait/s` 56–124,
+        `present_completion/s` 0–25, structural `frame_builder/s`
+        110–178.
+      - Zero new warnings / errors / VUIDs (only Ctrl-Alt-Backspace
+        zap on shutdown).
+      - **Pre-fix history:** first bee run after B.3 implementation
+        landed showed half-rendered desktop. Two hotfixes resolved
+        it:
+          1. `449e732` — Arc-wrap `GradientPicture` so client
+             `FreePicture` between trap-op append and frame close
+             doesn't destroy the GPU resources mid-record. Caught
+             the "missing at emit — was present at append" warns.
+          2. `78f71fe` — every frame-builder body (B.1's
+             `composite_glyphs`, B.2's src/mask Drawable arms, B.3
+             Tasks 2/6/8/10/14) was reading `storage.current_layout`
+             instead of `inner.current_layout_for_drawable`. The
+             overlay is the source of truth between op-appends; the
+             body rewrites missed it from copying the wrong B.1
+             template. RDNA2 surfaced this as visible corruption;
+             yoga's GPU was lenient. Codex (out-of-session) found
+             and fixed all five B.3 sites + the B.1/B.2 sites in
+             one diff.
+
+    **Remaining hardware-smoke gates (NOT YET — pending capture):**
       - silence (dual-output) regression check — no scene-compose
         regression, no ERROR_DEVICE_LOST, no fault chains.
       - iMac / fuji regression checks.
