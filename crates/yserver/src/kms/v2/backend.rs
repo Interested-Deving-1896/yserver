@@ -8320,6 +8320,11 @@ impl Backend for KmsBackendV2 {
                 log::warn!("v2 render_composite: engine returned {e:?} on dst 0x{host_dst:x}");
             }
         }
+        // Phase B.2 Task 15: render_composite may open a frame; drain
+        // any resulting close events into telemetry so the per-second
+        // emit picks them up without stale lag. Mirrors the B.1 drain
+        // at the composite_glyphs wrapper.
+        self.drain_frame_builder_telemetry();
         Ok(())
     }
 
@@ -8796,6 +8801,11 @@ impl Backend for KmsBackendV2 {
         } else if let Err(e) = stats {
             log::warn!("v2 render_fill_rectangles: engine returned {e:?} on dst 0x{host_dst:x}");
         }
+        // Phase B.2 Task 15: render_fill_rectangles may open a frame;
+        // drain any resulting close events into telemetry so the
+        // per-second emit picks them up without stale lag. Mirrors the
+        // B.1 drain at the composite_glyphs wrapper.
+        self.drain_frame_builder_telemetry();
         Ok(())
     }
 
