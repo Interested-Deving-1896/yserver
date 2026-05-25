@@ -1727,15 +1727,74 @@ impl KmsBackendV2 {
     /// `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE` sub-gate at runtime.
     /// Independent of the B.1 main gate above. Production reads the
     /// env var on first access; tests flip via this wrapper.
-    #[cfg(test)]
-    #[allow(
-        dead_code,
-        reason = "Phase B.2 Task 5: wrapper lands ahead of its first \
-                  test caller; Task 6+ (render-composite route + \
-                  integration tests) consume it."
-    )]
-    pub(crate) fn set_frame_builder_render_composite_enabled_for_tests(&self, on: bool) {
+    ///
+    /// Task 9 widened visibility from `pub(crate) #[cfg(test)]` to
+    /// `pub` (no cfg) so the `v2_acceptance` integration test crate
+    /// can flip the gate for the render-composite frame-builder path.
+    pub fn set_frame_builder_render_composite_enabled_for_tests(&self, on: bool) {
         super::engine::set_frame_builder_render_composite_enabled_for_tests(on);
+    }
+
+    /// Phase B.2 Task 9: allocate a fresh BGRA8 pixmap via the
+    /// engine's `create_pixmap`. Returns the host xid the test code
+    /// uses as an opaque drawable handle; the integration crate
+    /// can't see `DrawableId` (it's `pub(crate)`) so xids are the
+    /// stable test surface.
+    ///
+    /// Returns `None` on Vk failure (e.g. test fixture without Vk
+    /// or storage allocation error).
+    pub fn allocate_test_pixmap_bgra(&mut self, width: u16, height: u16) -> Option<u32> {
+        let xid = self.core.next_host_xid();
+        let storage = self
+            .platform
+            .allocate_drawable_storage(width, height, 32)
+            .ok()?;
+        self.store
+            .allocate(xid, super::store::DrawableKind::Pixmap, 32, false, storage)
+            .ok()?;
+        Some(xid)
+    }
+
+    /// Phase B.2 Task 9: invoke `render_composite` with an empty
+    /// `rects` slice. The frame-builder path's first check is
+    /// `if rects.is_empty() { return Ok(stats); }` BEFORE any state
+    /// mutation — used by the empty-rects-doesn't-open-frame test.
+    ///
+    /// `dst_xid` must resolve in the store; the function ignores the
+    /// dst layout because the early-return path doesn't touch it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `dst_xid` doesn't resolve in the store; the
+    /// engine call itself is infallible on empty rects.
+    pub fn render_composite_empty_for_tests(&mut self, dst_xid: u32) -> Result<(), io::Error> {
+        let Some(dst_id) = self.store.lookup(dst_xid) else {
+            return Err(io::Error::other(format!(
+                "render_composite_empty_for_tests: dst xid 0x{dst_xid:x} not in store"
+            )));
+        };
+        const OP_SRC: u8 = 1;
+        self.engine
+            .render_composite(
+                &mut self.store,
+                &mut self.platform,
+                OP_SRC,
+                super::engine::ResolvedSource::Solid([0.0, 0.0, 0.0, 1.0]),
+                super::engine::ResolvedSource::None,
+                dst_id,
+                &[],
+                None,
+                crate::kms::cpu_types::Repeat::Pad,
+                crate::kms::cpu_types::Repeat::Pad,
+                None,
+                None,
+                false,
+                0,
+                0,
+                0,
+            )
+            .map(|_| ())
+            .map_err(|e| io::Error::other(format!("render_composite_empty_for_tests: {e:?}")))
     }
 
     /// Phase B.1 Task 15: is the frame builder currently open?

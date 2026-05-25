@@ -939,7 +939,11 @@ fn frame_builder_render_composite_enabled() -> bool {
 /// Phase B.2 Task 5: test override for the render-composite sub-gate.
 /// Mirrors `RenderEngine::set_frame_builder_enabled` but at the
 /// process-level cell (the sub-gate is not per-engine).
-#[cfg(test)]
+///
+/// Task 9 dropped the `#[cfg(test)]` gate so the backend's `pub`
+/// wrapper can route integration-test calls into this crate-private
+/// override without the test code path being elided from non-test
+/// builds.
 pub(crate) fn set_frame_builder_render_composite_enabled_for_tests(on: bool) {
     let cell =
         FRAME_BUILDER_RENDER_COMPOSITE.get_or_init(|| std::sync::atomic::AtomicBool::new(false));
@@ -6318,24 +6322,31 @@ impl RenderEngine {
         Ok(stats)
     }
 
-    /// Phase B.2 Task 8: frame-builder composite path skeleton.
+    /// Phase B.2 Task 9: frame-builder composite path — prelude only.
     ///
-    /// Stub returning an empty [`CompositeStats`]; selected by
-    /// [`Self::render_composite`] when the
-    /// `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE` sub-gate is ON
-    /// (test-only during the B.2 implementation window). Subsequent
-    /// tasks (9-13) replace this body with the prelude → scratch
-    /// peek → open + touch → encode → close pipeline. The dispatcher
-    /// deliberately does NOT call the M2 close before invoking this:
-    /// under sub-gate=ON this method IS the frame builder, so the
-    /// open frame must remain open across consecutive composites.
+    /// Implements Phase 9A (scratch peek + close-on-grow, NO state
+    /// mutation yet) + Phase 9B (open frame + ticket-touch dst).
+    /// Subsequent tasks (10-13) fill in src/mask resolution, scratch
+    /// pinning, descriptor acquisition, op record, and emit.
+    ///
+    /// **Phase 9A — close-then-grow ordering is LOAD-BEARING** (USER-
+    /// codex U-R10.F1). The grow must happen BEFORE any new frame
+    /// opens. With no open frame at the time of `ensure_returning_old`,
+    /// the engine's `adopt_retired_resource_for_gpu_retirement`
+    /// helper falls through case (a) (open frame) and attaches the
+    /// retired Box to `submitted.back` — the just-closed frame's
+    /// `SubmittedOp` — so its `release(&vk)` rides the in-flight CB's
+    /// fence rather than the about-to-open new frame's pin set.
+    ///
+    /// The dispatcher deliberately does NOT call the M2 close before
+    /// invoking this: under sub-gate=ON this method IS the frame
+    /// builder, so the open frame must remain open across consecutive
+    /// composites.
     ///
     /// # Errors
     ///
-    /// Same shape as [`render_composite`]; the stub itself is
-    /// infallible.
+    /// Same shape as [`Self::render_composite`].
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::unnecessary_wraps)]
     fn render_composite_via_frame_builder(
         &mut self,
         store: &mut DrawableStore,
@@ -6355,16 +6366,207 @@ impl RenderEngine {
         mask_pict_format: u32,
         dst_pict_format: u32,
     ) -> Result<CompositeStats, RenderError> {
-        // STUB — Tasks 9-13 fill in. Discard every parameter so the
-        // signature stays stable while the body is empty.
+        use crate::kms::vk::render_pipeline::StdPictOp;
+
+        let stats = CompositeStats::default();
+        if rects.is_empty() {
+            return Ok(stats);
+        }
+
+        // (0) Flush pre-existing cow/render batches so they submit
+        //     under their own (per-op) ticket before this call opens a
+        //     frame.
+        self.flush_cow_batch(store, platform)?;
+        self.flush_render_batch(store, platform)?;
+
+        // (1) Lazy-init RENDER assets (pipelines, solid 1x1 images,
+        //     scratch slots).
+        self.ensure_render_assets(platform)?;
+
+        // (2) PHASE 9A — scratch peek + close-on-grow. NO state
+        //     mutation yet (beyond the assets ensure above which is
+        //     idempotent + doesn't touch the open frame).
+        //
+        //     Resolve dst metadata. Scoped so the `&self.inner` borrow
+        //     is released before any later `as_mut()` re-borrow.
+        let (_dst_image, _dst_view, dst_extent, dst_format, dst_depth) = {
+            let _inner = self.inner.as_ref().ok_or(RenderError::NoVk)?;
+            if platform.renderer_failed {
+                return Err(RenderError::RendererFailed);
+            }
+            let d = store
+                .get(dst_id)
+                .ok_or(RenderError::UnknownDrawable(dst_id))?;
+            (
+                d.storage.image,
+                d.storage.image_view,
+                d.storage.extent,
+                d.storage.format,
+                d.depth,
+            )
+        };
+        if dst_extent.width == 0 || dst_extent.height == 0 {
+            return Ok(stats);
+        }
+        if !matches!(
+            dst_format,
+            vk::Format::B8G8R8A8_UNORM | vk::Format::R8_UNORM
+        ) {
+            log::debug!(
+                "v2 render_composite (frame_builder) gap: dst format \
+                 {dst_format:?} not BGRA/R8 (dst id={dst_id:?})"
+            );
+            return Ok(stats);
+        }
+        let _dst_has_alpha = dst_has_alpha_for_pict_format(dst_format, dst_depth, dst_pict_format);
+
+        // Map the protocol op byte to the pipeline cache's enum.
+        let Some(std_op) = StdPictOp::from_u8(op) else {
+            log::debug!(
+                "v2 render_composite (frame_builder) gap: unsupported op {op} \
+                 (dst id={dst_id:?})"
+            );
+            return Ok(stats);
+        };
+        let needs_dst_readback = std_op.needs_dst_readback();
+        let src_self_alias = matches!(src, ResolvedSource::Drawable(id) if id == dst_id);
+        let mask_self_alias = matches!(mask, ResolvedSource::Drawable(id) if id == dst_id);
+        let self_alias_used = src_self_alias || mask_self_alias;
+
+        // (2a) PEEK growth. Both scratches (when needed) grow to
+        //      (dst_format, dst_extent.width, dst_extent.height). If
+        //      the slot is empty (`None`), `fits` defaults to false
+        //      → grow.
+        let need_grow_dst_rb = needs_dst_readback && {
+            let inner = self.inner.as_ref().expect("inner");
+            inner
+                .dst_readback
+                .as_ref()
+                .map(|rb| !rb.fits(dst_format, dst_extent.width, dst_extent.height))
+                .unwrap_or(true)
+        };
+        let need_grow_alias = self_alias_used && {
+            let inner = self.inner.as_ref().expect("inner");
+            inner
+                .src_alias_readback
+                .as_ref()
+                .map(|rb| !rb.fits(dst_format, dst_extent.width, dst_extent.height))
+                .unwrap_or(true)
+        };
+
+        // (2b) If growth would fire AND a frame is open with prior ops,
+        //      close BEFORE touching anything for the current op.
+        //      Pitfall 4 — guards record_copy_from at emit-time from
+        //      writing into a scratch instance newer than the one the
+        //      recorded views resolved against.
+        if (need_grow_dst_rb || need_grow_alias) && {
+            let inner = self.inner.as_ref().expect("inner");
+            inner
+                .frame_builder
+                .open
+                .as_ref()
+                .is_some_and(|o| !o.ops.is_empty())
+        } {
+            self.close_open_frame(
+                store,
+                platform,
+                super::frame_builder::CloseReason::ScratchGrow,
+            )?;
+        }
+
+        // (2c) CRITICAL: grow + adopt BEFORE opening the new frame
+        //      (USER-codex U-R10.F1). If we grew AFTER opening, the
+        //      helper's case (a) would attach the retired Box to the
+        //      NEW frame's pin set — a new-frame abort would then
+        //      release Vk handles while the just-closed CB is still
+        //      sampling them. With no open frame here, the helper
+        //      falls through to case (b) and rides `submitted.back`'s
+        //      fence (the just-closed frame's SubmittedOp).
+        if need_grow_dst_rb {
+            let retired = {
+                let inner = self.inner.as_mut().expect("inner");
+                inner
+                    .dst_readback
+                    .as_mut()
+                    .expect("ensured")
+                    .ensure_returning_old(dst_format, dst_extent.width, dst_extent.height)
+                    .map_err(|e| {
+                        log::warn!(
+                            "v2 render_composite (frame_builder): dst_readback \
+                             ensure failed: {e:?}"
+                        );
+                        RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+                    })?
+            };
+            let inner = self.inner.as_mut().expect("inner");
+            inner.adopt_retired_resource_for_gpu_retirement(retired);
+        }
+        if need_grow_alias {
+            let retired = {
+                let inner = self.inner.as_mut().expect("inner");
+                inner
+                    .src_alias_readback
+                    .as_mut()
+                    .expect("ensured")
+                    .ensure_returning_old(dst_format, dst_extent.width, dst_extent.height)
+                    .map_err(|e| {
+                        log::warn!(
+                            "v2 render_composite (frame_builder): \
+                             src_alias_readback ensure failed: {e:?}"
+                        );
+                        RenderError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED)
+                    })?
+            };
+            let inner = self.inner.as_mut().expect("inner");
+            inner.adopt_retired_resource_for_gpu_retirement(retired);
+        }
+
+        // (3) PHASE 9B — open + ticket-touch dst. Scratch slots are
+        //     now sized correctly; Task 10's view queries don't grow.
+        //
+        //     Phase B.2 Mechanism 2: bump `acquire_generation` once at
+        //     open and capture the resulting value on the OpenFrame.
+        let inner = self.inner.as_mut().expect("inner");
+        if !inner.frame_builder.is_open() {
+            // Release the inner borrow before calling the platform
+            // method which doesn't need it.
+            let _ = inner;
+            let ticket = platform.submit_group_ticket_or_open()?;
+            let inner = self.inner.as_mut().expect("inner");
+            inner.acquire_generation = inner.acquire_generation.saturating_add(1);
+            let frame_generation = inner.acquire_generation;
+            inner.frame_builder.open_for_paint(ticket, frame_generation);
+        }
+        let inner = self.inner.as_mut().expect("inner");
+
+        // (4) Ticket-touch dst + snapshot prior ticket + FIRST-TOUCH
+        //     dst layout overlay (the overlay's pre_frame_layout is
+        //     what `rollback_pre_submit` writes back on close-failure).
+        let frame_ticket = inner
+            .frame_builder
+            .open
+            .as_ref()
+            .expect("just opened")
+            .ticket
+            .clone();
+        let prior_dst_ticket = store.get(dst_id).and_then(|d| d.last_render_ticket.clone());
+        let dst_pre_frame_layout = store
+            .get(dst_id)
+            .map(|d| d.storage.current_layout)
+            .unwrap_or(vk::ImageLayout::UNDEFINED);
+        {
+            let open = inner.frame_builder.open.as_mut().expect("just opened");
+            open.touched.first_touch(dst_id, prior_dst_ticket);
+            open.layouts
+                .first_touch_drawable(dst_id, dst_pre_frame_layout);
+        }
+        store.touch_render_fence(dst_id, frame_ticket.clone());
+
+        // STUB — Tasks 10-13 fill in src/mask resolution, scratch
+        // pinning, descriptor acquisition, op record, emit. Suppress
+        // unused-binding warnings for the parameters consumed by
+        // later tasks while preserving the public signature.
         let _ = (
-            store,
-            platform,
-            op,
-            src,
-            mask,
-            dst_id,
-            rects,
             clip_rects,
             src_repeat,
             mask_repeat,
@@ -6373,9 +6575,9 @@ impl RenderEngine {
             mask_component_alpha,
             src_pict_format,
             mask_pict_format,
-            dst_pict_format,
+            frame_ticket,
         );
-        Ok(CompositeStats::default())
+        Ok(stats)
     }
 
     // ── Op: render_fill_rectangles (Stage 3c) ───────────────────

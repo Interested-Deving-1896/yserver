@@ -3825,3 +3825,48 @@ fn acquire_descriptor_uses_frame_generation_when_open() {
 
     be.engine_destroy_descriptor_set_layout_for_tests(layout);
 }
+
+/// Phase B.2 Task 9: `render_composite_via_frame_builder` returns
+/// early on `rects.is_empty()` BEFORE any state mutation — including
+/// before opening a frame. The function's first check is
+/// `if rects.is_empty() { return Ok(stats); }`; under sub-gate=ON,
+/// an empty render_composite must leave the frame builder closed.
+///
+/// This pins the empty-rects early-return contract; if a future task
+/// accidentally moves the `is_empty` check below `flush_*` / asset
+/// init / open-for-paint, this test catches it.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_render_composite_via_fb_opens_frame() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+    be.set_frame_builder_render_composite_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate_test_pixmap_bgra");
+
+    // Empty rects — the via_frame_builder body returns Ok(empty stats)
+    // before opening the frame. No flush, no asset init, no open.
+    let result = be.render_composite_empty_for_tests(dst);
+
+    // Reset the process-level sub-gate IMMEDIATELY so neighbouring
+    // tests in the same cargo-test binary are not routed through the
+    // (still partially-stubbed for non-empty rects) frame-builder
+    // composite path. Done before assertions so any later panic
+    // still leaves the global in a clean state.
+    be.set_frame_builder_render_composite_enabled_for_tests(false);
+
+    result.expect("render_composite_empty_for_tests");
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "empty render_composite must NOT open a frame \
+         (rects.is_empty() early return)",
+    );
+}
