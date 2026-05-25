@@ -635,11 +635,11 @@ The flush call can itself close an open frame (since `flush_render_batch` may su
 
 Deleting `pending_cow_batch` without migrating (2) would break PRESENT-completion attachment for COW presents. The frame builder MUST replace this attachment surface.
 
-**Migration design (load-bearing):**
+**Migration design (load-bearing).** All three sub-fixes here address codex round-14 findings.
 
-1. **New slot on OpenFrame.** Add `OpenFrame::pending_present_completions: Vec<PendingPresentEntry>` (defaults empty, no per-cow_id keying — all entries share the open frame's ticket at close).
+1. **New slot on OpenFrame.** Add `OpenFrame::pending_present_completions: Vec<PendingPresentEntry>` (defaults empty, no per-cow_id keying — all entries share the open frame's ticket at close. Codex round-14 confirmed multi-cow grouping on one frame ticket is fine).
 
-2. **Rewrite `attach_cow_present_completion(cow_id, entry)`:**
+2. **Rewrite `attach_cow_present_completion(cow_id, entry)` — predicate fix (codex round-14 MEDIUM #1):**
    ```
    pub(crate) fn attach_cow_present_completion(
        &mut self,
@@ -648,26 +648,54 @@ Deleting `pending_cow_batch` without migrating (2) would break PRESENT-completio
    ) -> Result<(), PendingPresentEntry> {
        let Some(inner) = self.inner.as_mut() else { return Err(entry); };
        let Some(open) = inner.frame_builder.open.as_mut() else { return Err(entry); };
-       // Match the legacy dst-equality check: only attach if the open frame
-       // currently holds any RecordedCopyArea (or other op) writing to cow_id.
-       // The cheapest check is open.touched.contains(cow_id); cow ops first-touch
-       // cow_id during their append, so post-append the touched set carries the id.
-       if !open.touched.contains_for_lookup(cow_id) {
+       // Predicate: this frame WRITES to cow_id (not just reads/samples).
+       // Legacy used exact `batch.dst == cow_id`; that semantic is preserved by
+       // walking open.ops and matching any variant whose dst_id == cow_id.
+       // (`open.touched` is the WRONG predicate — it's a first-touch snapshot
+       // that includes drawables sampled-only, codex round-14 catch.)
+       let writes_to_cow = open.ops.iter().any(|op| op.dst_id() == Some(cow_id));
+       if !writes_to_cow {
            return Err(entry);
        }
        open.pending_present_completions.push(entry);
        Ok(())
    }
    ```
-   The backend (backend.rs:9904) call site is unchanged — the helper's signature stays the same; only the body changes.
+   The body relies on a new helper `RecordedOp::dst_id(&self) -> Option<DrawableId>` returning the dst for write-variants and `None` for variants without a writable dst (e.g., GlyphUpload, future read-only variants). Match arms cover RecordedCopyArea (which covers both copy_area and cow_copy_area per N3), RecordedPutImage, RecordedFillRect, RecordedLogicFill, RecordedImageText, RecordedRenderTrapsOrTris — all return `Some(self.dst_id)`. GlyphUpload (B.1 reused variant) returns `None`. The backend (backend.rs:9904) call site is unchanged — the helper's signature is preserved; only the body changes.
 
-3. **Close-success transfer.** In `close_open_frame`'s post-flush_submit_group path (the `Ok(_)` branch around engine.rs:1470+), after the SubmittedOp is pushed but before commit_close_success runs: if `open_frame.pending_present_completions` is non-empty, build a `PendingPresentBatch` mirroring the legacy flush_cow_batch logic (engine.rs:3497-3567):
-   - If the open frame's ticket carries a sufficient signal (or the completion semaphore can be allocated), wait = `PresentBatchWait::Semaphore { ... }`; else wait = `PresentBatchWait::Poll`.
-   - events = drained `pending_present_completions`.
-   - Push onto `EngineInner::pending_present_batches`.
-   - This is a NEW code path in close_open_frame, not just a deletion. It is the load-bearing replacement for engine.rs:3497-3567.
+3. **Close-success transfer — mirror legacy precisely (codex round-14 MEDIUM #3).** In `close_open_frame`'s post-`flush_submit_group` `Ok(_)` path (around engine.rs:1474+), after the SubmittedOp is pushed but before commit_close_success runs: if `open_frame.pending_present_completions` is non-empty, build a `PendingPresentBatch` mirroring the legacy flush_cow_batch logic at engine.rs:3522-3556 EXACTLY. The actual API (per `crates/yserver/src/kms/v2/present_completion.rs:29-52`) is:
 
-4. **Close-failure semantics.** If flush_submit_group fails, the open frame's `pending_present_completions` drops with the OpenFrame. Each `PendingPresentEntry` should self-handle drop cleanly (the X PRESENT semantics treat missing completion events as "lost" — same as pre-B.3 behavior when flush_cow_batch returned Err).
+   - `PresentBatchWait::{Fd(OwnedFd), Ready, Poll}` — NOT `Semaphore { ... }` (an earlier draft of N10 used that wrong name).
+   - `PendingPresentBatch { wait, ticket: Option<FenceTicket>, signal: Option<PresentCompletionSignal>, events }`.
+
+   Pseudocode (mirror engine.rs:3534-3555):
+   ```
+   // Allocate completion signal + run a signal-only queue submit. Phase A Step 8:
+   // the export must be queued AFTER the frame's submit so the signal op exists
+   // before vkGetSemaphoreFdKHR.
+   let completion_signal: Option<PresentCompletionSignal> = allocate_present_completion_signal(...);
+   // flush_submit_group already ran successfully (we're in the Ok path); the
+   // SubmittedOp at submitted.back() carries the frame's ticket.
+   let (wait, signal) = match completion_signal {
+       Some(signal) => match signal.export_sync_file_fd() {
+           Ok(Some(fd)) => (PresentBatchWait::Fd(fd), Some(signal)),
+           Ok(None)     => (PresentBatchWait::Ready, Some(signal)),
+           Err(_e)      => (PresentBatchWait::Poll, Some(signal)),
+       },
+       None => (PresentBatchWait::Ready, None),
+   };
+   let ticket = inner.submitted.back().map(|op| op.ticket.clone());
+   inner.pending_present_batches.push(PendingPresentBatch {
+       wait,
+       ticket,
+       signal,
+       events: std::mem::take(&mut open_frame.pending_present_completions),
+   });
+   ```
+
+   The `signal: Option<PresentCompletionSignal>` field MUST be stored on the PendingPresentBatch even when its sync_file fd has been exported — the backend explicitly keeps the semaphore alive until both the sync primitive is ready AND the batch ticket signals (backend.rs:2334). Destroying the semaphore earlier is a use-after-free hazard.
+
+4. **Close-failure semantics — force-enqueue, NOT silent drop (codex round-14 MEDIUM #2).** If `flush_submit_group` FAILS in `close_open_frame`, the legacy `flush_cow_batch` at engine.rs:3556-3567 does NOT silently drop the completions. It force-enqueues a degraded `PendingPresentBatch` with `wait: PresentBatchWait::Ready, ticket: None, signal: None, events: present_completions` and STILL returns Err. The X PRESENT protocol observes the events as delivered (with "Ready" wait), and the caller observes the Err for separate error handling. The B.3 close_open_frame's Err path MUST mirror this: take the open frame's pending_present_completions, build a `PendingPresentBatch { wait: Ready, ticket: None, signal: None, events: completions }`, push onto `pending_present_batches`, THEN return Err. Silent drop would be a protocol-visible regression.
 
 5. **Test helper.** `has_pending_batches_for_tests` (engine.rs:1717-1722) currently checks `pending_cow_batch.is_some() || pending_render_batch.is_some()`. Replace with `frame_builder.open.is_some() || pending_render_batch.is_some()`. Behavioral meaning is preserved: "is there any in-flight work the frame builder hasn't committed yet?".
 
