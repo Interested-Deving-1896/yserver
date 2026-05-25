@@ -4661,3 +4661,103 @@ fn v2_frame_builder_cow_copy_area_delivers_present_completion() {
         events.len(),
     );
 }
+
+// ── Task 6: put_image frame-builder integration test ─────────────────────
+
+/// B.3 Task 6 acceptance gate (collapse): two consecutive `put_image` calls
+/// in the same open frame produce exactly ONE `flush_submit_group` call
+/// (one `vkQueueSubmit2`). Pre-B.3 each call submitted its own CB
+/// independently via `end_and_submit_op`.
+///
+/// The test uploads two non-overlapping 32×32 tiles into a 64×64 pixmap.
+/// Both calls must stay in the open frame — no `close_open_frame_for_non_ported_op`
+/// firing between them (that call was deleted from the B.3 body per N9).
+///
+/// Asserts:
+/// - Frame is still open after both `put_image` calls.
+/// - After force-close, the `submit_group_flushes` delta is exactly 1.
+/// - `close_reason_non_ported` counter is unchanged (put_image no longer
+///   fires CloseReason::NonPortedPaintOp).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_frame_builder_put_image_collapses_two_in_one_frame() {
+    let mut be = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    be.set_frame_builder_enabled_for_tests(true);
+
+    let dst = be
+        .allocate_test_pixmap_bgra(64, 64)
+        .expect("allocate dst pixmap");
+
+    // Drain any setup CBs so the counter snapshot is at a clean baseline.
+    be.engine_flush_submit_group_for_tests()
+        .expect("setup drain");
+    let pre_flushes = be.telemetry_submit_group_flushes_for_tests();
+    let pre_non_ported = be.telemetry_close_reason_non_ported_for_tests();
+
+    // 32×32 pixels of solid BGRA (B=0xff, G=0x00, R=0x00, A=0xff).
+    let bytes: Vec<u8> = vec![0xffu8; 32 * 32 * 4];
+
+    // First tile: top-left 32×32.
+    be.engine_put_image_for_tests(
+        dst,
+        ash::vk::Offset2D { x: 0, y: 0 },
+        ash::vk::Extent2D {
+            width: 32,
+            height: 32,
+        },
+        &bytes,
+        32,
+    )
+    .expect("first put_image");
+
+    // Second tile: top-right 32×32.
+    be.engine_put_image_for_tests(
+        dst,
+        ash::vk::Offset2D { x: 32, y: 0 },
+        ash::vk::Extent2D {
+            width: 32,
+            height: 32,
+        },
+        &bytes,
+        32,
+    )
+    .expect("second put_image");
+
+    // Both calls must have stayed in the open frame.
+    assert!(
+        be.frame_builder_is_open_for_tests(),
+        "open frame must survive two put_image calls (not closed by non-ported M2 path)"
+    );
+
+    // Force-close via the Timeout helper (one flush = one vkQueueSubmit2).
+    be.engine_close_open_frame_for_timeout_for_tests()
+        .expect("force-close");
+
+    let post_flushes = be.telemetry_submit_group_flushes_for_tests();
+    let post_non_ported = be.telemetry_close_reason_non_ported_for_tests();
+
+    assert_eq!(
+        post_flushes.saturating_sub(pre_flushes),
+        1,
+        "two put_image calls must collapse to ONE flush_submit_group call (got delta={})",
+        post_flushes.saturating_sub(pre_flushes),
+    );
+    assert_eq!(
+        post_non_ported.saturating_sub(pre_non_ported),
+        0,
+        "put_image must NOT fire CloseReason::NonPortedPaintOp (got delta={})",
+        post_non_ported.saturating_sub(pre_non_ported),
+    );
+
+    // Frame must be closed after the force-close.
+    assert!(
+        !be.frame_builder_is_open_for_tests(),
+        "frame must be closed after engine_close_open_frame_for_timeout_for_tests",
+    );
+}

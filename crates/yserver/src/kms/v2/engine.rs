@@ -3610,21 +3610,24 @@ impl RenderEngine {
         src_bytes: &[u8],
         src_depth: u8,
     ) -> Result<(), RenderError> {
-        // Phase B Invariant M2: close any open composite_glyphs frame
-        // first (no-op if no frame open). Preserves existing
-        // batch-coalescing semantics in the common case.
-        self.close_open_frame_for_non_ported_op(store, platform)?;
+        // Phase B.3 (N9): empty-input fast-path FIRST — before renderer_failed
+        // and flush_render_batch.
         if src_extent.width == 0 || src_extent.height == 0 {
             return Ok(());
         }
-        self.flush_render_batch(store, platform)?;
-        let Some(inner) = self.inner.as_mut() else {
-            return Err(RenderError::NoVk);
-        };
+        // Phase B.3 (N9): renderer_failed check before any open-frame mutation.
         if platform.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
-        let Some(drawable) = store.get_mut(target) else {
+        // Phase B.3 (N9): flush pending_render_batch at entry. May close an
+        // open frame (chronological X11 ordering with pre-existing batches).
+        // No flush_cow_batch — that helper is deleted in Task 4.
+        self.flush_render_batch(store, platform)?;
+
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(RenderError::NoVk);
+        };
+        let Some(drawable) = store.get(target) else {
             return Err(RenderError::UnknownDrawable(target));
         };
 
@@ -3650,6 +3653,10 @@ impl RenderEngine {
         }
 
         let dst_extent = drawable.storage.extent;
+        let dst_image = drawable.storage.image;
+        let dst_pre_layout = drawable.storage.current_layout;
+        let prior_dst_ticket = drawable.last_render_ticket.clone();
+
         // Clamp the put rect to the storage extent. Per Stage 2
         // plan, GC clipping is the backend wrapper's concern;
         // the engine only sees the dst-extent guard.
@@ -3664,6 +3671,9 @@ impl RenderEngine {
             return Ok(());
         }
 
+        // Phase B.3 (N8-style ordering): allocate the staging buffer BEFORE
+        // any open-frame mutation so an allocation failure leaves the frame
+        // untouched (no rollback needed).
         let staging = Arc::new(StagingBuffer::new(inner.vk.clone(), staging_size.max(1))?);
         // Convert src_bytes → staging according to (depth, dst_format).
         let (sx, sy) = src_origin_in_input;
@@ -3678,74 +3688,55 @@ impl RenderEngine {
             staging.mapped.as_ptr(),
         )?;
 
-        let (cb, ticket) = begin_op_cb(inner, platform)?;
-        let device = &inner.vk.device;
+        // Open the frame if not already open. Phase B.2 Mechanism 2: bump
+        // acquire_generation at open + capture on OpenFrame. (Same pattern as
+        // composite_glyphs_via_frame_builder.)
+        if !inner.frame_builder.is_open() {
+            let _ = inner;
+            let ticket = platform.submit_group_ticket_or_open()?;
+            let inner = self.inner.as_mut().expect("inner");
+            inner.acquire_generation = inner.acquire_generation.saturating_add(1);
+            let frame_generation = inner.acquire_generation;
+            inner.frame_builder.open_for_paint(ticket, frame_generation);
+        }
+        let inner = self.inner.as_mut().expect("inner");
+        let frame_ticket = inner
+            .frame_builder
+            .open
+            .as_ref()
+            .expect("just opened")
+            .ticket
+            .clone();
 
-        drawable.record_layout_transition(
-            &inner.vk,
-            cb,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::PipelineStageFlags2::ALL_COMMANDS,
-            vk::AccessFlags2::SHADER_SAMPLED_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::COPY,
-            vk::AccessFlags2::TRANSFER_WRITE,
-        );
+        // Phase B.3 (N2): pin the staging Arc into the frame pin-set BEFORE
+        // any `store` mutation (first_touch + damage happen after pinning so
+        // that a pin-failure doesn't leave store state inconsistent).
+        let staging_pin_idx = {
+            let open = inner.frame_builder.open.as_mut().expect("open");
+            open.touched.first_touch(target, prior_dst_ticket);
+            open.layouts.first_touch_drawable(target, dst_pre_layout);
+            open.pins.pin_staging(Arc::clone(&staging))
+        };
+        store.touch_render_fence(target, frame_ticket.clone());
+        store.damage(target, dst_rect);
 
-        let region = [vk::BufferImageCopy::default()
-            .buffer_offset(0)
-            .buffer_row_length(0)
-            .buffer_image_height(0)
-            .image_subresource(
-                vk::ImageSubresourceLayers::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .layer_count(1),
-            )
-            .image_offset(vk::Offset3D {
-                x: dst_rect.offset.x,
-                y: dst_rect.offset.y,
-                z: 0,
-            })
-            .image_extent(vk::Extent3D {
-                width: copy_w,
-                height: copy_h,
-                depth: 1,
-            })];
-        unsafe {
-            device.cmd_copy_buffer_to_image(
-                cb,
-                staging.buffer,
-                drawable.storage.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &region,
+        // Phase B.3 (N1): push the op and set the terminal layout
+        // SHADER_READ_ONLY_OPTIMAL for the dst.
+        let payload = Box::new(super::frame_builder::RecordedPutImage {
+            dst_id: target,
+            dst_rect,
+            dst_image,
+            dst_extent,
+            dst_old_layout: dst_pre_layout,
+            staging_pin_idx,
+        });
+        {
+            let open = inner.frame_builder.open.as_mut().expect("open");
+            open.push_op_and_set_layouts(
+                super::frame_builder::RecordedOp::PutImage(payload),
+                &[(target, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
             );
         }
-
-        drawable.record_layout_transition(
-            &inner.vk,
-            cb,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::COPY,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-        );
-
-        end_and_submit_op(inner, platform, cb, &ticket)?;
-        store.touch_render_fence(target, ticket.clone());
-        store.damage(target, dst_rect);
-        inner.acquire_generation += 1;
-        let generation = inner.acquire_generation;
-        inner.pending_group_ops.push(SubmittedOp {
-            cb,
-            ticket,
-            staging: Some(staging),
-            scratch: Vec::new(),
-            atlas_ticket: None,
-            generation,
-            retired_resources: Vec::new(),
-        });
-        // `inner` borrow released. Auto-flush.
-        self.maybe_auto_flush_submit_group(platform)?;
         Ok(())
     }
 
@@ -7968,7 +7959,7 @@ fn emit_recorded_op_into_cb(
         Op::RenderComposite(rc) => emit_recorded_render_composite_into_cb(inner, cb, pins, rc),
         // Phase B.3 — CopyArea implemented in Task 2; stubs for later tasks.
         Op::CopyArea(ca) => emit_recorded_copy_area_into_cb(inner, cb, ca),
-        Op::PutImage(_) => unimplemented!("Phase B.3 Task 6: emit_recorded_put_image_into_cb"),
+        Op::PutImage(pi) => emit_recorded_put_image_into_cb(inner, cb, pins, pi),
         Op::FillRect(_) => unimplemented!("Phase B.3 Task 8: emit_recorded_fill_rect_into_cb"),
         Op::LogicFill(_) => {
             unimplemented!("Phase B.3 Task 10: emit_recorded_logic_fill_into_cb")
@@ -8384,6 +8375,85 @@ fn emit_recorded_copy_area_into_cb(
         device,
         cb,
         ca.dst_image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags2::COPY,
+        vk::AccessFlags2::TRANSFER_WRITE,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+    );
+    Ok(())
+}
+
+/// Phase B.3 Task 6 (N1 + N2): replay a deferred `RecordedPutImage` into
+/// the frame's command buffer. Staging buffer handle is read from the
+/// frame pin-set (N2 — index pre-recorded at append time). Barrier shape
+/// mirrors the legacy `put_image` body (engine.rs pre-B.3 lines ~3684-3731):
+///
+/// - Pre-barrier: dst `old_layout` → `TRANSFER_DST_OPTIMAL` with
+///   `ALL_COMMANDS / SHADER_SAMPLED_READ | COLOR_ATTACHMENT_WRITE`
+///   producer mask (N1 — drains prior compose/fill/paint writes).
+/// - `cmd_copy_buffer_to_image` from the pinned staging buffer.
+/// - Post-barrier: dst `TRANSFER_DST_OPTIMAL` → `SHADER_READ_ONLY_OPTIMAL`
+///   (N1 terminal layout).
+fn emit_recorded_put_image_into_cb(
+    inner: &mut RenderEngineInner,
+    cb: vk::CommandBuffer,
+    pins: &super::frame_builder::FramePinSet,
+    pi: &super::frame_builder::RecordedPutImage,
+) -> Result<(), RenderError> {
+    let device = &inner.vk.device;
+    // N1 put_image pre-barrier (DST only — staging buffers have no layout).
+    // Mirrors engine.rs:3684-3692 producer mask: SHADER_SAMPLED_READ |
+    // COLOR_ATTACHMENT_WRITE drains any prior compose/fill/put-image writes
+    // to this drawable.
+    barrier_to_layout(
+        device,
+        cb,
+        pi.dst_image,
+        pi.dst_old_layout,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::PipelineStageFlags2::ALL_COMMANDS,
+        vk::AccessFlags2::SHADER_SAMPLED_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        vk::PipelineStageFlags2::COPY,
+        vk::AccessFlags2::TRANSFER_WRITE,
+    );
+    // N2: read the staging buffer handle from the frame pin-set.
+    let staging_buffer = pins.staging_buffers[pi.staging_pin_idx.0 as usize].buffer;
+    let region = [vk::BufferImageCopy::default()
+        .buffer_offset(0)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .layer_count(1),
+        )
+        .image_offset(vk::Offset3D {
+            x: pi.dst_rect.offset.x,
+            y: pi.dst_rect.offset.y,
+            z: 0,
+        })
+        .image_extent(vk::Extent3D {
+            width: pi.dst_rect.extent.width,
+            height: pi.dst_rect.extent.height,
+            depth: 1,
+        })];
+    unsafe {
+        device.cmd_copy_buffer_to_image(
+            cb,
+            staging_buffer,
+            pi.dst_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &region,
+        );
+    }
+    // N1 post-barrier: dst → SHADER_READ_ONLY_OPTIMAL (terminal layout).
+    // Mirrors engine.rs:3723-3731.
+    barrier_to_layout(
+        device,
+        cb,
+        pi.dst_image,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         vk::PipelineStageFlags2::COPY,

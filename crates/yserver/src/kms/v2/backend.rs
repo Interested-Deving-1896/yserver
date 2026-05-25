@@ -2303,6 +2303,40 @@ impl KmsBackendV2 {
             .map_err(|e| std::io::Error::other(format!("engine_cow_copy_area_for_tests: {e:?}")))
     }
 
+    /// B.3 Task 6 — test-only: invoke `engine.put_image` against the given
+    /// dst_xid. Constructs a staging payload of `src_extent.width *
+    /// src_extent.height * 4` bytes (BGRA, depth 32) from `pixel_bytes`.
+    /// Returns `Err` if `dst_xid` doesn't resolve or if the engine call fails.
+    #[allow(
+        dead_code,
+        reason = "used by v2_frame_builder_put_image_collapses_two_in_one_frame"
+    )]
+    pub fn engine_put_image_for_tests(
+        &mut self,
+        dst_xid: u32,
+        dst_pos: ash::vk::Offset2D,
+        src_extent: ash::vk::Extent2D,
+        pixel_bytes: &[u8],
+        src_depth: u8,
+    ) -> Result<(), std::io::Error> {
+        let Some(dst_id) = self.store.lookup(dst_xid) else {
+            return Err(std::io::Error::other(format!(
+                "engine_put_image_for_tests: dst xid 0x{dst_xid:x} not in store"
+            )));
+        };
+        self.engine
+            .put_image(
+                &mut self.store,
+                &mut self.platform,
+                dst_id,
+                dst_pos,
+                src_extent,
+                pixel_bytes,
+                src_depth,
+            )
+            .map_err(|e| std::io::Error::other(format!("engine_put_image_for_tests: {e:?}")))
+    }
+
     /// B.3 Task 4 — test-only: attach a synthetic PRESENT completion
     /// to the open frame's cow slot (via `engine.attach_cow_present_completion`)
     /// without a real X PRESENT client. Returns `true` if the attach
