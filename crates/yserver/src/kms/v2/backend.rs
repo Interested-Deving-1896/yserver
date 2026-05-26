@@ -3128,20 +3128,43 @@ impl KmsBackendV2 {
         let mut hit: Option<(u32, f64, f64)> = None;
         for &window_id in self.core.top_level_order.iter().rev() {
             let Some(w) = self.windows_v2.get(&window_id) else {
+                log::trace!(
+                    target: "yserver::kms::v2::pointer",
+                    "wuc: skip 0x{window_id:x} (not in windows_v2)"
+                );
                 continue;
             };
             if !w.mapped {
+                log::trace!(
+                    target: "yserver::kms::v2::pointer",
+                    "wuc: skip 0x{window_id:x} (unmapped)"
+                );
                 continue;
             }
             let wx = f64::from(w.x);
             let wy = f64::from(w.y);
             if cx < wx || cx >= wx + f64::from(w.width) || cy < wy || cy >= wy + f64::from(w.height)
             {
+                log::trace!(
+                    target: "yserver::kms::v2::pointer",
+                    "wuc: skip 0x{window_id:x} cursor=({cx},{cy}) outside geom=({},{} {}x{})",
+                    w.x, w.y, w.width, w.height
+                );
                 continue;
             }
             if !self.cursor_inside_shape(window_id, cx - wx, cy - wy) {
+                log::trace!(
+                    target: "yserver::kms::v2::pointer",
+                    "wuc: skip 0x{window_id:x} local=({},{}) SHAPE-excluded (geom={},{} {}x{})",
+                    cx - wx, cy - wy, w.x, w.y, w.width, w.height
+                );
                 continue;
             }
+            log::trace!(
+                target: "yserver::kms::v2::pointer",
+                "wuc: HIT 0x{window_id:x} cursor=({cx},{cy}) local=({},{}) geom=({},{} {}x{})",
+                cx - wx, cy - wy, w.x, w.y, w.width, w.height
+            );
             hit = Some((window_id, wx, wy));
             break;
         }
@@ -3283,6 +3306,10 @@ impl KmsBackendV2 {
     /// the body only touches KmsCore + nested-resource look-ups.
     fn update_pointer_window(&mut self, server_state: &ServerState, new_xid: u32, mask: u16) {
         if self.core.prev_pointer_window == Some(new_xid) {
+            log::trace!(
+                target: "yserver::kms::v2::pointer",
+                "upw: SKIP-SAME prev=new=0x{new_xid:x}"
+            );
             return;
         }
         let prev_host = self.core.prev_pointer_window;
@@ -3296,9 +3323,22 @@ impl KmsBackendV2 {
         };
         let prev_id = prev_host.and_then(|p| resolve_host_to_nested(p, &self.core.xid_map));
         let new_id = resolve_host_to_nested(new_xid, &self.core.xid_map);
+        log::trace!(
+            target: "yserver::kms::v2::pointer",
+            "upw: prev_host={:?} new_host=0x{:x} prev_nested={:?} new_nested={:?}",
+            prev_host.map(|h| format!("0x{h:x}")),
+            new_xid,
+            prev_id.map(|r| r.0),
+            new_id.map(|r| r.0),
+        );
 
         if let (Some(from), Some(to)) = (prev_id, new_id) {
             let events = yserver_core::crossings::normal_mode_crossings(server_state, from, to);
+            log::trace!(
+                target: "yserver::kms::v2::pointer",
+                "upw: normal_mode_crossings(from={}, to={}) → {} events",
+                from.0, to.0, events.len()
+            );
             for ev in events {
                 let win_host_xid = if ev.window == yserver_core::resources::ROOT_WINDOW {
                     self.core.window_id
@@ -3313,9 +3353,19 @@ impl KmsBackendV2 {
                     yserver_core::crossings::CrossingKind::Enter => PointerEventKind::EnterNotify,
                     yserver_core::crossings::CrossingKind::Leave => PointerEventKind::LeaveNotify,
                 };
+                log::trace!(
+                    target: "yserver::kms::v2::pointer",
+                    "upw: emit_crossing host=0x{win_host_xid:x} kind={:?} detail={} child={:#x}",
+                    kind, ev.detail, ev.child.0
+                );
                 self.emit_crossing(win_host_xid, kind, ev.detail, 0, ev.child.0, mask);
             }
         } else {
+            log::trace!(
+                target: "yserver::kms::v2::pointer",
+                "upw: FALLBACK path (prev_id={:?}, new_id={:?})",
+                prev_id, new_id
+            );
             // First-motion bootstrap or unmapped host_xid —
             // fall back to a single Leave/Enter with detail=0.
             if let Some(prev) = prev_host {
@@ -3335,6 +3385,11 @@ impl KmsBackendV2 {
         // see motion when the cursor is over the wallpaper.
         let host_xid = self.window_under_cursor().unwrap_or(self.core.window_id);
         let mask = self.serialize_modifiers() | self.core.button_mask;
+        log::trace!(
+            target: "yserver::kms::v2::pointer",
+            "dispatch_motion: cursor=({},{}) → host_xid=0x{host_xid:x}",
+            self.core.cursor_x, self.core.cursor_y
+        );
         self.update_pointer_window(server_state, host_xid, mask);
         self.emit_motion_only(host_xid, mask);
     }
