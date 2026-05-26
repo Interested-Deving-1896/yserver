@@ -3252,6 +3252,71 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
         likely fix lives at the pixmap-pool / recycling layer, not
         Phase B.
 
+    **Silence pixmap-churn followup — RESOLVED 2026-05-26
+    (`71e7542` + `faee4b8`).** Two-step diagnostic: (1) added
+    `returns_rejected_oversize_by_bin[<=256,<=512,<=1024,>1024]`
+    to the 1-s `pixmap pool` telemetry line — purely an observation
+    surface, no behaviour change; (2) captured a fresh MATE drag on
+    silence, observed **99.3 % of all oversize rejects landing in
+    the `<=256` bin at peak burst** (8026 / 8080 per second). Other
+    bins were noise (`<=512` peaked at 282/s, `<=1024` at 66/s,
+    `>1024` startup-only). Cause: icon-theme thumbnails
+    (16/24/32/…/256), Cairo subsurface tiles, and panel-applet
+    backings — all in the 128 < max(W, H) ≤ 256 band that the
+    old `MAX_POOLED_DIM=128` cap excluded. The cap predated this
+    workload; it was sized for adapta-nokto/mate-cc 32×32 widgets.
+
+    Raised `MAX_POOLED_DIM` to 256. Worst-case extra pool footprint
+    32–64 MB across the new bucket range, comparable to Mesa's
+    userspace BO cache budget. Bucket cap kept at 32 (data showed
+    demand was high in the hottest bucket; tightening would push
+    rejects into the `bucket_full` path).
+
+    Post-bump big-drag capture results — measured against the
+    pre-bump same-workload run:
+      - `<=256` oversize rejects: **8026/s peak → 0/s** ✓.
+        Bin completely captured.
+      - Total oversize rejects: **8080/s peak → 86/s steady**
+        (one 340/s startup blip with `<=512=277, >1024=54`).
+        ~99 % reduction.
+      - `takes_hit/s` (pool): **1573 peak → 4730 peak**. Pool
+        roughly tripled in throughput; ~98 % of takes are hits.
+      - Real `vkCreateImage + vkAllocateMemory + vkBindImageMemory`
+        rate (≡ `takes_miss/s`): **~8000/s → ~100/s** — **~80×
+        reduction** in the expensive Vk allocation path.
+      - `storage_allocations/s`: 9875 peak → 5195 peak (~50 %).
+        Note the metric counts every CreatePixmap regardless of
+        pool path — see footnote below.
+      - `paint_submits/s`: 27938 peak → 16735 peak (~40 %).
+      - `cpu_fence_wait_ns/s`: 307 ms/s peak → 235 ms/s peak
+        (~23 %); the remaining lag is `sync_wait`-driven
+        client readbacks, orthogonal to allocation.
+
+    **Telemetry footnote — `image_view_creates/s` is a
+    CreatePixmap-frequency counter, not a `vkCreateImageView`
+    counter.** The pool keys on `(W, H, format)` but the
+    sample-side view is depth-specific (a depth-32 BGRA8 image
+    can serve a depth-24 request and vice versa per
+    `Storage::from_pooled` at `store.rs:201`), so
+    `allocate_drawable_storage` builds a fresh sample_view on
+    every CreatePixmap — pool hit or miss
+    (`platform.rs:1186-1207`). Code comment is explicit: "View
+    creation is cheap; pooling the image + memory is where the
+    win is." If a future debugging session needs the *real* view
+    creation rate, derive it from `storage_allocations - takes_hit`
+    or split the counter at the v2 backend's `record_image_view_create`
+    call site.
+
+    **Other silence followups (separate from the pool bump):**
+      - `legacy_sc` close reason ~150-330/s — kill-switch-off
+        scene compose. Expected through B.5 when SubmitGroup
+        retires entirely and scene compose folds into the frame
+        builder.
+      - `cpu_fence_wait_ns/s` 50-235 ms/s tied to
+        `close_reasons[sync_wait]` 80-175/s — MATE applet
+        `get_image` readbacks. Same shape as bee post-B.3 (an
+        orthogonal next target).
+
     **Remaining hardware-smoke gates (NOT YET — pending capture):**
       - iMac / fuji regression checks.
       - Cross-vendor sanity — same MATE drag on non-radv (nvidia,
