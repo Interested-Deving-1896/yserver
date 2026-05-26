@@ -36,7 +36,7 @@ Cross-cutting bugs and followups that don't fit a stage live in
   Task 3 + Task 4 layer 1) has been fast-forwarded from
   `rendering-model-v2` → `cow-authoritative-mode` → `perf` into
   `master`. **v1 retired 2026-05-26** after Phase B.3 closed
-  across the hardware matrix (bee/yoga/silence/air/nvidia). The
+  across the hardware matrix (bee/yoga/silence/air/M2-Asahi/nvidia). The
   v1 `KmsBackend` struct + all its impl blocks, the `KmsBackendKind`
   dispatcher, the `YSERVER_RENDER_MODEL` env knob, and the
   4 stub modules (compositor / render / event / fonts) were
@@ -101,7 +101,8 @@ Cross-cutting bugs and followups that don't fit a stage live in
   Phase A closed 2026-05-24; Phase B sub-phases B.1, B.2, B.3
   all CLOSED by 2026-05-26 — bee MATE drag is lag-free across
   the chain, silence dual-output passes, yoga and air (Apple M1
-  / Asahi) green, nvidia bootstraps. Three correctness fixes
+  / Asahi) green, M2 Asahi (ALARM, first M2 capture) green,
+  nvidia bootstraps. Three correctness fixes
   during B.3 closure: trap-emit α-loss on depth-32 backings
   (`b0b57f8`), SHAPE Input region not mirrored to backend
   (`ae480a2` — fixed adapta-nokto menu hover + click), graceful
@@ -3418,6 +3419,11 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
       - air (Apple M1 / Asahi / Mesa AGX-V, aarch64) — bootstrap
         clean (cherry-picked DRM-resolver fix on master); user
         subjective lag-free under the same MATE drag.
+      - M2 Asahi (ALARM, aarch64) — first M2 capture
+        (2026-05-26 user-reported); full MATE session runs on
+        the same `0c08568` master HEAD as the rest of the
+        matrix. Extends AGX-V coverage from M1 to M2 with no
+        platform-specific fix needed.
       - nvidia (proprietary) — MATE bootstraps and runs.
       - Three correctness fixes landed during the closure window:
         trap-emit α-loss on depth-32 backings (`b0b57f8`),
