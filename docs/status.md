@@ -3194,9 +3194,65 @@ Per the spec (`docs/superpowers/specs/2026-05-15-rendering-model-v2.md`).
              and fixed all five B.3 sites + the B.1/B.2 sites in
              one diff.
 
+    **Post-PASS Task 12 hotfix 3 — `b0b57f8` 2026-05-26.** Bee +
+    silence both rendered the mate-control-center appearance dialog
+    with α=0 across marco's SSD title bar / side borders / bottom
+    action row — visible as "partially transparent" CSD chrome over
+    whatever was behind. Drawable-dump PAM RGB+α extraction confirmed
+    RGB correct everywhere; α bimodal (1 over the inner client area
+    + the Help/Close button islands, 0 elsewhere) — exactly matching
+    marco's SSD frame regions. Bisect inside the B.3 chain:
+    `c4083fc` (Task 10) clean, `2300db1` (Task 12 + frame_generation
+    hotfix) bad → regression in `369c8c2` (Task 12 base, trap-emit
+    body). Root cause: `emit_recorded_render_traps_or_tris_into_cb`
+    used a `StorageCompositeTarget` built from
+    `storage.current_layout` and called `record_render_composite`,
+    which reads `dst.current_layout()` for the `to_color` barrier.
+    Under deferred recording, storage is NOT committed mid-frame —
+    `commit_close_success` writes the overlay back only on submit
+    success — so the barrier declared `old_layout = storage` ≠ the
+    GPU's actual layout (e.g. SHADER_READ_ONLY_OPTIMAL after a
+    prior B.2 `render_composite` in the same frame). Driver-undefined
+    dst contents; α channel discard on RADV (both RDNA2 and GCN4),
+    RGB survives via LOAD_OP=LOAD + tile-cache. Fix swaps to
+    `RecordedCompositeTarget` + `record_render_composite_open_with_old_layout(rt.dst_old_layout)`,
+    matching the B.2 `render_composite` emit path's deferred-recording
+    contract verbatim. Regression test
+    `v2_frame_builder_render_traps_or_tris_after_prior_dst_paint_uses_recorded_old_layout`
+    drives the exact two-op same-dst scenario.
+
+    **Silence (dual-output, RX580 / GCN4 / RADV) — PASS 2026-05-26**
+    (capture `yserver-hw-mate.log` + `yserver-mate.submit.tsv` at
+    10:13, with the hotfix 3 fix applied). User reports fully
+    responsive; appearance dialog renders correctly.
+      - `close_reasons[non_ported]/s` = **0** across all samples
+        (target ≤ 10). ✓
+      - `frame_builder_aborts/s` = **0**. ✓
+      - `submit_group_aborts/s` = **0**, `submit_group_size_max_in_window`
+        = **1** (M1 enforced). ✓
+      - `pin_ceiling=0`, `scratch_grow=0` — no pin pressure / no
+        scratch grow churn. ✓
+      - No new validation VUIDs, no `ERROR_DEVICE_LOST`, no fault
+        chains.
+      - **Followup observation (NOT a B.3 regression — workload-side):**
+        absolute submit volume on silence is ~3-4× bee's at peak
+        — `submit_group_flushes/s` 1408–2088 (vs bee's 180–510),
+        `queue_submit2/s` peaking at 25024, `paint_submits/s` peaking
+        at 27938. Dominant feeder is **`storage_allocations/s` = 8478**
+        (matched by `image_view_creates/s` = 8478) — ~8K fresh
+        Vk image+view pairs per second. v2 doesn't self-allocate
+        at that rate, so this is client-side pixmap churn (marco's
+        compositor pipeline + mate-panel applets are the usual
+        suspects). `cpu_fence_wait_ns/s` peaks at 307 ms/s tracked
+        1:1 by `cpu_fence_wait_count/s = 409` and
+        `close_reasons[sync_wait] = 397` — clients doing
+        `get_image` / xshmfence-style readbacks at ~400 Hz.
+        Followup item logged: identify the pixmap-churn culprit via
+        per-client `CreatePixmap` pivot on the captured log; the
+        likely fix lives at the pixmap-pool / recycling layer, not
+        Phase B.
+
     **Remaining hardware-smoke gates (NOT YET — pending capture):**
-      - silence (dual-output) regression check — no scene-compose
-        regression, no ERROR_DEVICE_LOST, no fault chains.
       - iMac / fuji regression checks.
       - Cross-vendor sanity — same MATE drag on non-radv (nvidia,
         intel, lavapipe) — no new validation VUIDs.
