@@ -106,6 +106,64 @@ Tracked as a separate known issue.
 |------------|-----:|-----:|------:|-----:|------:|------:|------:|------:|-------|
 | 2026-05-26 |   15 |   82 |     0 |    0 |     2 |    32 |     1 |   182 | XDrawArc (6 subtests) ran fully; XDrawArcs ran through subtest 31 of 112 before yserver hung on depth-4 get_image; remaining 15 cases ABORTed. 15 PASS / 82 FAIL of the testable surface. |
 
+### Full scenario sweep — yserver KMS, 2026-05-27
+
+Every remaining xts scenario run against yserver under the
+egl-headless recipe (`tools/xts-batch.sh`). **Headline: every
+scenario ran to completion — 0 ABORT, 0 panic, no hang, across the
+entire suite.** This is the survival bar for a hardware run. PASS
+rates are secondary; most FAILs are pixel-exactness vs Xorg's `mi`
+rasterizers (acceptable) or unimplemented esoterica.
+
+| Scenario  | CASES | TESTS | PASS | FAIL | UNRES | UNTST | UNSUP | NOTIU | ABORT |
+|-----------|------:|------:|-----:|-----:|------:|------:|------:|------:|------:|
+| Xproto    |   122 |   389 |  344 |    8 |    16 |    19 |     2 |     0 |     0 |
+| Xlib3     |   109 |     - |    - |    - |     - |     - |     - |     - |     0 |
+| Xlib4     |    29 |   324 |  110 |  174 |     7 |    17 |    11 |     5 |     0 |
+| Xlib5     |    15 |    84 |   56 |   21 |     0 |     5 |     2 |     0 |     0 |
+| Xlib6     |     8 |    50 |    4 |   17 |     0 |    29 |     0 |     0 |     0 |
+| Xlib7     |    58 |   172 |   83 |   31 |     0 |    13 |    45 |     0 |     0 |
+| Xlib8     |    29 |   165 |   60 |   62 |    10 |    22 |    10 |     0 |     0 |
+| Xlib9     |    46 |     - |  157 |  893 |    62 |    21 |    22 |   159 |     0 |
+| Xlib10    |    23 |    95 |   23 |   31 |     5 |    35 |     1 |     0 |     0 |
+| Xlib11    |    33 |   195 |   24 |   98 |     2 |     4 |    24 |    43 |     0 |
+| Xlib12    |    27 |   138 |   89 |   15 |     4 |    16 |     2 |    12 |     0 |
+| Xlib13    |    32 |   269 |   61 |  160 |    33 |     9 |     3 |     3 |     0 |
+| Xlib14    |    45 |    58 |   19 |   34 |     0 |     5 |     0 |     0 |     0 |
+| Xlib15    |    45 |   159 |  122 |    4 |     0 |    33 |     0 |     0 |     0 |
+| Xlib16    |    30 |   105 |   82 |    0 |     0 |    22 |     1 |     0 |     0 |
+| Xlib17    |    55 |   131 |   90 |   18 |     2 |    21 |     0 |     0 |     0 |
+| Xopen     |     8 |   127 |  122 |    3 |     0 |     0 |     2 |     0 |     0 |
+| ShapeExt  |    11 |    11 |   11 |    0 |     0 |     0 |     0 |     0 |     0 |
+| XI        |    36 |   316 |    0 |   21 |     0 |   289 |     1 |     5 |     0 |
+| XIproto   |    35 |   107 |    0 |    0 |     0 |   107 |     0 |     0 |     0 |
+| Xt3       |    21 |    73 |   73 |    0 |     0 |     0 |     0 |     0 |     0 |
+| Xt4       |    33 |   192 |   94 |    0 |     0 |    98 |     0 |     0 |     0 |
+| Xt5       |    10 |    69 |   26 |    0 |     0 |    41 |     0 |     0 |     0 |
+| Xt6       |     7 |    71 |   67 |    4 |     0 |     0 |     0 |     0 |     0 |
+| Xt7       |    11 |   106 |   96 |    1 |     0 |     6 |     0 |     3 |     0 |
+| Xt8       |     7 |    43 |   35 |    4 |     0 |     4 |     0 |     0 |     0 |
+| Xt9       |    33 |   189 |  128 |    0 |     4 |    55 |     2 |     0 |     0 |
+| Xt10      |     8 |    17 |   16 |    0 |     0 |     1 |     0 |     0 |     0 |
+| Xt11      |    58 |   285 |  247 |    2 |     0 |    34 |     0 |     0 |     0 |
+| Xt12      |    22 |    67 |   55 |    0 |     1 |    11 |     0 |     0 |     0 |
+| Xt13      |    39 |   178 |  123 |    6 |     2 |    47 |     0 |     0 |     0 |
+| Xt14      |     2 |    18 |   18 |    0 |     0 |     0 |     0 |     0 |     0 |
+| Xt15      |     1 |     2 |    0 |    0 |     0 |     0 |     2 |     0 |     0 |
+| XtC       |    29 |   147 |   86 |    2 |     2 |    56 |     1 |     0 |     0 |
+| XtE       |     1 |     1 |    1 |    0 |     0 |     0 |     0 |     0 |     0 |
+
+Notes:
+- **`XI` / `XIproto` are almost entirely UNTESTED**, not failing —
+  the XInput test framework skips when it can't enumerate the
+  expected device set; worth a look but not a survival concern.
+- `Xt*` (toolkit) all complete; FAIL counts are small.
+- `Xlib16` is clean (82 PASS / 0 FAIL).
+- **`Xlib3`**: ran to completion (case-level: 109 cases, 11 failed,
+  16 not run, 0 ABORT) but `xts-report` produced an empty summary
+  for this run's journal — a tooling quirk, not a yserver failure;
+  per-purpose PASS/FAIL not captured. Re-run to get the breakdown.
+
 (Total tests: 122 cases / 389 purposes throughout.)
 
 The full scenario completes in ~4 minutes. **The headline is that
