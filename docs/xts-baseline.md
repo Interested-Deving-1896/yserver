@@ -76,6 +76,35 @@ Full scenario completed (23 cases / 95 tests). Subset of interest:
 | `XListInstalledColormaps`  |    0 |    2 |     0 | Stub reply returns empty list. |
 | Xlib10 totals              |   16 |   37 |    36 | UNRES=5, UNSUP=1. |
 
+### `Xlib8` baseline 2026-05-26
+
+Full scenario completed (29 cases / 165 tests). Subset of interest
+for the draw-primitives work:
+
+| Test                  | PASS | FAIL | UNTST | UNRES | Notes |
+|-----------------------|-----:|-----:|------:|------:|-------|
+| `XSetArcMode`         |    1 |    1 |     1 |     0 | Plus 1 NORESULT. ArcMode stored but not honoured in poly_fill_arc. |
+| `XSetDashes`          |    1 |    4 |     1 |     1 | Opcode 58 unhandled — `gc.dashes` stays at the single-byte CreateGC/ChangeGC form. |
+| `XSetLineAttributes`  |    3 |    2 |     1 |     0 | line_width / line_style / cap_style / join_style stored but not honoured in rasterizer. |
+| Xlib8 totals          |   53 |   67 |    22 |    12 | UNSUP=10. |
+
+### `Xlib9draw` baseline 2026-05-26
+
+Custom scenario: `Xlib9draw` is a local addition to
+`xts/xts5/tet_scen` listing only the `Xlib9/X(Draw|Fill|Put)*` tests,
+since the full `Xlib9` scenario triggers a yserver hang after
+`XCopyPlane` (depth-4 GetImage spam). With the custom scenario we
+get signal on the draw primitives directly without waiting on the
+`XCopyPlane` fix.
+
+The hang still recurs ~31 subtests into `XDrawArcs` (same depth-4
+get_image path), so we only get partial signal on the draw cases.
+Tracked as a separate known issue.
+
+| Date       | PASS | FAIL | UNRES | UNIN | UNTST | NOTIU | UNSUP | ABORT | Notes |
+|------------|-----:|-----:|------:|-----:|------:|------:|------:|------:|-------|
+| 2026-05-26 |   15 |   82 |     0 |    0 |     2 |    32 |     1 |   182 | XDrawArc (6 subtests) ran fully; XDrawArcs ran through subtest 31 of 112 before yserver hung on depth-4 get_image; remaining 15 cases ABORTed. 15 PASS / 82 FAIL of the testable surface. |
+
 (Total tests: 122 cases / 389 purposes throughout.)
 
 The full scenario completes in ~4 minutes. **The headline is that
