@@ -209,6 +209,9 @@ pub fn process_request(
         39 => handle_get_motion_events(state, client_id, sequence),
         52 => handle_get_font_path(state, client_id, sequence),
         83 => handle_list_installed_colormaps(state, client_id, sequence, body),
+        // ── GC dashes (multi-byte pattern; opcode 58 is its own request,
+        //    distinct from the single-byte CreateGC/ChangeGC dash form). ──
+        58 => handle_set_dashes(state, client_id, sequence, body),
         // ── colormap lifecycle (BadIDChoice on duplicate ID) ──
         78 => handle_create_colormap(state, client_id, sequence, body),
         79 => handle_free_colormap(state, client_id, sequence, body),
@@ -9408,6 +9411,51 @@ fn handle_install_colormap(
     }
     state.installed_colormaps.push(cmap);
     emit_colormap_notify_for(state, cmap, true);
+    Ok(RequestOutcome::Handled)
+}
+
+/// SetDashes (58): replace the GC's dash pattern with the multi-byte
+/// list supplied. Distinct from the single-byte `CPDashList` form in
+/// `CreateGC` / `ChangeGC` (which can only set a uniform [n, n]).
+///
+/// Wire: `gc u32, dash_offset u16, n u16, dashes u8[n]`. `n == 0` or
+/// any `dashes[i] == 0` is `BadValue` per spec.
+fn handle_set_dashes(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    if body.len() < 8 {
+        return Ok(RequestOutcome::Handled);
+    }
+    let gc = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+    let dash_offset = u16::from_le_bytes([body[4], body[5]]);
+    let n = u16::from_le_bytes([body[6], body[7]]) as usize;
+    debug!(
+        "client {} #{} SetDashes gc=0x{:x} offset={} n={}",
+        client_id.0, sequence.0, gc.0, dash_offset, n
+    );
+    if n == 0 {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_VALUE, 0, 58);
+    }
+    let end = 8usize.saturating_add(n);
+    if body.len() < end {
+        return Ok(RequestOutcome::Handled);
+    }
+    let dashes = &body[8..end];
+    // BadGC takes priority over BadValue when the GC id itself is
+    // bogus. Use the client-range check rather than `gc().is_some()`
+    // because other GC mutators (`set_clip_rectangles`, etc.)
+    // auto-vivify entries via `entry().or_insert_with`, so an
+    // invalid id can be present in the map from an earlier request.
+    if xid_out_of_client_range(state, client_id, gc.0) || state.resources.gc(gc).is_none() {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_GC, gc.0, 58);
+    }
+    if dashes.contains(&0) {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_VALUE, 0, 58);
+    }
+    state.resources.set_dashes(gc, dash_offset, dashes);
     Ok(RequestOutcome::Handled)
 }
 

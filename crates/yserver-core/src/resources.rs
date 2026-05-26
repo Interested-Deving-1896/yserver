@@ -1557,6 +1557,30 @@ impl ResourceTable {
         }
     }
 
+    /// `SetDashes` (opcode 58). `dashes` is the multi-byte pattern in
+    /// pixel units; spec § "If the list is of odd length, then it is
+    /// effectively concatenated with itself to produce an even-length
+    /// list", so callers normalize before storing — we do it here so
+    /// every read site sees an even-length cycle.
+    pub fn set_dashes(&mut self, gc_id: ResourceId, dash_offset: u16, dashes: &[u8]) {
+        let gc = self
+            .gcs
+            .entry(gc_id.0)
+            .or_insert_with(|| Gc::with_defaults(gc_id, ResourceId(0), SERVER_OWNER));
+        gc.dash_offset = dash_offset as i16;
+        if dashes.is_empty() {
+            return;
+        }
+        if dashes.len().is_multiple_of(2) {
+            gc.dashes = dashes.to_vec();
+        } else {
+            let mut doubled = Vec::with_capacity(dashes.len() * 2);
+            doubled.extend_from_slice(dashes);
+            doubled.extend_from_slice(dashes);
+            gc.dashes = doubled;
+        }
+    }
+
     pub fn set_clip_rectangles(&mut self, request: SetClipRectanglesRequest) {
         let gc = self
             .gcs

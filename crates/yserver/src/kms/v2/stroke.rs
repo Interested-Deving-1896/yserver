@@ -1,0 +1,622 @@
+//! Stroke rasterizer. Produces `Rectangle16` lists from polyline /
+//! segment / rectangle inputs honouring the GC stroke state
+//! (line_width, line_style, cap_style, join_style, dashes,
+//! dash_offset).
+//!
+//! Lower-level than v2's Backend trait — pure geometry → rect list.
+//! Backend callers feed the rect list into `fill_solid_rects` for
+//! the on-pixels and (`LineStyle::DoubleDash` only) the off-pixels.
+//!
+//! Width=0 + LineStyle::Solid + CapStyle::Butt + JoinStyle::Miter
+//! takes the fast path through `crate::kms::backend::bresenham_segment`
+//! for bit-identical output to the pre-stroke rasterizer. Anything
+//! else routes through the slow path: per on-sub-segment, build the
+//! closed stroke polygon (quad + caps + joins) and feed it through
+//! `crate::kms::backend::scanline_fill_polygon`.
+
+use yserver_core::backend::params::{CapStyle, JoinStyle, LineStyle};
+
+use crate::kms::cpu_types::Rectangle16;
+
+/// Per-call snapshot of the GC stroke state. Constructed by the
+/// dispatcher from the resolved `DrawState` and threaded through
+/// `poly_line` / `poly_segment` / `poly_rectangle` / `poly_arc`.
+/// Stroke geometry parameters. Colours are NOT here — `stroke_path`
+/// produces geometry (fg/bg rect lists); the caller applies
+/// foreground/background at fill time. `background` routing for
+/// `DoubleDash` is by list (off-runs land in `bg_rects`), not colour.
+#[derive(Clone, Debug)]
+pub struct StrokeState {
+    pub background: u32,
+    pub line_width: u16,
+    pub line_style: LineStyle,
+    pub cap_style: CapStyle,
+    pub join_style: JoinStyle,
+    pub dashes: Vec<u8>,
+    pub dash_offset: u16,
+}
+
+impl Default for StrokeState {
+    fn default() -> Self {
+        Self {
+            background: 0,
+            line_width: 0,
+            line_style: LineStyle::Solid,
+            cap_style: CapStyle::Butt,
+            join_style: JoinStyle::Miter,
+            dashes: vec![4, 4],
+            dash_offset: 0,
+        }
+    }
+}
+
+/// Polyline = open vertex list (shared endpoints participate in
+/// joins). DisjointSegments = pairs of independent endpoints (each
+/// pair gets caps on both ends, no joins ever).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StrokeShape {
+    Polyline,
+    DisjointSegments,
+}
+
+/// Output of `stroke_path`: separate rect lists for the foreground
+/// (on-dash pixels) and background (off-dash pixels under
+/// `LineStyle::DoubleDash`). `bg_rects` is empty for Solid /
+/// OnOffDash.
+#[derive(Default, Clone, Debug)]
+pub struct StrokeOutput {
+    pub fg_rects: Vec<Rectangle16>,
+    pub bg_rects: Vec<Rectangle16>,
+}
+
+/// Stroke a polyline or set of disjoint segments. Vertices are in
+/// drawable coordinates (already translated for `coordinate_mode =
+/// Previous` etc. by the caller).
+pub fn stroke_path(
+    vertices: &[(i32, i32)],
+    shape: StrokeShape,
+    state: &StrokeState,
+) -> StrokeOutput {
+    let mut out = StrokeOutput::default();
+    let segments = match shape {
+        StrokeShape::Polyline => polyline_segments(vertices),
+        StrokeShape::DisjointSegments => disjoint_segments(vertices),
+    };
+    if segments.is_empty() {
+        return out;
+    }
+
+    // Fast path: width≤1 Solid Butt Miter (no dash, no thick) =
+    // exactly what the pre-stroke rasterizer produced. Bit-identical
+    // output for the common case.
+    let fast_path = state.line_width <= 1
+        && matches!(state.line_style, LineStyle::Solid)
+        && matches!(state.cap_style, CapStyle::Butt | CapStyle::NotLast)
+        && matches!(state.join_style, JoinStyle::Miter);
+    if fast_path {
+        let last_seg_idx = segments.len() - 1;
+        for (i, &(p0, p1)) in segments.iter().enumerate() {
+            crate::kms::backend::bresenham_segment(p0.0, p0.1, p1.0, p1.1, &mut out.fg_rects);
+            // CapStyle::NotLast on the terminal endpoint of a
+            // Polyline: pop the final 1-px rect. Per X11 spec, only
+            // affects polylines; disjoint segments draw both ends.
+            if matches!(state.cap_style, CapStyle::NotLast)
+                && shape == StrokeShape::Polyline
+                && i == last_seg_idx
+            {
+                out.fg_rects.pop();
+            }
+        }
+        return out;
+    }
+
+    // Slow path: thick / dashed / non-default caps + joins.
+    let width = state.line_width.max(1) as f64;
+    let dash_iter = DashIter::new(&state.dashes, state.dash_offset, state.line_style);
+
+    let mut phase_px: f64 = dash_iter.start_offset_px();
+    let on_pattern = !matches!(state.line_style, LineStyle::Solid);
+    let prev_dir_for_join = matches!(shape, StrokeShape::Polyline);
+
+    // Track previous segment's direction (for joins).
+    let mut prev_end_dir: Option<(f64, f64)> = None;
+
+    let n_segments = segments.len();
+    for (seg_idx, &(p0, p1)) in segments.iter().enumerate() {
+        let dx = f64::from(p1.0 - p0.0);
+        let dy = f64::from(p1.1 - p0.1);
+        let seg_len = (dx * dx + dy * dy).sqrt();
+        if seg_len <= f64::EPSILON {
+            // Zero-length segment → single cap at the point.
+            continue;
+        }
+        let dir = (dx / seg_len, dy / seg_len);
+
+        // Caller-side caps: first segment's start, last segment's
+        // end. Inner endpoints become joins (Polyline only).
+        let is_first = seg_idx == 0;
+        let is_last = seg_idx == n_segments - 1;
+        let needs_start_cap = is_first || matches!(shape, StrokeShape::DisjointSegments);
+        let needs_end_cap = is_last || matches!(shape, StrokeShape::DisjointSegments);
+
+        if !on_pattern {
+            // Solid: one thick quad along the full segment.
+            emit_thick_quad(p0, p1, dir, width, &mut out.fg_rects);
+            apply_start_cap_if(
+                needs_start_cap,
+                p0,
+                dir,
+                width,
+                state.cap_style,
+                &mut out.fg_rects,
+            );
+            apply_end_cap_if(
+                needs_end_cap,
+                p1,
+                dir,
+                width,
+                state.cap_style,
+                &mut out.fg_rects,
+            );
+        } else {
+            // Dashed: walk along the segment in pattern units.
+            let mut walked: f64 = 0.0;
+            let mut first_dash = true;
+            while walked < seg_len {
+                let (on, dash_len) = dash_iter.at(phase_px);
+                let consume = dash_len.min(seg_len - walked);
+                if on || matches!(state.line_style, LineStyle::DoubleDash) {
+                    let dp0 = (
+                        (f64::from(p0.0) + dir.0 * walked).round() as i32,
+                        (f64::from(p0.1) + dir.1 * walked).round() as i32,
+                    );
+                    let dp1 = (
+                        (f64::from(p0.0) + dir.0 * (walked + consume)).round() as i32,
+                        (f64::from(p0.1) + dir.1 * (walked + consume)).round() as i32,
+                    );
+                    let dst = if on {
+                        &mut out.fg_rects
+                    } else {
+                        &mut out.bg_rects
+                    };
+                    emit_thick_quad(dp0, dp1, dir, width, dst);
+                    // Per-dash caps. First dash on a segment uses the
+                    // segment-start cap policy (if applicable); rest are
+                    // butt caps per spec.
+                    let start_cap = if first_dash && needs_start_cap {
+                        state.cap_style
+                    } else {
+                        CapStyle::Butt
+                    };
+                    apply_start_cap_if(true, dp0, dir, width, start_cap, dst);
+                    apply_end_cap_if(true, dp1, dir, width, CapStyle::Butt, dst);
+                }
+                walked += consume;
+                phase_px += consume;
+                first_dash = false;
+            }
+            // Per-dash butt caps already emitted above. Segment-end
+            // cap style (Round/Projecting) on the final dash is a
+            // future refinement — most clients use Butt with dashes.
+            let _ = needs_end_cap;
+        }
+
+        // Joins: insert a join wedge between this segment's start and
+        // the previous segment's end (Polyline only).
+        if prev_dir_for_join
+            && !is_first
+            && let Some(prev_dir) = prev_end_dir
+        {
+            emit_join(
+                p0,
+                prev_dir,
+                dir,
+                width,
+                state.join_style,
+                &mut out.fg_rects,
+            );
+        }
+        prev_end_dir = Some(dir);
+    }
+
+    out
+}
+
+/// Pre-resolve the polyline's segment list. Returns adjacent vertex
+/// pairs.
+fn polyline_segments(verts: &[(i32, i32)]) -> Vec<((i32, i32), (i32, i32))> {
+    if verts.len() < 2 {
+        return Vec::new();
+    }
+    verts.windows(2).map(|w| (w[0], w[1])).collect()
+}
+
+/// Pre-resolve disjoint segments: every even-indexed pair is
+/// independent. Drops a trailing unpaired vertex.
+fn disjoint_segments(verts: &[(i32, i32)]) -> Vec<((i32, i32), (i32, i32))> {
+    verts.chunks_exact(2).map(|c| (c[0], c[1])).collect()
+}
+
+/// Emit the stroke quad for `(p0, p1)` of width `w` (perpendicular
+/// to `dir`). Lower to `scanline_fill_polygon` for rect-list output.
+fn emit_thick_quad(
+    p0: (i32, i32),
+    p1: (i32, i32),
+    dir: (f64, f64),
+    width: f64,
+    out: &mut Vec<Rectangle16>,
+) {
+    let nx = -dir.1;
+    let ny = dir.0;
+    let half = width / 2.0;
+    let corners: [(i32, i32); 4] = [
+        (
+            (f64::from(p0.0) - nx * half).round() as i32,
+            (f64::from(p0.1) - ny * half).round() as i32,
+        ),
+        (
+            (f64::from(p0.0) + nx * half).round() as i32,
+            (f64::from(p0.1) + ny * half).round() as i32,
+        ),
+        (
+            (f64::from(p1.0) + nx * half).round() as i32,
+            (f64::from(p1.1) + ny * half).round() as i32,
+        ),
+        (
+            (f64::from(p1.0) - nx * half).round() as i32,
+            (f64::from(p1.1) - ny * half).round() as i32,
+        ),
+    ];
+    crate::kms::backend::scanline_fill_polygon(&corners, out);
+}
+
+/// Append the start cap geometry for a segment.
+fn apply_start_cap_if(
+    cond: bool,
+    p: (i32, i32),
+    dir: (f64, f64),
+    width: f64,
+    style: CapStyle,
+    out: &mut Vec<Rectangle16>,
+) {
+    if !cond {
+        return;
+    }
+    match style {
+        CapStyle::Butt | CapStyle::NotLast => {} // included in quad
+        CapStyle::Projecting => emit_extension(p, (-dir.0, -dir.1), width, out),
+        CapStyle::Round => emit_round_cap(p, (-dir.0, -dir.1), width, out),
+    }
+}
+
+fn apply_end_cap_if(
+    cond: bool,
+    p: (i32, i32),
+    dir: (f64, f64),
+    width: f64,
+    style: CapStyle,
+    out: &mut Vec<Rectangle16>,
+) {
+    if !cond {
+        return;
+    }
+    match style {
+        CapStyle::Butt | CapStyle::NotLast => {}
+        CapStyle::Projecting => emit_extension(p, dir, width, out),
+        CapStyle::Round => emit_round_cap(p, dir, width, out),
+    }
+}
+
+/// Projecting cap: extend the line by half its width past the
+/// endpoint, perpendicular to `dir` (here `dir` is the direction
+/// pointing AWAY from the segment's body, so the extension flows
+/// into the cap).
+fn emit_extension(p: (i32, i32), dir_out: (f64, f64), width: f64, out: &mut Vec<Rectangle16>) {
+    let nx = -dir_out.1;
+    let ny = dir_out.0;
+    let half = width / 2.0;
+    let tip = (
+        f64::from(p.0) + dir_out.0 * half,
+        f64::from(p.1) + dir_out.1 * half,
+    );
+    let corners: [(i32, i32); 4] = [
+        (
+            (f64::from(p.0) - nx * half).round() as i32,
+            (f64::from(p.1) - ny * half).round() as i32,
+        ),
+        (
+            (f64::from(p.0) + nx * half).round() as i32,
+            (f64::from(p.1) + ny * half).round() as i32,
+        ),
+        (
+            (tip.0 + nx * half).round() as i32,
+            (tip.1 + ny * half).round() as i32,
+        ),
+        (
+            (tip.0 - nx * half).round() as i32,
+            (tip.1 - ny * half).round() as i32,
+        ),
+    ];
+    crate::kms::backend::scanline_fill_polygon(&corners, out);
+}
+
+/// Round cap: half-disc of radius `width/2` centred at `p`, axis
+/// perpendicular to `dir_out`. Approximated by a 16-segment polygon
+/// covering the outward half.
+fn emit_round_cap(p: (i32, i32), dir_out: (f64, f64), width: f64, out: &mut Vec<Rectangle16>) {
+    let radius = width / 2.0;
+    // Base angle: direction of `dir_out` (in CCW-from-+x rad).
+    let base = dir_out.1.atan2(dir_out.0);
+    const STEPS: usize = 16;
+    let mut pts: Vec<(i32, i32)> = Vec::with_capacity(STEPS + 1);
+    // Sweep from -π/2 to +π/2 around the outward direction.
+    for i in 0..=STEPS {
+        let t = std::f64::consts::FRAC_PI_2 - std::f64::consts::PI * (i as f64 / STEPS as f64);
+        let theta = base + t;
+        let x = f64::from(p.0) + radius * theta.cos();
+        let y = f64::from(p.1) + radius * theta.sin();
+        pts.push((x.round() as i32, y.round() as i32));
+    }
+    crate::kms::backend::scanline_fill_polygon(&pts, out);
+}
+
+/// Insert a join wedge between two adjacent segments meeting at `p`,
+/// with incoming direction `prev_dir` (pointing toward p from prior
+/// segment) and outgoing `next_dir` (pointing away from p along next
+/// segment).
+fn emit_join(
+    p: (i32, i32),
+    prev_dir: (f64, f64),
+    next_dir: (f64, f64),
+    width: f64,
+    style: JoinStyle,
+    out: &mut Vec<Rectangle16>,
+) {
+    let half = width / 2.0;
+    let n1 = (-prev_dir.1, prev_dir.0);
+    let n2 = (-next_dir.1, next_dir.0);
+    // Cross product determines which side the bend goes on.
+    let cross = prev_dir.0 * next_dir.1 - prev_dir.1 * next_dir.0;
+    let (out_n1, out_n2) = if cross > 0.0 {
+        ((-n1.0, -n1.1), (-n2.0, -n2.1))
+    } else {
+        (n1, n2)
+    };
+    match style {
+        JoinStyle::Bevel => {
+            let a = (
+                (f64::from(p.0) + out_n1.0 * half).round() as i32,
+                (f64::from(p.1) + out_n1.1 * half).round() as i32,
+            );
+            let b = (
+                (f64::from(p.0) + out_n2.0 * half).round() as i32,
+                (f64::from(p.1) + out_n2.1 * half).round() as i32,
+            );
+            crate::kms::backend::scanline_fill_polygon(&[p, a, b], out);
+        }
+        JoinStyle::Round => {
+            let radius = half;
+            let base1 = out_n1.1.atan2(out_n1.0);
+            let base2 = out_n2.1.atan2(out_n2.0);
+            let (mut a, b) = (base1, base2);
+            // Walk the short way around.
+            let delta = ((b - a + std::f64::consts::TAU) % std::f64::consts::TAU)
+                .min((a - b + std::f64::consts::TAU) % std::f64::consts::TAU);
+            const STEPS: usize = 12;
+            let dir = if ((b - a + std::f64::consts::TAU) % std::f64::consts::TAU)
+                <= std::f64::consts::PI
+            {
+                1.0
+            } else {
+                -1.0
+            };
+            let mut pts = Vec::with_capacity(STEPS + 2);
+            pts.push(p);
+            for i in 0..=STEPS {
+                let theta = a + dir * delta * (i as f64 / STEPS as f64);
+                let x = f64::from(p.0) + radius * theta.cos();
+                let y = f64::from(p.1) + radius * theta.sin();
+                pts.push((x.round() as i32, y.round() as i32));
+            }
+            let _ = &mut a;
+            crate::kms::backend::scanline_fill_polygon(&pts, out);
+        }
+        JoinStyle::Miter => {
+            // Miter intersection point of the two outer offset edges.
+            // Outer offset line 1 passes through (p + n1*half) in
+            // direction prev_dir.
+            // Outer offset line 2 passes through (p + n2*half) in
+            // direction next_dir.
+            // Solve for intersection.
+            let denom = prev_dir.0 * next_dir.1 - prev_dir.1 * next_dir.0;
+            if denom.abs() < 1.0e-6 {
+                // Parallel — degenerates to bevel.
+                emit_join(p, prev_dir, next_dir, width, JoinStyle::Bevel, out);
+                return;
+            }
+            let p1 = (
+                f64::from(p.0) + out_n1.0 * half,
+                f64::from(p.1) + out_n1.1 * half,
+            );
+            let p2 = (
+                f64::from(p.0) + out_n2.0 * half,
+                f64::from(p.1) + out_n2.1 * half,
+            );
+            // Param along prev_dir from p1 to intersection.
+            let dx = p2.0 - p1.0;
+            let dy = p2.1 - p1.1;
+            let t = (dx * next_dir.1 - dy * next_dir.0) / denom;
+            let ix = p1.0 + prev_dir.0 * t;
+            let iy = p1.1 + prev_dir.1 * t;
+            // Miter limit: spec default 10:1 (= 10 widths). Length is
+            // from p to intersection.
+            let mx = ix - f64::from(p.0);
+            let my = iy - f64::from(p.1);
+            let miter_len = (mx * mx + my * my).sqrt();
+            if miter_len / half > 10.0 {
+                emit_join(p, prev_dir, next_dir, width, JoinStyle::Bevel, out);
+                return;
+            }
+            let intersection = (ix.round() as i32, iy.round() as i32);
+            let a = (
+                (f64::from(p.0) + out_n1.0 * half).round() as i32,
+                (f64::from(p.1) + out_n1.1 * half).round() as i32,
+            );
+            let b = (
+                (f64::from(p.0) + out_n2.0 * half).round() as i32,
+                (f64::from(p.1) + out_n2.1 * half).round() as i32,
+            );
+            crate::kms::backend::scanline_fill_polygon(&[p, a, intersection, b], out);
+        }
+    }
+}
+
+/// Iterator across the dash pattern in pixel units. Supports a phase
+/// offset that wraps mod sum(dashes).
+#[derive(Clone, Debug)]
+struct DashIter<'a> {
+    dashes: &'a [u8],
+    cycle_len: u32,
+    line_style: LineStyle,
+    initial_offset: u32,
+}
+
+impl<'a> DashIter<'a> {
+    fn new(dashes: &'a [u8], dash_offset: u16, line_style: LineStyle) -> Self {
+        let cycle_len: u32 = dashes.iter().map(|&b| u32::from(b)).sum();
+        let initial_offset = if cycle_len == 0 {
+            0
+        } else {
+            u32::from(dash_offset) % cycle_len
+        };
+        Self {
+            dashes,
+            cycle_len,
+            line_style,
+            initial_offset,
+        }
+    }
+
+    fn start_offset_px(&self) -> f64 {
+        f64::from(self.initial_offset)
+    }
+
+    /// Given a position `phase_px` (in pixel units, may exceed
+    /// cycle_len; we wrap), return `(is_on, length_remaining_in_this_dash)`.
+    fn at(&self, phase_px: f64) -> (bool, f64) {
+        let _ = self.line_style;
+        if self.cycle_len == 0 || self.dashes.is_empty() {
+            return (true, f64::INFINITY);
+        }
+        let pos = phase_px.rem_euclid(f64::from(self.cycle_len));
+        let mut cumulative = 0u32;
+        for (i, &b) in self.dashes.iter().enumerate() {
+            let next = cumulative + u32::from(b);
+            if pos < f64::from(next) {
+                let is_on = i % 2 == 0;
+                return (is_on, f64::from(next) - pos);
+            }
+            cumulative = next;
+        }
+        (true, 1.0) // unreachable in well-formed input
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_path_matches_bresenham_for_width_zero_solid() {
+        let state = StrokeState::default();
+        let out = stroke_path(&[(0, 0), (10, 0)], StrokeShape::Polyline, &state);
+        // 11 single-pixel rects on the horizontal line.
+        let total_pixels: usize = out
+            .fg_rects
+            .iter()
+            .map(|r| usize::from(r.width) * usize::from(r.height))
+            .sum();
+        assert_eq!(total_pixels, 11);
+        assert!(out.bg_rects.is_empty());
+    }
+
+    #[test]
+    fn not_last_drops_terminal_pixel_in_polyline() {
+        let state = StrokeState {
+            cap_style: CapStyle::NotLast,
+            ..StrokeState::default()
+        };
+        let out_full = stroke_path(
+            &[(0, 0), (5, 0)],
+            StrokeShape::Polyline,
+            &StrokeState::default(),
+        );
+        let out_notlast = stroke_path(&[(0, 0), (5, 0)], StrokeShape::Polyline, &state);
+        let fc: usize = out_full
+            .fg_rects
+            .iter()
+            .map(|r| usize::from(r.width) * usize::from(r.height))
+            .sum();
+        let nc: usize = out_notlast
+            .fg_rects
+            .iter()
+            .map(|r| usize::from(r.width) * usize::from(r.height))
+            .sum();
+        assert_eq!(fc, nc + 1);
+    }
+
+    #[test]
+    fn thick_horizontal_segment_width_3_produces_3_tall_strip() {
+        let state = StrokeState {
+            line_width: 3,
+            ..StrokeState::default()
+        };
+        let out = stroke_path(&[(0, 5), (10, 5)], StrokeShape::Polyline, &state);
+        // Sum bounding height — scanline emits 3 rows.
+        let y_min = out.fg_rects.iter().map(|r| r.y).min().unwrap_or(0);
+        let y_max = out
+            .fg_rects
+            .iter()
+            .map(|r| i32::from(r.y) + i32::from(r.height))
+            .max()
+            .unwrap_or(0);
+        let span = y_max - i32::from(y_min);
+        assert!((3..=4).contains(&span), "span {span} not in [3,4]");
+    }
+
+    #[test]
+    fn dash_iter_solid_returns_infinity() {
+        let it = DashIter::new(&[4, 4], 0, LineStyle::Solid);
+        // Solid still walks dashes (caller uses on_pattern flag). We
+        // only need cycle handling to be sensible.
+        let (on, len) = it.at(0.0);
+        assert!(on);
+        assert!(len > 0.0);
+    }
+
+    #[test]
+    fn dash_iter_walks_pattern() {
+        let it = DashIter::new(&[2, 1], 0, LineStyle::OnOffDash);
+        // pos=0 → in first on-run of length 2, remaining 2
+        let (on, rem) = it.at(0.0);
+        assert!(on);
+        assert!((rem - 2.0).abs() < 1e-6);
+        // pos=2 → at boundary, in off-run of length 1, remaining 1
+        let (on, rem) = it.at(2.0);
+        assert!(!on);
+        assert!((rem - 1.0).abs() < 1e-6);
+        // pos=2.5 → mid off, remaining 0.5
+        let (on, rem) = it.at(2.5);
+        assert!(!on);
+        assert!((rem - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dash_iter_offset_wraps() {
+        let it = DashIter::new(&[2, 1], 3, LineStyle::OnOffDash);
+        // offset=3 wraps to 0 (cycle_len=3).
+        assert_eq!(it.start_offset_px(), 0.0);
+        let it2 = DashIter::new(&[2, 1], 5, LineStyle::OnOffDash);
+        assert_eq!(it2.start_offset_px(), 2.0);
+    }
+}

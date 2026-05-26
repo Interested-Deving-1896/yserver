@@ -26,7 +26,10 @@ use std::{
 };
 
 use yserver_core::{
-    backend::{ClipState, FillState, GcFunction, PixmapHandle, SubwindowMode},
+    backend::{
+        ClipState, FillState, GcFunction, PixmapHandle, SubwindowMode,
+        params::{CapStyle, JoinStyle, LineStyle},
+    },
     host_x11::{HostPointerEvent, HostXidMap},
 };
 use yserver_protocol::x11::{CharInfo as ProtocolCharInfo, FontMetrics, ResourceId, xfixes};
@@ -762,6 +765,17 @@ pub(crate) struct KmsCore {
     // longer "miss" its own children by virtue of separate
     // storage).
     pub(crate) current_subwindow_mode: SubwindowMode,
+    // Stroke state: snapshotted from the resolved DrawState on every
+    // apply_draw_state call so the poly_line / poly_segment /
+    // poly_rectangle / poly_arc dispatch sites can honour the GC's
+    // line_width / line_style / cap_style / join_style / dashes /
+    // dash_offset without re-resolving the GC.
+    pub(crate) current_line_width: u16,
+    pub(crate) current_line_style: LineStyle,
+    pub(crate) current_cap_style: CapStyle,
+    pub(crate) current_join_style: JoinStyle,
+    pub(crate) current_dashes: Vec<u8>,
+    pub(crate) current_dash_offset: u16,
 
     // SHAPE extension: per-window shape regions keyed by host XID.
     // None entry = no shape (full rectangle). Some(vec![]) = empty region.
@@ -873,6 +887,12 @@ impl KmsCore {
             current_fill: FillState::Solid,
             current_clip: ClipState::None,
             current_subwindow_mode: SubwindowMode::ClipByChildren,
+            current_line_width: 0,
+            current_line_style: LineStyle::Solid,
+            current_cap_style: CapStyle::Butt,
+            current_join_style: JoinStyle::Miter,
+            current_dashes: vec![4, 4],
+            current_dash_offset: 0,
             shape_bounding: HashMap::new(),
             shape_clip: HashMap::new(),
             shape_input: HashMap::new(),
@@ -944,6 +964,12 @@ impl KmsCore {
             current_fill: FillState::Solid,
             current_clip: ClipState::None,
             current_subwindow_mode: SubwindowMode::ClipByChildren,
+            current_line_width: 0,
+            current_line_style: LineStyle::Solid,
+            current_cap_style: CapStyle::Butt,
+            current_join_style: JoinStyle::Miter,
+            current_dashes: vec![4, 4],
+            current_dash_offset: 0,
             shape_bounding: HashMap::new(),
             shape_clip: HashMap::new(),
             shape_input: HashMap::new(),

@@ -3780,6 +3780,40 @@ impl KmsBackendV2 {
     /// paint-translation offset for COMPOSITE redirect. Window-
     /// local `rects` are shifted by `target.offset` before going
     /// to the engine.
+    /// Build the per-call stroke snapshot from the GC state captured
+    /// in `apply_draw_state`.
+    fn current_stroke_state(&self, _foreground: u32) -> crate::kms::v2::stroke::StrokeState {
+        crate::kms::v2::stroke::StrokeState {
+            background: self.core.current_background,
+            line_width: self.core.current_line_width,
+            line_style: self.core.current_line_style,
+            cap_style: self.core.current_cap_style,
+            join_style: self.core.current_join_style,
+            dashes: self.core.current_dashes.clone(),
+            dash_offset: self.core.current_dash_offset,
+        }
+    }
+
+    /// Clip a stroke's fg/bg rect lists against the current GC clip
+    /// and submit them. `LineStyle::DoubleDash` off-runs land in
+    /// `bg_rects` and paint in the GC background colour.
+    fn emit_stroke_output(
+        &mut self,
+        target: PaintTarget,
+        foreground: u32,
+        background: u32,
+        out: crate::kms::v2::stroke::StrokeOutput,
+    ) {
+        if !out.fg_rects.is_empty() {
+            let fg_clipped = self.intersect_with_current_clip(&out.fg_rects);
+            self.fill_solid_rects(target, foreground, &fg_clipped);
+        }
+        if !out.bg_rects.is_empty() {
+            let bg_clipped = self.intersect_with_current_clip(&out.bg_rects);
+            self.fill_solid_rects(target, background, &bg_clipped);
+        }
+    }
+
     fn fill_solid_rects(&mut self, target: PaintTarget, fg: u32, rects: &[Rectangle16]) {
         use yserver_core::backend::GcFunction;
         if rects.is_empty() {
@@ -7273,6 +7307,14 @@ impl Backend for KmsBackendV2 {
         // `copy_area` (and any other future op that consults it)
         // can split the destination rect against the child rects.
         self.core.current_subwindow_mode = state.subwindow_mode;
+        // Stroke state — consumed by poly_line / poly_segment /
+        // poly_rectangle / poly_arc via `kms::v2::stroke::stroke_path`.
+        self.core.current_line_width = state.line_width;
+        self.core.current_line_style = state.line_style;
+        self.core.current_cap_style = state.cap_style;
+        self.core.current_join_style = state.join_style;
+        self.core.current_dashes = state.dashes.clone();
+        self.core.current_dash_offset = u16::try_from(state.dash_offset).unwrap_or(0);
         Ok(())
     }
 
@@ -7836,9 +7878,9 @@ impl Backend for KmsBackendV2 {
             self.log_v2_gap("poly_line_unknown_xid");
             return Ok(());
         };
-        // coordinate_mode 0 = Origin (absolute), 1 = Previous
-        // (each point is a delta from the previous).
-        let mut rects: Vec<Rectangle16> = Vec::new();
+        // Cook the polyline vertices (coordinate_mode 0 = Origin
+        // absolute, 1 = Previous deltas).
+        let mut verts: Vec<(i32, i32)> = Vec::new();
         let mut prev: Option<(i32, i32)> = None;
         let mut offset = 0;
         while let Some((x, y)) = crate::kms::backend::read_i16_pair(points, offset) {
@@ -7852,13 +7894,16 @@ impl Backend for KmsBackendV2 {
             } else {
                 (i32::from(x), i32::from(y))
             };
-            if let Some((px, py)) = prev {
-                crate::kms::backend::bresenham_segment(px, py, xi, yi, &mut rects);
-            }
+            verts.push((xi, yi));
             prev = Some((xi, yi));
         }
-        let rects = self.intersect_with_current_clip(&rects);
-        self.fill_solid_rects(target, foreground, &rects);
+        let stroke = self.current_stroke_state(foreground);
+        let out = crate::kms::v2::stroke::stroke_path(
+            &verts,
+            crate::kms::v2::stroke::StrokeShape::Polyline,
+            &stroke,
+        );
+        self.emit_stroke_output(target, foreground, stroke.background, out);
         Ok(())
     }
 
@@ -7873,8 +7918,10 @@ impl Backend for KmsBackendV2 {
             self.log_v2_gap("poly_segment_unknown_xid");
             return Ok(());
         };
-        // Each segment is (x1:i16, y1:i16, x2:i16, y2:i16).
-        let mut rects: Vec<Rectangle16> = Vec::new();
+        // Each segment is (x1:i16, y1:i16, x2:i16, y2:i16). Cook into
+        // a flat (p0, p1, p0, p1, ...) vertex list for stroke_path's
+        // DisjointSegments shape.
+        let mut verts: Vec<(i32, i32)> = Vec::new();
         let mut offset = 0;
         while offset + 8 <= segments.len() {
             let Some((x1, y1)) = crate::kms::backend::read_i16_pair(segments, offset) else {
@@ -7884,16 +7931,16 @@ impl Backend for KmsBackendV2 {
                 break;
             };
             offset += 8;
-            crate::kms::backend::bresenham_segment(
-                i32::from(x1),
-                i32::from(y1),
-                i32::from(x2),
-                i32::from(y2),
-                &mut rects,
-            );
+            verts.push((i32::from(x1), i32::from(y1)));
+            verts.push((i32::from(x2), i32::from(y2)));
         }
-        let rects = self.intersect_with_current_clip(&rects);
-        self.fill_solid_rects(target, foreground, &rects);
+        let stroke = self.current_stroke_state(foreground);
+        let out = crate::kms::v2::stroke::stroke_path(
+            &verts,
+            crate::kms::v2::stroke::StrokeShape::DisjointSegments,
+            &stroke,
+        );
+        self.emit_stroke_output(target, foreground, stroke.background, out);
         Ok(())
     }
 
@@ -7908,8 +7955,9 @@ impl Backend for KmsBackendV2 {
             self.log_v2_gap("poly_rectangle_unknown_xid");
             return Ok(());
         };
-        // Rectangle outlines: 4 thin (1-px) rects per input rect.
-        let mut rects = Vec::new();
+        let stroke = self.current_stroke_state(foreground);
+        let mut fg_rects: Vec<Rectangle16> = Vec::new();
+        let mut bg_rects: Vec<Rectangle16> = Vec::new();
         let mut offset = 0;
         while offset + 8 <= rectangles.len() {
             let Some(r) = crate::kms::backend::read_rect(rectangles, offset) else {
@@ -7919,37 +7967,28 @@ impl Backend for KmsBackendV2 {
             if r.width == 0 || r.height == 0 {
                 continue;
             }
-            // top edge
-            rects.push(Rectangle16 {
-                x: r.x,
-                y: r.y,
-                width: r.width,
-                height: 1,
-            });
-            // bottom edge
-            rects.push(Rectangle16 {
-                x: r.x,
-                y: r.y.wrapping_add(r.height as i16).wrapping_sub(1),
-                width: r.width,
-                height: 1,
-            });
-            // left edge
-            rects.push(Rectangle16 {
-                x: r.x,
-                y: r.y,
-                width: 1,
-                height: r.height,
-            });
-            // right edge
-            rects.push(Rectangle16 {
-                x: r.x.wrapping_add(r.width as i16).wrapping_sub(1),
-                y: r.y,
-                width: 1,
-                height: r.height,
-            });
+            // Per-rectangle polyline: 5 vertices, closes back to start
+            // so the corner joins fire. fast-path width≤1 keeps this
+            // bit-identical to the prior 4-edge-rect emission.
+            let x0 = i32::from(r.x);
+            let y0 = i32::from(r.y);
+            let x1 = x0 + i32::from(r.width) - 1;
+            let y1 = y0 + i32::from(r.height) - 1;
+            let verts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)];
+            let out = crate::kms::v2::stroke::stroke_path(
+                &verts,
+                crate::kms::v2::stroke::StrokeShape::Polyline,
+                &stroke,
+            );
+            fg_rects.extend(out.fg_rects);
+            bg_rects.extend(out.bg_rects);
         }
-        let rects = self.intersect_with_current_clip(&rects);
-        self.fill_solid_rects(target, foreground, &rects);
+        self.emit_stroke_output(
+            target,
+            foreground,
+            stroke.background,
+            crate::kms::v2::stroke::StrokeOutput { fg_rects, bg_rects },
+        );
         Ok(())
     }
 
