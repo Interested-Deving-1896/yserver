@@ -52,6 +52,30 @@ per X function exposed by `libXext`'s SHAPE binding).
 | 2026-05-06 |   96 |   31 |     3 |    25 |     6 | First Xlib3 run (162 tests / 109 cases) on top of all the Xproto fixes. |
 | 2026-05-06 |  110 |   17 |     3 |    25 |     6 | `xts-xlib3` branch — vendor string ("The X.Org Foundation"), release_number (12_401_011), 7 pixmap formats (added depth=15, depth=16), screen mm dimensions (677×381 reference), SetCloseDownMode validates header.data ∈ {0,1,2}. **PASS 96 → 110** (+14). Remaining FAILs are mostly XCloseDisplay subtests requiring full resource-lifecycle accounting and a couple of colormap-install limit tests. |
 
+## Run history (yserver KMS, drawing primitives + colormap)
+
+First yserver runs of `Xlib9` (drawing primitives) and `Xlib10`
+(colormap install/uninstall + misc) on 2026-05-26, driven by
+`just xts-yserver <scenario>` (vng harness). Baseline for the
+draw-primitives-completeness program of work.
+
+### `Xlib9` baseline 2026-05-26
+
+| Date       | PASS | FAIL | UNRES | UNIN | UNTST | NOTIU | UNSUP | ABORT | Notes |
+|------------|-----:|-----:|------:|-----:|------:|------:|------:|------:|-------|
+| 2026-05-26 |   14 |   61 |     0 |   17 |     0 |     3 |     1 |  1375 | First yserver Xlib9 run. Test cases 0-3 (XClearArea, XClearWindow, XCopyArea, XCopyPlane) ran to completion; XDrawArc (case 4) and all subsequent 42 cases ABORT — yserver stops responding after XCopyPlane's depth-4 GetImage spam (`UnsupportedDepth(4)` repeats ~120 times). Separate yserver hang to investigate. No baseline yet for our actual targets (XDrawArc, XDrawLine, XFillArc, XFillPolygon, XPutImage, etc.). |
+
+### `Xlib10` baseline 2026-05-26
+
+Full scenario completed (23 cases / 95 tests). Subset of interest:
+
+| Test                       | PASS | FAIL | UNTST | Notes |
+|----------------------------|-----:|-----:|------:|-------|
+| `XInstallColormap`         |    0 |    3 |     3 | Opcode 81 unhandled — request silently dropped. |
+| `XUninstallColormap`       |    0 |    1 |     4 | Opcode 82 unhandled. |
+| `XListInstalledColormaps`  |    0 |    2 |     0 | Stub reply returns empty list. |
+| Xlib10 totals              |   16 |   37 |    36 | UNRES=5, UNSUP=1. |
+
 (Total tests: 122 cases / 389 purposes throughout.)
 
 The full scenario completes in ~4 minutes. **The headline is that
