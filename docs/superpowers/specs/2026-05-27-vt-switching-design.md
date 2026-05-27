@@ -138,7 +138,7 @@ There is **no per-device pause callback** surfaced to client code. Per-device re
 | `enable_seat`   | Sets `pending.enable_fired = true`       | Resume sequence (reopen devices, modeset, repaint) |
 | `disable_seat`  | Sets `pending.disable_fired = true`      | Suspend sequence                                   |
 
-Practically: on `disable_seat`, we **close every input fd** and **drop DRM master while leaving DRM fds open** before calling `libseat_disable_seat()` to ack. The asymmetry matters; see "Device fd lifetime contract" below. On `enable_seat`, we reopen each device via `seat.open_device(path)`, which returns a fresh `(device_id, fd)` pair — we treat the fd as opaque and replace the old one unconditionally.
+Practically: on `disable_seat`, we **close every input fd** and **stop submitting GPU work / committing modesets** before calling `libseat_disable_seat()` to ack. We do **not** call `drmDropMaster` ourselves — wlroots doesn't, and libseat / seatd / logind revoke master at the kernel level as part of disable processing. DRM fds stay open; see "Device fd lifetime contract" below. On `enable_seat`, we reopen each device via `seat.open_device(path)`, which returns a fresh `(device_id, fd)` pair — we treat the fd as opaque and replace the old one unconditionally.
 
 ### Console / TTY state stays in `kms/console.rs`
 
@@ -218,10 +218,11 @@ Triggered by `disable_seat` callback firing on the main thread during `seat.disp
 3. Drain any input events still in the main channel up to the `Ack` watermark, dispatching them normally. Now `xkb_state` and `pointer_state` reflect every input event the kernel delivered before suspend.
 4. **Synthesize held-key release.** Walk `XkbState` for the master keyboard and per-pointer button masks; dispatch synthetic `KeyRelease` / `ButtonRelease` through the normal fanout (Core delivery, XI2 *focused* event delivery, focus rules, passive-grab release semantics — same machinery exercised by the Cinnamon keyring fix `0c117e7`). XI2 raw listeners are **not** updated — see "XI2 raw events" below.
 5. Wait for in-flight Vulkan submits to finish (`vkQueueWaitIdle` per render queue, bounded by the same timeout we use on shutdown).
-6. Drop DRM master on every KMS card (`drmDropMaster`). Best-effort; an error here is logged but doesn't abort the sequence (we still need to ack libseat to release the VT).
-7. Close every managed input fd. The input thread is already stopped from step 2; we drop the `OwnedFd`s so the kernel can reclaim them before libseat / seatd needs to forcibly revoke. DRM fds are **not** closed — see "Device fd lifetime contract" — Mesa retains them and they remain valid for non-master operations.
-8. Call `libseat_disable_seat()` to ack. Set `seat_state = Suspended`.
-9. Re-check `pending_enable`; if set, primes the next iteration to begin resume the moment `enable_seat` arrives.
+6. Close every managed input fd. The input thread is already stopped from step 2; we drop the `OwnedFd`s so the kernel can reclaim them before libseat / seatd needs to forcibly revoke. DRM fds are **not** closed — see "Device fd lifetime contract" — Mesa retains them and they remain valid for non-master operations.
+7. Call `libseat_disable_seat()` to ack. Set `seat_state = Suspended`.
+8. Re-check `pending_enable`; if set, primes the next iteration to begin resume the moment `enable_seat` arrives.
+
+**No explicit `drmDropMaster`.** Following wlroots's pattern (`backend/drm/backend.c::handle_session_active`): wlroots does not call `drmDropMaster` itself on disable. libseat / seatd / logind revoke master at the kernel level as part of processing the `disable_seat` ack. By the time the kernel completes the VT switch, master is gone. We don't need to do it ourselves and adding a redundant explicit drop would just be one more ioctl that can fail at an awkward time.
 
 Crossing events (Enter / Leave) are **not** synthesised at suspend.
 
@@ -242,7 +243,7 @@ Triggered by `enable_seat` callback firing on the main thread during `seat.dispa
 
 ### Subtleties
 
-**Main-loop stall during suspend / resume.** The `disable_seat` and `enable_seat` callbacks run on the main thread inside `seat.dispatch()`. Suspend blocks on the input-quiesce ack, `vkQueueWaitIdle`, and a series of `drmDropMaster` calls. Resume blocks on `seat.open_device`, `drmSetMaster`, modeset, and the input thread's `Resume` ack. During these blocks the main loop is **not polling** client sockets, the signalfd channel, or any other event source. Crossbeam's unbounded channel queues incoming messages — no events are lost, just delayed.
+**Main-loop stall during suspend / resume.** The `disable_seat` and `enable_seat` callbacks run on the main thread inside `seat.dispatch()`. Suspend blocks on the input-quiesce ack and `vkQueueWaitIdle`. Resume blocks on `seat.open_device`, `drmSetMaster`, modeset, and the input thread's `Resume` ack. During these blocks the main loop is **not polling** client sockets, the signalfd channel, or any other event source. Crossbeam's unbounded channel queues incoming messages — no events are lost, just delayed.
 
 **Each blocking step must have an explicit timeout enforced by the implementation.** In-tree today, only `FenceTicket::wait` (5s on the GPU fence) has a real bound; everything else listed above is new code introduced by this work. The implementation plan must define and enforce:
 
@@ -253,7 +254,7 @@ Triggered by `enable_seat` callback firing on the main thread during `seat.dispa
 
 The above are starting points; the implementation should treat them as tuning knobs to be validated under load on the hardware matrix (a loaded laptop kernel may need higher ack timeouts), not as guarantees the spec proves. With those bounds in place, the worst-case stall sums to ~6 s. The screen is going dark during the stall anyway; clients perceive a brief input lag at the VT-switch boundary, identical to what Xorg shows. If telemetry shows a typical switch exceeding ~250 ms we revisit (likely by moving the GPU wait to a worker thread and pumping the main loop), but the lean MVP path doesn't pay that cost upfront.
 
-**Outstanding pageflips at disable time.** Once we drop master we are no longer the foreground VT. A flip queued just before drop-master either (a) completes — the PageFlip event arrives but the buffer never reaches the screen because the new VT owns the connector — or (b) errors at ack time. We tolerate both by treating "missed pageflip during suspend" as expected, not a telemetry alert.
+**Outstanding pageflips at disable time.** Once libseat / the kernel revoke master, a flip we queued just before suspend either (a) completes — the PageFlip event arrives but the buffer never reaches the screen because the new VT owns the connector — or (b) errors. We tolerate both by treating "missed pageflip during suspend" as expected, not a telemetry alert.
 
 **Frame-builder retire pins.** The v2 frame builder pins resources until the GPU retires them via fence. `vkQueueWaitIdle` in step 5 retires everything. The render fd remains valid (wlroots contract); pinned `VkBuffer`/`VkImage` objects stay live; submissions resume without buffer reupload.
 
@@ -266,7 +267,7 @@ silence has the split-driver layout (KMS-only card + separate render card). The 
 Under libseat:
 
 - The seat-wide `enable_seat` / `disable_seat` callbacks drive the *server-wide* `SeatState`. There is one `SeatState`, not one per card.
-- On `disable_seat`, we iterate every `ManagedDevice` that is a KMS card and `drmDropMaster` it. Render-only DRM cards have no master to drop.
+- On `disable_seat`, we don't explicitly drop master on any DRM device — libseat / kernel revocation handles it during the ack. We only need to stop issuing master-requiring ioctls (modeset, pageflip) which the `seat_state != Active` gates already prevent.
 - Submitting to a render-only DRM fd after the seat is disabled may eventually return errors from libvulkan once libseat / seatd has applied per-device revocation, but the `vkQueueSubmit2` gate on `seat_state != Active` (set in suspend step 1) prevents us from ever reaching that point.
 - On `enable_seat`, we reopen every `ManagedDevice` via `seat.open_device(path)`. Each may return a fresh fd; we replace the held fd and re-acquire master on KMS cards.
 
@@ -315,7 +316,7 @@ Two distinct tracks:
 
 **Stub-backend integration (yserver crate, no libseat dep):**
 
-- `TestSeat` impl behind the same trait as `LibseatBackend`. Drive enable/disable callbacks programmatically. Assert end-to-end: input-quiesce → synthesise-release → vkQueueWaitIdle → drop-master → close input fds → ack disable → re-open → master → modeset → repaint. Assert full damage posts on every output on resume.
+- `TestSeat` impl behind the same trait as `LibseatBackend`. Drive enable/disable callbacks programmatically. Assert end-to-end: input-quiesce → synthesise-release → vkQueueWaitIdle → close input fds → ack disable → re-open → drmSetMaster → modeset → repaint. Assert full damage posts on every output on resume.
 - `ynest --simulate-vt-switch` debug knob: fires fake `enable_seat` / `disable_seat` into the loop after N seconds. Confirms the resume path doesn't deadlock and the next composite goes through.
 
 **Real-libseat integration (CI with seatd in a container):**
@@ -343,9 +344,9 @@ A rapid-double-switch capture is added to bee's run: Ctrl-Alt-F2 then immediatel
 
 Ordered by likelihood × blast radius.
 
-1. **DRM master not dropped before VT switch fires.** Kernel switches foreground VT while we're still master → new owner can't take master → screen wedges. Mitigation: `libseat_disable_seat()` is the last call in suspend; libseat ensures the underlying VT_RELDISP doesn't fire until after that. If we crash / panic during suspend before the ack, wrap suspend steps in error-tolerant code and ack disable in all paths. Final escape: Ctrl-Alt-Backspace zap.
+1. **VT switch fires while we haven't ack'd.** Kernel can't perform the switch until we call `libseat_disable_seat()`. If we crash / panic during suspend before the ack, the kernel waits — screen freezes on whatever was last drawn until something kills yserver. Mitigation: wrap suspend steps in error-tolerant code so any failure still reaches the ack. Final escape: Ctrl-Alt-Backspace zap (which exits the process; libseat's session-destroy then unblocks the kernel).
 2. **Input-quiesce barrier times out.** Input thread doesn't ack `Stop` (blocked in a kernel read, or panicked). Mitigation: bounded timeout, then proceed with a best-effort snapshot. On timeout, log `WARN yserver: input quiesce timeout; suspend proceeding with stale snapshot`. Worst case is one or two stuck keys on resume — clients tolerate this far better than a wedged screen.
-3. **`vkQueueWaitIdle` hang on suspend.** Hung GPU submit blocks indefinitely. Mitigation: bound the wait with a timeout (already used on shutdown); proceed to drop-master + ack on timeout. Worst case is GPU work continues invisibly on the other VT.
+3. **`vkQueueWaitIdle` hang on suspend.** Hung GPU submit blocks indefinitely. Mitigation: bound the wait with a timeout (already used on shutdown); proceed to ack on timeout. Worst case is GPU work continues invisibly on the other VT until libseat's kernel-level revoke kicks in.
 4. **Reopen on resume returns a different device or fails for an essential card.** Hardware actually disappeared mid-suspend (eGPU detached, USB DRM device removed). Mitigation: log loudly and exit; the user sees yserver die rather than wedge. Full recovery is the Vulkan-device-loss follow-up.
 5. **Modeset on resume fails on a hot-unplugged output.** User switches VT, unplugs a monitor, switches back. Mitigation: re-query connector state via `drmModeGetResources` (resume step 4); drop missing outputs; fire RandR change-event.
 6. **Rapid double-switch races the state machine.** Mitigation: `pending_enable` / `pending_disable` flags; explicit resume-completion / suspend-completion re-checks before committing the next stable state. Tested in the bee hardware capture.
