@@ -7061,10 +7061,15 @@ fn handle_xi2_request(
             return Ok(RequestOutcome::Handled);
         }
         45 => {
-            // XIGetClientPointer reply layout (xinput.xml):
+            // XIGetClientPointer reply layout (xXIGetClientPointerReply,
+            // X11/extensions/XI2proto.h):
             //   response_type(1) | pad0(1) | sequence(2) | length(4)
-            //   | set:BOOL(1) | pad1(3) | deviceid(2) | pad2(18)
-            // Total = 32 bytes.
+            //   | set:BOOL(1) | pad0(1) | deviceid(2) | pad1..5(20)
+            // Total = 32 bytes. NOTE: deviceid sits at byte 10 — only
+            // ONE pad byte follows `set`. Writing 3 pad bytes here pushed
+            // deviceid to byte 12, so clients read 0 (broke nemo's
+            // desktop rubber-band, which looks up its pointer device via
+            // this reply).
             //
             // Must reply `set=True`: libXi's `XIGetClientPointer`
             // only writes the caller's `*deviceid` out-parameter
@@ -7086,13 +7091,11 @@ fn handle_xi2_request(
                 client_id.0, sequence.0
             );
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
-            // set=True (1) + 3 bytes pad — write as a single u32 with
-            // the low byte = 1 so byte order doesn't matter.
-            reply.push(1);
-            reply.extend_from_slice(&[0u8; 3]);
-            // deviceid (u16) = 2, then pad to reach 32 bytes total.
+            reply.push(1); // byte 8: set = True
+            reply.push(0); // byte 9: pad0
+            // bytes 10-11: deviceid = master pointer (2).
             x11::write_u16(byte_order, &mut reply, 2);
-            reply.extend_from_slice(&[0u8; 18]);
+            reply.extend_from_slice(&[0u8; 20]); // bytes 12-31: pad1..5
             debug_assert_eq!(reply.len(), 32);
             buf.extend_from_slice(&reply);
         }
@@ -9261,13 +9264,15 @@ fn set_focused_window_to_state(state: &mut ServerState, client_id: ClientId, win
     for c in state.clients.values_mut() {
         c.focused_window = window;
     }
+    let (ptr_x, ptr_y) = state.pointer_root;
     let crossings = normal_mode_crossings(state, prev, window);
     if crossings.is_empty() {
         let _dropped =
             emit_window_event_to_state(state, window, FOCUS_CHANGE_MASK, |buf, seq, order| {
                 x11::encode_focus_event(buf, seq, order, true, window);
             });
-        let _dropped = emit_xi2_focus_event_to_state(state, window, 9, XI2_MAJOR_OPCODE, 0, 0);
+        let _dropped =
+            emit_xi2_focus_event_to_state(state, window, 9, XI2_MAJOR_OPCODE, 0, 0, ptr_x, ptr_y);
         return;
     }
     for crossing in crossings {
@@ -9299,6 +9304,8 @@ fn set_focused_window_to_state(state: &mut ServerState, client_id: ClientId, win
             XI2_MAJOR_OPCODE,
             0,
             crossing.detail,
+            ptr_x,
+            ptr_y,
         );
     }
 }
@@ -18995,6 +19002,126 @@ mod tests {
                  _NET_WM_MOVERESIZE move aborts on an empty mask",
             );
         }
+    }
+
+    /// `XIGetClientPointer` reply must place `deviceid` at bytes 10-11.
+    /// Per `xXIGetClientPointerReply` (X11/extensions/XI2proto.h):
+    /// `set` at byte 8, `pad0` at byte 9, `deviceid` (u16) at bytes
+    /// 10-11. Regression: the encoder wrote 3 pad bytes after `set`,
+    /// pushing deviceid to bytes 12-13, so clients read deviceid=0.
+    /// nemo's desktop rubber-band asks `XIGetClientPointer` for its
+    /// pointer device, got 0, and queried that for the band anchor —
+    /// anchoring it at (0,0). caja never calls it, so it was immune.
+    #[test]
+    fn xi_get_client_pointer_reply_deviceid_offset() {
+        const CLIENT_ID: u32 = 1;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        peer.set_nonblocking(true).unwrap();
+        let mut backend = RecordingBackend::new();
+
+        // XIGetClientPointer body: window(4).
+        let body = 0u32.to_le_bytes().to_vec();
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 131,
+            data: 45, // XIGetClientPointer
+            length_units: 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("xi get client pointer");
+
+        let mut buf = [0u8; 64];
+        let n = peer.read(&mut buf).expect("reply");
+        assert_eq!(n, 32, "reply must be 32 bytes");
+        assert_eq!(buf[8], 1, "byte 8: set = True");
+        assert_eq!(
+            u16::from_le_bytes([buf[10], buf[11]]),
+            2,
+            "deviceid (bytes 10-11 per xXIGetClientPointerReply) must be the \
+             master pointer (2); a wrong offset reads as 0 and breaks nemo's \
+             pointer-device lookup for the rubber-band anchor",
+        );
+    }
+
+    /// XI2 `FocusIn`/`FocusOut` events share the `xXIEnterEvent` layout
+    /// and must carry the current pointer position (Xorg populates
+    /// root_x/root_y/event_x/event_y from it). yserver emits focus events
+    /// from request handlers that have no backend handle, so it reads the
+    /// cached `state.pointer_root`. Regression target: focus events
+    /// shipped at (0,0).
+    #[test]
+    fn xi_focus_in_carries_cached_pointer_position() {
+        use crate::resources::ROOT_VISUAL;
+
+        const CLIENT_ID: u32 = 1;
+        const FOCUS_WIN: u32 = 0x0010_0007;
+        const PREV_WIN: u32 = 0x0010_0008;
+        const XI_FOCUS_IN: u16 = 9;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        peer.set_nonblocking(true).unwrap();
+
+        for xid in [FOCUS_WIN, PREV_WIN] {
+            state.resources.create_window(
+                yserver_protocol::x11::ClientId(CLIENT_ID),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(xid),
+                    parent: ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    border_width: 0,
+                    class: 1,
+                    visual: ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(ResourceId(xid));
+        }
+        // Client selects XI_FocusIn on FOCUS_WIN (keyboard device 3).
+        state
+            .clients
+            .get_mut(&CLIENT_ID)
+            .unwrap()
+            .xi2_masks
+            .insert((ResourceId(FOCUS_WIN), 3), 1 << XI_FOCUS_IN);
+
+        // Cache the pointer position; prior focus is on an unrelated window
+        // so a Focus crossing actually fires onto FOCUS_WIN.
+        state.pointer_root = (631, 641);
+        state.clients.get_mut(&CLIENT_ID).unwrap().focused_window = ResourceId(PREV_WIN);
+
+        set_focused_window_to_state(&mut state, ClientId(CLIENT_ID), ResourceId(FOCUS_WIN));
+
+        let mut buf = [0u8; 128];
+        let n = peer.read(&mut buf).expect("focus event");
+        assert!(n >= 36, "expected an XI2 focus event (got {n} bytes)");
+        assert_eq!(buf[0], 35, "must be an XI2 GenericEvent");
+        assert_eq!(
+            u16::from_le_bytes([buf[8], buf[9]]),
+            XI_FOCUS_IN,
+            "evtype must be FocusIn",
+        );
+        // root_x is FP1616 at bytes 32-35 (after the 32-byte boundary).
+        let root_x_fp = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
+        assert_eq!(
+            root_x_fp,
+            (631i32 << 16) as u32,
+            "FocusIn must carry the current pointer X (631), not 0; Xorg \
+             populates focus-event coords from the pointer position",
+        );
     }
 
     /// Core `AllowEvents(ReplayKeyboard)` (mode 5 — what muffin/mutter

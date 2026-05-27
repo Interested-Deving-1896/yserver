@@ -54,6 +54,11 @@ pub fn pointer_event_fanout_to_state(
     // Step 1 — translate host-screen coords to ynest-root coords.
     let event = translate_host_event(state, xid_map, event);
 
+    // Cache the pointer position so server-generated events that must
+    // carry it (XI2 focus events) don't ship (0,0). Mirrors Xorg keeping
+    // the sprite position in device state.
+    state.pointer_root = (event.root_x, event.root_y);
+
     if matches!(
         event.kind,
         PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease

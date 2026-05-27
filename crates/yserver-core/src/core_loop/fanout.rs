@@ -192,6 +192,8 @@ pub fn emit_xi2_focus_event_to_state(
     xi2_major_opcode: u8,
     mode: u8,
     detail: u8,
+    root_x: i16,
+    root_y: i16,
 ) -> Vec<ClientId> {
     let targets: Vec<ClientId> = state
         .clients
@@ -215,6 +217,11 @@ pub fn emit_xi2_focus_event_to_state(
     if targets.is_empty() {
         return Vec::new();
     }
+    // Focus events carry the pointer position (xXIEnterEvent layout).
+    // `event_x/event_y` are relative to the focus window's origin.
+    let (origin_x, origin_y) = state.resources.window_absolute_position(window);
+    let event_x = i16::try_from(i32::from(root_x).saturating_sub(origin_x)).unwrap_or(i16::MAX);
+    let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y)).unwrap_or(i16::MAX);
     fanout_event_to_clients(state, &targets, |buf, seq, order| {
         x11::encode_xi2_focus_event(
             buf,
@@ -225,6 +232,10 @@ pub fn emit_xi2_focus_event_to_state(
             3,
             0,
             window,
+            root_x,
+            root_y,
+            event_x,
+            event_y,
             mode,
             detail,
         );
@@ -528,7 +539,7 @@ mod tests {
         // Client 2 selects nothing on root.
         let mut peer2 = install(&mut state, 2, 0);
 
-        let dropped = emit_xi2_focus_event_to_state(&mut state, window, 9, 137, 0, 0);
+        let dropped = emit_xi2_focus_event_to_state(&mut state, window, 9, 137, 0, 0, 0, 0);
         assert!(dropped.is_empty());
 
         let mut buf = [0u8; 64];

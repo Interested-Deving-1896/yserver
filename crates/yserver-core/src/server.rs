@@ -216,6 +216,12 @@ pub struct ServerState {
     /// Active pointer grab: (grab owner, grab window). When set, all pointer
     /// events are redirected to the grab owner regardless of where the cursor is.
     pub pointer_grab: Option<(ClientId, ResourceId)>,
+    /// Last known pointer position in root coordinates, cached from the
+    /// pointer fanout. XI2 focus events (FocusIn/FocusOut share the
+    /// `xXIEnterEvent` layout and carry the pointer position) are emitted
+    /// from request handlers that have no backend handle to query the
+    /// pointer; without this cache they ship at (0,0).
+    pub pointer_root: (i16, i16),
     /// Active pointer grab record (full state including event_mask/cursor/time).
     /// When set, mirrors `pointer_grab` and supersedes it for spec-correct
     /// `ChangeActivePointerGrab` semantics.
@@ -398,6 +404,7 @@ impl ServerState {
             xkb_select_event_masks: HashMap::new(),
             selections: HashMap::new(),
             pointer_grab: None,
+            pointer_root: (0, 0),
             active_pointer_grab: None,
             button_grabs: Vec::new(),
             pointer_grab_is_passive: false,
