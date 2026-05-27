@@ -4,6 +4,7 @@ pub mod input;
 pub mod input_thread;
 pub mod kms;
 pub mod present;
+mod seat;
 
 use std::{
     fs,
