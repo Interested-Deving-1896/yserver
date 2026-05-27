@@ -51,9 +51,11 @@ This keeps the daily-driver path (yoga, bee, silence under logind) unprivileged 
 
 Simple rule, matching wlroots: if `libseat_open_seat` (via `libseat-rs`) returns success, use the `Libseat` backend; if it returns an error (any error), log it and fall back to `Direct`. The `libseat-rs` API returns `Errno`-flavoured errors and does not expose a discriminated enum that would let us safely distinguish "no backend available" from "backend present, denied" — so we don't try.
 
-One explicit safety check on top: if the `LIBSEAT_BACKEND` environment variable is set to `direct`, we refuse to start with an `ERROR yserver: LIBSEAT_BACKEND=direct refused; not bypassing seat policy`. This blocks the only configured way an operator could intentionally demote a seat-managed session to unprivileged direct access; every other failure is genuinely "no working seat manager" and is safe to fall back from.
+One explicit safety check on top: if the `LIBSEAT_BACKEND` environment variable is set to `direct`, we refuse to start with `ERROR yserver: LIBSEAT_BACKEND=direct refused; not bypassing seat policy`. This blocks the case where an operator explicitly demotes a seat-managed session to libseat's direct backend.
 
-When falling back to `Direct`, log `INFO yserver: libseat unavailable (<errno>); VT switching disabled, opening devices directly`.
+**Auto-detected `direct` backend is not a bypass.** libseat's `direct` backend requires root. If libseat auto-selects it (no logind on D-Bus, no `/run/seatd.sock`), the only callers that succeed are processes already running as root — i.e., the same population that already has unmediated `/dev/dri/cardN` access via the current `Direct` path. We gain VT switching gratis without granting any new privilege. We log `INFO yserver: libseat selected direct backend (no IPC seat manager); VT switching enabled, running as root` and proceed.
+
+When `libseat_open_seat` itself fails, fall back to the legacy direct-open path and log `INFO yserver: libseat unavailable (<errno>); VT switching disabled, opening devices directly`.
 
 ## Architecture
 
@@ -138,25 +140,27 @@ There is **no per-device pause callback** surfaced to client code. Per-device re
 | `enable_seat`   | Sets `pending.enable_fired = true`       | Resume sequence (reopen devices, modeset, repaint) |
 | `disable_seat`  | Sets `pending.disable_fired = true`      | Suspend sequence                                   |
 
-Practically: on `disable_seat`, we close (or stop using) every managed device fd ourselves before calling `libseat_disable_seat()` to ack. On `enable_seat`, we reopen each device we still want via `seat.open_device(path)`, which returns a fresh `(device_id, fd)` pair — we treat the fd as opaque and replace the old one unconditionally.
+Practically: on `disable_seat`, we **close every input fd** and **drop DRM master while leaving DRM fds open** before calling `libseat_disable_seat()` to ack. The asymmetry matters; see "Device fd lifetime contract" below. On `enable_seat`, we reopen each device via `seat.open_device(path)`, which returns a fresh `(device_id, fd)` pair — we treat the fd as opaque and replace the old one unconditionally.
 
 ### Console / TTY state stays in `kms/console.rs`
 
 libseat does not call `KDSETMODE` / `KDSKBMODE` for us. Those remain `ConsoleGuard`'s responsibility. Both Seat modes (Libseat and Direct) keep using it unchanged.
 
-### Device fd lifetime contract (anchored to wlroots)
+### Device fd lifetime contract
 
-wlroots's `wlr_session_open_file` header documents the libseat contract authoritatively:
+wlroots's `wlr_session_open_file` header documents what libseat guarantees:
 
 > When the session becomes inactive:
 > - DRM files lose their DRM master status
 > - evdev files become invalid and should be closed
 
-We adopt this verbatim. Concretely:
+That contract covers only the fds *we* hold. Vulkan's behaviour across the suspend depends on a second mechanism that wlroots's docstring doesn't claim but that production wlroots+Vulkan compositors all rely on. Spelling it out so the spec doesn't lean on a transitive guarantee that isn't actually written down:
 
-- **DRM card fds (KMS and render):** after `disable_seat`, the fd remains open and remains usable for non-master operations (most Vulkan calls, which do `drmSyncobjWait` / `drmIoctl(DRM_IOCTL_GEM_*)` etc. without master). Master capability is gone; modeset and pageflip ioctls will fail. On `enable_seat` we call `seat.open_device(path)` again to get a fresh fd; this may be the same numerical fd or a new one. We re-master via `drmSetMaster` on that fd.
-- **`VkDevice` / Vulkan objects:** the wlroots contract guarantees the underlying DRM render-node fd remains valid for non-master operations across the suspend, which is exactly what Mesa needs. `VkDevice`, `VkQueue`, `VkBuffer`, `VkImage`, command pools, and the frame builder's pinned resources all survive the suspend. Every wlroots-based compositor (sway, Hyprland, smithay derivatives) relies on this in production. We rely on it too.
-- **Input (evdev) fds:** invalid after `disable_seat`. We close them ourselves before ack'ing (the kernel will revoke if we don't). On `enable_seat` we reopen via `seat.open_device(path)` and hand the new fd to the input thread.
+- **DRM card fds (KMS) — the ones we open via libseat:** after `disable_seat`, the fd remains open and usable for non-master operations. Master capability is gone; modeset and pageflip ioctls will fail. We leave the fd open (don't `close`) because Mesa shares the master state via the kernel DRM context, not via our fd — closing ours wouldn't help. On `enable_seat` we call `seat.open_device(path)` again to get a fresh fd and `drmSetMaster` on it.
+- **Vulkan render fds — owned by Mesa, not us:** Mesa opens its own `/dev/dri/renderD*` (or its own additional handle to the same primary node) inside the driver when we create `VkInstance` / `VkDevice`. That fd is in the same kernel DRM master context as ours, so when libseat revokes master it loses master too. But Vulkan render contexts don't need master — `vkQueueSubmit2`, `vkCmdCopyBufferToImage`, `vkWaitForFences`, etc. all use non-master ioctls that continue to work. The kernel does not close Mesa's fd; revoke ≠ close. So `VkDevice`, `VkQueue`, `VkBuffer`, `VkImage`, command pools, and the frame builder's pinned resources all survive the suspend, provided we stop submitting before libseat's revoke fully lands (the `vkQueueSubmit2` gate in suspend step 1 ensures this).
+- **Input (evdev) fds:** invalid after `disable_seat`. We close them ourselves before ack'ing (the kernel will revoke if we don't, but explicit close gives us cleaner ownership accounting). On `enable_seat` we reopen via `seat.open_device(path)` and hand the new fd to the input thread.
+
+Every wlroots+Vulkan compositor (sway, Hyprland, smithay derivatives) in production demonstrates this pattern working across logind / seatd / direct backends. If a future libseat backend breaks the "revoke ≠ close, non-master ops continue" assumption, we'd see `VK_ERROR_DEVICE_LOST` on the first post-resume submit and exit (see Risks #9).
 
 ### What we do NOT rely on
 
@@ -235,6 +239,8 @@ Triggered by `enable_seat` callback firing on the main thread during `seat.dispa
 10. Otherwise: set `seat_state = Active`. Main loop resumes normal scheduling.
 
 ### Subtleties
+
+**Main-loop stall during suspend / resume.** The `disable_seat` and `enable_seat` callbacks run on the main thread inside `seat.dispatch()`. Suspend blocks on the input-quiesce ack (up to its timeout) and on `vkQueueWaitIdle` (up to its timeout). Resume blocks on `drmSetMaster`, modeset, and the input thread's `Resume` ack. During these blocks the main loop is **not polling** client sockets, the signalfd channel, or any other event source. Crossbeam's unbounded channel queues incoming messages — no events are lost, just delayed. Worst-case stall is bounded by the sum of the two timeouts (input quiesce + vkQueueWaitIdle), which the suspend code enforces. This is acceptable because the screen is going dark during the stall anyway; clients perceive a brief input lag at the VT-switch boundary, identical to what Xorg shows. If a future telemetry capture shows the stall exceeding ~250 ms we revisit (likely by moving `vkQueueWaitIdle` to a worker thread and pumping the main loop while waiting), but the lean MVP path doesn't pay that cost.
 
 **Outstanding pageflips at disable time.** Once we drop master we are no longer the foreground VT. A flip queued just before drop-master either (a) completes — the PageFlip event arrives but the buffer never reaches the screen because the new VT owns the connector — or (b) errors at ack time. We tolerate both by treating "missed pageflip during suspend" as expected, not a telemetry alert.
 
