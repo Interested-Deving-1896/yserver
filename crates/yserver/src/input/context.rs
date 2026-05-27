@@ -8,6 +8,7 @@
 //! [`InputEvent`].
 
 use std::{
+    cell::RefCell,
     fs::{File, OpenOptions},
     io,
     os::{
@@ -15,7 +16,10 @@ use std::{
         unix::fs::OpenOptionsExt,
     },
     path::Path,
+    rc::Rc,
 };
+
+use crate::seat::{DeviceKind, LibseatInner};
 
 use input::{
     Event, Libinput, LibinputInterface,
@@ -132,6 +136,55 @@ impl Context {
 impl AsFd for Context {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.libinput.as_fd()
+    }
+}
+
+/// libinput interface that opens evdev devices through libseat (wlroots'
+/// `libinput_open_restricted` → `wlr_session_open_file`). Used only in
+/// libseat mode, only on the core thread — the `Rc` never crosses a
+/// thread boundary.
+///
+/// Task 8 is the caller; suppressing `dead_code` until then.
+#[allow(dead_code)]
+struct LibseatInterface {
+    seat: Rc<RefCell<LibseatInner>>,
+}
+
+impl LibinputInterface for LibseatInterface {
+    fn open_restricted(&mut self, path: &Path, _flags: i32) -> Result<OwnedFd, i32> {
+        // libseat decides read/write; we ignore `flags` like wlroots does
+        // (backend.c:18). open_device hands back an OwnedFd dup of
+        // libseat's fd; libseat keeps its own handle, released later by
+        // close_restricted → close_device_by_fd.
+        self.seat
+            .borrow_mut()
+            .open_device(path, DeviceKind::Input)
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
+    }
+
+    fn close_restricted(&mut self, fd: OwnedFd) {
+        // libinput hands back the exact OwnedFd we returned; its raw
+        // number is our `handed_fd` key. Release libseat's side, then drop
+        // libinput's dup. Mirrors wlroots' libinput_close_restricted
+        // (backend.c:28).
+        self.seat.borrow_mut().close_device_by_fd(fd.as_raw_fd());
+        drop(fd);
+    }
+}
+
+impl Context {
+    /// Build a libinput context whose device opens route through libseat.
+    /// Caller owns this on the core thread (NOT wrapped in `SendContext`).
+    ///
+    /// Task 8 is the caller; suppressing `dead_code` until then.
+    #[allow(dead_code)]
+    pub fn new_libseat(seat: Rc<RefCell<LibseatInner>>) -> io::Result<Self> {
+        log_input_devnodes();
+        let mut libinput = Libinput::new_with_udev(LibseatInterface { seat });
+        libinput.udev_assign_seat("seat0").map_err(|()| {
+            io::Error::other("libinput: udev_assign_seat(\"seat0\") failed under libseat")
+        })?;
+        Ok(Self { libinput })
     }
 }
 
