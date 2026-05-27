@@ -37,11 +37,48 @@ const WIRE_MODIFIER_MASK: u16 = 0x004d;
 /// during the fanout — the caller (run_core) issues
 /// `Message::ClientDisconnected` for each.
 pub fn key_event_fanout_to_state(state: &mut ServerState, event: HostKeyEvent) -> Vec<ClientId> {
-    let Some(target_window) = key_target_window(state, &event) else {
-        return Vec::new();
-    };
+    match key_route(state, &event) {
+        KeyRoute::Drop => Vec::new(),
+        KeyRoute::PassiveGrabOwner {
+            owner,
+            grab_window,
+            freeze,
+        } => {
+            // Synchronous passive key grab: hold the activating press
+            // so AllowEvents(ReplayKeyboard) can replay it to the
+            // focus window if the grab owner declines it. Mirrors the
+            // sync passive-button-grab freeze in `pointer_fanout`.
+            if freeze && event.pressed {
+                state.frozen_keyboard_event = Some(event);
+            }
+            deliver_key_to_grab_owner(state, &event, owner, grab_window)
+        }
+        KeyRoute::Window(window) => deliver_key_to_window(state, &event, window),
+    }
+}
 
-    // Core KeyPress / KeyRelease.
+/// Replay a frozen key (held by a synchronous passive grab) to the
+/// current focus window, bypassing grab matching. Called from the
+/// AllowEvents `ReplayKeyboard` / XIAllowEvents `ReplayDevice` path
+/// after the grab owner declines the key. Mirrors Xorg
+/// `ComputeFreezes` → `DeliverFocusedEvent` (dix/events.c:1360).
+pub fn replay_frozen_key_to_focus(state: &mut ServerState, event: HostKeyEvent) -> Vec<ClientId> {
+    let focus = current_focus(state);
+    if focus == ROOT_WINDOW {
+        return Vec::new();
+    }
+    deliver_key_to_window(state, &event, focus)
+}
+
+/// Deliver a key event to a single window's subscribers — the normal
+/// path (focus window, or an explicit-grab window). Core KeyPress/
+/// KeyRelease to `KeyPressMask`/`KeyReleaseMask` subscribers, plus a
+/// parallel XI2 device event to XI2 selectors on the same window.
+fn deliver_key_to_window(
+    state: &mut ServerState,
+    event: &HostKeyEvent,
+    target_window: ResourceId,
+) -> Vec<ClientId> {
     let mask_bit = if event.pressed {
         KEY_PRESS_MASK
     } else {
@@ -49,33 +86,10 @@ pub fn key_event_fanout_to_state(state: &mut ServerState, event: HostKeyEvent) -
     };
     let mut dropped =
         emit_window_event_to_state(state, target_window, mask_bit, |buf, seq, order| {
-            x11::encode_key_event(
-                buf,
-                order,
-                x11::KeyEvent {
-                    pressed: event.pressed,
-                    keycode: event.keycode,
-                    sequence: seq,
-                    time: event.time,
-                    root: ROOT_WINDOW,
-                    event: target_window,
-                    root_x: event.root_x,
-                    root_y: event.root_y,
-                    event_x: event.event_x,
-                    event_y: event.event_y,
-                    state: event.state & WIRE_MODIFIER_MASK,
-                },
-            );
+            x11::encode_key_event(buf, order, key_event_wire(event, seq, target_window));
         });
 
-    // XI2 device-event fanout. Same target window, picks clients
-    // selecting the matching XI2 evtype on `(target, deviceid)` for any
-    // of the fallback device candidates [5, 3, 1, 0].
-    let xi2_evtype = if event.pressed {
-        XI2_KEYPRESS_EVTYPE
-    } else {
-        XI2_KEYRELEASE_EVTYPE
-    };
+    let xi2_evtype = xi2_evtype_for(event);
     let xi2_targets: Vec<ClientId> = state
         .clients
         .iter()
@@ -100,29 +114,93 @@ pub fn key_event_fanout_to_state(state: &mut ServerState, event: HostKeyEvent) -
         .collect();
     if !xi2_targets.is_empty() {
         let xi2_dropped = fanout_event_to_clients(state, &xi2_targets, |buf, seq, order| {
-            x11::encode_xi2_device_event(
-                buf,
-                order,
-                seq,
-                XI2_MAJOR_OPCODE,
-                xi2_evtype,
-                XI2_MASTER_KEYBOARD_DEVICE_ID,
-                event.time,
-                ROOT_WINDOW,
-                target_window,
-                ResourceId(0), // child=None; key events target the focus window directly
-                event.root_x,
-                event.root_y,
-                event.event_x,
-                event.event_y,
-                event.state & WIRE_MODIFIER_MASK,
-                u32::from(event.keycode),
-                XI2_SLAVE_KEYBOARD_DEVICE_ID,
-            );
+            encode_key_xi2(buf, order, seq, event, target_window);
         });
         merge_dropped(&mut dropped, xi2_dropped);
     }
     dropped
+}
+
+/// Deliver a key event to the grab owner client, addressed to the
+/// grab window. When a passive (or explicit) keyboard grab is active,
+/// X11 delivers to the *grab owner* using the grab's event mask, not
+/// to whichever clients happen to have selected key events on the
+/// grab window. yserver previously delivered via window selection, so
+/// a grab owner that registered the grab via `XIPassiveGrabDevice`
+/// (without a matching `XISelectEvents` on the root) received nothing
+/// and the key was lost. Both core and XI2 forms are sent (the owner
+/// uses whichever protocol it grabbed with), mirroring the passive
+/// button-grab delivery in `pointer_fanout`.
+fn deliver_key_to_grab_owner(
+    state: &mut ServerState,
+    event: &HostKeyEvent,
+    owner: ClientId,
+    grab_window: ResourceId,
+) -> Vec<ClientId> {
+    let mut dropped = fanout_event_to_clients(state, &[owner], |buf, seq, order| {
+        x11::encode_key_event(buf, order, key_event_wire(event, seq, grab_window));
+    });
+    let xi2_dropped = fanout_event_to_clients(state, &[owner], |buf, seq, order| {
+        encode_key_xi2(buf, order, seq, event, grab_window);
+    });
+    merge_dropped(&mut dropped, xi2_dropped);
+    dropped
+}
+
+fn xi2_evtype_for(event: &HostKeyEvent) -> u16 {
+    if event.pressed {
+        XI2_KEYPRESS_EVTYPE
+    } else {
+        XI2_KEYRELEASE_EVTYPE
+    }
+}
+
+fn key_event_wire(
+    event: &HostKeyEvent,
+    sequence: x11::SequenceNumber,
+    target_window: ResourceId,
+) -> x11::KeyEvent {
+    x11::KeyEvent {
+        pressed: event.pressed,
+        keycode: event.keycode,
+        sequence,
+        time: event.time,
+        root: ROOT_WINDOW,
+        event: target_window,
+        root_x: event.root_x,
+        root_y: event.root_y,
+        event_x: event.event_x,
+        event_y: event.event_y,
+        state: event.state & WIRE_MODIFIER_MASK,
+    }
+}
+
+fn encode_key_xi2(
+    buf: &mut Vec<u8>,
+    order: x11::ClientByteOrder,
+    seq: x11::SequenceNumber,
+    event: &HostKeyEvent,
+    target_window: ResourceId,
+) {
+    x11::encode_xi2_device_event(
+        buf,
+        order,
+        seq,
+        XI2_MAJOR_OPCODE,
+        xi2_evtype_for(event),
+        XI2_MASTER_KEYBOARD_DEVICE_ID,
+        event.time,
+        ROOT_WINDOW,
+        target_window,
+        ResourceId(0), // child=None; key events target the window directly
+        event.root_x,
+        event.root_y,
+        event.event_x,
+        event.event_y,
+        event.state & WIRE_MODIFIER_MASK,
+        u32::from(event.keycode),
+        XI2_SLAVE_KEYBOARD_DEVICE_ID,
+    );
 }
 
 fn merge_dropped(into: &mut Vec<ClientId>, more: Vec<ClientId>) {
@@ -133,29 +211,56 @@ fn merge_dropped(into: &mut Vec<ClientId>, more: Vec<ClientId>) {
     }
 }
 
-/// Apply X11 keyboard routing rules to derive the target window for
-/// `event`. `None` means "drop" (no client has focus or the event would
-/// land on root).
-fn key_target_window(state: &mut ServerState, event: &HostKeyEvent) -> Option<ResourceId> {
-    // Active explicit/passive grab: deliver to grab_window. Release
-    // a passive-key grab on the matching key-release.
+/// Where a key event should go.
+enum KeyRoute {
+    /// No focus and no grab — drop the event.
+    Drop,
+    /// A passive key grab is active — deliver only to the grab owner.
+    /// `freeze` is set for a synchronous grab on the activating press,
+    /// signalling that the event must be held for possible replay.
+    PassiveGrabOwner {
+        owner: ClientId,
+        grab_window: ResourceId,
+        freeze: bool,
+    },
+    /// Normal delivery to a window's subscribers (focus window, or an
+    /// explicit-grab window).
+    Window(ResourceId),
+}
+
+/// Apply X11 keyboard routing rules. May activate a passive grab or
+/// auto-release one on the matching key release.
+fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
+    // Active grab in effect.
     if let Some(g) = state.active_keyboard_grab {
+        let passive = matches!(g.source, ActiveKeyboardGrabSource::PassiveKey { .. });
+        // Auto-release a passive-key grab on the matching key-release
+        // (the release still goes to the grab owner below).
         if !event.pressed
             && let ActiveKeyboardGrabSource::PassiveKey { keycode: kc } = g.source
             && kc == event.keycode
         {
             state.active_keyboard_grab = None;
+            state.frozen_keyboard_event = None;
         }
-        return Some(g.grab_window);
+        if passive {
+            return KeyRoute::PassiveGrabOwner {
+                owner: g.owner,
+                grab_window: g.grab_window,
+                freeze: false,
+            };
+        }
+        // Explicit grab (GrabKeyboard): keep existing window delivery.
+        return KeyRoute::Window(g.grab_window);
     }
 
     let focus = current_focus(state);
 
     // Press: try to match a passive key grab, activating it.
     if event.pressed
-        && let Some((owner, grab_window)) = state
+        && let Some((owner, grab_window, keyboard_mode)) = state
             .find_key_grab(focus, event.keycode, event.state)
-            .map(|g| (g.owner, g.grab_window))
+            .map(|g| (g.owner, g.grab_window, g.keyboard_mode))
     {
         state.active_keyboard_grab = Some(ActiveKeyboardGrab {
             owner,
@@ -164,14 +269,19 @@ fn key_target_window(state: &mut ServerState, event: &HostKeyEvent) -> Option<Re
                 keycode: event.keycode,
             },
         });
-        return Some(grab_window);
+        return KeyRoute::PassiveGrabOwner {
+            owner,
+            grab_window,
+            // keyboard_mode 0 == Synchronous → freeze for replay.
+            freeze: keyboard_mode == 0,
+        };
     }
 
     // Drop key events that would land on root with no grab.
     if focus == ROOT_WINDOW {
-        return None;
+        return KeyRoute::Drop;
     }
-    Some(focus)
+    KeyRoute::Window(focus)
 }
 
 /// Pick the current keyboard focus.
@@ -194,6 +304,15 @@ mod tests {
     use crate::server::{ActiveKeyboardGrab, ActiveKeyboardGrabSource, KeyGrab, ServerState};
     use yserver_protocol::x11::ClientId;
 
+    use crate::server::ClientState;
+    use std::{
+        collections::{HashMap, HashSet, VecDeque},
+        io::Read,
+        os::unix::net::UnixStream,
+        sync::{Arc, Mutex, atomic::AtomicU16},
+    };
+    use yserver_protocol::x11::ClientByteOrder;
+
     fn key_event(pressed: bool, keycode: u8) -> HostKeyEvent {
         HostKeyEvent {
             pressed,
@@ -205,6 +324,128 @@ mod tests {
             event_y: 20,
             state: 0,
         }
+    }
+
+    /// Install a client whose core+XI2 selection on `window` is
+    /// `core_mask` / `xi2_mask`. Returns the peer socket for reading
+    /// what the server delivered.
+    fn install_kf(
+        state: &mut ServerState,
+        id: u32,
+        window: ResourceId,
+        core_mask: u32,
+        xi2_mask: u32,
+    ) -> UnixStream {
+        let (server_side, peer) = UnixStream::pair().unwrap();
+        let client = ClientState {
+            writer: Arc::new(Mutex::new(server_side)),
+            byte_order: ClientByteOrder::LittleEndian,
+            last_sequence: Arc::new(AtomicU16::new(0)),
+            resource_id_base: 0,
+            resource_id_mask: 0,
+            event_masks: HashMap::from([(window, core_mask)]),
+            save_set: HashSet::new(),
+            big_requests_enabled: false,
+            xi2_masks: HashMap::from([((window, 3u16), xi2_mask)]),
+            outbound: VecDeque::new(),
+            watching_writable: false,
+            focused_window: ROOT_WINDOW,
+            reader_control: None,
+        };
+        state.clients.insert(id, client);
+        peer
+    }
+
+    fn received_bytes(peer: &mut UnixStream) -> usize {
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 512];
+        peer.read(&mut buf).unwrap_or(0)
+    }
+
+    /// A synchronous passive key grab routes the activating press to
+    /// the grab *owner* (even though the owner has no per-window key
+    /// selection, only the grab), and freezes the event for replay.
+    /// This is the dead-`p`-in-wezterm fix: previously the press was
+    /// delivered via window selection on the grab window, so a grab
+    /// owner that registered via XIPassiveGrabDevice received nothing.
+    #[test]
+    fn sync_passive_key_grab_delivers_to_owner_and_freezes() {
+        let mut state = ServerState::new();
+        // Grab owner selects NOTHING (mask 0) — only the grab matters.
+        let mut owner = install_kf(&mut state, 7, ROOT_WINDOW, 0, 0);
+        state.key_grabs.push(KeyGrab {
+            owner: ClientId(7),
+            grab_window: ROOT_WINDOW,
+            keycode: 33,
+            modifiers: 0,
+            owner_events: false,
+            pointer_mode: 1,
+            keyboard_mode: 0, // synchronous → freeze
+        });
+
+        let dropped = key_event_fanout_to_state(&mut state, key_event(true, 33));
+        assert!(dropped.is_empty());
+        assert!(
+            matches!(
+                state.active_keyboard_grab,
+                Some(ActiveKeyboardGrab {
+                    owner: ClientId(7),
+                    source: ActiveKeyboardGrabSource::PassiveKey { keycode: 33 },
+                    ..
+                })
+            ),
+            "passive grab must activate, owned by client 7"
+        );
+        assert!(
+            state.frozen_keyboard_event.is_some(),
+            "synchronous grab must freeze the press for replay"
+        );
+        assert!(
+            received_bytes(&mut owner) > 0,
+            "grab owner must receive the key press despite no window selection"
+        );
+    }
+
+    /// `replay_frozen_key_to_focus` re-delivers the held key to the
+    /// focused window's subscribers, bypassing the grab — the path
+    /// AllowEvents(ReplayKeyboard) drives so the focused app (wezterm)
+    /// finally sees the key the WM declined.
+    #[test]
+    fn replay_frozen_key_reaches_focus_window() {
+        const FOCUS_WIN: u32 = 0x0020_0007;
+        let mut state = ServerState::new();
+        // Focused client selects core KeyPress on its window.
+        let mut focus_peer = install_kf(&mut state, 9, ResourceId(FOCUS_WIN), KEY_PRESS_MASK, 0);
+        state.clients.get_mut(&9).unwrap().focused_window = ResourceId(FOCUS_WIN);
+
+        let _ = replay_frozen_key_to_focus(&mut state, key_event(true, 33));
+        assert!(
+            received_bytes(&mut focus_peer) > 0,
+            "replayed key must reach the focused window's subscriber"
+        );
+    }
+
+    /// Asynchronous passive key grab (keyboard_mode=1) does NOT freeze:
+    /// the owner gets the press but there's nothing to replay.
+    #[test]
+    fn async_passive_key_grab_does_not_freeze() {
+        let mut state = ServerState::new();
+        let _owner = install_kf(&mut state, 7, ROOT_WINDOW, 0, 0);
+        state.key_grabs.push(KeyGrab {
+            owner: ClientId(7),
+            grab_window: ROOT_WINDOW,
+            keycode: 33,
+            modifiers: 0,
+            owner_events: false,
+            pointer_mode: 1,
+            keyboard_mode: 1, // asynchronous → no freeze
+        });
+        let _ = key_event_fanout_to_state(&mut state, key_event(true, 33));
+        assert!(state.active_keyboard_grab.is_some());
+        assert!(
+            state.frozen_keyboard_event.is_none(),
+            "async grab must not freeze"
+        );
     }
 
     #[test]

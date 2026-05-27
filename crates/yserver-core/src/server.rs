@@ -225,6 +225,11 @@ pub struct ServerState {
     pub key_grabs: Vec<KeyGrab>,
     /// Active keyboard grab (explicit or passive-induced).
     pub active_keyboard_grab: Option<ActiveKeyboardGrab>,
+    /// Frozen key event held by a sync passive key grab, awaiting
+    /// `AllowEvents(ReplayKeyboard)` / `XIAllowEvents(ReplayDevice)`.
+    /// Mirrors `frozen_pointer_event`; its presence marks the active
+    /// keyboard grab as a synchronous freeze.
+    pub frozen_keyboard_event: Option<crate::host_x11::HostKeyEvent>,
     /// XFIXES regions owned by clients.
     pub xfixes_regions: HashMap<u32, XFixesRegion>,
     /// XFIXES selection event masks: (client, window, selection atom) -> mask.
@@ -394,6 +399,7 @@ impl ServerState {
             frozen_pointer_event: None,
             key_grabs: Vec::new(),
             active_keyboard_grab: None,
+            frozen_keyboard_event: None,
             xfixes_regions: HashMap::new(),
             xfixes_selection_masks: HashMap::new(),
             xfixes_cursor_masks: HashMap::new(),

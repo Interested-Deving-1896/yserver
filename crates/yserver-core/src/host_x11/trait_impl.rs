@@ -1054,7 +1054,10 @@ impl Backend for HostX11Backend {
         origin: Option<OriginContext>,
         minor: u8,
         body: &[u8],
+        _intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Option<Vec<u8>>> {
+        // Host-proxied path: the real X server supplies VirtualModNames,
+        // so the local interner is unused here.
         self.with_active_origin(origin, |this| HostX11Backend::xkb_proxy(this, minor, body))
     }
 

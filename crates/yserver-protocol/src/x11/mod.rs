@@ -2622,14 +2622,18 @@ pub fn write_get_pointer_mapping_reply(
     writer.write_all(&reply)
 }
 
+/// Degenerate `GetModifierMapping` reply used only when the backend
+/// cannot supply a real mapping. Emits `keycodes_per_modifier = 0`
+/// (an empty, wire-valid table) rather than inventing keycodes — the
+/// real mapping comes from `write_get_modifier_mapping_reply_with_keycodes`
+/// fed by the backend's keymap-derived table.
 pub fn write_get_modifier_mapping_reply(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
 ) -> io::Result<()> {
-    let mut reply = fixed_reply(byte_order, sequence, 1, 2);
+    let mut reply = fixed_reply(byte_order, sequence, 0, 0);
     reply.extend_from_slice(&[0; 24]);
-    reply.extend_from_slice(&[50, 66, 37, 64, 0, 0, 0, 133]);
     writer.write_all(&reply)
 }
 

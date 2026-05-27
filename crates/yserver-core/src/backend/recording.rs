@@ -1068,6 +1068,7 @@ impl Backend for RecordingBackend {
         _origin: Option<OriginContext>,
         _minor: u8,
         _body: &[u8],
+        _intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Option<Vec<u8>>> {
         Ok(None)
     }

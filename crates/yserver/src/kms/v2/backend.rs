@@ -10539,6 +10539,7 @@ impl Backend for KmsBackendV2 {
         _origin: Option<OriginContext>,
         minor: u8,
         _body: &[u8],
+        intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Option<Vec<u8>>> {
         // Mirror v1's xkb_proxy verbatim — pure protocol
         // bookkeeping using the shared `KmsCore.xkb_keymap`.
@@ -10552,7 +10553,10 @@ impl Backend for KmsBackendV2 {
             6 => Some(xkb_replies::reply_get_controls(&self.core.xkb_keymap.0)),
             8 => Some(xkb_replies::reply_get_map(&self.core.xkb_keymap.0)),
             10 => Some(xkb_replies::reply_get_compat_map()),
-            17 => Some(xkb_replies::reply_get_names(&self.core.xkb_keymap.0)),
+            17 => Some(xkb_replies::reply_get_names(
+                &self.core.xkb_keymap.0,
+                intern_atom,
+            )),
             21 => Some(xkb_replies::reply_per_client_flags(_body)),
             24 => Some(xkb_replies::reply_get_device_info()),
             4 | 12 | 13 | 15 | 19 | 22 | 23 | 101 => Some(xkb_replies::reply_minimal(minor)),
@@ -10795,21 +10799,13 @@ impl Backend for KmsBackendV2 {
         &mut self,
         _origin: Option<OriginContext>,
     ) -> io::Result<(u8, Vec<u8>)> {
-        // v1-parity conventional defaults. 8 rows × 4 keycodes:
-        // Shift(0x32,0x3E), Lock(0x42), Control(0x25,0x69),
-        // Mod1(0x40,0x6C), Mod2(0x4D), Mod3(0x73),
-        // Mod4(0x85,0x86), Mod5(empty).
-        let data: Vec<u8> = vec![
-            0x32, 0x3E, 0, 0, // Shift
-            0x42, 0, 0, 0, // Lock
-            0x25, 0x69, 0, 0, // Control
-            0x40, 0x6C, 0, 0, // Mod1
-            0x4D, 0, 0, 0, // Mod2
-            0x73, 0, 0, 0, // Mod3
-            0x85, 0x86, 0, 0, // Mod4
-            0, 0, 0, 0, // Mod5
-        ];
-        Ok((4, data))
+        // Derive the modifier→keycode table from the live keymap so
+        // it always agrees with the XKB GetMap modifier map (same
+        // `modifier_bit_for_keysym` source of truth). Avoids a
+        // hand-written table drifting from the actual keymap.
+        Ok(crate::kms::xkb::modifier_mapping_from_keymap(
+            &self.core.xkb_keymap.0,
+        ))
     }
 }
 

@@ -1440,11 +1440,16 @@ pub trait Backend: Send {
     // Other extensions
     // ──────────────────────────────────────────────────────────────
 
+    /// `intern_atom` interns an atom name into the server's atom table
+    /// and returns its id. Used to populate `VirtualModNames` in the
+    /// XKB GetNames reply (the core loop owns the atom table; the
+    /// backend builds the reply, so the interner is threaded through).
     fn xkb_proxy(
         &mut self,
         origin: Option<OriginContext>,
         minor: u8,
         body: &[u8],
+        intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Option<Vec<u8>>>;
 
     fn xfixes_change_cursor_by_name(

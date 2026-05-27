@@ -37,6 +37,7 @@ use crate::{
             emit_xi2_focus_event_to_state, fanout_event_to_clients, fanout_raw_event_to_clients,
             selection_owner_target_id, subscribers_by_id,
         },
+        key_fanout::replay_frozen_key_to_focus,
         pointer_fanout::pointer_event_fanout_to_state,
     },
     crossings::{CrossingKind as TreeCrossingKind, normal_mode_crossings},
@@ -7734,28 +7735,54 @@ fn handle_xi2_request(
             // AsyncDevice / ReplayDevice / paired-async modes all
             // release the grab on the requested device. The paired-
             // sync modes leave the grab in place. Touch modes are
-            // out of scope.
+            // out of scope. `deviceid` selects which device's grab the
+            // mode applies to (master pointer = 2, master keyboard = 3);
+            // the paired modes (3/5) also release the partner device.
             let releases_grab = matches!(mode, 0 | 2 | 3 | 5);
-            let replay_pointer = mode == 2;
-            let should_release_passive_pointer = releases_grab
+            let replay = mode == 2;
+            let targets_keyboard = deviceid == 3;
+            let targets_paired = matches!(mode, 3 | 5);
+
+            // Pointer grab release/replay (when the call targets the
+            // pointer device, or a paired mode releases both).
+            if (!targets_keyboard || targets_paired)
+                && releases_grab
                 && state
                     .pointer_grab
                     .is_some_and(|(owner, _)| owner == client_id)
-                && state.pointer_grab_is_passive;
-            let frozen = if should_release_passive_pointer {
-                state.frozen_pointer_event.take()
-            } else {
-                None
-            };
-            if should_release_passive_pointer {
+                && state.pointer_grab_is_passive
+            {
+                let frozen = state.frozen_pointer_event.take();
                 state.pointer_grab = None;
                 state.pointer_grab_is_passive = false;
+                if replay
+                    && let Some(event) = frozen
+                {
+                    let xid_map = backend.xid_map().clone();
+                    let _dropped =
+                        pointer_event_fanout_to_state(state, &xid_map, event, false, false);
+                }
             }
-            if replay_pointer
-                && let Some(event) = frozen
+
+            // Keyboard grab release/replay (when the call targets the
+            // keyboard device, or a paired mode releases both).
+            if (targets_keyboard || targets_paired)
+                && releases_grab
+                && state
+                    .active_keyboard_grab
+                    .is_some_and(|g| g.owner == client_id)
+                && matches!(
+                    state.active_keyboard_grab.map(|g| g.source),
+                    Some(crate::server::ActiveKeyboardGrabSource::PassiveKey { .. })
+                )
             {
-                let xid_map = backend.xid_map().clone();
-                let _dropped = pointer_event_fanout_to_state(state, &xid_map, event, false, false);
+                let frozen = state.frozen_keyboard_event.take();
+                state.active_keyboard_grab = None;
+                if replay
+                    && let Some(event) = frozen
+                {
+                    let _dropped = replay_frozen_key_to_focus(state, event);
+                }
             }
             return Ok(RequestOutcome::Handled);
         }
@@ -8032,7 +8059,17 @@ fn handle_xkb_request(
                 .insert((client_id.0, device_spec), selected);
         }
     }
-    let reply = backend.xkb_proxy(origin, minor, body).ok().flatten();
+    // Thread an atom interner so the backend can populate
+    // VirtualModNames in the GetNames reply (atoms live in the core
+    // loop's table; `backend` is a disjoint borrow from `state.atoms`).
+    let reply = {
+        let atoms = &mut state.atoms;
+        let mut intern = |name: &str| atoms.intern(name, false).0;
+        backend
+            .xkb_proxy(origin, minor, body, &mut intern)
+            .ok()
+            .flatten()
+    };
     if let Some(mut bytes) = reply {
         if bytes.len() >= 4 {
             bytes[2..4].copy_from_slice(&sequence.0.to_le_bytes());
@@ -10928,30 +10965,60 @@ fn handle_allow_events(
     sequence: SequenceNumber,
     header: RequestHeader,
 ) -> io::Result<RequestOutcome> {
+    // Core AllowEvents modes (X11 spec):
+    //   0 AsyncPointer  1 SyncPointer   2 ReplayPointer
+    //   3 AsyncKeyboard 4 SyncKeyboard  5 ReplayKeyboard
+    //   6 AsyncBoth     7 SyncBoth
     let mode = header.data;
     debug!(
-        "client {} #{} AllowEvents mode={} frozen_pending={}",
+        "client {} #{} AllowEvents mode={} frozen_pointer={} frozen_keyboard={}",
         client_id.0,
         sequence.0,
         mode,
-        state.frozen_pointer_event.is_some()
+        state.frozen_pointer_event.is_some(),
+        state.frozen_keyboard_event.is_some(),
     );
-    if !(mode == 0 || mode == 1 || mode == 2) {
-        return Ok(RequestOutcome::Handled);
-    }
-    let frozen = state.frozen_pointer_event.take();
-    if mode == 0 || mode == 1 {
-        if state.pointer_grab_is_passive {
-            state.pointer_grab = None;
-            state.pointer_grab_is_passive = false;
-        }
-    } else if mode == 2 && state.pointer_grab_is_passive {
+
+    // Pointer side: AsyncPointer / SyncPointer / ReplayPointer, plus
+    // the *Both modes which thaw the pointer too.
+    let pointer_release = matches!(mode, 0 | 1 | 2 | 6 | 7);
+    let pointer_replay = mode == 2;
+    // Keyboard side: AsyncKeyboard / SyncKeyboard / ReplayKeyboard,
+    // plus the *Both modes.
+    let keyboard_release = matches!(mode, 3..=7);
+    let keyboard_replay = mode == 5;
+
+    let frozen_pointer = if pointer_release {
+        state.frozen_pointer_event.take()
+    } else {
+        None
+    };
+    if pointer_release && state.pointer_grab_is_passive {
         state.pointer_grab = None;
         state.pointer_grab_is_passive = false;
     }
-    if mode == 2
-        && let Some(event) = frozen
+
+    // ReplayKeyboard / *Both: release the passive keyboard grab this
+    // client holds and (for replay) re-deliver the frozen key to the
+    // focus window, bypassing the grab. Mirrors Xorg ComputeFreezes.
+    let frozen_keyboard = if keyboard_release {
+        state.frozen_keyboard_event.take()
+    } else {
+        None
+    };
+    if keyboard_release
+        && state
+            .active_keyboard_grab
+            .is_some_and(|g| g.owner == client_id)
+        && matches!(
+            state.active_keyboard_grab.map(|g| g.source),
+            Some(crate::server::ActiveKeyboardGrabSource::PassiveKey { .. })
+        )
     {
+        state.active_keyboard_grab = None;
+    }
+
+    if pointer_replay && let Some(event) = frozen_pointer {
         // Snapshot the xid_map so we can release the immutable
         // borrow on `backend` before pointer_event_fanout_to_state
         // mutates `state`. The map is small (a few hundred entries)
@@ -10959,6 +11026,9 @@ fn handle_allow_events(
         // compared to the wire writes the fanout produces.
         let xid_map = backend.xid_map().clone();
         let _dropped = pointer_event_fanout_to_state(state, &xid_map, event, false, true);
+    }
+    if keyboard_replay && let Some(event) = frozen_keyboard {
+        let _dropped = replay_frozen_key_to_focus(state, event);
     }
     Ok(RequestOutcome::Handled)
 }
@@ -17704,6 +17774,86 @@ mod tests {
         assert!(
             matches!(target_read, Ok(n) if n >= 32 && buf[0] == 35),
             "ReplayDevice must redeliver the XI2 press to the natural target; got {target_read:?}",
+        );
+    }
+
+    /// Core `AllowEvents(ReplayKeyboard)` (mode 5 — what muffin/mutter
+    /// calls for a declined key) releases the passive keyboard grab and
+    /// replays the frozen key to the focused window. This is the
+    /// dead-`p`-in-wezterm fix end-to-end: a sync passive key grab held
+    /// `p`, the WM declined it, and ReplayKeyboard hands it to the
+    /// focused client.
+    #[test]
+    fn core_replay_keyboard_releases_grab_and_replays_to_focus() {
+        use crate::{
+            host_x11::HostKeyEvent,
+            server::{ActiveKeyboardGrab, ActiveKeyboardGrabSource},
+        };
+
+        const GRAB_CLIENT_ID: u32 = 1;
+        const FOCUS_CLIENT_ID: u32 = 2;
+        const FOCUS_WIN: u32 = 0x0020_0061;
+        const KEY_PRESS_MASK: u32 = 0x0000_0001;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let _grab_peer = install_client(&mut state, GRAB_CLIENT_ID);
+        let mut focus_peer = install_client(&mut state, FOCUS_CLIENT_ID);
+        focus_peer.set_nonblocking(true).unwrap();
+
+        // Focused client selects core KeyPress on its window.
+        {
+            let c = state.clients.get_mut(&FOCUS_CLIENT_ID).unwrap();
+            c.focused_window = ResourceId(FOCUS_WIN);
+            c.event_masks.insert(ResourceId(FOCUS_WIN), KEY_PRESS_MASK);
+        }
+
+        // A sync passive key grab held by the WM is active, with a
+        // frozen press waiting.
+        state.active_keyboard_grab = Some(ActiveKeyboardGrab {
+            owner: ClientId(GRAB_CLIENT_ID),
+            grab_window: ROOT_WINDOW,
+            source: ActiveKeyboardGrabSource::PassiveKey { keycode: 33 },
+        });
+        state.frozen_keyboard_event = Some(HostKeyEvent {
+            pressed: true,
+            keycode: 33,
+            time: 0x1234,
+            root_x: 10,
+            root_y: 20,
+            event_x: 10,
+            event_y: 20,
+            state: 0,
+        });
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 35,
+            data: 5, // ReplayKeyboard
+            length_units: 2,
+        };
+        handle_allow_events(
+            &mut state,
+            &mut backend,
+            ClientId(GRAB_CLIENT_ID),
+            SequenceNumber(1),
+            header,
+        )
+        .expect("allow events replay keyboard");
+
+        assert!(
+            state.active_keyboard_grab.is_none(),
+            "ReplayKeyboard must release the passive keyboard grab"
+        );
+        assert!(
+            state.frozen_keyboard_event.is_none(),
+            "the frozen key must be consumed by the replay"
+        );
+        let mut buf = [0u8; 64];
+        let n = focus_peer.read(&mut buf).unwrap_or(0);
+        assert!(
+            n >= 32 && buf[0] == 2,
+            "replayed KeyPress (event type 2) must reach the focused client; got n={n} type={}",
+            buf[0]
         );
     }
 

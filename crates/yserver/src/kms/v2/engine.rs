@@ -114,7 +114,8 @@ impl From<vk::Result> for RenderError {
 ///   → `TRANSFER_SRC_OPTIMAL` once on first appearance, records
 ///   `vkCmdCopyImage`, accumulates dst damage.
 /// - Subsequent appends record only `vkCmdCopyImage` (and a new
-///   src transition if the src hasn't appeared in this batch
+///   src transition if the src hasn't appeared in this batch).
+///
 /// Stage 5 Task 3 (render-composite generalization): conservative
 /// aggregation key. Two consecutive `render_composite` calls
 /// coalesce into one CB iff every field of their keys is equal.

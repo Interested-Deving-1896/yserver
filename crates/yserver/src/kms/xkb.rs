@@ -47,6 +47,154 @@ fn modifier_bit_for_keysym(sym: u32) -> u8 {
     }
 }
 
+/// Map a level-0 keysym to the XKB *virtual* modifier name it
+/// realises, or `None` for keys that are pure real modifiers
+/// (Shift/Lock/Control) or non-modifiers. These names are the XKB
+/// convention GDK/mutter match against (`gdkkeys-x11.c`'s
+/// `update_keymaps` looks up "Super"/"Hyper"/"Meta"/"Alt"/…), so the
+/// real-modifier *binding* for each is derived from the keymap (via
+/// [`modifier_bit_for_keysym`]) while only the name↔keysym pairing is
+/// convention.
+fn vmod_name_for_keysym(sym: u32) -> Option<&'static str> {
+    match sym {
+        0xFFE9 | 0xFFEA => Some("Alt"),   // Alt_L, Alt_R
+        0xFFE7 | 0xFFE8 => Some("Meta"),  // Meta_L, Meta_R
+        0xFFEB | 0xFFEC => Some("Super"), // Super_L, Super_R
+        0xFFED | 0xFFEE => Some("Hyper"), // Hyper_L, Hyper_R
+        0xFF7F => Some("NumLock"),        // Num_Lock
+        0xFE03 => Some("LevelThree"),     // ISO_Level3_Shift
+        0xFF14 => Some("ScrollLock"),     // Scroll_Lock
+        _ => None,
+    }
+}
+
+/// XKB caps virtual modifiers at 16 (`XkbNumVirtualMods`).
+const XKB_NUM_VIRTUAL_MODS: usize = 16;
+
+/// Virtual-modifier description derived from the live keymap.
+///
+/// Mutter/GDK devirtualize keybinding modifiers (`<Super>`, `<Alt>`)
+/// by reading the XKB virtual-modifier section: it matches a vmod by
+/// *name* (`VirtualModNames`, GetNames) then resolves it to a real
+/// modifier mask via `XkbVirtualModsToReal` over the `vmods[]`
+/// bindings (GetMap). With both empty (yserver's prior behaviour),
+/// `<Super>` resolves to 0 and `<Super>p` collapses to bare `p`.
+pub(super) struct VirtualModData {
+    /// Bitmask (16-bit) of which vmod indices are present.
+    pub present_mask: u16,
+    /// `bindings[i]` = real-modifier mask bound to vmod index `i`.
+    pub bindings: [u8; XKB_NUM_VIRTUAL_MODS],
+    /// `(vmod_index, name)` for each present vmod, in index order.
+    pub names: Vec<(u8, &'static str)>,
+    /// `VirtualModMap`: `(keycode, vmod_bits)` pairs.
+    pub vmodmap: Vec<(u8, u16)>,
+}
+
+/// Build the virtual-modifier section from the live keymap. Vmod
+/// indices are assigned in first-seen order over the keycode range;
+/// the same assignment feeds GetMap (`vmods[]` + `VirtualModMap`) and
+/// GetNames (`VirtualModNames`), so a client matching by name reads a
+/// consistent real-modifier binding.
+pub(super) fn virtual_mods_from_keymap(keymap: &Keymap) -> VirtualModData {
+    let raw_min = keymap.min_keycode().raw();
+    let raw_max = keymap.max_keycode().raw();
+    let min_kc: u8 = u8::try_from(raw_min).unwrap_or(8).max(8);
+    let max_kc: u8 = u8::try_from(raw_max.min(255)).unwrap_or(255).max(min_kc);
+
+    let mut present_mask: u16 = 0;
+    let mut bindings = [0u8; XKB_NUM_VIRTUAL_MODS];
+    let mut names: Vec<(u8, &'static str)> = Vec::new();
+    let mut vmodmap: Vec<(u8, u16)> = Vec::new();
+    // Name → assigned vmod index, so repeated keys (L/R) share an index.
+    let mut index_for_name: Vec<(&'static str, u8)> = Vec::new();
+
+    for kc_raw in min_kc..=max_kc {
+        let kc = Keycode::new(u32::from(kc_raw));
+        if keymap.num_layouts_for_key(kc) == 0 {
+            continue;
+        }
+        let level_syms = keymap.key_get_syms_by_level(kc, 0, 0);
+        let Some(sym) = level_syms.first().map(|s| s.raw()) else {
+            continue;
+        };
+        let Some(name) = vmod_name_for_keysym(sym) else {
+            continue;
+        };
+        // Real-modifier binding from the same source as the modmap.
+        let real_mod = modifier_bit_for_keysym(sym);
+
+        let idx = if let Some((_, idx)) = index_for_name.iter().find(|(n, _)| *n == name) {
+            *idx
+        } else {
+            let idx = u8::try_from(index_for_name.len()).unwrap_or(0);
+            if usize::from(idx) >= XKB_NUM_VIRTUAL_MODS {
+                continue; // out of vmod slots; ignore extras
+            }
+            index_for_name.push((name, idx));
+            names.push((idx, name));
+            idx
+        };
+        present_mask |= 1 << idx;
+        bindings[usize::from(idx)] |= real_mod;
+        vmodmap.push((kc_raw, 1 << idx));
+    }
+
+    VirtualModData {
+        present_mask,
+        bindings,
+        names,
+        vmodmap,
+    }
+}
+
+/// Build the core `GetModifierMapping` table from the live keymap.
+///
+/// Returns `(keycodes_per_modifier, data)` where `data` is
+/// `8 * keycodes_per_modifier` bytes: the keycodes assigned to each
+/// of Shift, Lock, Control, Mod1, Mod2, Mod3, Mod4, Mod5 in that
+/// order, zero-padded per row. Derived by walking the keymap's
+/// level-0 keysyms through [`modifier_bit_for_keysym`] — the same
+/// source of truth as the XKB `GetMap` modifier-map — so the core
+/// and XKB views of "which key is Super/Alt/…" never disagree.
+pub(super) fn modifier_mapping_from_keymap(keymap: &Keymap) -> (u8, Vec<u8>) {
+    // One row per standard X11 modifier bit, indexed by bit position
+    // (Shift=0, Lock=1, Control=2, Mod1=3, …, Mod5=7).
+    let mut rows: [Vec<u8>; 8] = Default::default();
+
+    let raw_min = keymap.min_keycode().raw();
+    let raw_max = keymap.max_keycode().raw();
+    let min_kc: u8 = u8::try_from(raw_min).unwrap_or(8).max(8);
+    let max_kc: u8 = u8::try_from(raw_max.min(255)).unwrap_or(255).max(min_kc);
+
+    for kc_raw in min_kc..=max_kc {
+        let kc = Keycode::new(u32::from(kc_raw));
+        if keymap.num_layouts_for_key(kc) == 0 {
+            continue;
+        }
+        let level_syms = keymap.key_get_syms_by_level(kc, 0, 0);
+        let Some(sym) = level_syms.first().map(|s| s.raw()) else {
+            continue;
+        };
+        let bit = modifier_bit_for_keysym(sym);
+        if bit == 0 {
+            continue;
+        }
+        // `bit` is a single power-of-two modifier flag; its
+        // trailing-zero count is the row index.
+        let row = bit.trailing_zeros() as usize;
+        rows[row].push(kc_raw);
+    }
+
+    let kpm = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    let mut data = Vec::with_capacity(8 * kpm);
+    for row in &rows {
+        for i in 0..kpm {
+            data.push(row.get(i).copied().unwrap_or(0));
+        }
+    }
+    (u8::try_from(kpm).unwrap_or(u8::MAX), data)
+}
+
 /// X11 modifier-map bitmask that picks `Shift` — used by the
 /// `TWO_LEVEL` `KeyType`'s map entry to say "Shift selects level 1".
 const SHIFT_MASK: u8 = 0x01;
@@ -199,6 +347,9 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
 
     let total_modmap = u8::try_from(modmap.len()).unwrap_or(u8::MAX);
 
+    // Virtual-modifier section, derived from the keymap.
+    let vmod = virtual_mods_from_keymap(keymap);
+
     // -- Section sizes --------------------------------------------
     // KeyTypes: 4 types. X11 reserves the first four indices
     // (ONE_LEVEL/TWO_LEVEL/ALPHABETIC/KEYPAD) and Xlib's
@@ -231,11 +382,22 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
     let modmap_pad = (4 - modmap_raw_bytes % 4) % 4;
     let modmap_bytes: usize = modmap_raw_bytes + modmap_pad;
 
-    // Other sections empty: VirtualMods (popcount(virtualMods)=0
-    // CARD8 + pad), ExplicitComponents (0 + pad), VirtualModMap
-    // (0 entries, no pad). All contribute zero bytes here.
+    // VirtualMods: one CARD8 binding per present vmod, padded to a
+    // 4-byte boundary (Xorg `XkbPaddedSize`).
+    let vmod_count: usize = vmod.present_mask.count_ones() as usize;
+    let vmod_pad = (4 - vmod_count % 4) % 4;
+    let vmod_bytes: usize = vmod_count + vmod_pad;
+    // VirtualModMap: `xkbVModMapWireDesc` { key(1) pad(1) vmods(2) } per
+    // entry — already 4-byte sized, no extra pad.
+    let vmodmap_bytes: usize = vmod.vmodmap.len() * 4;
+    // ExplicitComponents stays empty (0 bytes).
 
-    let extra = key_types_bytes + key_syms_bytes + key_actions_bytes + modmap_bytes;
+    let extra = key_types_bytes
+        + key_syms_bytes
+        + key_actions_bytes
+        + vmod_bytes
+        + modmap_bytes
+        + vmodmap_bytes;
     let total = 40 + extra;
     let length_words = u32::try_from((total - 32) / 4).unwrap_or(u32::MAX);
 
@@ -267,8 +429,10 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
     //                              actual list length, set next)
     r[33] = total_modmap;
     r[34] = min_kc; // firstVModMapKey
-    // [35..37] nVModMapKeys=0, totalVModMapKeys=0, [37] pad
-    // [38..40] virtualMods = 0
+    r[35] = n_keys; // nVModMapKeys — covers full range
+    r[36] = u8::try_from(vmod.vmodmap.len()).unwrap_or(u8::MAX); // totalVModMapKeys
+    // [37] pad
+    r[38..40].copy_from_slice(&vmod.present_mask.to_le_bytes()); // virtualMods
 
     // -- Section bodies ------------------------------------------
     let mut off = 40;
@@ -327,8 +491,16 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
     // + pad to 4-byte boundary + 0 Action structs.
     off += nk + actions_count_pad;
 
-    // VirtualMods empty (virtualMods=0 ⇒ popcount=0 ⇒ 0 bytes,
-    // no pad needed when already aligned).
+    // VirtualMods: one CARD8 real-mod binding per present vmod, in
+    // ascending bit order, then pad to a 4-byte boundary. Matches
+    // Xorg `XkbSendMap` (xkb.c:1430-1438).
+    for i in 0..XKB_NUM_VIRTUAL_MODS {
+        if vmod.present_mask & (1 << i) != 0 {
+            r[off] = vmod.bindings[i];
+            off += 1;
+        }
+    }
+    off += vmod_pad;
     // ExplicitComponents empty (0 entries, 0 pad).
 
     // ModifierMap: 2 bytes per entry, then pad.
@@ -339,7 +511,15 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
     }
     off += modmap_pad;
 
-    // VirtualModMap empty.
+    // VirtualModMap: `xkbVModMapWireDesc` { key, pad, vmods(CARD16) }
+    // per entry. Combined with the ModifierMap, lets clients resolve
+    // each vmod to its real modifier (`XkbVirtualModsToReal`).
+    for (key, vmods) in &vmod.vmodmap {
+        r[off] = *key;
+        // r[off + 1] pad = 0
+        r[off + 2..off + 4].copy_from_slice(&vmods.to_le_bytes());
+        off += 4;
+    }
 
     debug_assert_eq!(off, total, "GetMap reply body length matches total");
     r
@@ -363,12 +543,21 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
 /// `nLevelsPerType` list mirrors what `reply_get_map` published:
 /// `[1, 2]` for `ONE_LEVEL` and `TWO_LEVEL`. `sumof(nLevelsPerType)`
 /// = 3 atoms follow.
-pub(super) fn reply_get_names(keymap: &Keymap) -> Vec<u8> {
+pub(super) fn reply_get_names(
+    keymap: &Keymap,
+    intern_atom: &mut dyn FnMut(&str) -> u32,
+) -> Vec<u8> {
     let raw_min = keymap.min_keycode().raw();
     let raw_max = keymap.max_keycode().raw();
     let min_kc: u8 = u8::try_from(raw_min).unwrap_or(8).max(8);
     let max_kc: u8 = u8::try_from(raw_max.min(255)).unwrap_or(255).max(min_kc);
     let n_keys: u8 = max_kc - min_kc + 1;
+
+    // Virtual modifiers (same derivation as GetMap). VirtualModNames
+    // must carry one atom per present vmod, in ascending bit order, so
+    // a client can match "Super"/"Alt"/… to the binding GetMap sent.
+    let vmod = virtual_mods_from_keymap(keymap);
+    let vmod_count: usize = vmod.present_mask.count_ones() as usize;
 
     // -- which mask -----------------------------------------------
     // KeyTypeNames|KTLevelNames|VirtualModNames|KeyNames is what
@@ -413,8 +602,13 @@ pub(super) fn reply_get_names(keymap: &Keymap) -> Vec<u8> {
     let kt_level_names_bytes = kt_levels_count + kt_levels_count_pad + kt_level_names_count * 4;
     let nk = usize::from(n_keys);
     let key_names_bytes = nk * 4;
-    let extra =
-        unconditional_names_bytes + key_type_names_bytes + kt_level_names_bytes + key_names_bytes;
+    // VirtualModNames: one ATOM per present vmod (4 bytes each).
+    let vmod_names_bytes = vmod_count * 4;
+    let extra = unconditional_names_bytes
+        + key_type_names_bytes
+        + kt_level_names_bytes
+        + vmod_names_bytes
+        + key_names_bytes;
     let total = 32 + extra;
 
     let mut r = vec![0u8; total];
@@ -427,7 +621,7 @@ pub(super) fn reply_get_names(keymap: &Keymap) -> Vec<u8> {
     r[13] = max_kc;
     r[14] = 4; // nTypes — must match GetMap's nTypes
     // [15] groupNames = 0
-    // [16..18] virtualMods = 0
+    r[16..18].copy_from_slice(&vmod.present_mask.to_le_bytes()); // virtualMods
     r[18] = min_kc; // firstKey
     r[19] = n_keys; // nKeys — full range
     // [20..24] indicators = 0
@@ -454,7 +648,13 @@ pub(super) fn reply_get_names(keymap: &Keymap) -> Vec<u8> {
     r[off + 2] = 1; // ALPHABETIC stub
     r[off + 3] = 1; // KEYPAD stub
     off += kt_levels_count + kt_levels_count_pad + kt_level_names_count * 4;
-    // VirtualModNames is empty (popcount(virtualMods=0)=0).
+    // VirtualModNames: one ATOM per present vmod, ascending bit order.
+    // `vmod.names` is already (index, name) in ascending index order.
+    for (_idx, name) in &vmod.names {
+        let atom = intern_atom(name);
+        r[off..off + 4].copy_from_slice(&atom.to_le_bytes());
+        off += 4;
+    }
     // KeyNames: n_keys × 4 zero bytes (anonymous names).
     off += key_names_bytes;
     debug_assert_eq!(off, total, "GetNames reply body length matches total");
@@ -601,6 +801,36 @@ mod tests {
     }
 
     #[test]
+    fn modifier_mapping_derived_from_keymap_places_super_on_mod4() {
+        // Ground-truth against evdev/pc105/us: Super_L lives on Mod4,
+        // not Mod5; Alt on Mod1; Control_L on Control. The bug this
+        // guards against is a hand-written table putting Super on the
+        // wrong modifier (or omitting it), which makes WM clients
+        // resolve Super-shortcuts to a 0 modifier and grab plain keys.
+        let km = test_keymap();
+        let (kpm, data) = modifier_mapping_from_keymap(&km);
+        assert!(kpm >= 1, "at least one keycode per modifier");
+        let kpm = usize::from(kpm);
+        let row = |idx: usize| &data[idx * kpm..(idx + 1) * kpm];
+        let shift = row(0);
+        let control = row(2);
+        let mod1 = row(3);
+        let mod4 = row(6);
+        let mod5 = row(7);
+        assert!(shift.contains(&50), "Shift_L (50) on Shift row");
+        assert!(control.contains(&37), "Control_L (37) on Control row");
+        assert!(mod1.contains(&64), "Alt_L (64) on Mod1 row");
+        assert!(
+            mod4.contains(&133),
+            "Super_L (133) must be on Mod4, got mod4={mod4:?} mod5={mod5:?}"
+        );
+        assert!(
+            !mod5.contains(&133),
+            "Super_L must NOT be on Mod5 (the old hardcoded-fallback bug)"
+        );
+    }
+
+    #[test]
     fn get_controls_field_offsets_match_xkbproto() {
         // Field offsets ground-truthed against
         // /usr/include/X11/extensions/XKBproto.h's
@@ -744,9 +974,68 @@ mod tests {
     }
 
     #[test]
+    fn virtual_mods_bind_super_to_mod4_alt_to_mod1() {
+        // Ground-truth against evdev/pc105/us: the "Super" virtual
+        // modifier must bind to Mod4 (0x40) and "Alt" to Mod1 (0x08),
+        // with Super_L (keycode 133) carrying the Super vmod bit in the
+        // VirtualModMap. This is the dead-`p` fix: an empty vmod section
+        // made mutter resolve <Super> to 0 and grab bare keys.
+        let km = test_keymap();
+        let vmod = virtual_mods_from_keymap(&km);
+        assert!(vmod.present_mask != 0, "at least one vmod present");
+
+        let super_idx = vmod
+            .names
+            .iter()
+            .find(|(_, n)| *n == "Super")
+            .map(|(i, _)| *i)
+            .expect("Super vmod present");
+        assert_eq!(
+            vmod.bindings[usize::from(super_idx)],
+            0x40,
+            "Super must bind to Mod4"
+        );
+
+        if let Some((alt_idx, _)) = vmod.names.iter().find(|(_, n)| *n == "Alt") {
+            assert_eq!(
+                vmod.bindings[usize::from(*alt_idx)],
+                0x08,
+                "Alt must bind to Mod1"
+            );
+        }
+
+        // Super_L (keycode 133) maps to the Super vmod bit.
+        let super_bit = 1u16 << super_idx;
+        assert!(
+            vmod.vmodmap
+                .iter()
+                .any(|(kc, bits)| *kc == 133 && bits & super_bit != 0),
+            "Super_L (133) must carry the Super vmod bit; vmodmap={:?}",
+            vmod.vmodmap
+        );
+    }
+
+    #[test]
+    fn get_names_emits_super_vmod_name_atom() {
+        // VirtualModNames must carry a non-zero atom for each present
+        // vmod so a client can match "Super" by name. Verify the
+        // interner is invoked with "Super".
+        let km = test_keymap();
+        let mut seen: Vec<String> = Vec::new();
+        let _ = reply_get_names(&km, &mut |name| {
+            seen.push(name.to_owned());
+            0x77
+        });
+        assert!(
+            seen.iter().any(|n| n == "Super"),
+            "GetNames must intern the Super vmod name; interned={seen:?}"
+        );
+    }
+
+    #[test]
     fn get_names_advertises_required_bits_with_real_data() {
         let km = test_keymap();
-        let r = reply_get_names(&km);
+        let r = reply_get_names(&km, &mut |_| 0xFFu32);
         let which = u32::from_le_bytes([r[8], r[9], r[10], r[11]]);
         // Bits 6 (KeyTypeNames=0x40) | 7 (KTLevelNames=0x80) |
         // 9 (VirtualModNames=0x200) | 11 (KeyNames=0x800) = 0xAC0
@@ -782,7 +1071,7 @@ mod tests {
         // so xcb writes our zero atoms and xkbcommon skips the
         // GetAtomName calls (atom == 0 short-circuits).
         let km = test_keymap();
-        let r = reply_get_names(&km);
+        let r = reply_get_names(&km, &mut |_| 0xFFu32);
         let which = u32::from_le_bytes([r[8], r[9], r[10], r[11]]);
         let unconditionally_read = 0x0000_0035_u32;
         assert_eq!(
