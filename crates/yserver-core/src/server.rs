@@ -283,6 +283,11 @@ pub struct ServerState {
     pub composite_redirects: HashMap<(ResourceId, bool), RedirectRecord>,
     pub present_event_selections: HashMap<u32, PresentEventSelection>,
     pub present_msc: HashMap<ResourceId, u64>,
+    /// Diagnostic side-table: client_id → first WM_CLASS string the
+    /// client set on any of its windows. Used by perf logs to attribute
+    /// hot-path activity (e.g. SHM PutImage bursts) to a recognisable
+    /// process name. Updated in the WM_CLASS property handler.
+    pub client_wm_class: HashMap<u32, String>,
     /// MIT-SHM segments — keyed by client-supplied `shmseg` ID.
     pub mit_shm_segments: HashMap<u32, MitShmSegment>,
     /// GLX context registry. Indirect-rendering clients allocate one
@@ -442,6 +447,7 @@ impl ServerState {
             composite_redirects: HashMap::new(),
             present_event_selections: HashMap::new(),
             present_msc: HashMap::new(),
+            client_wm_class: HashMap::new(),
             mit_shm_segments: HashMap::new(),
             glx_contexts: HashMap::new(),
             glx_next_context_tag: 1,

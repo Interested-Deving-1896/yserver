@@ -4453,11 +4453,24 @@ fn handle_mit_shm_put_image(
     // PutImage steady-state is sub-100µs per call so threshold-
     // gating keeps the log quiet.
     if total >= std::time::Duration::from_millis(5) {
+        // CALLING client (the one issuing PutImage) is `client_id` —
+        // that's what we want to attribute the hot-path activity to.
+        // The drawable's OWNER (high bits of `req.drawable`) is a
+        // separate, less-actionable identity — typically a pixmap
+        // whose creator may have disconnected with the resource kept
+        // alive via X11 RetainTemporary / Permanent / SaveSet. So
+        // log the caller's WM_CLASS as the primary attribution and
+        // include the drawable XID for cross-reference.
+        let caller_class = state
+            .client_wm_class
+            .get(&client_id.0)
+            .map(String::as_str)
+            .unwrap_or("<unknown>");
         log::info!(
             "MIT-SHM PutImage perf: total={total_us}us \
              [extract={ext_us}us clear_clip+={cc_us}us put_image+={pi_us}us] \
              {w}x{h} depth={depth} bytes={bytes} borrowed={borrowed} \
-             drawable=0x{drawable:x}",
+             drawable=0x{drawable:x} caller=client{caller_id}/{caller_class:?}",
             total_us = total.as_micros(),
             ext_us = t_after_extract.as_micros(),
             cc_us = t_after_clear_clip
@@ -4472,6 +4485,7 @@ fn handle_mit_shm_put_image(
             bytes = snapshot_bytes,
             borrowed = snapshot_borrowed,
             drawable = req.drawable,
+            caller_id = client_id.0,
         );
     }
     Ok(RequestOutcome::Handled)
@@ -13814,12 +13828,18 @@ fn handle_change_property(
     if let Some(prop_name) = state.atoms.name(req.property) {
         if prop_name == "WM_CLASS" && req.format == 8 {
             let s = String::from_utf8_lossy(&req.data).replace('\0', " | ");
+            let trimmed = s.trim_end_matches(" | ").to_string();
             log::info!(
                 "client {} WM_CLASS on 0x{:x}: {}",
                 client_id.0,
                 req.window.0,
-                s.trim_end_matches(" | "),
+                trimmed,
             );
+            // Mirror into the side-table so the MIT-SHM PutImage perf
+            // log (and any future client-attributed diagnostics) can
+            // resolve drawable owner → recognisable process name
+            // without re-grepping the log.
+            state.client_wm_class.entry(client_id.0).or_insert(trimmed);
         } else if prop_name == "_NET_WM_PID" && req.format == 32 && req.data.len() >= 4 {
             let pid = u32::from_le_bytes([req.data[0], req.data[1], req.data[2], req.data[3]]);
             log::info!(
