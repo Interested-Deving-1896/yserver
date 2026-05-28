@@ -79,7 +79,7 @@ impl LibinputThreadState {
     ///
     /// `time_ms` lets tests pin the timestamp; production callers pass
     /// the wall clock.
-    fn map(&mut self, ev: InputEvent, time_ms: u32) -> HostInputEvent {
+    pub(crate) fn map(&mut self, ev: InputEvent, time_ms: u32) -> HostInputEvent {
         match ev {
             InputEvent::KeyPress { keycode } => HostInputEvent::Key(HostKeyEvent {
                 pressed: true,
@@ -148,7 +148,7 @@ impl LibinputThreadState {
     /// `dy_v120 < 0` → scroll-up (button 4). Horizontal axis maps to
     /// button 6 (left) / 7 (right). Mixed-axis events emit Y clicks
     /// first then X clicks within a single call.
-    fn drain_scroll(
+    pub(crate) fn drain_scroll(
         &mut self,
         dx_v120: i32,
         dy_v120: i32,

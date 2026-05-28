@@ -293,32 +293,28 @@ pub struct KmsBackendV2 {
     /// without requiring a separate event queue.
     last_drained_fb_opens: u64,
 
-    // ── VT switching (Task 8 — libseat mode). `Direct`/`None`/`-1` in
+    // ── VT switching (libseat mode). `Direct`/`None`/`-1` in
     //    Direct mode; populated during `open_libseat` construction.
     //
     //    `seat_fd` and `core_libinput_fd` are STABLE for the process
     //    lifetime (the DRM fd is opened once, Deviation #5 of the plan),
     //    so caching them once and never re-registering with the poller is
     //    correct.
-    //
-    //    Tasks 9/12 (`on_libinput_ready` / `on_seat_ready`) will consume
-    //    the fields below; they have no callers yet, so we suppress
-    //    dead_code until those tasks land.
     /// Seat mode (owns libseat in Libseat mode; marker in Direct mode).
     seat: crate::seat::Seat,
     /// State machine for the suspend/resume cycle.
+    /// Consumed by Tasks 11/12 (`on_seat_ready` suspend/resume).
     #[allow(dead_code)]
     seat_state: crate::seat::state::SeatState,
     /// Coalesced counter-events for the state machine.
+    /// Consumed by Tasks 11/12 (`on_seat_ready` suspend/resume).
     #[allow(dead_code)]
     seat_pending: crate::seat::state::SeatPending,
     /// On-core libinput context (libseat mode only). `None` in Direct mode
     /// (the dedicated input thread owns libinput there).
-    #[allow(dead_code)]
     core_libinput: Option<crate::input::Context>,
     /// Cursor/scroll accumulator for on-core libinput event mapping
     /// (libseat mode). `None` in Direct mode.
-    #[allow(dead_code)]
     core_input_state: Option<crate::input_thread::LibinputThreadState>,
     /// Cached libseat connection fd for `poll_fds` (`&self`). `-1` in
     /// Direct mode (never registered with the poller).
@@ -330,9 +326,8 @@ pub struct KmsBackendV2 {
     /// on-core hotkey path (libseat mode). Handed in via `set_input_sender`
     /// after the channel is created in `lib.rs`.
     input_sender: Option<yserver_core::core_loop::CoreSender>,
-    /// Hotkey detector — used on the core thread in libseat mode.
-    /// Pre-allocated here so Tasks 9/12 (`on_libinput_ready`) find it.
-    #[allow(dead_code)]
+    /// Hotkey detector — used on the core thread in libseat mode
+    /// (`on_libinput_ready`).
     hotkey: crate::input::hotkey::HotkeyDetector,
 }
 
@@ -5834,6 +5829,50 @@ fn depth_for_visual(visual: HostSubwindowVisual, parent_depth: Option<u8>) -> u8
 //    default-impl shape.
 // ───────────────────────────────────────────────────────────────
 
+impl KmsBackendV2 {
+    /// Handle a hotkey fired by the on-core libinput dispatch (libseat mode).
+    /// Each variant sends the corresponding control message via `input_sender`
+    /// or, for `SwitchVt`, requests the VT switch inline through libseat
+    /// (fire-and-forget; the actual state transition arrives later via the
+    /// seat disable callback).
+    fn handle_core_hotkey(&mut self, hk: crate::input::hotkey::Hotkey) {
+        use crate::input::hotkey::Hotkey;
+        use yserver_core::core_loop::Message;
+        match hk {
+            Hotkey::Zap => {
+                log::warn!("kms: Ctrl-Alt-Backspace — requesting shutdown (zap)");
+                if let Some(s) = &self.input_sender {
+                    let _ = s.send(Message::Shutdown);
+                }
+            }
+            Hotkey::DumpScanout => {
+                log::info!("kms: Ctrl-Alt-Enter — dumping scanout");
+                if let Some(s) = &self.input_sender {
+                    let _ = s.send(Message::DumpScanout);
+                }
+            }
+            Hotkey::DumpDrawables => {
+                log::info!("kms: Ctrl-Alt-F12 — dumping drawables");
+                if let Some(s) = &self.input_sender {
+                    let _ = s.send(Message::DumpDrawables);
+                }
+            }
+            Hotkey::SwitchVt(vt) => {
+                if let crate::seat::Seat::Libseat { inner, .. } = &self.seat {
+                    // Short borrow; switch_session is fire-and-forget and does
+                    // NOT transition seat_state — the state machine moves on the
+                    // later disable callback from libseat.
+                    if let Err(e) = inner.borrow_mut().switch_session(vt) {
+                        log::warn!("kms: switch_session({vt}) failed: {e}");
+                    } else {
+                        log::info!("kms: requested VT switch to {vt}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Backend for KmsBackendV2 {
     // ── A. Accessors (mirror KmsBackend exactly) ────────────────
 
@@ -6242,6 +6281,48 @@ impl Backend for KmsBackendV2 {
 
     fn set_input_sender(&mut self, sender: yserver_core::core_loop::CoreSender) {
         self.input_sender = Some(sender);
+    }
+
+    fn on_libinput_ready(&mut self, state: &mut ServerState) {
+        // Libseat mode: dispatch the on-core libinput context, then map each
+        // event through the same fanout that Direct mode uses. Hotkeys are
+        // intercepted here before forwarding to clients (wlroots'
+        // `handle_libinput_readable`, backend.c:49-63).
+        let Some(ctx) = self.core_libinput.as_mut() else {
+            return;
+        };
+        let events = match ctx.dispatch() {
+            Ok(evs) => evs,
+            Err(e) => {
+                log::warn!("kms: core libinput dispatch failed: {e}");
+                return;
+            }
+        };
+        let time_ms = crate::clock::server_time_ms();
+        let mut scroll_buf: Vec<yserver_core::core_loop::HostInputEvent> = Vec::new();
+        for ev in events {
+            if let Some(hk) = self.hotkey.check(&ev) {
+                self.handle_core_hotkey(hk);
+                continue; // do not forward the hotkey keypress to clients
+            }
+            // Scroll fans out to zero or many press+release pairs depending
+            // on accumulated v120 — mirror the input thread's path.
+            if let crate::input::InputEvent::PointerScroll { dx_v120, dy_v120 } = ev {
+                scroll_buf.clear();
+                if let Some(input_state) = self.core_input_state.as_mut() {
+                    input_state.drain_scroll(dx_v120, dy_v120, time_ms, &mut scroll_buf);
+                }
+                for host_ev in scroll_buf.drain(..) {
+                    self.on_host_input(state, host_ev);
+                }
+                continue;
+            }
+            // All other events go through map then the shared fanout.
+            if let Some(input_state) = self.core_input_state.as_mut() {
+                let host = input_state.map(ev, time_ms);
+                self.on_host_input(state, host);
+            }
+        }
     }
 
     // ── Subwindow lifecycle ─────────────────────────────────────
