@@ -320,6 +320,59 @@ connects + `render_create_picture` / `render_create_solid_fill`
 / `render_trapezoids` gap-logs fire on first paint — i.e.
 expected. No crash, no atomic-commit failure.
 
+## VT switching (branch `vt-switch`, 2026-05-28)
+
+Ctrl-Alt-F<N> switching away from a running yserver and back, ported
+from the wlroots model. Spec:
+`docs/superpowers/specs/2026-05-27-vt-switching-design.md`; plan:
+`docs/superpowers/plans/2026-05-28-vt-switching.md` (converged after 3
+codex rounds).
+
+**Two modes**, chosen at startup by whether `libseat_open_seat`
+succeeds:
+
+- **Libseat mode** (logind/seatd present): `libseat::Seat` lives in
+  `KmsBackendV2` on the core-loop thread as a new poll source
+  (`BackendFdKind::Seat`). libinput moves onto the core loop (the
+  reserved `LIBINPUT_TOKEN` hook) and opens its evdev fds through
+  `seat.open_device`; VT switching is enabled.
+- **Direct mode** (no seat manager — e.g. the bwrap sandbox): today's
+  behaviour exactly — separate libinput thread, direct device opens,
+  VT switching disabled. The fallback is silent.
+
+**What's implemented + unit-tested (no hardware):** the `SeatState`
+machine (`seat/state.rs`, exhaustive); Ctrl-Alt-F<N> detection via the
+shared `HotkeyDetector`; held-key/button release synthesis on suspend;
+`seat_state` gating of modeset/pageflip/submit; the suspend sequence
+(deterministic libinput drain → synth releases → GPU wait → libinput
+suspend → libseat `disable()` ack) and the resume driver + no-blink
+double-switch boundary (stub-driven via `inject_seat_event_for_test`).
+
+**wlroots-aligned deviations from the spec** (documented in the plan's
+"Deviations" section): libinput on the core thread (no input-quiesce
+barrier); the DRM fd is opened once and kept stable across switches
+(NOT reopened, NO `drmSetMaster`/`drmDropMaster` — libseat/logind owns
+master); on resume we only re-scan connectors + re-modeset the existing
+device.
+
+**MVP non-goals / known follow-ups:**
+- Hardware validation pending (Task 14): bee / yoga / silence / iMac
+  19,2 — Ctrl-Alt-F2 → getty → Ctrl-Alt-F1 → desktop restored, zero
+  `vk_device_lost` / `missed_pageflips` once Active; plus bee
+  rapid-double-switch. The sandbox can't acquire DRM master/seat0, so
+  these are user-run.
+- `wait_idle_bounded` is not truly timeout-bounded (relies on the
+  driver returning `DEVICE_LOST`); fence-timeout bounding deferred.
+- Resume repaint currently uses `scene.wake_for_damage()` rather than
+  explicit full-output damage — verify on hardware that switch-back
+  fully repaints; post explicit full damage if not.
+- Dynamic RandR change-events on hot-unplug-while-suspended are a stub
+  (logs dropped connectors) — that hot-plug path is an explicit
+  non-goal.
+- `YSERVER_SIMULATE_VT_SWITCH` live knob deferred (stub test covers the
+  logic deterministically).
+- No real-libseat container CI yet (CI is unit + lint).
+
 ## v1 → v2 transition
 
 The v1 model (per-window mirrors + scanout-walk) hit a structural
