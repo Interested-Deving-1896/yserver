@@ -306,8 +306,7 @@ pub struct KmsBackendV2 {
     /// Used by `scanout_allowed()` / `run_suspend` / Task 12's `on_seat_ready`.
     seat_state: crate::seat::state::SeatState,
     /// Coalesced counter-events for the state machine.
-    /// Consumed by Task 12's `on_seat_ready` driver.
-    #[allow(dead_code)]
+    /// Consumed by `on_seat_ready` / `drive_seat_event`.
     seat_pending: crate::seat::state::SeatPending,
     /// On-core libinput context (libseat mode only). `None` in Direct mode
     /// (the dedicated input thread owns libinput there).
@@ -3351,8 +3350,7 @@ impl KmsBackendV2 {
     /// XI2 raw listeners are intentionally NOT updated (spec §"XI2 raw
     /// events"). Crossing events are not synthesized.
     ///
-    /// Caller is Task 11's `run_suspend`.
-    #[allow(dead_code)]
+    /// Caller is `run_suspend`.
     fn synthesize_held_releases(&mut self, state: &mut ServerState) {
         use yserver_core::core_loop::{
             key_fanout::key_event_fanout_to_state, pointer_fanout::pointer_event_fanout_to_state,
@@ -3444,9 +3442,7 @@ impl KmsBackendV2 {
     ///
     /// # Caller
     ///
-    /// Task 12's `on_seat_ready`; no caller yet. Dead-code allow removed
-    /// when Task 12 lands.
-    #[allow(dead_code)] // caller is Task 12
+    /// `drive_seat_event` on `BeginSuspend`.
     fn run_suspend(&mut self, state: &mut ServerState) {
         // 2. DETERMINISTIC INPUT DRAIN — mio may deliver SEAT_TOKEN before
         //    LIBINPUT_TOKEN in the same poll batch, leaving events in the
@@ -3517,6 +3513,154 @@ impl KmsBackendV2 {
 
         // 7. Caller (`on_seat_ready`) calls `seat_state.suspend_complete()`
         //    after we return.
+    }
+
+    /// Resume sequence — called by `drive_seat_event` when the state
+    /// machine decides `BeginResume`. `seat_state` is already
+    /// `Resuming` at entry.
+    ///
+    /// Deviation #5: the DRM fd is NOT reopened and `drmSetMaster` is
+    /// NOT called. libseat/logind restored DRM master before
+    /// delivering `Enable`. We just re-modeset on the existing device
+    /// and re-arm input.
+    ///
+    /// Steps:
+    /// 1. State is already `Resuming`.
+    /// 2. Re-query connectors, drop missing, re-commit modeset on the
+    ///    existing device. If all commits fail (card gone), log + exit
+    ///    (Risk #4).
+    /// 3. Re-arm the hardware cursor plane.
+    /// 4. Resume libinput — `libinput.resume()` re-opens input devices
+    ///    via `open_restricted` → `seat.open_device`. MUST be called
+    ///    with NO `LibseatInner` borrow held (re-entrancy contract).
+    /// 5. Full-damage repaint is deferred to after `resume_complete`
+    ///    commits `Active` (gate must be open first) — handled in
+    ///    `drive_seat_event`.
+    fn run_resume(&mut self, state: &mut ServerState) {
+        // 2. Re-query connectors + redo modeset on existing device.
+        match self.platform.requery_outputs_and_modeset() {
+            Ok(dropped) => {
+                if !dropped.is_empty() {
+                    // MVP: log dropped outputs; dynamic RandR change events
+                    // require infra not yet built (see report: DONE_WITH_CONCERNS
+                    // — hot-unplug-while-suspended is an MVP non-goal edge).
+                    for name in &dropped {
+                        log::warn!(
+                            "kms: resume: output {name} was disconnected while suspended \
+                             (RandR change event not yet fired — MVP limitation)"
+                        );
+                    }
+                    self.fire_randr_changes(state, dropped);
+                }
+            }
+            Err(e) => {
+                log::error!("kms: resume: modeset failed (card gone?): {e}; exiting");
+                self.request_exit();
+                return;
+            }
+        }
+
+        // 3. Re-arm the hardware cursor plane. Use the current cursor
+        //    position + effective cursor hotspot.
+        let (hot_x, hot_y) = self
+            .effective_cursor_xid
+            .and_then(|xid| self.cursor_records.get(&xid))
+            .map(|rec| (rec.hot_x, rec.hot_y))
+            .unwrap_or((0, 0));
+        #[allow(clippy::cast_possible_truncation)]
+        let cx = self.core.cursor_x as i32;
+        #[allow(clippy::cast_possible_truncation)]
+        let cy = self.core.cursor_y as i32;
+        self.platform.rearm_cursor(hot_x, hot_y, cx, cy);
+
+        // 4. Resume libinput. MUST NOT hold a LibseatInner borrow across
+        //    this call — `resume()` re-enters `open_restricted` which
+        //    `borrow_mut`s `LibseatInner`. No borrow is held here.
+        if let Some(ctx) = self.core_libinput.as_mut()
+            && let Err(e) = ctx.resume()
+        {
+            log::warn!("kms: libinput resume failed: {e}");
+        }
+
+        // 5. Full-damage repaint deferred to `drive_seat_event` after
+        //    `resume_complete` commits `Active` and opens the scanout gate.
+    }
+
+    /// Request process shutdown through the core-channel sender
+    /// (same mechanism the input thread uses for Zap). Called on
+    /// unrecoverable errors during resume (Risk #4) or libseat
+    /// dispatch failure (Risk #7).
+    fn request_exit(&self) {
+        if let Some(s) = &self.input_sender {
+            let _ = s.send(yserver_core::core_loop::Message::Shutdown);
+        } else {
+            log::error!("kms: request_exit: no input_sender — cannot signal shutdown");
+        }
+    }
+
+    /// Notify the backend about dropped outputs (RandR). MVP: logs
+    /// each dropped output name. Full RandR change-event infra is not
+    /// yet built (DONE_WITH_CONCERNS — hot-unplug-while-suspended is
+    /// an MVP non-goal).
+    fn fire_randr_changes(&mut self, _state: &mut ServerState, dropped: Vec<String>) {
+        for name in dropped {
+            log::warn!(
+                "kms: RandR output-gone for {name}: dynamic RandR change events are an \
+                 MVP non-goal (hot-unplug-while-suspended); clients will see the output \
+                 gone on the next configuration query"
+            );
+        }
+    }
+
+    /// Per-event state-machine driver. Extracted so both
+    /// `on_seat_ready` and the test injection entry point
+    /// (`inject_seat_event_for_test`) share the same logic.
+    fn drive_seat_event(&mut self, state: &mut ServerState, ev: crate::seat::state::SeatEventKind) {
+        use crate::seat::state::SeatAction;
+
+        match self.seat_state.on_event(&mut self.seat_pending, ev) {
+            SeatAction::BeginSuspend => {
+                self.run_suspend(state);
+                self.seat_state.suspend_complete(&self.seat_pending);
+            }
+            SeatAction::BeginResume => {
+                self.run_resume(state);
+                match self.seat_state.resume_complete(&mut self.seat_pending) {
+                    SeatAction::BeginSuspend => {
+                        // A disable arrived during the resume sequence
+                        // (no-blink boundary): go straight back into
+                        // suspend without ever becoming Active.
+                        self.run_suspend(state);
+                        self.seat_state.suspend_complete(&self.seat_pending);
+                    }
+                    _ => {
+                        // Committed Active: scanout gate is open —
+                        // post a full-damage repaint on all outputs.
+                        self.scene.wake_for_damage();
+                    }
+                }
+            }
+            SeatAction::Nothing => {
+                log::debug!(
+                    "kms: seat event {:?} ignored in state {:?}",
+                    ev,
+                    self.seat_state
+                );
+            }
+        }
+    }
+
+    /// Drive a fake seat enable/disable, bypassing libseat. Used by
+    /// the integration test and the `YSERVER_SIMULATE_VT_SWITCH` knob
+    /// (Task 13).
+    pub fn inject_seat_event_for_test(&mut self, state: &mut ServerState, enable: bool) {
+        use crate::seat::state::SeatEventKind;
+        let ev = if enable {
+            SeatEventKind::Enable
+        } else {
+            SeatEventKind::Disable
+        };
+        self.drive_seat_event(state, ev);
     }
 
     /// Deepest mapped window under the cursor. Walks
@@ -6482,6 +6626,38 @@ impl Backend for KmsBackendV2 {
 
     fn set_input_sender(&mut self, sender: yserver_core::core_loop::CoreSender) {
         self.input_sender = Some(sender);
+    }
+
+    fn on_seat_ready(&mut self, state: &mut ServerState) {
+        use crate::seat::state::SeatEventKind;
+        use std::rc::Rc;
+
+        // Clone the Rc handles before borrowing so we don't hold a
+        // reference into `self.seat` while calling mutable methods.
+        let (inner, events) = match &self.seat {
+            crate::seat::Seat::Libseat {
+                inner,
+                pending_events,
+            } => (Rc::clone(inner), Rc::clone(pending_events)),
+            crate::seat::Seat::Direct => return,
+        };
+
+        // Dispatch libseat: the callback closure pushes Enable/Disable
+        // into `events`. Release the borrow immediately after.
+        if let Err(e) = inner.borrow_mut().dispatch() {
+            log::error!("kms: libseat dispatch failed: {e}; exiting"); // Risk #7
+            self.request_exit();
+            return;
+        }
+
+        // Drain the callback queue — release the borrow BEFORE calling
+        // drive_seat_event so no RefCell borrow is held during the
+        // suspend/resume sequences (which call libinput.suspend/resume
+        // that re-enter open_restricted → LibseatInner::borrow_mut).
+        let drained: Vec<SeatEventKind> = events.borrow_mut().drain(..).collect();
+        for ev in drained {
+            self.drive_seat_event(state, ev);
+        }
     }
 
     fn on_libinput_ready(&mut self, state: &mut ServerState) {

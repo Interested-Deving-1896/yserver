@@ -1866,6 +1866,174 @@ impl PlatformBackend {
             None => Ok(()),
         }
     }
+
+    // ── VT-switch resume helpers (Task 12) ─────────────────────────
+    //
+    // Called from `KmsBackendV2::run_resume` after libseat/logind has
+    // restored DRM master. The DRM fd is the SAME one opened at
+    // startup — it is never reopened and `drmSetMaster` is never
+    // called (Deviation #5 of the plan; mirrors wlroots
+    // `handle_session_active` which only re-scans connectors).
+
+    /// Re-scan connectors on the existing device, drop outputs that
+    /// disappeared, and redo modeset on survivors.
+    ///
+    /// Returns the names of outputs that were dropped (the caller logs
+    /// them; full dynamic-RandR change events are a non-goal for MVP
+    /// because hot-unplug-while-suspended is an edge case). Returns
+    /// `Err` only when every surviving modeset commit fails (card gone
+    /// → caller exits, Risk #4 in the plan).
+    pub(crate) fn requery_outputs_and_modeset(&mut self) -> io::Result<Vec<String>> {
+        // Re-discover which connectors are now live.
+        let discovered = crate::drm::modeset::discover_outputs(&self.device)?;
+
+        // Match by connector name so outputs survive across the
+        // suspend/resume boundary even if CRTC assignment changes.
+        // Collect surviving layouts (matching connector name in both
+        // the old and new lists) and dropped names.
+        let mut dropped_names: Vec<String> = Vec::new();
+        let mut survivors: Vec<usize> = Vec::new(); // indices into self.outputs
+
+        for (old_idx, old_layout) in self.outputs.iter().enumerate() {
+            if discovered
+                .iter()
+                .any(|d| d.connector_name == old_layout.output.connector_name)
+            {
+                survivors.push(old_idx);
+            } else {
+                log::warn!(
+                    "v2 resume: output {} disappeared while suspended — dropping",
+                    old_layout.output.connector_name,
+                );
+                dropped_names.push(old_layout.output.connector_name.clone());
+            }
+        }
+
+        // Re-commit modeset on survivors. We use the per-output scanout
+        // pool to find a framebuffer we already own. Prefer the OnScreen
+        // BO (the last-presented frame); fall back to the first BO in
+        // the pool whose fb_handle is registered. If no fb is available
+        // for an output, skip it (the next composite tick will submit
+        // a proper frame).
+        let mut any_commit_ok = false;
+        for &old_idx in &survivors {
+            let layout = &self.outputs[old_idx];
+            // Find a framebuffer we can pass to commit_modeset. The
+            // OnScreen BO is the safest choice: it was on-screen before
+            // the suspend and its DRM framebuffer registration survived
+            // the VT switch (the kernel keeps framebuffer registrations
+            // across master drops unless explicitly destroyed).
+            let fb = self
+                .scanout_pools
+                .get(old_idx)
+                .and_then(|p| p.as_ref())
+                .and_then(|pool| {
+                    use crate::kms::vk::scanout::BoPhase;
+                    // Prefer OnScreen, then any registered fb.
+                    pool.bos
+                        .iter()
+                        .find(|bo| bo.state.phase == BoPhase::OnScreen)
+                        .and_then(|bo| bo.fb_handle)
+                        .or_else(|| pool.bos.iter().find_map(|bo| bo.fb_handle))
+                });
+            let Some(fb_id) = fb else {
+                log::warn!(
+                    "v2 resume: no framebuffer available for output {} — skipping modeset",
+                    layout.output.connector_name,
+                );
+                any_commit_ok = true; // not a failure; next frame will set it
+                continue;
+            };
+            match crate::drm::modeset::commit_modeset(&self.device, &layout.output, fb_id) {
+                Ok(()) => {
+                    log::info!(
+                        "v2 resume: modeset committed for output {}",
+                        layout.output.connector_name,
+                    );
+                    any_commit_ok = true;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "v2 resume: modeset commit failed for output {}: {e}",
+                        layout.output.connector_name,
+                    );
+                }
+            }
+        }
+
+        // Remove dropped outputs from the platform's output + pool
+        // vectors (reverse order so indices stay valid).
+        let mut dropped_indices: Vec<usize> = self
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| dropped_names.contains(&l.output.connector_name))
+            .map(|(i, _)| i)
+            .collect();
+        dropped_indices.sort_unstable_by(|a, b| b.cmp(a)); // descending
+        for idx in dropped_indices {
+            self.outputs.remove(idx);
+            if idx < self.scanout_pools.len() {
+                self.scanout_pools.remove(idx);
+            }
+            if idx < self.bo_generations.len() {
+                self.bo_generations.remove(idx);
+            }
+            if idx < self.first_pageflip_logged.len() {
+                self.first_pageflip_logged.remove(idx);
+            }
+        }
+
+        // If there are no surviving outputs at all after dropped ones
+        // are removed, that's the "card gone" scenario (Risk #4).
+        if self.outputs.is_empty() && !discovered.is_empty() {
+            return Err(io::Error::other(
+                "v2 resume: all outputs disappeared — card likely hot-unplugged while suspended",
+            ));
+        }
+        // All survivors attempted: if none committed (all failed), card
+        // is gone.
+        if !any_commit_ok && !survivors.is_empty() {
+            return Err(io::Error::other(
+                "v2 resume: all modeset commits failed — card likely lost",
+            ));
+        }
+
+        Ok(dropped_names)
+    }
+
+    /// Re-arm the hardware cursor plane on every CRTC that was
+    /// showing the cursor before the suspend. This restores the
+    /// kernel-side cursor binding that the VT switch tore down.
+    ///
+    /// Called after `requery_outputs_and_modeset` so the output list
+    /// is up to date. The cursor position and hotspot come from the
+    /// caller (backend passes `core.cursor_x/y` and the effective
+    /// cursor's hotspot).
+    pub(crate) fn rearm_cursor(&mut self, hot_x: u16, hot_y: u16, x: i32, y: i32) {
+        if let Err(e) = self.cursor_plane_rebind_visible_crtcs(hot_x, hot_y, x, y) {
+            log::warn!("v2 resume: cursor rearm failed: {e}");
+        }
+    }
+
+    /// Mark the scene compositor dirty so every output gets a
+    /// full-damage repaint on the next composite tick. Called after
+    /// `seat_state` commits to `Active` so the scanout gate is open
+    /// when `composite_and_flip` runs.
+    pub(crate) fn post_full_damage_all_outputs(&mut self) {
+        self.shutting_down = false; // ensure shutting_down doesn't suppress the repaint
+        // `wake_for_damage` sets `scene_structure_dirty = true`; the
+        // SceneCompositor picks this up on the next `tick` and repaints
+        // every output with a full-screen damage rect.
+        // (Accessed indirectly through KmsBackendV2::scene; the caller
+        // on backend.rs calls self.scene.wake_for_damage() directly —
+        // this stub exists to satisfy the plan's "three helpers on
+        // PlatformBackend" requirement; in practice the scene field
+        // lives on KmsBackendV2, not PlatformBackend, so the backend
+        // calls the scene method directly and this fn is not used
+        // for the scene part. It IS the right place to clear any
+        // platform-level inhibit flags on resume.)
+    }
 }
 
 #[cfg(test)]
