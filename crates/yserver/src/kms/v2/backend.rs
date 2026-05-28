@@ -17224,4 +17224,189 @@ mod tests {
             "pending_pointer_events must be empty (fanned out) after synthesize_held_releases"
         );
     }
+
+    // ── Task 13: stub-backed VT-switch suspend/resume integration tests ──
+    //
+    // These tests drive `inject_seat_event_for_test` directly — no libseat,
+    // no DRM, no real hardware.  They exercise the full state-machine path
+    // plus `run_suspend` side-effects that are reachable in the stub harness.
+    //
+    // Resume path note: `run_resume` calls
+    // `platform.requery_outputs_and_modeset()` → `discover_outputs` which
+    // issues DRM ioctls on `/dev/null` and fails immediately.  The error
+    // path logs the failure, calls `request_exit()` (a no-op in the stub
+    // harness because `input_sender` is None), and returns.  `drive_seat_event`
+    // then always calls `resume_complete()` regardless, so the state machine
+    // still transitions from `Resuming` → `Active` (or `Suspending` if a
+    // pending disable is set).  This is correct and asserted below.
+    // The post-modeset parts of resume (cursor re-arm, repaint) are
+    // hardware-only and not asserted here — documented as DONE_WITH_CONCERNS.
+
+    /// After `inject_seat_event_for_test(false)` the backend must be in
+    /// `Suspended` and `scanout_allowed()` must return `false`.
+    ///
+    /// Also verifies that pre-seeded held keys and buttons are cleared by
+    /// `synthesize_held_releases` inside `run_suspend`.
+    #[test]
+    fn vt_switch_disable_transitions_to_suspended_and_releases_held_input() {
+        use crate::seat::state::SeatState;
+
+        let mut b = KmsBackendV2::for_tests();
+        let mut state = ServerState::new();
+
+        // Pre-seed held keys and a button so we can verify they're cleared.
+        b.core.down_keys.insert(38); // 'a'
+        b.core.down_keys.insert(56); // 'b'
+        b.core.button_mask = 0x0100; // BTN_LEFT held
+
+        // Precondition: starts Active with scanout allowed.
+        assert_eq!(b.seat_state, SeatState::Active);
+        assert!(
+            b.scanout_allowed(),
+            "scanout must be allowed before disable"
+        );
+
+        // Drive the Disable event.
+        b.inject_seat_event_for_test(&mut state, false);
+
+        // (a) State machine reached Suspended.
+        assert_eq!(
+            b.seat_state,
+            SeatState::Suspended,
+            "seat_state must be Suspended after Disable"
+        );
+
+        // (b) Scanout gate is closed.
+        assert!(
+            !b.scanout_allowed(),
+            "scanout must not be allowed while Suspended"
+        );
+
+        // (c) Held keys cleared by synthesize_held_releases.
+        assert!(
+            b.core.down_keys.is_empty(),
+            "down_keys must be empty after suspend (synthesize_held_releases)"
+        );
+
+        // (d) Held buttons cleared.
+        assert_eq!(
+            b.core.button_mask, 0,
+            "button_mask must be 0 after suspend (synthesize_held_releases)"
+        );
+    }
+
+    /// After a Disable→Enable cycle the state machine must return to `Active`.
+    ///
+    /// In the stub harness `run_resume`'s `requery_outputs_and_modeset` fails
+    /// (DRM ioctls on `/dev/null`), but the state machine still completes the
+    /// transition because `drive_seat_event` calls `resume_complete()` after
+    /// `run_resume` returns regardless of the modeset outcome.  This is the
+    /// correct behaviour: a failed modeset calls `request_exit` (a no-op here)
+    /// and the server would exit in production; the state-machine transition
+    /// is a logical consequence, not a claim that the hardware path succeeded.
+    #[test]
+    fn vt_switch_enable_after_disable_returns_to_active() {
+        use crate::seat::state::SeatState;
+
+        let mut b = KmsBackendV2::for_tests();
+        let mut state = ServerState::new();
+
+        // Drive Disable → Suspended.
+        b.inject_seat_event_for_test(&mut state, false);
+        assert_eq!(b.seat_state, SeatState::Suspended);
+
+        // Drive Enable → Active (modeset fails in stub, state still advances).
+        b.inject_seat_event_for_test(&mut state, true);
+
+        assert_eq!(
+            b.seat_state,
+            SeatState::Active,
+            "seat_state must be Active after Enable completes"
+        );
+        assert!(
+            b.scanout_allowed(),
+            "scanout must be allowed after returning to Active"
+        );
+    }
+
+    /// A rapid Disable-then-Enable-then-Disable sequence exercises the
+    /// no-blink boundary: a `Disable` coalesced during a resume sequence
+    /// causes `resume_complete` to return `BeginSuspend`, skipping `Active`
+    /// entirely.  The final state must be `Suspended`, not `Active`.
+    ///
+    /// Concretely this test drives:
+    ///
+    ///  1. Disable → Suspending → (suspend sequence) → Suspended
+    ///  2. Enable  → Resuming → (resume sequence) → resume_complete;
+    ///     before step 2 we pre-seed `pending_disable = true` to simulate
+    ///     a Disable that arrived mid-resume.
+    ///  3. `resume_complete` sees `pending_disable` → returns `BeginSuspend`
+    ///     → run_suspend again → Suspended
+    ///
+    /// The final assertion is `Suspended` and no panic (RefCell re-entrancy
+    /// is exercised by the full Disable→Enable path above as well).
+    #[test]
+    fn vt_switch_rapid_double_switch_never_passes_through_active() {
+        use crate::seat::state::{SeatPending, SeatState};
+
+        let mut b = KmsBackendV2::for_tests();
+        let mut state = ServerState::new();
+
+        // Step 1: normal Disable → Suspended.
+        b.inject_seat_event_for_test(&mut state, false);
+        assert_eq!(b.seat_state, SeatState::Suspended);
+
+        // Simulate a Disable that arrives during the resume sequence by
+        // pre-seeding `pending_disable`.  In production this would be set
+        // by `on_event(Disable)` arriving while `seat_state == Resuming`
+        // (the coalesce arm in `SeatState::on_event`).  We set it directly
+        // here because the stub drives events synchronously and we cannot
+        // interleave them mid-sequence without modifying the backend.
+        b.seat_pending = SeatPending {
+            pending_disable: true,
+            pending_enable: false,
+        };
+
+        // Step 2: Enable with pending_disable set → resume_complete skips
+        // Active and goes straight to Suspending → run_suspend → Suspended.
+        b.inject_seat_event_for_test(&mut state, true);
+
+        assert_eq!(
+            b.seat_state,
+            SeatState::Suspended,
+            "rapid double-switch must end in Suspended, never passing through Active"
+        );
+        assert!(
+            !b.scanout_allowed(),
+            "scanout must not be allowed after rapid double-switch lands in Suspended"
+        );
+        // pending_disable must have been consumed by resume_complete.
+        assert!(
+            !b.seat_pending.pending_disable,
+            "pending_disable must be cleared after resume_complete consumed it"
+        );
+    }
+
+    /// Re-entrancy smoke: a full Disable→Enable cycle completes without a
+    /// `RefCell` borrow panic.  In the stub harness `LibseatInner` is never
+    /// held because `seat` is `Seat::Direct`, so this primarily verifies that
+    /// no other RefCell in the backend panics during the sequence.  The
+    /// re-entrancy concern from the plan (libseat `borrow_mut` inside
+    /// `libinput.resume()`) is hardware-only and covered by the hardware
+    /// matrix (Task 14).
+    #[test]
+    fn vt_switch_full_cycle_no_refcell_panic() {
+        use crate::seat::state::SeatState;
+
+        let mut b = KmsBackendV2::for_tests();
+        let mut state = ServerState::new();
+
+        // Two full cycles — if any RefCell is double-borrowed this panics.
+        for _ in 0..2 {
+            b.inject_seat_event_for_test(&mut state, false);
+            assert_eq!(b.seat_state, SeatState::Suspended);
+            b.inject_seat_event_for_test(&mut state, true);
+            assert_eq!(b.seat_state, SeatState::Active);
+        }
+    }
 }
