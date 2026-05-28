@@ -312,6 +312,19 @@ impl CursorPlane {
         img_x: i32,
         img_y: i32,
     ) -> io::Result<()> {
+        log::debug!(
+            "cursor_plane::show CRTC={crtc:?} hotspot=({},{}) pos=({img_x},{img_y}) path={} \
+             prior_visible={} fb={:?}",
+            hotspot.0,
+            hotspot.1,
+            if self.per_crtc.contains_key(&crtc) && self.fb.is_some() {
+                "atomic"
+            } else {
+                "legacy"
+            },
+            self.visible.get(&crtc).copied().unwrap_or(false),
+            self.fb,
+        );
         if let (Some(state), Some(fb)) = (self.per_crtc.get(&crtc), self.fb) {
             let mut req = AtomicModeReq::new();
             req.add_raw_property(
@@ -378,6 +391,15 @@ impl CursorPlane {
     /// # Errors
     /// Atomic-commit or `set_cursor2` ioctl failure.
     pub fn hide(&mut self, crtc: crtc::Handle) -> io::Result<()> {
+        log::debug!(
+            "cursor_plane::hide CRTC={crtc:?} path={} prior_visible={}",
+            if self.per_crtc.contains_key(&crtc) {
+                "atomic"
+            } else {
+                "legacy"
+            },
+            self.visible.get(&crtc).copied().unwrap_or(false),
+        );
         if let Some(state) = self.per_crtc.get(&crtc) {
             let mut req = AtomicModeReq::new();
             req.add_raw_property(state.plane.into(), state.prop_fb_id, 0u64);

@@ -115,7 +115,11 @@ impl LibseatInner {
     /// Non-blocking dispatch. The enable/disable callback closure runs
     /// inside this call and pushes into the shared `pending_events` queue.
     pub fn dispatch(&mut self) -> io::Result<()> {
-        self.seat.dispatch(0).map(|_| ()).map_err(io::Error::from)
+        let n = self.seat.dispatch(0).map_err(io::Error::from)?;
+        if n > 0 {
+            log::debug!("seat: libseat dispatch delivered {n} event(s)");
+        }
+        Ok(())
     }
 }
 
@@ -146,6 +150,7 @@ impl Seat {
                 SeatEvent::Enable => SeatEventKind::Enable,
                 SeatEvent::Disable => SeatEventKind::Disable,
             };
+            log::info!("seat: libseat callback fired — {kind:?} queued");
             cb_events.borrow_mut().push(kind);
         });
         match seat {

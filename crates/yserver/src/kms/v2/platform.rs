@@ -2011,9 +2011,67 @@ impl PlatformBackend {
     /// caller (backend passes `core.cursor_x/y` and the effective
     /// cursor's hotspot).
     pub(crate) fn rearm_cursor(&mut self, hot_x: u16, hot_y: u16, x: i32, y: i32) {
-        if let Err(e) = self.cursor_plane_rebind_visible_crtcs(hot_x, hot_y, x, y) {
-            log::warn!("v2 resume: cursor rearm failed: {e}");
+        // Verbose INFO logging — fires only once per resume, so volume is fine.
+        // Diagnoses whether the cursor plane state survives a VT switch:
+        // (a) is the plane object still present, (b) which CRTCs has userspace
+        // recorded as visible, (c) does plane.show() actually issue the atomic
+        // commit on each, and with what outcome.
+        let n_outputs = self.outputs.len();
+        let cursor_plane_present = self.cursor_plane.is_some();
+        log::info!(
+            "v2 resume rearm_cursor: outputs={n_outputs} cursor_plane={} hot=({hot_x},{hot_y}) pos=({x},{y})",
+            if cursor_plane_present {
+                "present"
+            } else {
+                "MISSING"
+            }
+        );
+        if !cursor_plane_present {
+            log::warn!("v2 resume rearm_cursor: no cursor plane — cursor will not be re-armed");
+            return;
         }
+        // Snapshot output layouts so the per-CRTC ioctls can borrow
+        // `&mut self.cursor_plane` exclusively (mirrors
+        // `cursor_plane_rebind_visible_crtcs`).
+        let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
+            .outputs
+            .iter()
+            .map(|l| (l.output.crtc, l.x, l.y))
+            .collect();
+        // Safe to unwrap — checked above.
+        let plane = self.cursor_plane.as_mut().expect("cursor_plane present");
+        let mut shown = 0usize;
+        let mut skipped_invisible = 0usize;
+        let mut failed = 0usize;
+        for (crtc, layout_x, layout_y) in layouts {
+            let was_visible = plane.is_visible_on(crtc);
+            if !was_visible {
+                // The userspace `visible` flag is FALSE for this CRTC, so
+                // rebind_visible_crtcs would silently skip it. Log loudly —
+                // this is the prime suspect for "cursor stuck" on resume.
+                skipped_invisible += 1;
+                log::info!("v2 resume rearm_cursor: CRTC={crtc:?} skipped (is_visible_on=false)");
+                continue;
+            }
+            let cx = x - layout_x - i32::from(hot_x);
+            let cy = y - layout_y - i32::from(hot_y);
+            log::info!(
+                "v2 resume rearm_cursor: CRTC={crtc:?} calling plane.show pos=({cx},{cy}) hot=({hot_x},{hot_y})"
+            );
+            match plane.show(crtc, (i32::from(hot_x), i32::from(hot_y)), cx, cy) {
+                Ok(()) => {
+                    shown += 1;
+                    log::info!("v2 resume rearm_cursor: CRTC={crtc:?} plane.show ok");
+                }
+                Err(e) => {
+                    failed += 1;
+                    log::warn!("v2 resume rearm_cursor: CRTC={crtc:?} plane.show FAILED: {e}");
+                }
+            }
+        }
+        log::info!(
+            "v2 resume rearm_cursor: done — shown={shown} skipped_invisible={skipped_invisible} failed={failed}"
+        );
     }
 
     /// Mark the scene compositor dirty so every output gets a

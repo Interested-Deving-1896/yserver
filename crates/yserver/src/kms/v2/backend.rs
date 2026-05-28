@@ -3444,6 +3444,16 @@ impl KmsBackendV2 {
     ///
     /// `drive_seat_event` on `BeginSuspend`.
     fn run_suspend(&mut self, state: &mut ServerState) {
+        log::info!(
+            "kms: run_suspend enter — down_keys={} button_mask=0x{:04x} core_libinput={}",
+            self.core.down_keys.len(),
+            self.core.button_mask,
+            if self.core_libinput.is_some() {
+                "present"
+            } else {
+                "none"
+            },
+        );
         // 2. DETERMINISTIC INPUT DRAIN — mio may deliver SEAT_TOKEN before
         //    LIBINPUT_TOKEN in the same poll batch, leaving events in the
         //    libinput kernel buffer that we haven't read yet. Drain now so
@@ -3498,6 +3508,7 @@ impl KmsBackendV2 {
         //    LibseatInner borrow across this call (re-entrancy contract:
         //    close_restricted borrow_muts LibseatInner inside libinput).
         if let Some(ctx) = self.core_libinput.as_mut() {
+            log::info!("kms: run_suspend step 5 — libinput.suspend()");
             ctx.suspend();
         }
 
@@ -3505,14 +3516,17 @@ impl KmsBackendV2 {
         //    gate (step 1) already stopped all master ioctls; libseat/logind
         //    revokes master during this ack. Missing this ack wedges the
         //    kernel waiting for the VT switch (Risk #1).
-        if let crate::seat::Seat::Libseat { inner, .. } = &self.seat
-            && let Err(e) = inner.borrow_mut().disable()
-        {
-            log::warn!("kms: libseat disable() ack failed: {e}");
+        if let crate::seat::Seat::Libseat { inner, .. } = &self.seat {
+            log::info!("kms: run_suspend step 6 — libseat disable() ack");
+            match inner.borrow_mut().disable() {
+                Ok(()) => log::info!("kms: run_suspend libseat disable() ok"),
+                Err(e) => log::warn!("kms: libseat disable() ack failed: {e}"),
+            }
         }
 
         // 7. Caller (`on_seat_ready`) calls `seat_state.suspend_complete()`
         //    after we return.
+        log::info!("kms: run_suspend exit");
     }
 
     /// Resume sequence — called by `drive_seat_event` when the state
@@ -3537,7 +3551,19 @@ impl KmsBackendV2 {
     ///    commits `Active` (gate must be open first) — handled in
     ///    `drive_seat_event`.
     fn run_resume(&mut self, state: &mut ServerState) {
+        log::info!(
+            "kms: run_resume enter — cursor=({:.0},{:.0}) effective_cursor_xid={:?} core_libinput={}",
+            self.core.cursor_x,
+            self.core.cursor_y,
+            self.effective_cursor_xid,
+            if self.core_libinput.is_some() {
+                "present"
+            } else {
+                "none"
+            },
+        );
         // 2. Re-query connectors + redo modeset on existing device.
+        log::info!("kms: run_resume step 2 — requery_outputs_and_modeset");
         match self.platform.requery_outputs_and_modeset() {
             Ok(dropped) => {
                 if !dropped.is_empty() {
@@ -3581,9 +3607,13 @@ impl KmsBackendV2 {
         //    with no keyboard/mouse (and no way to zap). Treat it as
         //    fatal, exactly like the modeset-failure path above (Risk #4):
         //    exit cleanly rather than wedge with no input.
+        log::info!("kms: run_resume step 4 — libinput.resume()");
         let resume_failed = match self.core_libinput.as_mut() {
             Some(ctx) => match ctx.resume() {
-                Ok(()) => false,
+                Ok(()) => {
+                    log::info!("kms: run_resume libinput.resume() ok");
+                    false
+                }
                 Err(e) => {
                     log::error!("kms: libinput resume failed: {e}; exiting (no input on resume)");
                     true
@@ -3595,10 +3625,13 @@ impl KmsBackendV2 {
             // Nothing further to do here; the queued Shutdown will tear
             // the server down on the next loop iteration.
             self.request_exit();
+            log::info!("kms: run_resume exit (resume_failed=true; exit queued)");
+            return;
         }
 
         // 5. Full-damage repaint deferred to `drive_seat_event` after
         //    `resume_complete` commits `Active` and opens the scanout gate.
+        log::info!("kms: run_resume exit");
     }
 
     /// Request process shutdown through the core-channel sender
@@ -3641,7 +3674,12 @@ impl KmsBackendV2 {
         // only ever set by a real libseat callback, so the session has
         // genuinely toggled and DRM master is in the expected state when we
         // act on it.
+        let entry_state = self.seat_state;
         let mut action = self.seat_state.on_event(&mut self.seat_pending, ev);
+        log::info!(
+            "kms: drive_seat_event ev={ev:?} {entry_state:?}→{:?} action={action:?}",
+            self.seat_state,
+        );
         loop {
             match action {
                 SeatAction::BeginSuspend => {
@@ -6224,11 +6262,19 @@ impl KmsBackendV2 {
                     // Short borrow; switch_session is fire-and-forget and does
                     // NOT transition seat_state — the state machine moves on the
                     // later disable callback from libseat.
+                    log::info!(
+                        "kms: SwitchVt({vt}) requested — pre-call state: seat_state={:?} pending(enable={}, disable={})",
+                        self.seat_state,
+                        self.seat_pending.pending_enable,
+                        self.seat_pending.pending_disable,
+                    );
                     if let Err(e) = inner.borrow_mut().switch_session(vt) {
                         log::warn!("kms: switch_session({vt}) failed: {e}");
                     } else {
                         log::info!("kms: requested VT switch to {vt}");
                     }
+                } else {
+                    log::warn!("kms: SwitchVt({vt}) ignored — seat is Direct (no libseat)");
                 }
             }
         }
@@ -6690,9 +6736,20 @@ impl Backend for KmsBackendV2 {
         // suspend/resume sequences (which call libinput.suspend/resume
         // that re-enter open_restricted → LibseatInner::borrow_mut).
         let drained: Vec<SeatEventKind> = events.borrow_mut().drain(..).collect();
+        log::info!(
+            "kms: on_seat_ready dispatch ok — {} pending event(s) (state before drive: {:?}, pending: enable={} disable={})",
+            drained.len(),
+            self.seat_state,
+            self.seat_pending.pending_enable,
+            self.seat_pending.pending_disable,
+        );
         for ev in drained {
             self.drive_seat_event(state, ev);
         }
+        log::info!(
+            "kms: on_seat_ready done — state after drive: {:?}",
+            self.seat_state
+        );
     }
 
     fn on_libinput_ready(&mut self, state: &mut ServerState) {
