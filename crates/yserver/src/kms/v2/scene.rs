@@ -357,15 +357,17 @@ pub(crate) struct SceneCompositor {
 }
 
 /// Stage 5 Phase H — env gate for the HW cursor strategy. Default
-/// **OFF**: the software cursor path is the correctness baseline,
-/// and hardware MATE validation currently shows cursor-plane commits
-/// can be starved by scanout atomic `EBUSY` during COW/Present churn.
-/// Set `YSERVER_V2_HW_CURSOR=1` (or `true` / `yes` / `on`) to opt in
-/// for cursor-plane debugging.
+/// **ON**: the HW cursor plane is the right model on hardware that
+/// exposes it (it eliminates the SW-cursor-stuck-in-FB issue seen
+/// after a VT switch resume, where the scanout BO retains stale SW
+/// cursor pixels). Set `YSERVER_V2_HW_CURSOR=0` (or `false` / `no` /
+/// `off`) to opt out and fall back to the SW path — keep this lever
+/// in case the original concern (cursor-plane atomic commits being
+/// starved by scanout atomic `EBUSY` during COW/Present churn) recurs.
 fn hw_cursor_strategy_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("YSERVER_V2_HW_CURSOR").ok().as_deref(),
-        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF")
     )
 }
 
