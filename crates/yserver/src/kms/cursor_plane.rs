@@ -29,14 +29,11 @@ use std::{collections::HashMap, io, mem, ptr::NonNull, sync::Arc};
 
 use drm::{
     Device as DrmDevice, DriverCapability,
-    buffer::{Buffer, DrmFourcc, Handle as DrmBufferHandle, PlanarBuffer as DrmPlanarBuffer},
-    control::{
-        AtomicCommitFlags, Device as ControlDevice, FbCmd2Flags, PlaneType, atomic::AtomicModeReq,
-        crtc, dumbbuffer::DumbBuffer, framebuffer, plane, property,
-    },
+    buffer::{Buffer, DrmFourcc},
+    control::{Device as ControlDevice, crtc, dumbbuffer::DumbBuffer},
 };
 
-use crate::drm::{Device, modeset::PropMap};
+use crate::drm::Device;
 
 /// Fallback cursor size when `DRM_CAP_CURSOR_WIDTH/HEIGHT` query fails
 /// (very old drivers, broken devices). Every Intel / AMD / mainstream-
@@ -52,27 +49,8 @@ use crate::drm::{Device, modeset::PropMap};
 pub const HW_CURSOR_FALLBACK_W: u32 = 64;
 pub const HW_CURSOR_FALLBACK_H: u32 = 64;
 
-/// Per-CRTC atomic plane state. Populated during `CursorPlane::new()`
-/// from `DRM_CLIENT_CAP_UNIVERSAL_PLANES` plane enumeration. When
-/// present, all show/move/hide operations use atomic commits; when
-/// absent for a CRTC, the legacy `set_cursor2` / `move_cursor` ioctls
-/// are used as a fallback (works on Intel; may be no-ops on AMD).
-struct PerCrtcAtomicState {
-    plane: plane::Handle,
-    prop_fb_id: property::Handle,
-    prop_crtc_id: property::Handle,
-    prop_crtc_x: property::Handle,
-    prop_crtc_y: property::Handle,
-    prop_crtc_w: property::Handle,
-    prop_crtc_h: property::Handle,
-    prop_src_x: property::Handle,
-    prop_src_y: property::Handle,
-    prop_src_w: property::Handle,
-    prop_src_h: property::Handle,
-}
-
 /// A single shared DRM dumb buffer holding the current cursor image,
-/// plus per-CRTC visibility state and optional atomic plane handles.
+/// plus per-CRTC visibility state.
 ///
 /// Per-CRTC visibility (Stage 5 Phase B refactor): each CRTC tracks
 /// whether the plane is currently bound to it. v1's pre-Phase-B global
@@ -87,14 +65,9 @@ pub struct CursorPlane {
     stride: u32,
     /// Cursor buffer dimensions in pixels. Sourced from
     /// `DriverCapability::CursorWidth/Height`. Mandatory match with the
-    /// dumb buffer + atomic plane geometry — see [`HW_CURSOR_FALLBACK_W`].
+    /// dumb buffer geometry — see [`HW_CURSOR_FALLBACK_W`].
     width: u32,
     height: u32,
-    /// DRM framebuffer wrapping the dumb buffer, used by the atomic path.
-    fb: Option<framebuffer::Handle>,
-    /// Per-CRTC atomic cursor plane state; absent when cursor plane
-    /// discovery failed for a CRTC (legacy ioctls used as fallback).
-    per_crtc: HashMap<crtc::Handle, PerCrtcAtomicState>,
     /// Per-CRTC binding state — `Some(true)` when the plane is shown on
     /// that CRTC; `Some(false)` when hidden; absent until first show/hide.
     visible: HashMap<crtc::Handle, bool>,
@@ -148,54 +121,10 @@ impl CursorPlane {
         // Zero-fill the plane buffer up front.
         unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, len) };
 
-        // Atomic path: create DRM framebuffer from the dumb buffer, then
-        // discover cursor planes. Failure is non-fatal; per-CRTC entries
-        // are left empty and the legacy-ioctl fallback is used instead.
-        let fb = device
-            .add_planar_framebuffer(
-                &CursorDumbFb {
-                    dumb: &dumb,
-                    stride,
-                    width,
-                    height,
-                },
-                FbCmd2Flags::empty(),
-            )
-            .map_err(|e| {
-                log::warn!(
-                    "cursor: add_planar_framebuffer failed ({e}); \
-                     atomic cursor unavailable, falling back to legacy ioctls"
-                );
-                e
-            })
-            .ok();
-
-        let per_crtc = if let Some(fb_handle) = fb {
-            match discover_cursor_planes(&device, crtcs, fb_handle) {
-                Ok(map) => {
-                    let found = map.len();
-                    if found == crtcs.len() {
-                        log::info!("cursor: atomic cursor plane ready for {found} CRTC(s)");
-                    } else {
-                        log::warn!(
-                            "cursor: found {found}/{} atomic cursor planes; \
-                             remaining CRTCs will use legacy ioctls",
-                            crtcs.len()
-                        );
-                    }
-                    map
-                }
-                Err(e) => {
-                    log::warn!(
-                        "cursor: cursor plane discovery failed ({e}); \
-                         falling back to legacy ioctls for all CRTCs"
-                    );
-                    HashMap::new()
-                }
-            }
-        } else {
-            HashMap::new()
-        };
+        // crtcs parameter retained for API stability and future expansion;
+        // legacy `set_cursor2`/`move_cursor` route by CRTC handle directly,
+        // no per-CRTC plane discovery needed.
+        let _ = crtcs;
 
         Ok(Self {
             device,
@@ -205,8 +134,6 @@ impl CursorPlane {
             stride,
             width,
             height,
-            fb,
-            per_crtc,
             visible: HashMap::new(),
             uploaded_version: None,
         })
@@ -299,12 +226,17 @@ impl CursorPlane {
 
     /// Make the cursor visible on `crtc` at image-top-left position
     /// `(img_x, img_y)` in CRTC-local coordinates, with the given
-    /// `hotspot`. For the atomic path this is a single commit;
-    /// for the legacy fallback it is `set_cursor2` + `move_cursor`.
+    /// `hotspot`. Uses `set_cursor2` + `move_cursor` (legacy ioctls)
+    /// — Xorg's modesetting driver does the same
+    /// (`drmmode_display.c:1812`). Legacy cursor ioctls don't EBUSY-
+    /// collide with atomic scanout commits on the same CRTC (the
+    /// kernel routes them through a separate path), so we avoid the
+    /// atomic-cursor-vs-atomic-pageflip storm that motivated the
+    /// (now-abandoned) bundle-cursor-atomic branch.
     /// Idempotent — repeated calls just re-bind and reposition.
     ///
     /// # Errors
-    /// Ioctl or atomic-commit failure.
+    /// Ioctl failure.
     pub fn show(
         &mut self,
         crtc: crtc::Handle,
@@ -313,59 +245,13 @@ impl CursorPlane {
         img_y: i32,
     ) -> io::Result<()> {
         log::debug!(
-            "cursor_plane::show CRTC={crtc:?} hotspot=({},{}) pos=({img_x},{img_y}) path={} \
-             prior_visible={} fb={:?}",
+            "cursor_plane::show CRTC={crtc:?} hotspot=({},{}) pos=({img_x},{img_y}) \
+             prior_visible={}",
             hotspot.0,
             hotspot.1,
-            if self.per_crtc.contains_key(&crtc) && self.fb.is_some() {
-                "atomic"
-            } else {
-                "legacy"
-            },
             self.visible.get(&crtc).copied().unwrap_or(false),
-            self.fb,
         );
-        if let (Some(state), Some(fb)) = (self.per_crtc.get(&crtc), self.fb) {
-            let mut req = AtomicModeReq::new();
-            req.add_raw_property(
-                state.plane.into(),
-                state.prop_fb_id,
-                u64::from(u32::from(fb)),
-            );
-            req.add_raw_property(
-                state.plane.into(),
-                state.prop_crtc_id,
-                u64::from(u32::from(crtc)),
-            );
-            req.add_raw_property(state.plane.into(), state.prop_crtc_x, img_x as i64 as u64);
-            req.add_raw_property(state.plane.into(), state.prop_crtc_y, img_y as i64 as u64);
-            req.add_raw_property(state.plane.into(), state.prop_crtc_w, u64::from(self.width));
-            req.add_raw_property(
-                state.plane.into(),
-                state.prop_crtc_h,
-                u64::from(self.height),
-            );
-            req.add_raw_property(state.plane.into(), state.prop_src_x, 0u64);
-            req.add_raw_property(state.plane.into(), state.prop_src_y, 0u64);
-            req.add_raw_property(
-                state.plane.into(),
-                state.prop_src_w,
-                u64::from(self.width) << 16,
-            );
-            req.add_raw_property(
-                state.plane.into(),
-                state.prop_src_h,
-                u64::from(self.height) << 16,
-            );
-            self.device
-                .atomic_commit(AtomicCommitFlags::NONBLOCK, req)?;
-            self.visible.insert(crtc, true);
-            Ok(())
-        } else {
-            // Legacy fallback (works on Intel; may be a no-op on AMD with
-            // DRM_CLIENT_CAP_ATOMIC, hence the atomic path above).
-            self.show_legacy(crtc, hotspot, img_x, img_y)
-        }
+        self.show_legacy(crtc, hotspot, img_x, img_y)
     }
 
     #[allow(deprecated)]
@@ -386,31 +272,17 @@ impl CursorPlane {
     }
 
     /// Detach the cursor from `crtc`. The plane buffer is retained so
-    /// a future `show` doesn't have to re-allocate.
+    /// a future `show` doesn't have to re-allocate. Uses `set_cursor2`
+    /// (legacy ioctl) — see [`Self::show`] for why we don't use atomic.
     ///
     /// # Errors
-    /// Atomic-commit or `set_cursor2` ioctl failure.
+    /// `set_cursor2` ioctl failure.
     pub fn hide(&mut self, crtc: crtc::Handle) -> io::Result<()> {
         log::debug!(
-            "cursor_plane::hide CRTC={crtc:?} path={} prior_visible={}",
-            if self.per_crtc.contains_key(&crtc) {
-                "atomic"
-            } else {
-                "legacy"
-            },
+            "cursor_plane::hide CRTC={crtc:?} prior_visible={}",
             self.visible.get(&crtc).copied().unwrap_or(false),
         );
-        if let Some(state) = self.per_crtc.get(&crtc) {
-            let mut req = AtomicModeReq::new();
-            req.add_raw_property(state.plane.into(), state.prop_fb_id, 0u64);
-            req.add_raw_property(state.plane.into(), state.prop_crtc_id, 0u64);
-            self.device
-                .atomic_commit(AtomicCommitFlags::NONBLOCK, req)?;
-            self.visible.insert(crtc, false);
-            Ok(())
-        } else {
-            self.hide_legacy(crtc)
-        }
+        self.hide_legacy(crtc)
     }
 
     #[allow(deprecated)]
@@ -421,21 +293,22 @@ impl CursorPlane {
     }
 
     /// Move the cursor on `crtc` to image-top-left `(x, y)` in
-    /// CRTC-local coordinates. Uses an atomic position-only commit
-    /// when available; falls back to `move_cursor` ioctl otherwise.
+    /// CRTC-local coordinates. Uses `drmModeMoveCursor` (legacy ioctl)
+    /// — Xorg's modesetting driver does the same
+    /// (`drmmode_display.c:1797`).
+    ///
+    /// The legacy path is **immediate** (the kernel updates the cursor
+    /// plane synchronously, not vblank-paced) — perfect for cursor
+    /// responsiveness. It also doesn't EBUSY-collide with atomic
+    /// scanout commits on the same CRTC because the kernel routes
+    /// legacy cursor ops through a separate path from the atomic
+    /// state machine.
     ///
     /// # Errors
-    /// Atomic-commit or `move_cursor` ioctl failure.
+    /// `move_cursor` ioctl failure.
+    #[allow(deprecated)]
     pub fn move_to(&self, crtc: crtc::Handle, x: i32, y: i32) -> io::Result<()> {
-        if let Some(state) = self.per_crtc.get(&crtc) {
-            let mut req = AtomicModeReq::new();
-            req.add_raw_property(state.plane.into(), state.prop_crtc_x, x as i64 as u64);
-            req.add_raw_property(state.plane.into(), state.prop_crtc_y, y as i64 as u64);
-            self.device.atomic_commit(AtomicCommitFlags::NONBLOCK, req)
-        } else {
-            #[allow(deprecated)]
-            self.device.move_cursor(crtc, (x, y))
-        }
+        self.device.move_cursor(crtc, (x, y))
     }
 
     /// True iff the plane is currently bound (via `show`) on `crtc`.
@@ -516,128 +389,10 @@ impl Drop for CursorPlane {
                 log::debug!("cursor: hide on drop for {crtc:?} failed: {e}");
             }
         }
-        if let Some(fb) = self.fb.take() {
-            let _ = self.device.destroy_framebuffer(fb);
-        }
         if let Some(dumb) = self.dumb.take() {
             let _ = self.device.destroy_dumb_buffer(dumb);
         }
     }
-}
-
-/// Thin wrapper so `DumbBuffer` can be passed to `add_planar_framebuffer`.
-struct CursorDumbFb<'a> {
-    dumb: &'a DumbBuffer,
-    stride: u32,
-    width: u32,
-    height: u32,
-}
-
-impl DrmPlanarBuffer for CursorDumbFb<'_> {
-    fn size(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
-    fn format(&self) -> DrmFourcc {
-        DrmFourcc::Argb8888
-    }
-    fn modifier(&self) -> Option<drm::buffer::DrmModifier> {
-        None
-    }
-    fn pitches(&self) -> [u32; 4] {
-        [self.stride, 0, 0, 0]
-    }
-    fn handles(&self) -> [Option<DrmBufferHandle>; 4] {
-        [Some(self.dumb.handle()), None, None, None]
-    }
-    fn offsets(&self) -> [u32; 4] {
-        [0, 0, 0, 0]
-    }
-}
-
-/// Discover cursor plane handles and their property handles for each
-/// requested CRTC. Uses `DRM_CLIENT_CAP_UNIVERSAL_PLANES` plane list
-/// (already opted-in by `Device::enable_atomic_capabilities`).
-///
-/// A cursor plane matches a CRTC when `resources.filter_crtcs` returns
-/// that CRTC for the plane's `possible_crtcs` filter.
-fn discover_cursor_planes(
-    device: &Device,
-    crtcs: &[crtc::Handle],
-    _fb: framebuffer::Handle,
-) -> io::Result<HashMap<crtc::Handle, PerCrtcAtomicState>> {
-    let resources = device.resource_handles()?;
-    let mut result: HashMap<crtc::Handle, PerCrtcAtomicState> = HashMap::new();
-
-    for ph in device.plane_handles()? {
-        // Determine plane type by matching the `type` property value.
-        let props = device.get_properties(ph)?;
-        let prop_map_raw = props.as_hashmap(device)?;
-        let Some(type_info) = prop_map_raw.get("type") else {
-            continue;
-        };
-        let type_val = props
-            .iter()
-            .find(|(h, _)| **h == type_info.handle())
-            .map(|(_, v)| *v)
-            .unwrap_or(0);
-        if type_val != PlaneType::Cursor as u64 {
-            continue;
-        }
-
-        let plane_info = device.get_plane(ph)?;
-        let drivable: std::collections::HashSet<crtc::Handle> = resources
-            .filter_crtcs(plane_info.possible_crtcs())
-            .into_iter()
-            .collect();
-
-        for &want_crtc in crtcs {
-            if result.contains_key(&want_crtc) {
-                continue; // already assigned a cursor plane to this CRTC
-            }
-            if !drivable.contains(&want_crtc) {
-                continue; // this plane can't drive this CRTC
-            }
-
-            match PropMap::for_object(device, ph) {
-                Ok(prop_map) => {
-                    let state = (|| -> io::Result<PerCrtcAtomicState> {
-                        Ok(PerCrtcAtomicState {
-                            plane: ph,
-                            prop_fb_id: prop_map.id("FB_ID")?,
-                            prop_crtc_id: prop_map.id("CRTC_ID")?,
-                            prop_crtc_x: prop_map.id("CRTC_X")?,
-                            prop_crtc_y: prop_map.id("CRTC_Y")?,
-                            prop_crtc_w: prop_map.id("CRTC_W")?,
-                            prop_crtc_h: prop_map.id("CRTC_H")?,
-                            prop_src_x: prop_map.id("SRC_X")?,
-                            prop_src_y: prop_map.id("SRC_Y")?,
-                            prop_src_w: prop_map.id("SRC_W")?,
-                            prop_src_h: prop_map.id("SRC_H")?,
-                        })
-                    })();
-                    match state {
-                        Ok(s) => {
-                            result.insert(want_crtc, s);
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "cursor: property lookup failed for cursor plane {ph:?} \
-                                 on CRTC {want_crtc:?}: {e}; using legacy ioctl fallback"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "cursor: get_properties failed for plane {ph:?}: {e}; \
-                         using legacy ioctl fallback for CRTC {want_crtc:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    Ok(result)
 }
 
 #[cfg(test)]
