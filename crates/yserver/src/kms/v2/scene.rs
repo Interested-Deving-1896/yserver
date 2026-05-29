@@ -361,6 +361,28 @@ struct OutputSceneState {
     /// successfully — a failed submit must leave the OLD prev rect
     /// in place so the next frame still clears the trail.
     cursor_prev_pos: Option<(i32, i32)>,
+    /// Diagnostic: last reason `tick_one_output` skipped a tick for
+    /// this output. Logged at INFO on transition (skip→different-skip,
+    /// no-skip→skip, skip→no-skip). Tracks the freeze-debug
+    /// hypothesis that one of the early-return gates gets stuck.
+    last_skip_reason: Option<TickSkipReason>,
+}
+
+/// Diagnostic: why `tick_one_output` returned `Ok(false)` for an
+/// output. Used to identify which gate is stuck when an output
+/// stops getting page-flips. See `record_tick_skip`.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum TickSkipReason {
+    /// `pending_acks` non-empty — flip in flight, KMS would EBUSY.
+    PendingAcks,
+    /// `next_submit_retry_at` deadline still in the future.
+    RetryDeadline,
+    /// `output_damage` is empty and this is not the first frame.
+    EmptyDamage,
+    /// `platform.acquire_scanout_bo` returned None — BO pool exhausted.
+    NoBO,
+    /// `pool_ring.acquire` returned None — descriptor-pool ring exhausted.
+    NoPool,
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -539,6 +561,7 @@ impl SceneCompositor {
                 next_submit_retry_at: None,
                 last_frame_cursor_mode: OutputCursorMode::Hidden,
                 cursor_prev_pos: None,
+                last_skip_reason: None,
             });
         }
         Ok(Self {
@@ -1229,6 +1252,67 @@ fn drain_pending_pool_releases(
     state.pending_pool_releases = remaining;
 }
 
+/// Opt-in gate for the per-tick skip/unblock diagnostic. Default OFF:
+/// the logging fires on every skip-state transition, which during
+/// healthy vsync operation is one line per frame per output — pure
+/// noise + CPU unless you're actively chasing a freeze. Set
+/// `YSERVER_TICK_SKIP_LOG=1` (or true/yes) to enable it; when unset,
+/// `record_tick_skip` / `record_tick_success` are no-ops (no logging,
+/// no `last_skip_reason` book-keeping).
+fn tick_skip_log_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("YSERVER_TICK_SKIP_LOG").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+        )
+    })
+}
+
+/// Diagnostic: record that `tick_one_output` skipped this output at
+/// `reason`. Logs at INFO **only on transition** (different reason
+/// from the previous tick, or first skip after a successful flip),
+/// keeping the log volume bounded at one line per skip-state change
+/// per output. Used to debug "output stops getting page-flips
+/// indefinitely" by identifying which gate is stuck. Gated OFF by
+/// default — see [`tick_skip_log_enabled`].
+fn record_tick_skip(
+    state: &mut OutputSceneState,
+    output_idx: usize,
+    reason: TickSkipReason,
+    output_damage_rects: usize,
+) {
+    if !tick_skip_log_enabled() {
+        return;
+    }
+    if state.last_skip_reason != Some(reason) {
+        log::info!(
+            "v2 scene tick skip: output={output_idx} reason={reason:?} \
+             pending_acks={pa} retry_at={ra:?} damage_rects={dr} \
+             scene_structure_rects={ssr} prev_reason={pr:?}",
+            pa = state.pending_acks.len(),
+            ra = state.next_submit_retry_at,
+            dr = output_damage_rects,
+            ssr = state.scene_structure_damage.rects().len(),
+            pr = state.last_skip_reason,
+        );
+        state.last_skip_reason = Some(reason);
+    }
+}
+
+/// Diagnostic: record that `tick_one_output` succeeded (composed +
+/// submitted) for this output, clearing any prior skip state. Logs
+/// at INFO **only if we were previously skipping**, marking the
+/// "unblocked" transition for the freeze-debug timeline.
+fn record_tick_success(state: &mut OutputSceneState, output_idx: usize) {
+    if !tick_skip_log_enabled() {
+        return;
+    }
+    if let Some(prev) = state.last_skip_reason.take() {
+        log::info!("v2 scene tick unblock: output={output_idx} prev_reason={prev:?} composed=ok",);
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn tick_one_output(
     inner: &mut SceneCompositorInner,
@@ -1271,11 +1355,13 @@ fn tick_one_output(
         // releasing the slot then would have tripped the VUID.
         drain_pending_pool_releases(s, vk.as_ref());
         if !s.pending_acks.is_empty() {
+            record_tick_skip(s, output_idx, TickSkipReason::PendingAcks, 0);
             return Ok(false);
         }
         if let Some(deadline) = s.next_submit_retry_at
             && std::time::Instant::now() < deadline
         {
+            record_tick_skip(s, output_idx, TickSkipReason::RetryDeadline, 0);
             return Ok(false);
         }
     }
@@ -1331,13 +1417,24 @@ fn tick_one_output(
 
     // 3. Empty-damage fast path (after first frame).
     if output_damage.is_empty() && !first_frame {
+        let s = inner.outputs.get_mut(output_idx).expect("range");
+        record_tick_skip(s, output_idx, TickSkipReason::EmptyDamage, 0);
         return Ok(false);
     }
 
     // 4. Acquire BO.
     let token = match platform.acquire_scanout_bo(output_idx) {
         Some(t) => t,
-        None => return Ok(false),
+        None => {
+            let s = inner.outputs.get_mut(output_idx).expect("range");
+            record_tick_skip(
+                s,
+                output_idx,
+                TickSkipReason::NoBO,
+                output_damage.rects().len(),
+            );
+            return Ok(false);
+        }
     };
 
     // 5. Pick repaint region via buffer-age algorithm.
@@ -1387,6 +1484,12 @@ fn tick_one_output(
         None => {
             log::debug!(
                 "v2 scene: descriptor-pool ring exhausted for output {output_idx}; skipping tick",
+            );
+            record_tick_skip(
+                state,
+                output_idx,
+                TickSkipReason::NoPool,
+                output_damage.rects().len(),
             );
             return Ok(false);
         }
@@ -1444,6 +1547,7 @@ fn tick_one_output(
                 cursor_mode_after_retire,
             });
             state.current_generation = frame_gen;
+            record_tick_success(state, output_idx);
             Ok(true)
         }
         Err(e) => {
