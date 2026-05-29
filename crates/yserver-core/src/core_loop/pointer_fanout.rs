@@ -446,25 +446,27 @@ pub fn pointer_event_fanout_to_state(
     }
 
     // If this is a wheel button press (4 = up, 5 = down, 6 = left,
-    // 7 = right), prepend an XI_Motion event carrying the per-
-    // event scroll delta before the XI_ButtonPress. The Motion's
-    // axis value is the DELTA (±1 per click), NOT the cumulative
-    // counter — XIScrollClass is declared Relative (mode=0), so
-    // per the XI2 spec the axis value in each Motion event is the
-    // change since the previous event. GDK divides by increment
-    // (1.0) and fires a scroll event.
+    // 7 = right), prepend an XI_Motion event carrying the scroll-axis
+    // valuator update before the XI_ButtonPress. The Motion's axis
+    // value is the **CUMULATIVE** scroll counter, not the per-event
+    // delta — XI2 §11.5: clients compute the delta as
+    // `(current - previous) / increment`. The previous-value
+    // baseline comes from `XIQueryDevice` (the valuator class
+    // declares the current position) and `DeviceChanged` events as
+    // clients connect mid-session.
     //
-    // The earlier cumulative-counter encoding was a Relative-mode
-    // mismatch: GDK interpreted the cumulative value AS the delta,
-    // which fires N scroll events on the Nth wheel click and
-    // confuses clients that joined mid-session. State tracking on
-    // ServerState (scroll_axis_value) is kept for telemetry / for
-    // any future Absolute-mode switch but isn't used for emission.
+    // A pre-2026-05-29 yserver sent `delta` (±1) here. GDK reads the
+    // axisvalue, subtracts its cached previous (which after the first
+    // scroll is also 1), and gets 0 — no scroll. The first scroll
+    // worked (1 - 0 = 1), every subsequent scroll on the same client
+    // got stuck. This bug went unnoticed because GDK was falling back
+    // to the legacy XI_ButtonPress(4..7) emulation (XIPointerEmulated
+    // flag wasn't being set, so GDK accepted those buttons as scroll).
+    // The XI_POINTER_EMULATED fix (Chrome scroll-crash repair) made
+    // GDK correctly skip the emulated buttons, exposing the latent
+    // cumulative-vs-delta bug.
     //
-    // ButtonRelease doesn't carry a delta; only ButtonPress does.
-    // The legacy XI_ButtonPress(4/5) event still goes out below
-    // for core-X11 clients and for non-XI2 fallback. XIScrollClass
-    // has NoEmulation flag set, so GDK ignores those for scroll.
+    // ButtonRelease doesn't carry an axis update; only ButtonPress does.
     let scroll_axis_info: Option<(u8, i32)> = if event.kind == PointerEventKind::ButtonPress
         && (event.detail >= 4 && event.detail <= 7)
     {
@@ -477,7 +479,7 @@ pub fn pointer_event_fanout_to_state(
         };
         state.scroll_axis_value[axis_idx] = state.scroll_axis_value[axis_idx].wrapping_add(delta);
         let scroll_axis_num: u8 = if axis_idx == 0 { 2 } else { 3 };
-        Some((scroll_axis_num, delta))
+        Some((scroll_axis_num, state.scroll_axis_value[axis_idx]))
     } else {
         None
     };
@@ -528,6 +530,23 @@ pub fn pointer_event_fanout_to_state(
                     value,
                 );
             }
+            // Mark scroll-emulated XI_ButtonPress/Release(4..7) with
+            // XIPointerEmulated so XI2-aware clients discard the legacy
+            // button event after consuming the matching XI_Motion
+            // scroll-axis update. Skipping this flag double-dispatches
+            // wheel input — release Chrome stack-smashed on rapid
+            // scroll into yserver from this exact gap (see
+            // `yserver-protocol::x11::XI_POINTER_EMULATED` for the full
+            // rationale).
+            let xi2_flags: u32 = if matches!(
+                event.kind,
+                PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
+            ) && (4..=7).contains(&event.detail)
+            {
+                x11::XI_POINTER_EMULATED
+            } else {
+                0
+            };
             x11::encode_xi2_device_event(
                 buf,
                 order,
@@ -546,6 +565,7 @@ pub fn pointer_event_fanout_to_state(
                 event.state,
                 u32::from(event.detail),
                 XI2_SLAVE_POINTER_DEVICE_ID,
+                xi2_flags,
             );
         }
     });

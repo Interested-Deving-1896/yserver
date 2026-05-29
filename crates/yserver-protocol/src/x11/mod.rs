@@ -1803,6 +1803,19 @@ pub fn write_list_properties_reply(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// XI2 device-event flags. Bit 16 (`XIPointerEmulated`) marks a button
+/// or key event that's a legacy emulation of an already-delivered
+/// device-class event (smooth-scroll axis change for buttons 4..7,
+/// keyboard touch emulation, etc.). Without this flag set on the
+/// scroll-emulated XI_ButtonPress/Release(4..7), XI2-aware clients
+/// double-handle the wheel input — process the smooth-scroll
+/// XI_Motion AND the button "click," with the click landing on the
+/// app's real button-5/6/7 handler (back/forward nav, custom JS).
+/// Release Chrome stack-smashed on rapid scroll into yserver because
+/// of this. Xorg sets the flag on every emulated button event.
+pub const XI_POINTER_EMULATED: u32 = 0x0001_0000;
+
+#[allow(clippy::too_many_arguments)]
 pub fn encode_xi2_device_event(
     out: &mut Vec<u8>,
     byte_order: ClientByteOrder,
@@ -1821,6 +1834,7 @@ pub fn encode_xi2_device_event(
     state: u16,
     detail: u32,
     sourceid: u16,
+    flags: u32,
 ) {
     // Per the X.Org reference trace (thunar inside MATE, sampled
     // 2026-05-15), XI2 Button events carry NO axis values: valuator
@@ -1839,13 +1853,28 @@ pub fn encode_xi2_device_event(
     // axis-bearing Press events differently from Xorg-style
     // axis-free Presses).
     let include_axes = evtype == 6; // XI_Motion only
-    let valuators_len_u16: u16 = if include_axes { 1 } else { 0 };
+    // Match Xorg's wire-format widths byte-for-byte: 8 u32s of buttons
+    // mask (covers 256 buttons; we only use bits 1..7 but pad to match
+    // Xorg's modesetting/evdev declaration) and 2 u32s of valuators
+    // mask (covers 64 valuators; we use bits 0..3 in the first u32).
+    //
+    // Release Chrome (Ozone X11 path) crashes on yserver scroll when
+    // event widths differ from Xorg's — our 1 u32 of buttons mask + 0
+    // u32 of valuators mask (on button events) under-fills Chrome's
+    // pre-sized struct from XIQueryDevice and walks into adjacent
+    // memory. Other XCB/Xlib-based clients track width per-event and
+    // are unaffected, so the bug was Chrome-specific. See
+    // 2026-05-29 chrome-scroll bug investigation (mate-xorg vs
+    // mate xtrace diff identified the width mismatch).
+    const BUTTONS_LEN_U16: u16 = 8;
+    const VALUATORS_LEN_U16: u16 = 2;
     let valuator_mask: u32 = if include_axes { 0x0000_0003 } else { 0 };
     // Tail layout: 4*FP1616(coords) + 12 (lens/sourceid/pad/flags) +
-    //   16 (mods) + 4 (group) + 4 (buttons mask) +
-    //   4*valuators_len_u16 (valuator mask) +
+    //   16 (mods) + 4 (group) + 4*BUTTONS_LEN_U16 (buttons mask) +
+    //   4*VALUATORS_LEN_U16 (valuator mask) +
     //   {2*FP3232 axisvalues if include_axes, else 0}.
-    let extra_bytes: u32 = 16 + 12 + 16 + 4 + 4 + 4 * u32::from(valuators_len_u16);
+    let extra_bytes: u32 =
+        16 + 12 + 16 + 4 + 4 * u32::from(BUTTONS_LEN_U16) + 4 * u32::from(VALUATORS_LEN_U16);
     let axes_bytes: u32 = if include_axes { 16 } else { 0 };
     let length_units = (extra_bytes + axes_bytes) / 4;
 
@@ -1869,11 +1898,11 @@ pub fn encode_xi2_device_event(
     write_u32(byte_order, out, (i32::from(event_x) << 16) as u32);
     write_u32(byte_order, out, (i32::from(event_y) << 16) as u32);
 
-    write_u16(byte_order, out, 1); // buttons_len: 1 u32 of button mask
-    write_u16(byte_order, out, valuators_len_u16);
+    write_u16(byte_order, out, BUTTONS_LEN_U16);
+    write_u16(byte_order, out, VALUATORS_LEN_U16);
     write_u16(byte_order, out, sourceid);
     write_u16(byte_order, out, 0); // pad
-    write_u32(byte_order, out, 0); // flags
+    write_u32(byte_order, out, flags);
 
     // mods: base, latched, locked, effective. Per XI2 / XKB spec these
     // are KEYBOARD modifier bits only (Shift/Lock/Control/Mod1..Mod5 in
@@ -1905,12 +1934,19 @@ pub fn encode_xi2_device_event(
     // (button 1) → mask-bit-1, and mask off the reserved bit-0.
     let pre_buttons: u32 = u32::from((state >> 7) & 0x3e);
     write_u32(byte_order, out, pre_buttons);
+    // Buttons mask padding to BUTTONS_LEN_U16 u32s — Xorg pads to 8
+    // even when only bits 1..7 are meaningful. See header comment.
+    for _ in 1..BUTTONS_LEN_U16 {
+        write_u32(byte_order, out, 0);
+    }
 
-    // Valuator mask (length = valuators_len_u16). Motion events carry
-    // the X/Y axes (mask = 0x03, bits 0 and 1); Press/Release/crossing
-    // events carry no axes (valuators_len = 0, no mask written).
-    if valuators_len_u16 > 0 {
-        write_u32(byte_order, out, valuator_mask);
+    // Valuator mask of VALUATORS_LEN_U16 u32s. Bit 0 (X), 1 (Y), 2/3
+    // (scroll axes) live in the first u32; second u32 is always 0.
+    // Motion events set X/Y bits; button/crossing events set no bits
+    // (mask = 0).
+    write_u32(byte_order, out, valuator_mask);
+    for _ in 1..VALUATORS_LEN_U16 {
+        write_u32(byte_order, out, 0);
     }
     if include_axes {
         // Axis values: FP3232 (signed i32 integer + u32 fraction).
@@ -1961,7 +1997,11 @@ pub fn encode_xi2_motion_with_scroll(
     write_u16(byte_order, out, sequence.0);
     // Tail = base 72 (see encode_xi2_device_event) + 8 (extra
     // FP3232 axis value) = 80 bytes = 20 units.
-    write_u32(byte_order, out, 20);
+    // Match `encode_xi2_device_event`'s padded layout: 8 u32 buttons,
+    // 2 u32 valuators. Tail = 16(coords) + 12(lens) + 16(mods) +
+    // 4(group) + 32(8 u32 buttons mask) + 8(2 u32 valuator mask) +
+    // 24(3 FP3232 axisvalues: X, Y, scroll) = 112 bytes = 28 units.
+    write_u32(byte_order, out, 28);
 
     write_u16(byte_order, out, 6); // evtype = XI_Motion
     write_u16(byte_order, out, deviceid);
@@ -1976,8 +2016,8 @@ pub fn encode_xi2_motion_with_scroll(
     write_u32(byte_order, out, (i32::from(event_x) << 16) as u32);
     write_u32(byte_order, out, (i32::from(event_y) << 16) as u32);
 
-    write_u16(byte_order, out, 1); // buttons_len
-    write_u16(byte_order, out, 1); // valuators_len
+    write_u16(byte_order, out, 8); // buttons_len — match Xorg's wire width
+    write_u16(byte_order, out, 2); // valuators_len — match Xorg's wire width
     write_u16(byte_order, out, sourceid);
     write_u16(byte_order, out, 0); // pad
     write_u32(byte_order, out, 0); // flags
@@ -1993,15 +2033,19 @@ pub fn encode_xi2_motion_with_scroll(
 
     out.extend_from_slice(&[0; 4]); // group
 
-    // Button mask: PRE-event buttons held. Bit N corresponds to button
-    // N (1-indexed); bit 0 is reserved per X11 spec. State bits 8..=12
-    // are Button1..5; shift down 7 to align state-bit-8 → mask-bit-1.
+    // Button mask (8 u32s of pre-event button state; only first carries
+    // meaningful bits — pad the rest with 0).
     let pre_buttons: u32 = u32::from((state >> 7) & 0x3e);
     write_u32(byte_order, out, pre_buttons);
+    for _ in 1..8 {
+        write_u32(byte_order, out, 0);
+    }
 
-    // Valuator mask: bits 0 (X), 1 (Y), and the scroll axis.
+    // Valuator mask (2 u32s). First u32 holds bits 0(X), 1(Y), and the
+    // scroll axis bit (2=vert or 3=horiz); second u32 is 0.
     let mask: u32 = 0x3 | (1u32 << u32::from(scroll_axis));
     write_u32(byte_order, out, mask);
+    write_u32(byte_order, out, 0);
 
     // Axis values (FP3232: signed i32 integer + u32 fraction).
     // Order matches mask LSB-first: axis 0 (X), 1 (Y), then scroll.
@@ -2012,7 +2056,7 @@ pub fn encode_xi2_motion_with_scroll(
     write_u32(byte_order, out, scroll_value as u32);
     write_u32(byte_order, out, 0); // scroll fraction
 
-    debug_assert_eq!(out.len() - start, 112);
+    debug_assert_eq!(out.len() - start, 144);
 }
 
 /// Encode an XInput2 raw device event (XI_RawKeyPress / XI_RawKeyRelease /
@@ -3555,22 +3599,25 @@ mod tests {
             5,
             0, // detail = 0 for motion
             2,
+            0, // flags
         );
 
-        // 84 bytes (pre-valuator layout) + 4 (valuator mask) +
-        // 16 (2 FP3232 X/Y axisvalues) = 104.
-        assert_eq!(out.len(), 104);
+        // Width-padded to match Xorg byte-for-byte: 32 header + 16 coords
+        // + 12 lens/sourceid/pad/flags + 16 mods + 4 group +
+        // 32 buttons mask (8 u32s) + 8 valuator mask (2 u32s) +
+        // 16 axisvalues (2 FP3232 X/Y) = 136 bytes.
+        assert_eq!(out.len(), 136);
         assert_eq!(&out[0..4], &[35, 137, 7, 0]);
-        // length-in-4-byte-units beyond the 32-byte header: (104 - 32) / 4 = 18.
-        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 18);
-        // Valuator mask at offset 84 (after groups + buttons mask): X+Y bits.
-        assert_eq!(u32::from_le_bytes(out[84..88].try_into().unwrap()), 0x3);
-        // X axis integer part at offset 88: passed as root_x = 1.
-        assert_eq!(u32::from_le_bytes(out[88..92].try_into().unwrap()), 1);
-        // X fraction at offset 92: always 0 (integer-valued positions).
-        assert_eq!(u32::from_le_bytes(out[92..96].try_into().unwrap()), 0);
-        // Y axis integer part at offset 96: passed as root_y = 2.
-        assert_eq!(u32::from_le_bytes(out[96..100].try_into().unwrap()), 2);
+        // length-in-4-byte-units beyond the 32-byte header: (136 - 32) / 4 = 26.
+        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 26);
+        // Valuator mask at offset 112 (after group at 80 + 32 button mask): X+Y bits.
+        assert_eq!(u32::from_le_bytes(out[112..116].try_into().unwrap()), 0x3);
+        // X axis integer part at offset 120 (after 8 byte valuator mask): root_x = 1.
+        assert_eq!(u32::from_le_bytes(out[120..124].try_into().unwrap()), 1);
+        // X fraction at offset 124: 0.
+        assert_eq!(u32::from_le_bytes(out[124..128].try_into().unwrap()), 0);
+        // Y axis integer part at offset 128: root_y = 2.
+        assert_eq!(u32::from_le_bytes(out[128..132].try_into().unwrap()), 2);
     }
 
     #[test]
@@ -3597,16 +3644,23 @@ mod tests {
             5,
             1,
             2,
+            0, // flags
         );
 
-        // 84 bytes (pre-valuator layout, valuators_len=0 means no
-        // mask u32 and no axisvalues) = 84 total.
-        assert_eq!(out.len(), 84);
+        // Width-padded to match Xorg: 32 header + 16 coords + 12 lens +
+        // 16 mods + 4 group + 32 buttons mask (8 u32s) + 8 valuator
+        // mask (2 u32s) + 0 axes = 120 bytes.
+        assert_eq!(out.len(), 120);
         assert_eq!(&out[0..4], &[35, 137, 7, 0]);
-        // length units: (84 - 32) / 4 = 13.
-        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 13);
-        // valuators_len at offset 50 (right after buttons_len at 48): 0.
-        assert_eq!(u16::from_le_bytes(out[50..52].try_into().unwrap()), 0);
+        // length units: (120 - 32) / 4 = 22.
+        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 22);
+        // buttons_len at offset 48: 8 (Xorg-matching pad width).
+        assert_eq!(u16::from_le_bytes(out[48..50].try_into().unwrap()), 8);
+        // valuators_len at offset 50: 2 (Xorg-matching pad width).
+        assert_eq!(u16::from_le_bytes(out[50..52].try_into().unwrap()), 2);
+        // Valuator mask at offset 112 (after 32-byte buttons mask): 0 — button
+        // events change no axes.
+        assert_eq!(u32::from_le_bytes(out[112..116].try_into().unwrap()), 0);
     }
 
     #[test]

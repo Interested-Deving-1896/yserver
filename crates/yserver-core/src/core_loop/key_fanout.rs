@@ -200,6 +200,7 @@ fn encode_key_xi2(
         event.state & WIRE_MODIFIER_MASK,
         u32::from(event.keycode),
         XI2_SLAVE_KEYBOARD_DEVICE_ID,
+        0, // flags: no XIPointerEmulated on key events
     );
 }
 

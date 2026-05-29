@@ -1718,6 +1718,20 @@ fn pointer_event_fanout_inner(
                 2,
             );
         } else {
+            // Pre-D3 legacy emitter (state.fanout_pointer). Mirror the
+            // D3 fanout's XIPointerEmulated handling for scroll-wheel
+            // emulation; same rationale as in
+            // `core_loop::pointer_fanout`.
+            let xi2_flags: u32 = if matches!(
+                event.kind,
+                crate::host_x11::PointerEventKind::ButtonPress
+                    | crate::host_x11::PointerEventKind::ButtonRelease
+            ) && (4..=7).contains(&event.detail)
+            {
+                x11::XI_POINTER_EMULATED
+            } else {
+                0
+            };
             x11::encode_xi2_device_event(
                 &mut buf,
                 target.byte_order,
@@ -1736,6 +1750,7 @@ fn pointer_event_fanout_inner(
                 event.state,
                 u32::from(event.detail),
                 2,
+                xi2_flags,
             );
         }
         if let Ok(mut w) = target.writer.lock() {

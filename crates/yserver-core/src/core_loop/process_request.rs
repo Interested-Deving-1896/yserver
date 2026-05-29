@@ -7510,15 +7510,24 @@ fn handle_xi2_request(
                 x11::write_u16(le, buf, number);
                 x11::write_u16(le, buf, scroll_type);
                 x11::write_u16(le, buf, 0); // pad
-                // Flags: NoEmulation (0x1) tells GDK "real axis
-                // events come on this scroll axis; do NOT expect or
-                // process XI_ButtonPress(4/5/6/7) as scroll
-                // emulation from this device." We emit both the
-                // XI_Motion-with-scroll-axis events and the core
-                // ButtonPress(4/5) (the latter for non-XI2 clients);
-                // setting NoEmulation prevents GDK's XI2 backend
-                // from double-firing scroll on both event types.
-                x11::write_u32(le, buf, 1); // flags = NoEmulation
+                // Flags: 0 (no NoEmulation, no Preferred). yserver
+                // emits BOTH the XI_Motion-with-scroll-axis update AND
+                // the legacy XI_ButtonPress/Release(4..7), with the
+                // `XIPointerEmulated` flag set on the latter (see
+                // `pointer_fanout` + `XI_POINTER_EMULATED`). This
+                // matches Xorg's modesetting/evdev declaration: the
+                // device class advertises "I emit emulated button
+                // events too," and clients use the per-event
+                // PointerEmulated flag to discard them after consuming
+                // the smooth-scroll Motion.
+                //
+                // Setting `NoEmulation` here while still emitting
+                // XI_ButtonPress(4..7) is a contract violation that
+                // crashed release Chrome on bee (Chrome's input
+                // dispatcher trusts the class declaration; receiving
+                // an event the class says can never come hits an
+                // internal invariant). Fixed 2026-05-29.
+                x11::write_u32(le, buf, 0); // flags = 0
                 // FP3232 increment = 1.0 → (1, 0)
                 x11::write_u32(le, buf, 1);
                 x11::write_u32(le, buf, 0);
