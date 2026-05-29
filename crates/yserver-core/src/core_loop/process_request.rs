@@ -5933,6 +5933,64 @@ pub fn fire_present_completion_events(
     }
 }
 
+/// Emit `Present::ConfigureNotify` to every client that selected
+/// `EVENT_MASK_CONFIGURE_NOTIFY` on `window`. Triggered from
+/// `handle_configure_window` whenever the window's geometry changes
+/// (size primarily — Mesa keys buffer reallocation on
+/// `pixmap_{width,height}` here). Mirrors the iteration shape of
+/// `fire_present_completion_events`.
+fn fire_present_configure_notify_for_window(
+    state: &mut ServerState,
+    window_id: ResourceId,
+    geometry: yserver_protocol::x11::Geometry,
+) {
+    use yserver_protocol::x11::present as x11present;
+    const PRESENT_MAJOR_OPCODE: u8 = 145;
+
+    let mut targets: Vec<(u32, ClientId, u32)> = Vec::new();
+    for (eid, sel) in &state.present_event_selections {
+        if sel.window == window_id {
+            targets.push((*eid, sel.owner, sel.event_mask));
+        }
+    }
+    for (eid, owner, mask) in targets {
+        if mask & x11present::EVENT_MASK_CONFIGURE_NOTIFY == 0 {
+            continue;
+        }
+        let Some(client) = state.clients.get_mut(&owner.0) else {
+            continue;
+        };
+        let byte_order = client.byte_order;
+        let seq = SequenceNumber(
+            client
+                .last_sequence
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let ev = x11present::encode_configure_notify(
+            byte_order,
+            seq,
+            PRESENT_MAJOR_OPCODE,
+            eid,
+            window_id.0,
+            geometry.x,
+            geometry.y,
+            geometry.width,
+            geometry.height,
+            0,
+            0,
+            geometry.width,
+            geometry.height,
+            0,
+        );
+        let _ = write_to_client(client, owner, &ev);
+        debug!(
+            "PRESENT ConfigureNotify -> client {} eid=0x{eid:x} window=0x{:x} \
+             geom=({},{} {}x{})",
+            owner.0, window_id.0, geometry.x, geometry.y, geometry.width, geometry.height,
+        );
+    }
+}
+
 fn fire_present_notify_msc_complete_events(
     state: &mut ServerState,
     byte_order: yserver_protocol::x11::ClientByteOrder,
@@ -9268,6 +9326,24 @@ fn handle_configure_window(
                 geometry.width,
                 geometry.height,
             );
+            // Present::ConfigureNotify. Tells DRI3+Present consumers
+            // (Mesa's loader_dri3_helper) that the window resized and
+            // they must reallocate the swap buffer. Without this, Mesa
+            // keeps presenting at the size of its first allocation —
+            // which for Firefox's profile chooser (window created 1×1,
+            // SelectInput'd, then ConfigureWindow'd to 800×800 before
+            // first PixmapFromBuffers had a chance to see the final
+            // size) means every present stays 1×1 over an 800×800
+            // window → blank content. Race-determined: when Mesa's
+            // first PixmapFromBuffers happens AFTER the configure, no
+            // ConfigureNotify is needed and FF renders; when Mesa
+            // allocates BEFORE the configure, no ConfigureNotify
+            // means it never reallocates. See mate.xtrace fail-vs-pass
+            // diff (2026-05-29): fail run had 8× `src=pixmap 1x1`
+            // PRESENT-INSTRs, pass run had 3× `src=pixmap 800x800` —
+            // same binary, same FF launch, pure timing race that this
+            // event closes.
+            fire_present_configure_notify_for_window(state, window_id, geometry);
         }
         // X11 Composite + DAMAGE interaction: configuring a redirected
         // window (move / resize / border / stack-order) changes its

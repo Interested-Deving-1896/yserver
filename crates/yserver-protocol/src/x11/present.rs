@@ -345,6 +345,85 @@ pub fn encode_idle_notify(
     out
 }
 
+/// Encode a `ConfigureNotify` GE event. Layout per `presentproto`:
+///
+/// ```text
+/// 1   GenericEvent (35)
+/// 1   extension major opcode
+/// 2   sequence number
+/// 4   length = 2  (8 extra bytes past the 32-byte slot)
+/// 2   evtype (0 = ConfigureNotify)
+/// 2   pad
+/// 4   eid
+/// 4   window
+/// 2   x
+/// 2   y
+/// 2   width
+/// 2   height
+/// 2   off_x
+/// 2   off_y
+/// 2   pixmap_width
+/// 2   pixmap_height
+/// 4   pixmap_flags
+/// ```
+///
+/// Total 40 bytes. Mesa's `loader_dri3_helper` consumes this to know it
+/// must reallocate the EGL/DRI3 swap buffer at the new window size — without
+/// it, Mesa keeps presenting whatever size it allocated initially, which
+/// for a profile-chooser window first created at 1×1 means 1×1 presents
+/// over an 800×800 window → blank content (Firefox empty-shadow on bee).
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn encode_configure_notify(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    extension_major: u8,
+    eid: u32,
+    window: u32,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    off_x: i16,
+    off_y: i16,
+    pixmap_width: u16,
+    pixmap_height: u16,
+    pixmap_flags: u32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(40);
+    out.push(35);
+    out.push(extension_major);
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 2);
+    write_u16(byte_order, &mut out, EVENT_CONFIGURE_NOTIFY.into());
+    write_u16(byte_order, &mut out, 0); // pad
+    write_u32(byte_order, &mut out, eid);
+    write_u32(byte_order, &mut out, window);
+    #[allow(clippy::cast_sign_loss)]
+    {
+        write_u16(byte_order, &mut out, x as u16);
+        write_u16(byte_order, &mut out, y as u16);
+    }
+    write_u16(byte_order, &mut out, width);
+    write_u16(byte_order, &mut out, height);
+    #[allow(clippy::cast_sign_loss)]
+    {
+        write_u16(byte_order, &mut out, off_x as u16);
+        write_u16(byte_order, &mut out, off_y as u16);
+    }
+    write_u16(byte_order, &mut out, pixmap_width);
+    write_u16(byte_order, &mut out, pixmap_height);
+    write_u32(byte_order, &mut out, pixmap_flags);
+    debug_assert_eq!(out.len(), 40);
+    out
+}
+
+/// `Present::SelectInput` event mask bits per `presentproto`.
+pub const EVENT_MASK_CONFIGURE_NOTIFY: u32 = 1;
+pub const EVENT_MASK_COMPLETE_NOTIFY: u32 = 1 << 1;
+pub const EVENT_MASK_IDLE_NOTIFY: u32 = 1 << 2;
+pub const EVENT_MASK_REDIRECT_NOTIFY: u32 = 1 << 3;
+
 #[must_use]
 pub fn encode_query_capabilities_reply(
     byte_order: ClientByteOrder,
