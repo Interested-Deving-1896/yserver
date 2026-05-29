@@ -988,7 +988,20 @@ fn handle_setup_allocate(
     let _ = response_tx.send(response);
 }
 
-fn handle_host_input(state: &mut ServerState, backend: &mut dyn Backend, ev: HostInputEvent) {
+/// Process a real host input event: arm/refresh/clear the auto-repeat
+/// timer before fanning the event out via `backend.on_host_input`.
+///
+/// This is the single entry point for input that originated from a
+/// user (libinput, host-X11 forwarded events, XTEST). Synthetic
+/// release+press pairs emitted by [`fire_pending_repeats`] must NOT
+/// route through here — they call `backend.on_host_input` directly so
+/// the synthetic release doesn't re-enter [`update_repeat_state`] and
+/// clear the armed key.
+///
+/// Reachable from the backend's on-core libinput dispatch in libseat
+/// mode (the backend owns libinput on the core thread there), hence
+/// `pub`.
+pub fn handle_host_input(state: &mut ServerState, backend: &mut dyn Backend, ev: HostInputEvent) {
     update_repeat_state(state, &ev);
     backend.on_host_input(state, ev);
 }
@@ -1306,6 +1319,55 @@ mod tests {
             3,
             "expected 3 on_page_flip_ready dispatches",
         );
+    }
+
+    /// `handle_host_input` arms the auto-repeat timer on a real
+    /// KeyPress, replaces it on a different KeyPress, and clears it
+    /// on the matching KeyRelease. Regression: when on-core libinput
+    /// dispatch (libseat mode) called `backend.on_host_input` directly
+    /// it bypassed this wrapper and keys never repeated.
+    #[test]
+    fn handle_host_input_arms_repeat_state() {
+        use crate::{backend::recording::RecordingBackend, host_x11::HostKeyEvent};
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        let key = |keycode: u8, pressed: bool| {
+            HostInputEvent::Key(HostKeyEvent {
+                pressed,
+                keycode,
+                time: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            })
+        };
+
+        // Press A → armed on A.
+        handle_host_input(&mut state, &mut backend, key(38, true));
+        let armed = state.repeat_state.expect("press should arm repeat_state");
+        assert_eq!(armed.event.keycode, 38);
+        assert!(armed.event.pressed);
+
+        // Press B (different keycode) → replaces armed key.
+        handle_host_input(&mut state, &mut backend, key(39, true));
+        let armed = state.repeat_state.expect("second press should re-arm");
+        assert_eq!(armed.event.keycode, 39);
+
+        // Release A while B is armed → ignored (only the armed key's
+        // release clears).
+        handle_host_input(&mut state, &mut backend, key(38, false));
+        assert!(
+            state.repeat_state.is_some(),
+            "release of non-armed key must not clear",
+        );
+
+        // Release B → clears.
+        handle_host_input(&mut state, &mut backend, key(39, false));
+        assert!(state.repeat_state.is_none());
     }
 
     #[test]

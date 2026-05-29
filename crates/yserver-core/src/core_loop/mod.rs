@@ -23,5 +23,5 @@ pub use message::{
     HostInputEvent, Message, SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT, SYNTH_SCROLL_RIGHT,
     SYNTH_SCROLL_UP, SetupAllocateResponse,
 };
-pub use run::run_core;
+pub use run::{handle_host_input, run_core};
 pub use sender::{CoreReceiver, CoreSender, NOTIFY_TOKEN, channel};

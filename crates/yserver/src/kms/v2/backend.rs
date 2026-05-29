@@ -6826,13 +6826,19 @@ impl Backend for KmsBackendV2 {
         let time_ms = crate::clock::server_time_ms();
         let mut scroll_buf: Vec<yserver_core::core_loop::HostInputEvent> = Vec::new();
         let mut pending_motion: Option<yserver_core::core_loop::HostInputEvent> = None;
+        // Route via `core_loop::handle_host_input` (not `self.on_host_input`
+        // directly) so `update_repeat_state` arms the core's auto-repeat
+        // timer for real input. The off-thread input_thread path goes
+        // through Message::HostInput → handle_host_input → on_host_input;
+        // the on-core libseat path must match that contract or keys
+        // never repeat (regressed when this dispatch first landed).
         for ev in events {
             if let Some(hk) = self.hotkey.check(&ev) {
                 // Hotkey absorbs the event — but flush any pending
                 // motion first so the cursor's last position is
                 // delivered chronologically before the hotkey effect.
                 if let Some(m) = pending_motion.take() {
-                    self.on_host_input(state, m);
+                    yserver_core::core_loop::handle_host_input(state, self, m);
                 }
                 self.handle_core_hotkey(hk);
                 continue;
@@ -6848,10 +6854,10 @@ impl Backend for KmsBackendV2 {
                 }
                 if !scroll_buf.is_empty() {
                     if let Some(m) = pending_motion.take() {
-                        self.on_host_input(state, m);
+                        yserver_core::core_loop::handle_host_input(state, self, m);
                     }
                     for host_ev in scroll_buf.drain(..) {
-                        self.on_host_input(state, host_ev);
+                        yserver_core::core_loop::handle_host_input(state, self, host_ev);
                     }
                 }
                 continue;
@@ -6868,16 +6874,16 @@ impl Backend for KmsBackendV2 {
                 }
                 non_motion => {
                     if let Some(m) = pending_motion.take() {
-                        self.on_host_input(state, m);
+                        yserver_core::core_loop::handle_host_input(state, self, m);
                     }
-                    self.on_host_input(state, non_motion);
+                    yserver_core::core_loop::handle_host_input(state, self, non_motion);
                 }
             }
         }
         // Flush trailing motion at the end of the dispatch batch so the
         // core sees the last cursor position before the next epoll wait.
         if let Some(m) = pending_motion.take() {
-            self.on_host_input(state, m);
+            yserver_core::core_loop::handle_host_input(state, self, m);
         }
     }
 
