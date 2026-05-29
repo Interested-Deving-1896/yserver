@@ -615,7 +615,8 @@ impl ScanoutBoPool {
     /// keep the bos." Re-allocating bos with new dimensions is the
     /// caller's responsibility (drop the pool, allocate a fresh one
     /// with `ScanoutBoPool::allocate`).
-    #[allow(dead_code)] // wired in by 4.1.2.6 modeset path; today's only consumer is Drop.
+    // Consumers: Drop, and `PlatformBackend::reset_scanout_bos_for_suspend`
+    // (VT-switch suspend reclaims orphaned scanout BOs after master loss).
     pub fn drain_all_pending(&mut self, vk: &VkContext) {
         if let Err(e) = unsafe { vk.device.device_wait_idle() } {
             log::warn!("scanout pool drain: vkDeviceWaitIdle: {e}");

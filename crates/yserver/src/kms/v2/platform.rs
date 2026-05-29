@@ -1757,6 +1757,38 @@ impl PlatformBackend {
         bo.state = BoState::default();
     }
 
+    /// VT-switch suspend: force every scanout BO on every output back to
+    /// `BoPhase::Free` and reset its content tracking.
+    ///
+    /// A pageflip submitted just before a VT switch never gets its
+    /// page-flip-complete event once DRM master is lost, so its BO would
+    /// stay stuck in `Pending`/`OnScreen` forever. Combined with the
+    /// scene draining its `pending_acks`, the platform pool would then
+    /// leak a BO per VT round until `acquire_scanout_bo` starves and the
+    /// output wedges (observed: `tick skip reason=NoBO` after a few VT
+    /// switches; also the `on_page_flip_complete: >1 pending BO` warning
+    /// from stale Pending BOs). `drain_all_pending` device-wait-idles and
+    /// transitions each BO to `Free`, closing any held dma-buf fences.
+    ///
+    /// Content is marked invalidated so the post-resume full-damage
+    /// repaint does a full redraw rather than trusting a stale buffer-age
+    /// generation. Safe to call while still master (no DRM ioctl here —
+    /// only Vulkan idle + fence-fd close).
+    pub(crate) fn reset_scanout_bos_for_suspend(&mut self) {
+        let Some(vk) = self.vk.clone() else {
+            return;
+        };
+        for pool in self.scanout_pools.iter_mut().flatten() {
+            pool.drain_all_pending(&vk);
+        }
+        for gens in &mut self.bo_generations {
+            for g in gens {
+                g.last_present_generation = None;
+                g.content_invalidated = true;
+            }
+        }
+    }
+
     /// Called by the SceneCompositor's tick after `present_scanout`
     /// returns Ok. Records that `bo_idx` is now pending the next
     /// page-flip-complete event for `output_idx`, and assigns the

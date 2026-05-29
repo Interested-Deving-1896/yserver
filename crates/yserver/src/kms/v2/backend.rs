@@ -3503,6 +3503,35 @@ impl KmsBackendV2 {
         // 4. Wait for in-flight GPU work, bounded.
         self.platform.wait_idle_bounded();
 
+        // 4b. Drain the scene's in-flight page-flip acks BEFORE master is
+        //     revoked (step 6). A pageflip submitted before the VT switch
+        //     will NEVER get its page-flip-complete event once we lose
+        //     master, so its per-output `pending_acks` entry would be
+        //     stranded forever — and `tick_one_output`'s first gate
+        //     (`if !pending_acks.is_empty()`) then bails every tick, leaving
+        //     that output frozen on its last frame after resume (observed:
+        //     "VT switch → 1 output frozen, switch again → both", diagnostic
+        //     `tick skip output=N reason=PendingAcks` accumulating forever).
+        //     `drain_all` clears pending_acks, releases pool slots, and
+        //     resets per-output cursor state; the GPU is already idle (step
+        //     4) so its compose-fence waits return immediately, and master
+        //     is still held so its cursor-plane-hide ioctl is valid. Resume
+        //     re-modesets + rearms the cursor + issues a full-damage repaint,
+        //     which submits a fresh flip that re-arms the completion cycle.
+        self.scene.drain_all(&mut self.platform);
+
+        // 4c. Reset the PLATFORM scanout-BO state too. `drain_all` (4b)
+        //     clears the SCENE's pending_acks, but the platform pool still
+        //     holds the orphaned flip's BO in Pending/OnScreen — its
+        //     page-flip-complete will never arrive after master loss. Left
+        //     alone, each VT round leaks a BO until `acquire_scanout_bo`
+        //     starves → `reason=NoBO` wedge (observed after a few switches),
+        //     plus the `on_page_flip_complete: >1 pending BO` warning from
+        //     stale Pending BOs. Force every BO back to Free here so resume
+        //     starts with a clean pool; the deferred full-damage repaint
+        //     re-renders (content marked invalidated).
+        self.platform.reset_scanout_bos_for_suspend();
+
         // 5. Suspend libinput — closes input device fds via close_restricted
         //    → seat.close_device for each input device. MUST NOT hold a
         //    LibseatInner borrow across this call (re-entrancy contract:
