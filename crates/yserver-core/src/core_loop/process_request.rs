@@ -35,7 +35,8 @@ use crate::{
             report_existing_damage_to_state,
         },
         fanout::{
-            client_target_id, emit_expose_subtree_to_state, emit_window_event_to_state,
+            client_target_id, emit_expose_subtree_to_state,
+            emit_visibility_unobscured_subtree_to_state, emit_window_event_to_state,
             emit_xi2_focus_event_to_state, fanout_event_to_clients, fanout_raw_event_to_clients,
             selection_owner_target_id, subscribers_by_id,
         },
@@ -10893,6 +10894,18 @@ fn handle_map_window(
                 emit_window_event_to_state(state, window, 0x0001_0000, |buf, seq, order| {
                     x11::encode_visibility_notify_event(buf, seq, order, window, 0);
                 });
+            // Descendants that were MapWindow'd while this window was
+            // still unmapped were Unviewable; mapping this window
+            // transitions them to Viewable. Xorg fires
+            // VisibilityNotify(Unobscured) on every such descendant
+            // (mate-xorg.xtrace seq 0x0147 shows VisibilityNotify on
+            // both the FF main window and its child 0x02400010).
+            // yserver previously only notified the directly-mapped
+            // window, so GTK3's frame clock for the child never woke
+            // and the profile chooser stayed blank — the "empty shadow"
+            // FF bug on bee. Order with the Expose subtree walk below
+            // doesn't matter; both are subtree-wide and idempotent.
+            let _dropped = emit_visibility_unobscured_subtree_to_state(state, window);
             let _dropped =
                 emit_window_event_to_state(state, window, 0x0000_8000, |buf, seq, order| {
                     x11::encode_expose_event(buf, seq, order, window, 0, 0, w, h, 0);

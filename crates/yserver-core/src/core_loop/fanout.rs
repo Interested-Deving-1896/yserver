@@ -328,7 +328,46 @@ pub fn emit_expose_subtree_to_state(state: &mut ServerState, root: ResourceId) -
     dropped
 }
 
+/// Walks every now-Viewable descendant of `root` and emits
+/// `VisibilityNotify(Unobscured)` to those that selected
+/// `VisibilityChangeMask`. Used after a top-level is mapped: any
+/// previously-mapped descendant transitioned Unviewable→Viewable, and
+/// GTK3's frame clock keys content paints off VisibilityNotify
+/// (see the call site in `handle_map_window` for the full rationale).
+/// Without this, FF's profile-chooser child (mapped while its parent
+/// was still unmapped) never gets the visibility transition and never
+/// schedules a content paint — visible as "empty shadow".
+pub fn emit_visibility_unobscured_subtree_to_state(
+    state: &mut ServerState,
+    root: ResourceId,
+) -> Vec<ClientId> {
+    let mut dropped = Vec::new();
+    let children: Vec<ResourceId> = state.resources.children(root).to_vec();
+    for child in children {
+        let viewable = state
+            .resources
+            .window(child)
+            .is_some_and(|w| w.map_state == MapState::Viewable);
+        if viewable {
+            let target = child;
+            let more = emit_window_event_to_state(
+                state,
+                target,
+                VISIBILITY_MASK_BIT,
+                |buf, seq, order| {
+                    x11::encode_visibility_notify_event(buf, seq, order, target, 0);
+                },
+            );
+            merge_dropped(&mut dropped, more);
+            let recursed = emit_visibility_unobscured_subtree_to_state(state, child);
+            merge_dropped(&mut dropped, recursed);
+        }
+    }
+    dropped
+}
+
 const EXPOSURE_MASK_BIT: u32 = 0x0000_8000;
+const VISIBILITY_MASK_BIT: u32 = 0x0001_0000;
 
 fn merge_dropped(into: &mut Vec<ClientId>, more: Vec<ClientId>) {
     for cid in more {
