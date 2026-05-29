@@ -9332,21 +9332,38 @@ fn handle_configure_window(
         }
         let grew = old_size.is_some_and(|(ow, oh)| geometry.width > ow || geometry.height > oh);
         if grew {
-            let _dropped =
-                emit_window_event_to_state(state, window_id, 0x0000_8000, |buf, seq, order| {
-                    x11::encode_expose_event(
-                        buf,
-                        seq,
-                        order,
-                        window_id,
-                        0,
-                        0,
-                        geometry.width,
-                        geometry.height,
-                        0,
-                    );
-                });
-            let _dropped = emit_expose_subtree_to_state(state, window_id);
+            // Per X11 spec, Expose fires only for visible regions. A
+            // grow-configure on an unmapped (or Unviewable) window has no
+            // visible region, so suppress the Expose until the window
+            // becomes Viewable (MapWindow's own viewable-gated Expose path
+            // covers that case). Without this gate, marco-style
+            // reparenting WMs make Firefox react to a phantom Expose ~50
+            // requests before MapNotify lands: FF paints its
+            // transparent-black background into the redirected backing,
+            // marks the window clean, and the actual content never reaches
+            // the compositor — visible as "empty shadow / blank profile
+            // chooser." Xorg only emits Expose post-Map.
+            let viewable = state
+                .resources
+                .window(window_id)
+                .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+            if viewable {
+                let _dropped =
+                    emit_window_event_to_state(state, window_id, 0x0000_8000, |buf, seq, order| {
+                        x11::encode_expose_event(
+                            buf,
+                            seq,
+                            order,
+                            window_id,
+                            0,
+                            0,
+                            geometry.width,
+                            geometry.height,
+                            0,
+                        );
+                    });
+                let _dropped = emit_expose_subtree_to_state(state, window_id);
+            }
         }
     }
     Ok(RequestOutcome::Handled)
