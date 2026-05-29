@@ -2072,6 +2072,176 @@ pub fn encode_xi2_raw_event(
     debug_assert_eq!(out.len(), 68);
 }
 
+/// XInput 1.x `ListInputDevices` (opcode minor 2) reply.
+///
+/// Real clients call `XListInputDevices` (XI 1.x) AND `XIQueryDevice`
+/// (XI2) and cross-check the two. Chromium/Electron's Ozone-X11
+/// device-list cache fatal-`CHECK`s (SIGTRAP) if XI2 reports a master
+/// pointer while XI1 reports zero devices — which an empty stub reply
+/// does. This mirrors the 4-device model emitted by the XIQueryDevice
+/// handler so the two agree: core pointer (2), core keyboard (3),
+/// slave pointer (4), slave keyboard (5).
+///
+/// Wire layout per the XInput 1.x protocol (NOTE: class `length`
+/// fields here are in BYTES, unlike the 4-byte-unit lengths in XI2):
+/// ```text
+///   reply header (32B): type=1, ndevices, sequence, length(4B units of data)
+///   data:
+///     [xDeviceInfo; ndevices]      8B each: type ATOM(4), id, num_classes, use, pad
+///     [class infos, per device, concatenated]
+///         xButtonInfo   (4B):  class=1, length=4, num_buttons:u16
+///         xKeyInfo      (8B):  class=0, length=8, min_kc:u8, max_kc:u8, num_keys:u16, pad:u16
+///         xValuatorInfo (8+12n): class=2, length, num_axes:u8, mode:u8,
+///                                motion_buffer_size:u32, [resolution:u32, min:i32, max:i32]×n
+///     [name STR list, per device]  1 length byte + name bytes
+///     pad to 4-byte boundary
+/// ```
+/// Constants from `XI.h`: `use` codes IsXPointer=0, IsXKeyboard=1,
+/// IsXExtensionKeyboard=3, IsXExtensionPointer=4; class ids KeyClass=0,
+/// ButtonClass=1, ValuatorClass=2; valuator mode Relative=0, Absolute=1.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn encode_list_input_devices_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
+    // Pointer button/axis shape mirrors the XIQueryDevice handler:
+    // 7 buttons (left/middle/right + 4 wheel directions), 4 relative
+    // valuators (X, Y, vert-scroll, horiz-scroll). min/max −1/−1 (and
+    // −1/0 for scroll) and mode=Relative match what Xorg's modesetting
+    // core pointer reports for relative axes.
+    const NUM_BUTTONS: u16 = 7;
+    const MODE_RELATIVE: u8 = 0;
+    // Relative pointer axes carry no fixed range; Xorg reports −1/−1.
+    const POINTER_AXES: [(i32, i32); 4] = [(-1, -1), (-1, -1), (-1, 0), (-1, 0)];
+    // Core keyboard: keycodes 8..=255 (matches the setup reply's
+    // min/max-keycode and the XIQueryDevice key class).
+    const KEY_MIN: u8 = 8;
+    const KEY_MAX: u8 = 255;
+    const NUM_KEYS: u16 = 248;
+
+    // Device descriptor: id, XI-1.x `use` code, name, and class count.
+    struct Dev {
+        id: u8,
+        use_code: u8,
+        name: &'static str,
+        num_classes: u8,
+    }
+
+    fn push_button_info(out: &mut Vec<u8>, bo: ClientByteOrder, num_buttons: u16) {
+        out.push(1); // class = ButtonClass
+        out.push(4); // length in BYTES
+        write_u16(bo, out, num_buttons);
+    }
+
+    fn push_key_info(
+        out: &mut Vec<u8>,
+        bo: ClientByteOrder,
+        min_kc: u8,
+        max_kc: u8,
+        num_keys: u16,
+    ) {
+        out.push(0); // class = KeyClass
+        out.push(8); // length in BYTES
+        out.push(min_kc);
+        out.push(max_kc);
+        write_u16(bo, out, num_keys);
+        write_u16(bo, out, 0); // pad
+    }
+
+    fn push_valuator_info(out: &mut Vec<u8>, bo: ClientByteOrder, mode: u8, axes: &[(i32, i32)]) {
+        let num_axes = u8::try_from(axes.len()).unwrap_or(u8::MAX);
+        let byte_len = 8 + 12 * axes.len();
+        out.push(2); // class = ValuatorClass
+        out.push(u8::try_from(byte_len).unwrap_or(u8::MAX)); // length in BYTES
+        out.push(num_axes);
+        out.push(mode);
+        write_u32(bo, out, 0); // motion_buffer_size
+        for &(min, max) in axes {
+            write_u32(bo, out, 0); // resolution
+            write_u32(bo, out, min.cast_unsigned());
+            write_u32(bo, out, max.cast_unsigned());
+        }
+    }
+
+    let devices = [
+        Dev {
+            id: 2,
+            use_code: 0,
+            name: "Virtual core pointer",
+            num_classes: 2,
+        },
+        Dev {
+            id: 3,
+            use_code: 1,
+            name: "Virtual core keyboard",
+            num_classes: 1,
+        },
+        Dev {
+            id: 4,
+            use_code: 4,
+            name: "Virtual core slave pointer",
+            num_classes: 2,
+        },
+        Dev {
+            id: 5,
+            use_code: 3,
+            name: "Virtual core slave keyboard",
+            num_classes: 1,
+        },
+    ];
+
+    // Class-info block for a given device id (matches num_classes above).
+    let push_classes = |out: &mut Vec<u8>, id: u8| match id {
+        2 | 4 => {
+            push_button_info(out, byte_order, NUM_BUTTONS);
+            push_valuator_info(out, byte_order, MODE_RELATIVE, &POINTER_AXES);
+        }
+        _ => push_key_info(out, byte_order, KEY_MIN, KEY_MAX, NUM_KEYS),
+    };
+
+    // 1. Device-info array.
+    let mut data = Vec::new();
+    for d in &devices {
+        write_u32(byte_order, &mut data, 0); // type ATOM = None
+        data.push(d.id);
+        data.push(d.num_classes);
+        data.push(d.use_code);
+        data.push(0); // attached (master device id; 0 = none, per XIproto.h)
+    }
+    // 2. Class-info blocks, per device, concatenated.
+    for d in &devices {
+        push_classes(&mut data, d.id);
+    }
+    // 3. Device names as a STR list (1 length byte + bytes each), in
+    //    device order. Xorg's `CopyDeviceName` leaves one trailing NUL
+    //    after the last name (its `strcpy` NUL is not overwritten by a
+    //    following length byte); match that for byte-for-byte parity
+    //    before the 4-byte pad.
+    for d in &devices {
+        data.push(u8::try_from(d.name.len()).unwrap_or(u8::MAX));
+        data.extend_from_slice(d.name.as_bytes());
+    }
+    data.push(0); // trailing NUL after the names blob (Xorg parity)
+    pad_vec4(&mut data);
+
+    let ndevices = u8::try_from(devices.len()).unwrap_or(u8::MAX);
+    let length = u32::try_from(data.len() / 4).unwrap_or(u32::MAX);
+    // `xListInputDevicesReply` layout (XIproto.h): byte 0 = reply type,
+    // byte 1 = RepType (client-ignored echo; 0 is safe), bytes 2-3 =
+    // sequence, bytes 4-7 = length, **byte 8 = ndevices**, bytes 9-31
+    // pad. ndevices is NOT in the standard reply "data" byte (byte 1) —
+    // putting it there makes every client read ndevices=0 from byte 8
+    // (the first device-info `type` ATOM byte) and ignore the whole
+    // list. `fixed_reply` fills bytes 0-7; we then place ndevices at
+    // byte 8 explicitly.
+    let mut reply = fixed_reply(byte_order, sequence, 0, length);
+    reply.push(ndevices); // byte 8
+    reply.extend_from_slice(&[0u8; 23]); // bytes 9-31 pad
+    reply.extend_from_slice(&data);
+    reply
+}
+
 pub fn encode_xi2_device_changed_event(
     out: &mut Vec<u8>,
     byte_order: ClientByteOrder,
@@ -4533,6 +4703,112 @@ mod tests {
             let length = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
             assert_eq!(length, (8 * u32::from(kpm)) / 4);
             assert_eq!(&buf[32..32 + 8 * kpm as usize], &kc[..]);
+        }
+
+        /// Walk the XI 1.x `ListInputDevices` reply byte-for-byte and
+        /// assert it decodes to the 4-device model with consistent
+        /// class/name framing. Guards against the empty-stub regression
+        /// that crashed Chromium/Electron (it cross-checks this reply
+        /// against XIQueryDevice).
+        #[test]
+        fn list_input_devices_reply_decodes_to_four_devices() {
+            let le = ClientByteOrder::LittleEndian;
+            let buf = encode_list_input_devices_reply(le, SequenceNumber(0x1234));
+
+            // Header. Per XIproto.h, ndevices is at byte 8 — NOT the
+            // standard reply "data" byte (byte 1). Byte 1 is RepType,
+            // which clients ignore; a regression that put ndevices at
+            // byte 1 made every client read 0 devices from byte 8.
+            assert_eq!(buf[0], 1, "reply type");
+            assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 0x1234, "sequence");
+            let length = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+            assert_eq!(buf.len(), 32 + length * 4, "length covers data, 4-aligned");
+            let ndevices = buf[8];
+            assert_eq!(ndevices, 4, "ndevices at byte 8");
+
+            // Device-info array (8B each), immediately after the 32B header.
+            let mut off = 32;
+            let mut dev = Vec::new();
+            for _ in 0..ndevices {
+                let type_atom =
+                    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+                let id = buf[off + 4];
+                let num_classes = buf[off + 5];
+                let use_code = buf[off + 6];
+                assert_eq!(type_atom, 0, "type ATOM = None");
+                assert_eq!(buf[off + 7], 0, "device-info pad");
+                dev.push((id, num_classes, use_code));
+                off += 8;
+            }
+            assert_eq!(
+                dev,
+                vec![(2, 2, 0), (3, 1, 1), (4, 2, 4), (5, 1, 3)],
+                "(id, num_classes, use) per device matches XIQueryDevice model",
+            );
+
+            // Class-info blocks, per device, walked by the BYTE length
+            // field (XI 1.x semantics, not 4-byte units).
+            for &(id, num_classes, _) in &dev {
+                for _ in 0..num_classes {
+                    let class = buf[off];
+                    let len = buf[off + 1] as usize;
+                    assert!(len >= 4 && off + len <= buf.len(), "class len in range");
+                    match class {
+                        0 => {
+                            // KeyClass: min, max, num_keys.
+                            assert_eq!(len, 8);
+                            assert_eq!(buf[off + 2], 8, "min keycode");
+                            assert_eq!(buf[off + 3], 255, "max keycode");
+                            assert_eq!(
+                                u16::from_le_bytes([buf[off + 4], buf[off + 5]]),
+                                248,
+                                "num_keys",
+                            );
+                        }
+                        1 => {
+                            // ButtonClass: num_buttons.
+                            assert_eq!(len, 4);
+                            assert_eq!(
+                                u16::from_le_bytes([buf[off + 2], buf[off + 3]]),
+                                7,
+                                "num_buttons",
+                            );
+                        }
+                        2 => {
+                            // ValuatorClass: num_axes, mode, 8 + 12n bytes.
+                            let num_axes = buf[off + 2] as usize;
+                            let mode = buf[off + 3];
+                            assert_eq!(len, 8 + 12 * num_axes, "valuator byte length");
+                            assert_eq!(num_axes, 4, "X, Y, vscroll, hscroll");
+                            assert_eq!(mode, 0, "mode = Relative");
+                        }
+                        other => panic!("unexpected class id {other} for device {id}"),
+                    }
+                    off += len;
+                }
+            }
+
+            // Name STR list: 1 length byte + bytes, in device order.
+            let names = [
+                "Virtual core pointer",
+                "Virtual core keyboard",
+                "Virtual core slave pointer",
+                "Virtual core slave keyboard",
+            ];
+            for name in names {
+                let n = buf[off] as usize;
+                assert_eq!(n, name.len(), "name length byte");
+                assert_eq!(&buf[off + 1..off + 1 + n], name.as_bytes(), "name bytes");
+                off += 1 + n;
+            }
+            // After the names: one trailing NUL (Xorg parity) plus up
+            // to 3 pad bytes, all zero. The per-name length bytes fully
+            // describe the names, so a correct parser never reads here.
+            assert!(buf.len() - off <= 4, "only trailing NUL + pad remains");
+            assert!(
+                buf[off..].iter().all(|&b| b == 0),
+                "trailing bytes are zero"
+            );
         }
     }
 }

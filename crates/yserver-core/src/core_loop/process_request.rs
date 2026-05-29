@@ -8228,13 +8228,26 @@ fn handle_xi2_request(
             );
             return Ok(RequestOutcome::Handled);
         }
-        // XI 1.x reply-required minors. xts opens a probe XListInputDevices /
-        // XOpenDevice on every test, so without these stubs the entire
-        // XI / XIproto suites hang on _XReply. Each reply is exactly
-        // 32 bytes (the standard reply header + 24 zero bytes); all
-        // count/status fields default to 0 which means
-        // "empty list" / "Success" in their respective contexts.
-        2 |  // ListInputDevices: ndevices = 0
+        // XI 1.x ListInputDevices (minor 2). Returns the real 4-device
+        // model (mirrors XIQueryDevice). A previous empty-list stub
+        // crashed Chromium/Electron: Ozone-X11 cross-checks XI1's
+        // ListInputDevices against XI2's XIQueryDevice and fatal-CHECKs
+        // when XI2 has a master pointer but XI1 reports zero devices.
+        2 => {
+            debug!("client {} #{} XListInputDevices", client_id.0, sequence.0);
+            buf.extend_from_slice(&x11::encode_list_input_devices_reply(byte_order, sequence));
+        }
+        // XI 1.x reply-required minors. xts opens a probe XOpenDevice on
+        // every test, so without these stubs the XI / XIproto suites
+        // hang on _XReply. Each reply is exactly 32 bytes (the standard
+        // reply header + 24 zero bytes); all count/status fields default
+        // to 0 which means "empty list" / "Success" in their respective
+        // contexts.
+        //
+        // TODO(no-stub): these remain zero-stubs. They satisfy xts but
+        // may mislead real clients (see the ListInputDevices crash that
+        // motivated minor 2's real implementation). Implement against
+        // real device state as clients are found to need them.
         3 |  // OpenDevice: num_classes = 0
         5 |  // SetDeviceMode: status = Success
         7 |  // GetSelectedExtensionEvents: counts = 0
