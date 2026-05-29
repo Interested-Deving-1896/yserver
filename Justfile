@@ -463,7 +463,7 @@ yserver-xfce-hw log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::store
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null'
 
-yserver-mate-hw log="warn,yserver_core::core_loop::pointer_fanout=trace,yserver_core::core_loop::process_request=debug":
+yserver-mate-hw log="warn":
     cargo build --release --bin yserver
     bash -c '\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-mate.log 2>&1 &\
