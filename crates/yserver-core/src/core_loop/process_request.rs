@@ -5249,9 +5249,7 @@ fn handle_present_request(
             {
                 let (src_kind, sw, sh) = match &src {
                     Some(crate::resources::HostDrawableTarget::Pixmap {
-                        width,
-                        height,
-                        ..
+                        width, height, ..
                     }) => ("pixmap", *width, *height),
                     Some(_) => ("non-pixmap", 0, 0),
                     None => ("unresolved", 0, 0),
@@ -5564,9 +5562,7 @@ fn handle_present_request(
             {
                 let (src_kind, sw, sh) = match &src {
                     Some(crate::resources::HostDrawableTarget::Pixmap {
-                        width,
-                        height,
-                        ..
+                        width, height, ..
                     }) => ("pixmap", *width, *height),
                     Some(_) => ("non-pixmap", 0, 0),
                     None => ("unresolved", 0, 0),
