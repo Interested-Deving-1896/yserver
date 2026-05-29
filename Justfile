@@ -463,19 +463,17 @@ yserver-xfce-hw log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::store
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null'
 
-yserver-mate-hw log="info":
-    cargo build --bin yserver
+yserver-mate-hw log="warn,yserver_core::core_loop::pointer_fanout=trace,yserver_core::core_loop::process_request=debug":
+    cargo build --release --bin yserver
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-mate.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             dbus-run-session mate-session --display :7 > mate.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;'
+        wait $yserver_pid 2>/dev/null'
 
 # Counterpart to `yserver-mate-hw` with Vulkan validation + RADV
 # hang reporting wired in for tracking down GPU VM faults / device
@@ -584,28 +582,6 @@ yserver-mate-hw-trace log="debug,yserver_core::core_loop::damage_fanout=trace,ys
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             YSERVER_V2_SCENE_WALK_ALL=1 \
             target/debug/yserver > yserver-hw-mate.log 2>&1 &\
-        yserver_pid=$!;\
-        sleep 2;\
-        x11trace -d :7 -D :8 -n -o mate.xtrace &\
-        xtrace_pid=$!;\
-        sleep 1;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
-            dbus-run-session mate-session --display :8 > mate.log 2>&1;\
-        kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null;'
-
-# Reproduce/debug the known HW cursor-plane jam on yserver/KMS.
-yserver-mate-hwcursor-trace log="debug,yserver::kms::v2::scene=debug,yserver::kms::v2::backend=debug,yserver::kms::v2::platform=debug,yserver::kms::cursor_plane=debug":
-    cargo build --bin yserver
-    rm -f mate.xtrace
-    bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
-            YSERVER_V2_HW_CURSOR=1 \
-            YSERVER_V2_SCENE_WALK_ALL=1 \
-            target/debug/yserver > yserver-hwcursor-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         x11trace -d :7 -D :8 -n -o mate.xtrace &\
@@ -779,13 +755,13 @@ yserver-mate-hw-release-trace log="warn":
 # rollups. RUST_LOG defaults to `info` so the telemetry lines come
 # through; pass `log=warn` if you need quieter output, but you'll
 # lose the rollup lines (they're info!-level).
-yserver-mate-hw-telemetry log="info,yserver::kms::v2::fbtrace=warn" drawable_id="redirected-argb-backings":
+yserver-mate-hw-telemetry log="info":
     RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --bin yserver
     rm -f yserver-mate.submit.tsv
     bash -c '\
         xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
         YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-mate.submit.tsv \
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_FB_TRACE_DRAWABLE_ID="{{drawable_id}}" \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
