@@ -2565,12 +2565,24 @@ fn apply_alarm_attributes(
 
 /// Evaluate every active alarm watching `counter` after it moved from
 /// `old` to `new`, firing `AlarmNotify` to each alarm's owner when its
-/// trigger test crosses. A triggered alarm with non-zero delta re-arms
-/// (its `wait_value` advances past the current value so it fires again
-/// on the next crossing); with zero delta it becomes Inactive. This is
-/// the frame-timing signal mutter/muffin waits on before compositing a
-/// client frame and emitting `_NET_WM_FRAME_DRAWN`.
-fn evaluate_alarms_for_counter(state: &mut ServerState, counter: u32, old: i64, new: i64) {
+/// trigger test crosses.
+///
+/// Re-arm behaviour (Xorg sync.c:548-555, 589-597):
+/// - `delta != 0`: advance `wait_value` past the current value so the
+///   next crossing re-fires; on `i64` overflow transition to Inactive.
+/// - `delta == 0` + Comparison test type: transition to Inactive.
+/// - `delta == 0` + Transition test type: stay Active with `wait_value`
+///   unchanged — the alarm quiesces until the next edge crossing.
+///
+/// This is the frame-timing signal mutter/muffin waits on before
+/// compositing a client frame and emitting `_NET_WM_FRAME_DRAWN`, and
+/// also the idle/wake pair used by mate-power-manager.
+pub(crate) fn evaluate_alarms_for_counter(
+    state: &mut ServerState,
+    counter: u32,
+    old: i64,
+    new: i64,
+) {
     use yserver_protocol::x11::sync as x11sync;
     let candidates: Vec<u32> = state
         .sync_alarms
@@ -2595,23 +2607,46 @@ fn evaluate_alarms_for_counter(state: &mut ServerState, counter: u32, old: i64, 
         let fired_wait = a.wait_value;
         let delta = a.delta;
 
-        let (new_wait, new_state) = if delta == 0 {
+        // Per Xorg sync.c:548-555: state → Inactive when
+        // (counter==None) OR (delta==0 AND test_type is Comparison).
+        // Transitions with delta=0 stay Active — once the edge passes,
+        // the alarm sits quiescent waiting for the next crossing.
+        // Per Xorg sync.c:589-597: re-arm overflow → state Inactive
+        // (test_value left unmodified).
+        let is_comparison = matches!(
+            test_type,
+            x11sync::TEST_POSITIVE_COMPARISON | x11sync::TEST_NEGATIVE_COMPARISON
+        );
+        let (new_wait, new_state) = if delta == 0 && is_comparison {
             (fired_wait, x11sync::ALARM_STATE_INACTIVE)
+        } else if delta == 0 {
+            // Transition + delta=0: stay Active, wait_value unchanged.
+            (fired_wait, x11sync::ALARM_STATE_ACTIVE)
         } else {
-            // Advance past the current value so the next crossing fires
-            // again instead of re-triggering on this same value. Bounded
-            // in case delta points away from the test direction.
+            // delta != 0: re-arm by adding delta until trigger stops firing.
+            // Overflow on the addition → state Inactive, wait_value reverts
+            // to fired_wait (Xorg sync.c:589-597).
             let mut w = fired_wait;
             let mut guard = 0u32;
+            let mut overflowed = false;
             while x11sync::comparison_satisfied(test_type, new, w) && guard < 1_000_000 {
-                let next = w.saturating_add(delta);
-                if next == w {
-                    break;
+                match w.checked_add(delta) {
+                    Some(next) if next != w => {
+                        w = next;
+                        guard += 1;
+                    }
+                    Some(_) => break, // delta=0 inside this branch can't happen, defensive
+                    None => {
+                        overflowed = true;
+                        break;
+                    }
                 }
-                w = next;
-                guard += 1;
             }
-            (w, x11sync::ALARM_STATE_ACTIVE)
+            if overflowed {
+                (fired_wait, x11sync::ALARM_STATE_INACTIVE)
+            } else {
+                (w, x11sync::ALARM_STATE_ACTIVE)
+            }
         };
 
         if let Some(a) = state.sync_alarms.get_mut(&alarm_id) {
@@ -26413,6 +26448,131 @@ mod tests {
         assert!(
             value >= 100 && value <= 3_000,
             "VCK IDLETIME ≈ 200ms; got {value}"
+        );
+    }
+
+    #[test]
+    fn evaluate_alarms_positive_transition_with_delta_zero_stays_active() {
+        // Regression: Xorg sync.c:548-555 — only delta=0 + Comparison
+        // goes Inactive. Transitions with delta=0 must stay Active so
+        // the next crossing re-fires.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let counter = 0x1000;
+        state.sync_counters.insert(
+            counter,
+            crate::server::SyncCounter {
+                owner: ClientId(1),
+                value: 0,
+            },
+        );
+        let alarm_id = 0x2000;
+        state.sync_alarms.insert(
+            alarm_id,
+            crate::server::SyncAlarm {
+                owner: ClientId(1),
+                counter,
+                wait_value: 100,
+                delta: 0,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                events: true,
+                state: x11sync::ALARM_STATE_ACTIVE,
+            },
+        );
+
+        // Counter transition from 50 → 150 crosses the trigger.
+        evaluate_alarms_for_counter(&mut state, counter, 50, 150);
+
+        let after = &state.sync_alarms[&alarm_id];
+        assert_eq!(
+            after.state,
+            x11sync::ALARM_STATE_ACTIVE,
+            "PositiveTransition + delta=0 must stay Active (Xorg sync.c:548-555)"
+        );
+        assert_eq!(
+            after.wait_value, 100,
+            "wait_value unchanged for delta=0 Transition"
+        );
+    }
+
+    #[test]
+    fn evaluate_alarms_positive_comparison_with_delta_zero_goes_inactive() {
+        // Companion test: PositiveComparison + delta=0 SHOULD go Inactive.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let counter = 0x1000;
+        state.sync_counters.insert(
+            counter,
+            crate::server::SyncCounter {
+                owner: ClientId(1),
+                value: 0,
+            },
+        );
+        let alarm_id = 0x2000;
+        state.sync_alarms.insert(
+            alarm_id,
+            crate::server::SyncAlarm {
+                owner: ClientId(1),
+                counter,
+                wait_value: 100,
+                delta: 0,
+                test_type: x11sync::TEST_POSITIVE_COMPARISON as u8,
+                events: true,
+                state: x11sync::ALARM_STATE_ACTIVE,
+            },
+        );
+
+        evaluate_alarms_for_counter(&mut state, counter, 50, 150);
+
+        let after = &state.sync_alarms[&alarm_id];
+        assert_eq!(after.state, x11sync::ALARM_STATE_INACTIVE);
+    }
+
+    #[test]
+    fn evaluate_alarms_re_arm_overflow_transitions_alarm_to_inactive() {
+        // Xorg sync.c:589-597 — re-arm overflow on i64::checked_add
+        // must transition the alarm to Inactive and leave wait_value
+        // unchanged.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let counter = 0x1000;
+        state.sync_counters.insert(
+            counter,
+            crate::server::SyncCounter {
+                owner: ClientId(1),
+                value: 0,
+            },
+        );
+        let alarm_id = 0x2000;
+        // Start near i64::MAX so adding delta overflows on the very
+        // first re-arm step. Use PositiveTransition so the trigger fires
+        // when new >= wait_value.
+        let near_max = i64::MAX - 10;
+        state.sync_alarms.insert(
+            alarm_id,
+            crate::server::SyncAlarm {
+                owner: ClientId(1),
+                counter,
+                wait_value: near_max,
+                delta: 100, // would overflow on first add
+                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                events: true,
+                state: x11sync::ALARM_STATE_ACTIVE,
+            },
+        );
+
+        // Crossing: old < wait_value, new >= wait_value → trigger fires.
+        evaluate_alarms_for_counter(&mut state, counter, near_max - 1, near_max + 5);
+
+        let after = &state.sync_alarms[&alarm_id];
+        assert_eq!(
+            after.state,
+            x11sync::ALARM_STATE_INACTIVE,
+            "overflow on re-arm → Inactive"
+        );
+        assert_eq!(
+            after.wait_value, near_max,
+            "wait_value unchanged on overflow (Xorg sync.c:589-597)"
         );
     }
 }
