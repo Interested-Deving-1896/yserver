@@ -1614,9 +1614,21 @@ fn tick_one_output(
     }
 }
 
-/// Pick the repaint region for the upcoming compose. Returns
-/// `Repaint::Full` for fallback paths and `Repaint::Clipped` for
-/// the buffer-age steady state.
+/// Pick the repaint region for the upcoming compose. Currently always
+/// returns `Repaint::Full` — the `Repaint::Clipped` + `loadOp=LOAD`
+/// buffer-age optimisation below is correct in isolation but produces
+/// visible multi-pixel "drag-shake" on non-composited MATE: stale
+/// drag-phase window content remains in BOs the catch-up scissor
+/// doesn't cover. Compositing-ON masks it because COW-authoritative
+/// mode re-presents the compositor image fully each frame, which is
+/// equivalent to what we now do for every output. Two attempted root-
+/// cause fixes (input-coord hysteresis; invalidate-all-BOs on
+/// scene-structure change) made things worse rather than better; until
+/// the actual failure mode in the buffer-age propagation is
+/// identified, Always-Full is the correctness hammer. Measurable GPU
+/// cost was not observable in interactive testing.
+///
+/// Re-enable the optimisation by removing the early return below.
 fn pick_repaint_region(
     bo_last_gen: Option<u64>,
     bo_invalidated: bool,
@@ -1625,21 +1637,32 @@ fn pick_repaint_region(
     history: &BufferAgeRing,
     extent: vk::Extent2D,
 ) -> Repaint {
-    if bo_invalidated {
-        return Repaint::Full(extent);
-    }
-    let Some(last) = bo_last_gen else {
-        return Repaint::Full(extent);
-    };
-    if !history.contains_all(last, frame_gen) {
-        return Repaint::Full(extent);
-    }
-    let mut repaint = current_damage.clone();
-    history.union_history_into(last, frame_gen, &mut repaint);
-    match repaint.bounding_rect() {
-        Some(r) if r.extent.width > 0 && r.extent.height > 0 => Repaint::Clipped(r),
-        _ => Repaint::Full(extent),
-    }
+    let _ = (
+        bo_last_gen,
+        bo_invalidated,
+        frame_gen,
+        current_damage,
+        history,
+    );
+    Repaint::Full(extent)
+
+    // Disabled buffer-age logic (see doc comment above):
+    //
+    // if bo_invalidated {
+    //     return Repaint::Full(extent);
+    // }
+    // let Some(last) = bo_last_gen else {
+    //     return Repaint::Full(extent);
+    // };
+    // if !history.contains_all(last, frame_gen) {
+    //     return Repaint::Full(extent);
+    // }
+    // let mut repaint = current_damage.clone();
+    // history.union_history_into(last, frame_gen, &mut repaint);
+    // match repaint.bounding_rect() {
+    //     Some(r) if r.extent.width > 0 && r.extent.height > 0 => Repaint::Clipped(r),
+    //     _ => Repaint::Full(extent),
+    // }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3338,8 +3361,15 @@ mod tests {
         assert!(matches!(p, Repaint::Full(_)));
     }
 
+    /// Buffer-age partial-repaint is currently disabled (see the
+    /// `pick_repaint_region` doc-comment on the drag-shake stopgap).
+    /// While disabled, every steady-state call returns `Repaint::Full`
+    /// regardless of input — this test pins that contract so an
+    /// accidental re-enable is caught by CI. When the real fix lands,
+    /// flip the expectation back to `Repaint::Clipped(58, 58)` and
+    /// remove this comment.
     #[test]
-    fn pick_repaint_clipped_when_history_complete() {
+    fn pick_repaint_returns_full_while_optimisation_disabled() {
         let mut history = BufferAgeRing::new(4);
         let mut h3 = RegionSet::new();
         h3.add(rect(10, 10, 5, 5));
@@ -3350,15 +3380,10 @@ mod tests {
         let mut current = RegionSet::new();
         current.add(rect(0, 0, 3, 3));
         let p = pick_repaint_region(Some(2), false, 5, &current, &history, extent(800, 600));
-        match p {
-            Repaint::Clipped(rect) => {
-                // Bounding rect should cover (0,0) to (58, 58).
-                assert_eq!(rect.offset, vk::Offset2D { x: 0, y: 0 });
-                assert_eq!(rect.extent.width, 58);
-                assert_eq!(rect.extent.height, 58);
-            }
-            Repaint::Full(_) => panic!("expected clipped"),
-        }
+        assert!(
+            matches!(p, Repaint::Full(_)),
+            "always-Full stopgap returns Full unconditionally; got {p:?}",
+        );
     }
 
     #[test]
