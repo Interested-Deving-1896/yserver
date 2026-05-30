@@ -65,15 +65,17 @@ cargo build --release
 
 ## Running the standalone DRM/KMS server
 
-`yserver` libseat for seat management if available.
+`yserver` uses libseat for seat management if available.
 It can also drive atomic KMS directly, but then you need access to /dev/dri/ and to /dev/input/.
 
 The [`Justfile`](Justfile) wraps the recipes:
 
 ```sh
 ## switch to a free TTY, then run:
-just yserver-mate-hw-release
+just startx
 ```
+
+which will start yserver and then execute your `~/.xinitrc` (or fall back to `/etc/X11/xinitrc`)
 
 If you are using libseat, you can switch VT, but if you use direct, you CAN NOT switch VT when yserver is running. Zap the server, or log out of your session otherwise.
 ## Development
