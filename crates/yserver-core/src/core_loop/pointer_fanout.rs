@@ -50,7 +50,11 @@ pub fn pointer_event_fanout_to_state(
     handle_grabs: bool,
     is_replay: bool,
 ) -> Vec<ClientId> {
-    state.dpms.last_activity = std::time::Instant::now();
+    let now = std::time::Instant::now();
+    state.dpms.last_activity = now;
+    state
+        .per_device_last_activity
+        .insert(XI2_MASTER_POINTER_DEVICE_ID as u8, now);
     if state.dpms.enabled && state.dpms.power_level != 0 {
         crate::core_loop::process_request::apply_dpms_transition(state, backend, 0);
         // DPMS coupling tail already flipped SS Off if it was On.
@@ -995,5 +999,35 @@ mod tests {
 
         assert_eq!(state.screensaver.active, ScreenSaverActive::Off);
         assert!(!state.screensaver.forced, "input-driven Off is non-forced");
+    }
+
+    #[test]
+    fn pointer_event_updates_global_and_per_device_vcp_last_activity() {
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(30);
+        let stale = state.dpms.last_activity;
+        let xid_map = HostXidMap::new();
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            motion_event(),
+            true,
+            false,
+        );
+
+        assert!(
+            state.dpms.last_activity > stale,
+            "global last_activity advanced"
+        );
+        let vcp = state
+            .per_device_last_activity
+            .get(&2)
+            .copied()
+            .expect("VCP per-device entry inserted");
+        assert!(vcp > stale, "VCP per-device last_activity advanced");
     }
 }

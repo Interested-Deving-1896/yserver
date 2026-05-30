@@ -401,6 +401,17 @@ pub struct ServerState {
     pub present_scheduler: crate::present_scheduler::PresentScheduler,
     pub sync_counters: HashMap<u32, SyncCounter>,
     pub sync_alarms: HashMap<u32, SyncAlarm>,
+    /// Per-XI2-master-device idle clock. Key = device id (VCP=2, VCK=3
+    /// hard-coded in key_fanout.rs:29 / pointer_fanout.rs:30). Updated
+    /// by the fanouts on each input event for the affected device.
+    /// `dpms.last_activity` continues to track "any device" — that's the
+    /// global IDLETIME baseline.
+    pub per_device_last_activity: HashMap<u8, Instant>,
+    /// Per-counter cache of the IDLETIME value at the last evaluator
+    /// pass. Lets the post-poll evaluator compute `(old, new)`
+    /// transitions for `trigger_fires`. Keyed by counter id (one of
+    /// `IDLETIME_COUNTER` / `IDLETIME_DEVICE_VCP` / `IDLETIME_DEVICE_VCK`).
+    pub idletime_last_evaluated: HashMap<u32, i64>,
     /// XSync `Fence` resources (Phase 4.2.2). Phase 4.2.2 first cut
     /// stores only the triggered bit + owner; the underlying
     /// `VkSemaphore` for fences imported via DRI3 `FenceFromFD`
@@ -573,6 +584,8 @@ impl ServerState {
             present_scheduler: crate::present_scheduler::PresentScheduler::default(),
             sync_counters: HashMap::new(),
             sync_alarms: HashMap::new(),
+            per_device_last_activity: HashMap::new(),
+            idletime_last_evaluated: HashMap::new(),
             sync_fences: HashMap::new(),
             damage_objects: HashMap::new(),
             composite_redirects: HashMap::new(),
@@ -622,6 +635,29 @@ impl ServerState {
         #[allow(clippy::cast_possible_truncation)]
         let ts = elapsed as u32;
         ts
+    }
+
+    /// Baseline `Instant` for an IDLETIME-family counter. Falls back to
+    /// `dpms.last_activity` (global) for unknown counters so that a
+    /// per-device counter query before any device-specific input has
+    /// landed still returns a sensible "any device" idle.
+    #[must_use]
+    pub fn idletime_baseline(&self, counter: u32) -> Instant {
+        use yserver_protocol::x11::sync as x11sync;
+        match counter {
+            x11sync::IDLETIME_DEVICE_VCP => self
+                .per_device_last_activity
+                .get(&2)
+                .copied()
+                .unwrap_or(self.dpms.last_activity),
+            x11sync::IDLETIME_DEVICE_VCK => self
+                .per_device_last_activity
+                .get(&3)
+                .copied()
+                .unwrap_or(self.dpms.last_activity),
+            // Global IDLETIME (and any unknown counter routed here).
+            _ => self.dpms.last_activity,
+        }
     }
 
     /// Earliest instant a DPMS transition could fire. Picks the
@@ -3696,5 +3732,43 @@ mod tests {
         state.screensaver.interval_ms = 0;
         state.screensaver.next_cycle = None;
         assert!(state.screensaver_cycle_deadline().is_none());
+    }
+
+    #[test]
+    fn idletime_baseline_global_returns_dpms_last_activity() {
+        use std::time::Instant;
+        let mut state = ServerState::new();
+        let baseline = Instant::now();
+        state.dpms.last_activity = baseline;
+        assert_eq!(
+            state.idletime_baseline(yserver_protocol::x11::sync::IDLETIME_COUNTER),
+            baseline
+        );
+    }
+
+    #[test]
+    fn idletime_baseline_per_device_uses_per_device_entry() {
+        use std::time::{Duration, Instant};
+        let mut state = ServerState::new();
+        let global = Instant::now() - Duration::from_secs(60);
+        let pointer = Instant::now() - Duration::from_secs(5);
+        state.dpms.last_activity = global;
+        state.per_device_last_activity.insert(2, pointer);
+        assert_eq!(
+            state.idletime_baseline(yserver_protocol::x11::sync::IDLETIME_DEVICE_VCP),
+            pointer
+        );
+        // VCK has no per-device entry; falls back to global.
+        assert_eq!(
+            state.idletime_baseline(yserver_protocol::x11::sync::IDLETIME_DEVICE_VCK),
+            global
+        );
+    }
+
+    #[test]
+    fn idletime_baseline_unknown_counter_falls_back_to_global() {
+        let state = ServerState::new();
+        let baseline = state.dpms.last_activity;
+        assert_eq!(state.idletime_baseline(0xdead_beef), baseline);
     }
 }

@@ -26,6 +26,12 @@ pub const AWAIT_FENCE: u8 = 19;
 
 pub const SERVERTIME_COUNTER: u32 = 0x106;
 pub const IDLETIME_COUNTER: u32 = 0x107;
+/// Per-master-device IDLETIME counters. yserver hard-codes the XI2
+/// master pair: VCP=2, VCK=3 (see `key_fanout.rs:29`,
+/// `pointer_fanout.rs:30`). Counter IDs picked to avoid collision
+/// with anything in `resources.rs`.
+pub const IDLETIME_DEVICE_VCP: u32 = 0x108;
+pub const IDLETIME_DEVICE_VCK: u32 = 0x109;
 
 // Alarm trigger semantics, sourced from
 // `/usr/include/X11/extensions/syncconst.h`.
@@ -329,6 +335,8 @@ pub fn encode_list_system_counters_reply(
     const COUNTERS: &[(u32, i64, &[u8])] = &[
         (SERVERTIME_COUNTER, 4, b"SERVERTIME"),
         (IDLETIME_COUNTER, 4, b"IDLETIME"),
+        (IDLETIME_DEVICE_VCP, 4, b"DEVICEIDLETIME 2"),
+        (IDLETIME_DEVICE_VCK, 4, b"DEVICEIDLETIME 3"),
     ];
 
     let payload_len: usize = COUNTERS
@@ -438,29 +446,37 @@ mod tests {
     }
 
     #[test]
-    fn list_system_counters_advertises_servertime_and_idletime() {
+    fn list_system_counters_advertises_four_counters_with_device_idletime() {
         let reply =
             encode_list_system_counters_reply(ClientByteOrder::LittleEndian, SequenceNumber(0x88));
-        assert_eq!(reply.len(), 80);
-        assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 12);
-        assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 2);
+        // header: tag(1B) data(1B) seq(2B) length(4B) counters_len(4B) pad(20B) = 32B
         assert_eq!(
-            u32::from_le_bytes(reply[32..36].try_into().unwrap()),
-            SERVERTIME_COUNTER
+            u32::from_le_bytes([reply[32], reply[33], reply[34], reply[35]]),
+            SERVERTIME_COUNTER,
+            "first entry counter id"
         );
-        assert_eq!(i32::from_le_bytes(reply[36..40].try_into().unwrap()), 0);
-        assert_eq!(u32::from_le_bytes(reply[40..44].try_into().unwrap()), 4);
-        assert_eq!(u16::from_le_bytes(reply[44..46].try_into().unwrap()), 10);
-        assert_eq!(&reply[46..56], b"SERVERTIME");
+        // each entry: counter(4) resolution(8) name_len(2) name(padded to 4)
+        // SERVERTIME entry: 14 + 10 = 24 bytes, padded to 24.
+        // IDLETIME entry starts at byte 32 + 24 = 56.
         assert_eq!(
-            u32::from_le_bytes(reply[56..60].try_into().unwrap()),
-            IDLETIME_COUNTER
+            u32::from_le_bytes([reply[56], reply[57], reply[58], reply[59]]),
+            IDLETIME_COUNTER,
+            "second entry counter id"
         );
-        assert_eq!(i32::from_le_bytes(reply[60..64].try_into().unwrap()), 0);
-        assert_eq!(u32::from_le_bytes(reply[64..68].try_into().unwrap()), 4);
-        assert_eq!(u16::from_le_bytes(reply[68..70].try_into().unwrap()), 8);
-        assert_eq!(&reply[70..78], b"IDLETIME");
-        assert_eq!(&reply[78..80], &[0, 0]);
+        // IDLETIME entry: 14 + 8 = 22, padded to 24. Next at 80.
+        assert_eq!(
+            u32::from_le_bytes([reply[80], reply[81], reply[82], reply[83]]),
+            IDLETIME_DEVICE_VCP,
+            "third entry: per-pointer IDLETIME"
+        );
+        assert_eq!(&reply[94..110], b"DEVICEIDLETIME 2");
+        // Per-VCP entry: 14 + 16 = 30, padded to 32. Next at 112.
+        assert_eq!(
+            u32::from_le_bytes([reply[112], reply[113], reply[114], reply[115]]),
+            IDLETIME_DEVICE_VCK,
+            "fourth entry: per-keyboard IDLETIME"
+        );
+        assert_eq!(&reply[126..142], b"DEVICEIDLETIME 3");
     }
 
     // Reconstructs the exact CreateAlarm muffin sends under Cinnamon

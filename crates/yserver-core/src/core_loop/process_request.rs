@@ -2289,13 +2289,23 @@ fn handle_sync_request(
         }
         x11sync::QUERY_COUNTER => {
             let counter = x11sync::parse_resource(body).unwrap_or(0);
-            let value = if matches!(
-                counter,
-                x11sync::SERVERTIME_COUNTER | x11sync::IDLETIME_COUNTER
-            ) {
-                i64::from(state.timestamp_now())
-            } else {
-                state.sync_counters.get(&counter).map_or(0, |c| c.value)
+            let value = match counter {
+                x11sync::SERVERTIME_COUNTER => i64::from(state.timestamp_now()),
+                x11sync::IDLETIME_COUNTER
+                | x11sync::IDLETIME_DEVICE_VCP
+                | x11sync::IDLETIME_DEVICE_VCK => {
+                    let baseline = state.idletime_baseline(counter);
+                    // X11 timestamps are 32-bit ms; saturate at u32::MAX
+                    // (~49 days idle) per X11 spec.
+                    let elapsed_ms = std::time::Instant::now()
+                        .duration_since(baseline)
+                        .as_millis()
+                        .min(u128::from(u32::MAX)) as u64;
+                    #[allow(clippy::cast_possible_wrap)]
+                    let v = elapsed_ms as i64;
+                    v
+                }
+                _ => state.sync_counters.get(&counter).map_or(0, |c| c.value),
             };
             let reply = x11sync::encode_query_counter_reply(byte_order, sequence, value);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -15851,6 +15861,7 @@ mod tests {
 
     use yserver_protocol::x11::{
         ClientByteOrder, ClientId, RequestHeader, SequenceNumber, screensaver as x11screensaver,
+        sync as x11sync,
     };
 
     use super::*;
@@ -15928,7 +15939,6 @@ mod tests {
     // value 1, PositiveComparison, delta 1, events true, watching
     // counter 0x02600006.
     fn muffin_alarm_body() -> Vec<u8> {
-        use yserver_protocol::x11::sync as x11sync;
         let mut b = Vec::new();
         b.extend_from_slice(&0x01e0_0019u32.to_le_bytes());
         let mask = x11sync::CA_COUNTER
@@ -26293,5 +26303,116 @@ mod tests {
         let b = read_all_available(&mut peer_b);
         let idx = b.iter().position(|&x| x == 162).expect("B receives Cycle");
         assert_eq!(b[idx + 1], x11screensaver::SCREEN_SAVER_CYCLE);
+    }
+
+    /// Read the XSync i64 counter value from a QueryCounter reply.
+    /// Protocol encoding: hi(INT32 LE at bytes[8..12]) || lo(CARD32 LE at
+    /// bytes[12..16]) — NOT a raw 8-byte little-endian integer.
+    fn read_query_counter_reply_value(bytes: &[u8]) -> i64 {
+        let hi = i32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let lo = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        (i64::from(hi) << 32) | i64::from(lo)
+    }
+
+    #[test]
+    fn query_counter_idletime_returns_elapsed_since_last_activity_not_uptime() {
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(30);
+
+        let header = RequestHeader {
+            opcode: 142,
+            data: x11sync::QUERY_COUNTER,
+            length_units: 2,
+        };
+        let body = x11sync::IDLETIME_COUNTER.to_le_bytes();
+        let _ = handle_sync_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        );
+
+        let bytes = read_all_available(&mut peer);
+        // QueryCounter reply: tag(1) data(1) seq(2) length(4) value:i64(8) pad(16)
+        assert_eq!(bytes[0], 1, "reply tag");
+        let value = read_query_counter_reply_value(&bytes);
+        assert!(
+            value >= 29_000 && value <= 35_000,
+            "IDLETIME ≈ 30_000ms ± scheduling slack; got {value}"
+        );
+    }
+
+    #[test]
+    fn query_counter_idletime_device_vcp_uses_per_device_baseline() {
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Global was idle 60s ago, but the pointer device is fresh.
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(60);
+        state
+            .per_device_last_activity
+            .insert(2, std::time::Instant::now() - Duration::from_millis(500));
+
+        let header = RequestHeader {
+            opcode: 142,
+            data: x11sync::QUERY_COUNTER,
+            length_units: 2,
+        };
+        let body = x11sync::IDLETIME_DEVICE_VCP.to_le_bytes();
+        let _ = handle_sync_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        );
+
+        let bytes = read_all_available(&mut peer);
+        let value = read_query_counter_reply_value(&bytes);
+        assert!(
+            value >= 400 && value <= 5_000,
+            "VCP IDLETIME ≈ 500ms; got {value}"
+        );
+    }
+
+    #[test]
+    fn query_counter_idletime_device_vck_uses_per_device_baseline() {
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(60);
+        state
+            .per_device_last_activity
+            .insert(3, std::time::Instant::now() - Duration::from_millis(200));
+
+        let header = RequestHeader {
+            opcode: 142,
+            data: x11sync::QUERY_COUNTER,
+            length_units: 2,
+        };
+        let body = x11sync::IDLETIME_DEVICE_VCK.to_le_bytes();
+        let _ = handle_sync_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        );
+
+        let bytes = read_all_available(&mut peer);
+        let value = read_query_counter_reply_value(&bytes);
+        assert!(
+            value >= 100 && value <= 3_000,
+            "VCK IDLETIME ≈ 200ms; got {value}"
+        );
     }
 }

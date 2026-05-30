@@ -44,7 +44,11 @@ pub fn key_event_fanout_to_state(
     // DPMS: any key resets the idle timer; from any non-On level
     // we wake the screen *before* fanning out, so the first event
     // of the resumed session lands on a visible scanout.
-    state.dpms.last_activity = std::time::Instant::now();
+    let now = std::time::Instant::now();
+    state.dpms.last_activity = now;
+    state
+        .per_device_last_activity
+        .insert(XI2_MASTER_KEYBOARD_DEVICE_ID as u8, now);
     if state.dpms.enabled && state.dpms.power_level != 0 {
         crate::core_loop::process_request::apply_dpms_transition(state, backend, 0);
         // DPMS coupling tail already flipped SS Off if it was On.
@@ -621,5 +625,27 @@ mod tests {
 
         assert_eq!(state.screensaver.active, ScreenSaverActive::Off);
         assert!(!state.screensaver.forced, "input-driven Off is non-forced");
+    }
+
+    #[test]
+    fn key_event_updates_global_and_per_device_vck_last_activity() {
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(30);
+        let stale = state.dpms.last_activity;
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
+
+        assert!(
+            state.dpms.last_activity > stale,
+            "global last_activity advanced"
+        );
+        let vck = state
+            .per_device_last_activity
+            .get(&3)
+            .copied()
+            .expect("VCK per-device entry inserted");
+        assert!(vck > stale, "VCK per-device last_activity advanced");
     }
 }
