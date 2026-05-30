@@ -182,6 +182,45 @@ pub enum CompositeRedirectMode {
     Automatic,
 }
 
+/// Global DPMS extension state. Mirrors Xorg's per-server (not
+/// per-screen) DPMS data model. `kms_capable` is snapshotted from
+/// the backend at init and never changes; `enabled` mirrors Xorg's
+/// `DPMSEnabled` and starts equal to `kms_capable` (Xorg
+/// `Xext/dpms.c:587`).
+#[derive(Debug, Clone)]
+pub struct DpmsState {
+    pub kms_capable: bool,
+    pub enabled: bool,
+    /// 0=On, 1=Standby, 2=Suspend, 3=Off.
+    pub power_level: u8,
+    /// 0 means "this level disabled" (Xorg `os/WaitFor.c:403-410`).
+    pub standby_ms: u32,
+    pub suspend_ms: u32,
+    pub off_ms: u32,
+    pub last_activity: Instant,
+    /// Client IDs that issued `DPMSSelectInput(DPMS_INFO_NOTIFY_MASK)`.
+    pub selected_by: std::collections::HashSet<ClientId>,
+}
+
+impl DpmsState {
+    /// Initial state — built lazily from the backend's
+    /// `dpms_capable()` at `ServerState::new(...)` time. Defaults
+    /// match Xorg: timeouts = `ScreenSaverTime` (600s) ×3.
+    #[must_use]
+    pub fn new(kms_capable: bool) -> Self {
+        Self {
+            kms_capable,
+            enabled: kms_capable,
+            power_level: 0, // On
+            standby_ms: 600_000,
+            suspend_ms: 600_000,
+            off_ms: 600_000,
+            last_activity: Instant::now(),
+            selected_by: std::collections::HashSet::new(),
+        }
+    }
+}
+
 /// Per-window XComposite redirect record stored in
 /// [`ServerState::composite_redirects`]. The `owner` is the client
 /// that issued the `RedirectWindow` / `RedirectSubwindows` — used
@@ -311,6 +350,8 @@ pub struct ServerState {
     /// `repeat_state.next_fire` to compute its wake-up timeout so an
     /// idle server still costs zero CPU.
     pub repeat_state: Option<KeyRepeatState>,
+    /// Global DPMS extension state (power management).
+    pub dpms: DpmsState,
     /// Per-client close-down mode set by `SetCloseDownMode` (opcode 112).
     /// Absent / 0 = Destroy (default); 1 = RetainPermanent; 2 = RetainTemporary.
     /// Only non-zero entries are stored. Read at disconnect time to decide
@@ -454,6 +495,7 @@ impl ServerState {
             glx_drawables: HashMap::new(),
             sync_pending_awaits: Vec::new(),
             repeat_state: None,
+            dpms: DpmsState::new(false),
             close_down_modes: HashMap::new(),
             zombie_clients: HashMap::new(),
             scroll_axis_value: [0; 2],
@@ -489,6 +531,35 @@ impl ServerState {
         #[allow(clippy::cast_possible_truncation)]
         let ts = elapsed as u32;
         ts
+    }
+
+    /// Earliest instant a DPMS transition could fire. Picks the
+    /// smallest non-zero timeout strictly above the current level.
+    /// Returns `None` when DPMS is off (either `!enabled` or
+    /// `!kms_capable`), when there is no higher level to reach, or
+    /// when every higher level's timeout is zero (disabled).
+    #[must_use]
+    pub fn dpms_transition_deadline(&self) -> Option<std::time::Instant> {
+        if !self.dpms.enabled || !self.dpms.kms_capable {
+            return None;
+        }
+        let mut next: Option<u32> = None;
+        let mut push = |ms: u32| {
+            if ms > 0 {
+                next = Some(next.map_or(ms, |n| n.min(ms)));
+            }
+        };
+        let lvl = self.dpms.power_level;
+        if lvl < 1 {
+            push(self.dpms.standby_ms);
+        }
+        if lvl < 2 {
+            push(self.dpms.suspend_ms);
+        }
+        if lvl < 3 {
+            push(self.dpms.off_ms);
+        }
+        Some(self.dpms.last_activity + std::time::Duration::from_millis(u64::from(next?)))
     }
 }
 
@@ -1757,6 +1828,23 @@ fn pointer_event_fanout_inner(
             let _ = w.write_all(&buf);
         }
     }
+}
+
+/// Highest-first evaluation of "given current level + idle time, what
+/// should `power_level` become?" — leapfrogs equal timeouts and skips
+/// zero-disabled levels. Matches Xorg `os/WaitFor.c:446-448`.
+#[must_use]
+pub fn next_dpms_level(current: u8, idle_ms: u32, dpms: &DpmsState) -> u8 {
+    if current < 3 && dpms.off_ms > 0 && idle_ms >= dpms.off_ms {
+        return 3;
+    }
+    if current < 2 && dpms.suspend_ms > 0 && idle_ms >= dpms.suspend_ms {
+        return 2;
+    }
+    if current < 1 && dpms.standby_ms > 0 && idle_ms >= dpms.standby_ms {
+        return 1;
+    }
+    current
 }
 
 #[cfg(test)]
@@ -3274,5 +3362,111 @@ mod tests {
             Some((desktop, 25, 30))
         );
         assert_eq!(state.direct_child_at(ROOT_WINDOW, 25, 30), Some(desktop));
+    }
+
+    #[test]
+    fn dpms_transition_deadline_picks_smallest_non_zero_above_current() {
+        use std::time::{Duration, Instant};
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        let baseline = Instant::now();
+        state.dpms.last_activity = baseline;
+        state.dpms.standby_ms = 300_000;
+        state.dpms.suspend_ms = 600_000;
+        state.dpms.off_ms = 900_000;
+
+        state.dpms.power_level = 0; // On
+        assert_eq!(
+            state.dpms_transition_deadline(),
+            Some(baseline + Duration::from_millis(300_000))
+        );
+
+        state.dpms.power_level = 1; // Standby
+        assert_eq!(
+            state.dpms_transition_deadline(),
+            Some(baseline + Duration::from_millis(600_000))
+        );
+
+        state.dpms.power_level = 2; // Suspend
+        assert_eq!(
+            state.dpms_transition_deadline(),
+            Some(baseline + Duration::from_millis(900_000))
+        );
+
+        state.dpms.power_level = 3; // Off — nothing above
+        assert_eq!(state.dpms_transition_deadline(), None);
+    }
+
+    #[test]
+    fn dpms_transition_deadline_returns_none_when_disabled() {
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = false; // disabled
+        state.dpms.standby_ms = 300_000;
+        assert!(state.dpms_transition_deadline().is_none());
+    }
+
+    #[test]
+    fn dpms_transition_deadline_returns_none_when_not_kms_capable() {
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = false;
+        state.dpms.enabled = true; // a ynest client called DPMSEnable
+        state.dpms.standby_ms = 300_000;
+        // No backend to drive — no deadline.
+        assert!(state.dpms_transition_deadline().is_none());
+    }
+
+    #[test]
+    fn dpms_transition_deadline_zero_skips_not_halts() {
+        use std::time::{Duration, Instant};
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        let baseline = Instant::now();
+        state.dpms.last_activity = baseline;
+        // Standby + Off disabled, Suspend at 900s.
+        state.dpms.standby_ms = 0;
+        state.dpms.suspend_ms = 900_000;
+        state.dpms.off_ms = 0;
+
+        state.dpms.power_level = 0; // On
+        assert_eq!(
+            state.dpms_transition_deadline(),
+            Some(baseline + Duration::from_millis(900_000))
+        );
+
+        state.dpms.power_level = 2; // Suspend — nothing above non-zero
+        assert!(state.dpms_transition_deadline().is_none());
+    }
+
+    #[test]
+    fn next_dpms_level_leapfrogs_on_equal_timeouts() {
+        let mut state = ServerState::new();
+        state.dpms.standby_ms = 600_000;
+        state.dpms.suspend_ms = 600_000;
+        state.dpms.off_ms = 600_000;
+        // From On, with idle = exactly 600_000ms, highest expired wins → Off.
+        assert_eq!(next_dpms_level(0, 600_000, &state.dpms), 3);
+    }
+
+    #[test]
+    fn next_dpms_level_skips_zero_levels() {
+        let mut state = ServerState::new();
+        state.dpms.standby_ms = 0;
+        state.dpms.suspend_ms = 900_000;
+        state.dpms.off_ms = 0;
+        // From On, idle = 900s → Suspend (Standby and Off skipped).
+        assert_eq!(next_dpms_level(0, 900_000, &state.dpms), 2);
+    }
+
+    #[test]
+    fn next_dpms_level_stable_when_under_threshold() {
+        let mut state = ServerState::new();
+        state.dpms.standby_ms = 300_000;
+        state.dpms.suspend_ms = 600_000;
+        state.dpms.off_ms = 900_000;
+        assert_eq!(next_dpms_level(0, 0, &state.dpms), 0);
+        assert_eq!(next_dpms_level(1, 100_000, &state.dpms), 1);
     }
 }
