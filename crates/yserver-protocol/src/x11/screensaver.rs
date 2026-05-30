@@ -174,6 +174,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_unset_attributes_extracts_drawable_and_rejects_short_body() {
+        assert_eq!(
+            parse_unset_attributes_request(&[0xab, 0xcd, 0xef, 0x12]),
+            Some(0x12ef_cdab)
+        );
+        assert_eq!(parse_unset_attributes_request(&[0u8; 3]), None);
+    }
+
+    #[test]
     fn encode_query_info_reply_shape() {
         // saverproto.h: state(1) window(8) til_or_since(12) idle(16)
         // event_mask(20) kind(24) pads to 32.
