@@ -44,8 +44,8 @@ MATE / xfce4 desktop on:
 - **AMD** — Ryzen 9 6900HX (Rembrandt, RDNA2, RADV); i9 13900k + RX580
   (Polaris/GCN4, RADV).
 - **Intel** — i5-7200U (Kaby Lake, ANV).
-- **NVIDIA** — proprietary driver.
-- **Snapdragon X1** (Adreno X1, Turnip). 
+- **NVIDIA** — i5 6500 with GTX 1050 (proprietary driver).
+- **Snapdragon X1** X1E80100 (Adreno X1, Turnip). 
 - **Apple** M1 MBA, M2 MBP on Asahi Linux (apple-drm KMS + asahi GPU, Mesa AGX-V).
 - **Virtual** — virtio-gpu inside `virtme-ng` (lavapipe and Venus passthrough).
 
@@ -65,10 +65,8 @@ cargo build --release
 
 ## Running the standalone DRM/KMS server
 
-`yserver` opens `/dev/dri/card0`, acquires DRM master, and drives
-atomic KMS directly. It needs access to /dev/dri/ and to /dev/input/.
-
-!! make sure your user is in the `input` group (or otherwise has access to /dev/input/ devices) !!
+`yserver` libseat for seat management if available.
+It can also drive atomic KMS directly, but then you need access to /dev/dri/ and to /dev/input/.
 
 The [`Justfile`](Justfile) wraps the recipes:
 
@@ -77,7 +75,7 @@ The [`Justfile`](Justfile) wraps the recipes:
 just yserver-mate-hw-release
 ```
 
-Note that you CAN NOT switch VT when yserver is running. Zap the server, or log out of your session otherwise.
+If you are using libseat, you can switch VT, but if you use direct, you CAN NOT switch VT when yserver is running. Zap the server, or log out of your session otherwise.
 ## Development
 
 Some convenience keybinds are available:
@@ -91,13 +89,13 @@ Some convenience keybinds are available:
 #### Arch
 
 ```sh
-sudo pacman -S just gcc libxshmfence libxkbcommon libinput glslc systemd-libs fontconfig
+sudo pacman -S just gcc libseat libxshmfence libxkbcommon libinput glslc systemd-libs fontconfig
 ```
 
 #### Ubuntu
 
 ```sh
-sudo apt install just gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libfontconfig-dev
+sudo apt install just gcc libseat-dev libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libfontconfig-dev
 ```
 
 ## Regression coverage with xts5
