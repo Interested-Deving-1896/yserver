@@ -1,0 +1,1404 @@
+# IDLETIME counter + SYNC alarm firing — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Make yserver's `IDLETIME` system counter actually track idle time (currently aliased to SERVERTIME), and wire SYNC alarm evaluation for IDLETIME counters end-to-end — so MATE's `mate-screensaver` lockscreen and `mate-power-manager` display-blank trigger on real user idle.
+
+**Architecture:** Mirror the DPMS+SS evaluator pattern just shipped on `feat/mit-screen-saver`. Replace the IDLETIME branch of `QUERY_COUNTER` to return `(now - last_activity_ms)`; add per-master-device (VCP=2, VCK=3) `last_activity` tracking on `ServerState`; add `idletime_alarm_deadline()` that feeds the poll-deadline `.min()` chain in `run.rs`; add `evaluate_idletime_alarms_post_poll` that walks alarms on each IDLETIME counter; fix `evaluate_alarms_for_counter`'s broken `delta == 0 + Transition` branch (it currently goes Inactive; Xorg keeps it Active per `sync.c:548-555`); fanout-prologue Negative-trigger firing on input wake.
+
+**Tech Stack:** Rust 2024, yserver-protocol's existing SYNC wire encoders (`encode_alarm_notify_event`, `encode_list_system_counters_reply`, `encode_query_counter_reply`), the existing `SyncAlarm` struct (`server.rs:739`), the existing `evaluate_alarms_for_counter` helper (`process_request.rs:2563`), the `RecordingBackend` test double.
+
+**Spec reference:** [docs/superpowers/specs/2026-05-31-idletime-sync-alarms-design.md](../specs/2026-05-31-idletime-sync-alarms-design.md). Behavioural truth: `/home/jos/Projects/xserver/Xext/sync.c` (`IdleTimeQueryValue:2627`, `SyncCheckTrigger*:258-304`, `SyncSendAlarmNotifyEvents:428`, `SyncAlarmTriggerFired:540-606`, `IdleTimeBlockHandler:2647`).
+
+---
+
+## File map
+
+| Path | Action | Responsibility |
+|------|--------|----------------|
+| `crates/yserver-protocol/src/x11/sync.rs` | modify | Add `IDLETIME_DEVICE_VCP` + `IDLETIME_DEVICE_VCK` const; extend `encode_list_system_counters_reply` to advertise all four counters; add new tests. |
+| `crates/yserver-core/src/server.rs` | modify | Add `per_device_last_activity: HashMap<u8, Instant>` and `idletime_last_evaluated: HashMap<u32, i64>` fields on `ServerState`; init in `with_geometry`. Add `idletime_baseline(counter)` and `idletime_alarm_deadline()` helpers + tests. |
+| `crates/yserver-core/src/core_loop/process_request.rs` | modify | Replace IDLETIME branch in `QUERY_COUNTER` (`:2292-2299`). Extend `CREATE_ALARM` create-time fire path (`:2330`) to recognise IDLETIME counters. Fix the `delta == 0 + Transition` bug in `evaluate_alarms_for_counter` (`:2588-2589`). Add tests. |
+| `crates/yserver-core/src/core_loop/run.rs` | modify | Add `pub(crate) fn evaluate_idletime_alarms_post_poll`. Chain `state.idletime_alarm_deadline()` into the `.min()` poll-deadline at `:393-407`. Call evaluator after `evaluate_screen_saver_post_poll` at `:684`. Add tests. |
+| `crates/yserver-core/src/core_loop/key_fanout.rs` | modify | Update `per_device_last_activity[3]` on every key event (prologue, before SS-off sibling check). Add `evaluate_idletime_negative_alarms_on_input_wake` call. Add tests. |
+| `crates/yserver-core/src/core_loop/pointer_fanout.rs` | modify | Same shape for `per_device_last_activity[2]`. Add tests. |
+
+No file is created. All edits are additive to existing files.
+
+---
+
+## Pre-existing bug discovered during planning
+
+`evaluate_alarms_for_counter` at `process_request.rs:2588-2589` flips `delta == 0` alarms to `ALARM_STATE_INACTIVE` regardless of test type:
+
+```rust
+let (new_wait, new_state) = if delta == 0 {
+    (fired_wait, x11sync::ALARM_STATE_INACTIVE)
+} else { ... };
+```
+
+Per Xorg `Xext/sync.c:548-555`, only `delta == 0 + (PositiveComparison | NegativeComparison)` should go Inactive. `delta == 0 + (PositiveTransition | NegativeTransition)` must stay Active (the trigger is edge-triggered; once the edge passes, the alarm sits quiescent waiting for the next crossing). MATE's two alarms at value=59999 are both `PositiveTransition` and `NegativeTransition` with `delta=0` — under the current bug, they'd fire once and then go Inactive forever (and we'd never see the NegativeTransition fire because the counter going back below 59999 requires the alarm to be Active to be re-evaluated).
+
+**Task 2 fixes this.** It is a precondition for IDLETIME alarms working at all under MATE.
+
+---
+
+## Task 1: IDLETIME counter values + per-device counter IDs + per-device tracking
+
+**Files:**
+- Modify: `crates/yserver-protocol/src/x11/sync.rs` (add 2 consts + extend ListSystemCounters reply + 1 test)
+- Modify: `crates/yserver-core/src/server.rs` (add 2 fields, init, add `idletime_baseline` helper + 3 tests)
+- Modify: `crates/yserver-core/src/core_loop/process_request.rs` (replace IDLETIME branch in `QUERY_COUNTER` at `:2292-2299` + 3 tests)
+- Modify: `crates/yserver-core/src/core_loop/key_fanout.rs` (update `per_device_last_activity[3]` in prologue + 1 test)
+- Modify: `crates/yserver-core/src/core_loop/pointer_fanout.rs` (update `per_device_last_activity[2]` in prologue + 1 test)
+
+After this commit, `xset q` style clients still see the old behaviour (alarms still don't fire on IDLETIME because nothing evaluates them) but `XSyncQueryCounter(IDLETIME)` now returns the right value. This makes the regression visible to clients that read the counter directly.
+
+- [ ] **Step 1: Add per-device counter consts to `sync.rs`**
+
+In `crates/yserver-protocol/src/x11/sync.rs`, after the existing `pub const IDLETIME_COUNTER: u32 = 0x107;` at `:28`, add:
+
+```rust
+/// Per-master-device IDLETIME counters. yserver hard-codes the XI2
+/// master pair: VCP=2, VCK=3 (see `key_fanout.rs:29`,
+/// `pointer_fanout.rs:30`). Counter IDs picked to avoid collision
+/// with anything in `resources.rs`.
+pub const IDLETIME_DEVICE_VCP: u32 = 0x108;
+pub const IDLETIME_DEVICE_VCK: u32 = 0x109;
+```
+
+- [ ] **Step 2: Extend `encode_list_system_counters_reply` to advertise all four counters**
+
+In the same file, find `encode_list_system_counters_reply` at `:325`. Update the `COUNTERS` table:
+
+```rust
+    const COUNTERS: &[(u32, i64, &[u8])] = &[
+        (SERVERTIME_COUNTER, 4, b"SERVERTIME"),
+        (IDLETIME_COUNTER, 4, b"IDLETIME"),
+        (IDLETIME_DEVICE_VCP, 4, b"DEVICEIDLETIME-2"),
+        (IDLETIME_DEVICE_VCK, 4, b"DEVICEIDLETIME-3"),
+    ];
+```
+
+- [ ] **Step 3: Update / add the corresponding ListSystemCounters test**
+
+Find the existing test at `:443` (`encode_list_system_counters_reply` + `:449-462` assertions). The test asserts SERVERTIME at one offset and IDLETIME at another. Extend it to also assert the two new counters:
+
+```rust
+    #[test]
+    fn list_system_counters_advertises_four_counters_with_device_idletime() {
+        let reply = encode_list_system_counters_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x88),
+        );
+        // header: tag(1B) data(1B) seq(2B) length(4B) counters_len(4B) pad(20B) = 32B
+        assert_eq!(
+            u32::from_le_bytes([reply[32], reply[33], reply[34], reply[35]]),
+            SERVERTIME_COUNTER,
+            "first entry counter id"
+        );
+        // each entry: counter(4) resolution(8) name_len(2) name(padded to 4)
+        // SERVERTIME entry: 14 + 10 = 24 bytes, padded to 24.
+        // IDLETIME entry starts at byte 32 + 24 = 56.
+        assert_eq!(
+            u32::from_le_bytes([reply[56], reply[57], reply[58], reply[59]]),
+            IDLETIME_COUNTER,
+            "second entry counter id"
+        );
+        // IDLETIME entry: 14 + 8 = 22, padded to 24. Next at 80.
+        assert_eq!(
+            u32::from_le_bytes([reply[80], reply[81], reply[82], reply[83]]),
+            IDLETIME_DEVICE_VCP,
+            "third entry: per-pointer IDLETIME"
+        );
+        assert_eq!(&reply[94..110], b"DEVICEIDLETIME-2");
+        // Per-VCP entry: 14 + 16 = 30, padded to 32. Next at 112.
+        assert_eq!(
+            u32::from_le_bytes([reply[112], reply[113], reply[114], reply[115]]),
+            IDLETIME_DEVICE_VCK,
+            "fourth entry: per-keyboard IDLETIME"
+        );
+        assert_eq!(&reply[126..142], b"DEVICEIDLETIME-3");
+    }
+```
+
+If a single existing test was named differently and asserts the 2-counter shape, **replace** its body with this 4-counter shape (don't keep two conflicting tests).
+
+- [ ] **Step 4: Run the protocol test to verify the wire layout**
+
+```bash
+cargo test -p yserver-protocol list_system_counters
+```
+
+Expected: pass (or fail with offset mismatches if the byte arithmetic is off — fix by reading the byte buffer manually with `eprintln!`).
+
+- [ ] **Step 5: Add the per-device tracking + helper to `server.rs`**
+
+In `crates/yserver-core/src/server.rs`, add two fields to `ServerState` (alongside `pub sync_alarms`):
+
+```rust
+    /// Per-XI2-master-device idle clock. Key = device id (VCP=2, VCK=3
+    /// hard-coded in key_fanout.rs:29 / pointer_fanout.rs:30). Updated
+    /// by the fanouts on each input event for the affected device.
+    /// `dpms.last_activity` continues to track "any device" — that's the
+    /// global IDLETIME baseline.
+    pub per_device_last_activity: HashMap<u8, Instant>,
+
+    /// Per-counter cache of the IDLETIME value at the last evaluator
+    /// pass. Lets the post-poll evaluator compute `(old, new)`
+    /// transitions for `trigger_fires`. Keyed by counter id (one of
+    /// IDLETIME_COUNTER / IDLETIME_DEVICE_VCP / IDLETIME_DEVICE_VCK).
+    pub idletime_last_evaluated: HashMap<u32, i64>,
+```
+
+Init both in `with_geometry` (alongside `sync_alarms: HashMap::new()` at `:575`):
+
+```rust
+            per_device_last_activity: HashMap::new(),
+            idletime_last_evaluated: HashMap::new(),
+```
+
+Add a helper method on `impl ServerState` (near `timestamp_now` at `:528`):
+
+```rust
+    /// Baseline `Instant` for an IDLETIME-family counter. Falls back to
+    /// `dpms.last_activity` (global) for unknown counters so that a
+    /// per-device counter query before any device-specific input has
+    /// landed still returns a sensible "any device" idle.
+    #[must_use]
+    pub fn idletime_baseline(&self, counter: u32) -> Instant {
+        use yserver_protocol::x11::sync as x11sync;
+        match counter {
+            x11sync::IDLETIME_DEVICE_VCP => self
+                .per_device_last_activity
+                .get(&2)
+                .copied()
+                .unwrap_or(self.dpms.last_activity),
+            x11sync::IDLETIME_DEVICE_VCK => self
+                .per_device_last_activity
+                .get(&3)
+                .copied()
+                .unwrap_or(self.dpms.last_activity),
+            // Global IDLETIME (and any unknown counter routed here).
+            _ => self.dpms.last_activity,
+        }
+    }
+```
+
+- [ ] **Step 6: Add server-state tests for `idletime_baseline`**
+
+In `server.rs`'s `#[cfg(test)] mod tests`, append:
+
+```rust
+    #[test]
+    fn idletime_baseline_global_returns_dpms_last_activity() {
+        use std::time::Instant;
+        let mut state = ServerState::new();
+        let baseline = Instant::now();
+        state.dpms.last_activity = baseline;
+        assert_eq!(
+            state.idletime_baseline(yserver_protocol::x11::sync::IDLETIME_COUNTER),
+            baseline
+        );
+    }
+
+    #[test]
+    fn idletime_baseline_per_device_uses_per_device_entry() {
+        use std::time::{Duration, Instant};
+        let mut state = ServerState::new();
+        let global = Instant::now() - Duration::from_secs(60);
+        let pointer = Instant::now() - Duration::from_secs(5);
+        state.dpms.last_activity = global;
+        state.per_device_last_activity.insert(2, pointer);
+        assert_eq!(
+            state.idletime_baseline(yserver_protocol::x11::sync::IDLETIME_DEVICE_VCP),
+            pointer
+        );
+        // VCK has no per-device entry; falls back to global.
+        assert_eq!(
+            state.idletime_baseline(yserver_protocol::x11::sync::IDLETIME_DEVICE_VCK),
+            global
+        );
+    }
+
+    #[test]
+    fn idletime_baseline_unknown_counter_falls_back_to_global() {
+        let mut state = ServerState::new();
+        let baseline = state.dpms.last_activity;
+        assert_eq!(state.idletime_baseline(0xdead_beef), baseline);
+    }
+```
+
+Run: `cargo test -p yserver-core idletime_baseline`
+Expected: 3 passed.
+
+- [ ] **Step 7: Replace the IDLETIME branch in `QUERY_COUNTER`**
+
+In `crates/yserver-core/src/core_loop/process_request.rs:2292-2299`, the current code is:
+
+```rust
+        x11sync::QUERY_COUNTER => {
+            let counter = x11sync::parse_resource(body).unwrap_or(0);
+            let value = if matches!(
+                counter,
+                x11sync::SERVERTIME_COUNTER | x11sync::IDLETIME_COUNTER
+            ) {
+                i64::from(state.timestamp_now())
+            } else {
+                state.sync_counters.get(&counter).map_or(0, |c| c.value)
+            };
+```
+
+Replace with:
+
+```rust
+        x11sync::QUERY_COUNTER => {
+            let counter = x11sync::parse_resource(body).unwrap_or(0);
+            let value = match counter {
+                x11sync::SERVERTIME_COUNTER => i64::from(state.timestamp_now()),
+                x11sync::IDLETIME_COUNTER
+                | x11sync::IDLETIME_DEVICE_VCP
+                | x11sync::IDLETIME_DEVICE_VCK => {
+                    let baseline = state.idletime_baseline(counter);
+                    // X11 timestamps are 32-bit ms; saturate at u32::MAX
+                    // (~49 days idle) per X11 spec.
+                    let elapsed_ms = std::time::Instant::now()
+                        .duration_since(baseline)
+                        .as_millis()
+                        .min(u128::from(u32::MAX)) as u64;
+                    elapsed_ms as i64
+                }
+                _ => state.sync_counters.get(&counter).map_or(0, |c| c.value),
+            };
+```
+
+- [ ] **Step 8: Add `QUERY_COUNTER` tests for IDLETIME**
+
+In `process_request.rs`'s `#[cfg(test)] mod tests`, append:
+
+```rust
+    #[test]
+    fn query_counter_idletime_returns_elapsed_since_last_activity_not_uptime() {
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(30);
+
+        let header = RequestHeader {
+            opcode: 142,
+            data: x11sync::QUERY_COUNTER,
+            length_units: 2,
+        };
+        let body = x11sync::IDLETIME_COUNTER.to_le_bytes();
+        let _ = handle_sync_request(&mut state, &mut backend, ClientId(1),
+                                    SequenceNumber(1), header, &body);
+
+        let bytes = read_all_available(&mut peer);
+        // QueryCounter reply: tag(1) data(1) seq(2) length(4) value:i64(8) pad(16)
+        assert_eq!(bytes[0], 1, "reply tag");
+        let value = i64::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
+        assert!(
+            value >= 29_000 && value <= 35_000,
+            "IDLETIME ≈ 30_000ms ± scheduling slack; got {value}"
+        );
+    }
+
+    #[test]
+    fn query_counter_idletime_device_vcp_uses_per_device_baseline() {
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Global was idle 60s ago, but the pointer device is fresh.
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(60);
+        state.per_device_last_activity.insert(2,
+            std::time::Instant::now() - Duration::from_millis(500));
+
+        let header = RequestHeader {
+            opcode: 142,
+            data: x11sync::QUERY_COUNTER,
+            length_units: 2,
+        };
+        let body = x11sync::IDLETIME_DEVICE_VCP.to_le_bytes();
+        let _ = handle_sync_request(&mut state, &mut backend, ClientId(1),
+                                    SequenceNumber(1), header, &body);
+
+        let bytes = read_all_available(&mut peer);
+        let value = i64::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
+        assert!(
+            value >= 400 && value <= 5_000,
+            "VCP IDLETIME ≈ 500ms; got {value}"
+        );
+    }
+
+    #[test]
+    fn query_counter_idletime_device_vck_uses_per_device_baseline() {
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(60);
+        state.per_device_last_activity.insert(3,
+            std::time::Instant::now() - Duration::from_millis(200));
+
+        let header = RequestHeader {
+            opcode: 142,
+            data: x11sync::QUERY_COUNTER,
+            length_units: 2,
+        };
+        let body = x11sync::IDLETIME_DEVICE_VCK.to_le_bytes();
+        let _ = handle_sync_request(&mut state, &mut backend, ClientId(1),
+                                    SequenceNumber(1), header, &body);
+
+        let bytes = read_all_available(&mut peer);
+        let value = i64::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
+        assert!(
+            value >= 100 && value <= 3_000,
+            "VCK IDLETIME ≈ 200ms; got {value}"
+        );
+    }
+```
+
+If `x11sync` is not yet imported in the test module, add:
+
+```rust
+    use yserver_protocol::x11::sync as x11sync;
+```
+
+to the existing test-module `use` block.
+
+- [ ] **Step 9: Update fanouts to maintain `per_device_last_activity`**
+
+In `crates/yserver-core/src/core_loop/key_fanout.rs:47`, the existing prologue line is:
+
+```rust
+    state.dpms.last_activity = std::time::Instant::now();
+```
+
+Change to:
+
+```rust
+    let now = std::time::Instant::now();
+    state.dpms.last_activity = now;
+    state
+        .per_device_last_activity
+        .insert(XI2_MASTER_KEYBOARD_DEVICE_ID as u8, now);
+```
+
+(Yes, `XI2_MASTER_KEYBOARD_DEVICE_ID` is `u16` but the value is always 3; the cast is safe and the comment in `server.rs` references the u8 keying.)
+
+In `crates/yserver-core/src/core_loop/pointer_fanout.rs:53`, the existing line is the same shape. Change to:
+
+```rust
+    let now = std::time::Instant::now();
+    state.dpms.last_activity = now;
+    state
+        .per_device_last_activity
+        .insert(XI2_MASTER_POINTER_DEVICE_ID as u8, now);
+```
+
+- [ ] **Step 10: Add fanout per-device tracking tests**
+
+In `key_fanout.rs`'s `#[cfg(test)] mod tests`, append:
+
+```rust
+    #[test]
+    fn key_event_updates_global_and_per_device_vck_last_activity() {
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(30);
+        let stale = state.dpms.last_activity;
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
+
+        assert!(state.dpms.last_activity > stale, "global last_activity advanced");
+        let vck = state.per_device_last_activity.get(&3).copied()
+            .expect("VCK per-device entry inserted");
+        assert!(vck > stale, "VCK per-device last_activity advanced");
+    }
+```
+
+In `pointer_fanout.rs`'s test module, append the analogue (use the existing `motion_event()` or similar test helper — find it via `rg motion_event crates/yserver-core/src/core_loop/pointer_fanout.rs | head` — and assert `per_device_last_activity.get(&2)`).
+
+- [ ] **Step 11: Format, lint, full test, commit**
+
+```bash
+cargo +nightly fmt
+cargo clippy --workspace
+cargo test --workspace
+git add crates/yserver-protocol/src/x11/sync.rs crates/yserver-core/src/server.rs crates/yserver-core/src/core_loop/process_request.rs crates/yserver-core/src/core_loop/key_fanout.rs crates/yserver-core/src/core_loop/pointer_fanout.rs
+git commit -m "feat(sync): IDLETIME values + per-device counters + per-device tracking
+
+QUERY_COUNTER for IDLETIME now returns (now - last_activity)
+instead of (now - server_start). Adds two per-master-device
+counters (IDLETIME_DEVICE_VCP=0x108, IDLETIME_DEVICE_VCK=0x109),
+advertised in ListSystemCounters as DEVICEIDLETIME-2/-3 per Xorg
+convention. ServerState gains per_device_last_activity (keyed by
+XI2 master device id) which the key/pointer fanouts update
+alongside the existing global last_activity.
+
+Alarms on IDLETIME counters still don't fire — that arrives in
+Tasks 3 and 4. After this commit, clients QueryCounter-ing
+IDLETIME directly (e.g. xset diagnostics) see the right value.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 2: Fix `delta == 0 + Transition` alarm-state bug
+
+**Files:**
+- Modify: `crates/yserver-core/src/core_loop/process_request.rs:2588-2589` (`evaluate_alarms_for_counter`)
+- Add 1 test (regression)
+
+Pre-existing bug independent of IDLETIME — but a precondition for IDLETIME alarms to work under MATE. Currently every `delta == 0` alarm transitions to Inactive on fire; Xorg only does this for `Comparison` test types. Transitions with `delta == 0` must stay Active so the next crossing re-fires the alarm.
+
+- [ ] **Step 1: Write the failing regression test**
+
+In `process_request.rs`'s `#[cfg(test)] mod tests`, append:
+
+```rust
+    #[test]
+    fn evaluate_alarms_positive_transition_with_delta_zero_stays_active() {
+        // Regression: Xorg sync.c:548-555 — only delta=0 + Comparison
+        // goes Inactive. Transitions with delta=0 must stay Active so
+        // the next crossing re-fires.
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let counter = 0x1000;
+        state.sync_counters.insert(counter, crate::server::SyncCounter {
+            owner: ClientId(1),
+            value: 0,
+        });
+        let alarm_id = 0x2000;
+        state.sync_alarms.insert(alarm_id, crate::server::SyncAlarm {
+            owner: ClientId(1),
+            counter,
+            wait_value: 100,
+            delta: 0,
+            test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+            events: true,
+            state: x11sync::ALARM_STATE_ACTIVE,
+        });
+
+        // Counter transition from 50 → 150 crosses the trigger.
+        evaluate_alarms_for_counter(&mut state, counter, 50, 150);
+
+        let after = &state.sync_alarms[&alarm_id];
+        assert_eq!(
+            after.state, x11sync::ALARM_STATE_ACTIVE,
+            "PositiveTransition + delta=0 must stay Active (Xorg sync.c:548-555)"
+        );
+        assert_eq!(after.wait_value, 100, "wait_value unchanged for delta=0 Transition");
+    }
+
+    #[test]
+    fn evaluate_alarms_positive_comparison_with_delta_zero_goes_inactive() {
+        // Companion test: PositiveComparison + delta=0 SHOULD go Inactive.
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let counter = 0x1000;
+        state.sync_counters.insert(counter, crate::server::SyncCounter {
+            owner: ClientId(1),
+            value: 0,
+        });
+        let alarm_id = 0x2000;
+        state.sync_alarms.insert(alarm_id, crate::server::SyncAlarm {
+            owner: ClientId(1),
+            counter,
+            wait_value: 100,
+            delta: 0,
+            test_type: x11sync::TEST_POSITIVE_COMPARISON as u8,
+            events: true,
+            state: x11sync::ALARM_STATE_ACTIVE,
+        });
+
+        evaluate_alarms_for_counter(&mut state, counter, 50, 150);
+
+        let after = &state.sync_alarms[&alarm_id];
+        assert_eq!(after.state, x11sync::ALARM_STATE_INACTIVE);
+    }
+```
+
+Run: `cargo test -p yserver-core evaluate_alarms_positive_transition_with_delta_zero_stays_active evaluate_alarms_positive_comparison_with_delta_zero_goes_inactive`
+Expected: the Transition test FAILS (regression — state is currently Inactive); the Comparison test passes.
+
+- [ ] **Step 2: Apply the fix**
+
+In `process_request.rs:2588-2605`, the current code is:
+
+```rust
+        let (new_wait, new_state) = if delta == 0 {
+            (fired_wait, x11sync::ALARM_STATE_INACTIVE)
+        } else {
+            // Advance past the current value so the next crossing fires
+            // again instead of re-triggering on this same value. Bounded
+            // in case delta points away from the test direction.
+            let mut w = fired_wait;
+            let mut guard = 0u32;
+            while x11sync::comparison_satisfied(test_type, new, w) && guard < 1_000_000 {
+                let next = w.saturating_add(delta);
+                if next == w {
+                    break;
+                }
+                w = next;
+                guard += 1;
+            }
+            (w, x11sync::ALARM_STATE_ACTIVE)
+        };
+```
+
+Replace with:
+
+```rust
+        // Per Xorg sync.c:548-555: state → Inactive when
+        // (counter==None) OR (delta==0 AND test_type is Comparison).
+        // Transitions with delta=0 stay Active — once the edge passes,
+        // the alarm sits quiescent waiting for the next crossing.
+        let is_comparison = matches!(
+            test_type,
+            x11sync::TEST_POSITIVE_COMPARISON | x11sync::TEST_NEGATIVE_COMPARISON
+        );
+        let (new_wait, new_state) = if delta == 0 && is_comparison {
+            (fired_wait, x11sync::ALARM_STATE_INACTIVE)
+        } else if delta == 0 {
+            // Transition + delta=0: stay Active, wait_value unchanged.
+            (fired_wait, x11sync::ALARM_STATE_ACTIVE)
+        } else {
+            // delta != 0: re-arm by adding delta until trigger stops firing.
+            let mut w = fired_wait;
+            let mut guard = 0u32;
+            while x11sync::comparison_satisfied(test_type, new, w) && guard < 1_000_000 {
+                let next = w.saturating_add(delta);
+                if next == w {
+                    break;
+                }
+                w = next;
+                guard += 1;
+            }
+            (w, x11sync::ALARM_STATE_ACTIVE)
+        };
+```
+
+- [ ] **Step 3: Run both tests to verify they pass**
+
+```bash
+cargo test -p yserver-core evaluate_alarms_positive_transition_with_delta_zero_stays_active evaluate_alarms_positive_comparison_with_delta_zero_goes_inactive
+```
+
+Expected: both pass.
+
+- [ ] **Step 4: Run full crate test to check for regressions in other alarm tests**
+
+```bash
+cargo test -p yserver-core
+```
+
+Expected: all green. If any existing test asserted the buggy `delta == 0 + Transition → Inactive` behaviour, **fix the test** (it was asserting the bug). Comment why in the commit message.
+
+- [ ] **Step 5: Format, lint, commit**
+
+```bash
+cargo +nightly fmt
+cargo clippy -p yserver-core
+git add crates/yserver-core/src/core_loop/process_request.rs
+git commit -m "fix(sync): keep Transition alarms Active when delta=0
+
+evaluate_alarms_for_counter was sending every delta=0 alarm to
+ALARM_STATE_INACTIVE on fire. Xorg sync.c:548-555 only does
+this for the two Comparison test types — Transitions with
+delta=0 must stay Active so the next crossing re-fires.
+
+Precondition for IDLETIME alarms working under MATE: MATE's
+mate-power-manager creates two delta=0 alarms at value=59999
+(PositiveTransition for idle, NegativeTransition for wake);
+under the old code the wake alarm went Inactive after the
+idle alarm fired and never re-fired on input.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 3: `idletime_alarm_deadline` + chain into poll-deadline `.min()`
+
+**Files:**
+- Modify: `crates/yserver-core/src/server.rs` (add `idletime_alarm_deadline()` + 5 tests)
+- Modify: `crates/yserver-core/src/core_loop/run.rs` (chain into `.min()` at `:393-407`)
+
+After this commit, the poll-deadline wakes when an IDLETIME PositiveTransition / PositiveComparison alarm would fire — but the evaluator that actually fires it lands in Task 4.
+
+- [ ] **Step 1: Write failing tests**
+
+In `server.rs`'s `#[cfg(test)] mod tests`, append:
+
+```rust
+    #[test]
+    fn idletime_alarm_deadline_none_when_no_alarms() {
+        let state = ServerState::new();
+        assert!(state.idletime_alarm_deadline().is_none());
+    }
+
+    #[test]
+    fn idletime_alarm_deadline_picks_smallest_active_pos_alarm() {
+        use std::time::Duration;
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        let baseline = std::time::Instant::now();
+        state.dpms.last_activity = baseline;
+
+        for (id, wait) in &[(1u32, 60_000i64), (2, 30_000), (3, 90_000)] {
+            state.sync_alarms.insert(*id, crate::server::SyncAlarm {
+                owner: ClientId(1),
+                counter: x11sync::IDLETIME_COUNTER,
+                wait_value: *wait,
+                delta: 0,
+                test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+                events: true,
+                state: x11sync::ALARM_STATE_ACTIVE,
+            });
+        }
+
+        let deadline = state.idletime_alarm_deadline().expect("Some");
+        let expected = baseline + Duration::from_millis(30_000);
+        // Allow ±1ms for monotonic-clock resolution.
+        let diff = if deadline > expected {
+            deadline - expected
+        } else {
+            expected - deadline
+        };
+        assert!(diff < Duration::from_millis(2),
+                "deadline ~ baseline + 30_000ms; got diff {diff:?}");
+    }
+
+    #[test]
+    fn idletime_alarm_deadline_ignores_negative_alarms() {
+        // Negative-* alarms only fire on input wake, not on a positive
+        // deadline. They must not be considered when computing the
+        // poll-deadline `.min()`.
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        state.sync_alarms.insert(1, crate::server::SyncAlarm {
+            owner: ClientId(1),
+            counter: x11sync::IDLETIME_COUNTER,
+            wait_value: 60_000,
+            delta: 0,
+            test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
+            events: true,
+            state: x11sync::ALARM_STATE_ACTIVE,
+        });
+        assert!(state.idletime_alarm_deadline().is_none());
+    }
+
+    #[test]
+    fn idletime_alarm_deadline_ignores_inactive_alarms() {
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        state.sync_alarms.insert(1, crate::server::SyncAlarm {
+            owner: ClientId(1),
+            counter: x11sync::IDLETIME_COUNTER,
+            wait_value: 60_000,
+            delta: 0,
+            test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+            events: true,
+            state: x11sync::ALARM_STATE_INACTIVE,
+        });
+        assert!(state.idletime_alarm_deadline().is_none());
+    }
+
+    #[test]
+    fn idletime_alarm_deadline_none_when_screensaver_suspended() {
+        // Mirrors the dpms_transition_deadline suspend gate
+        // (server.rs ~:542). XScreenSaverSuspend inhibits both the
+        // DPMS cascade AND IDLETIME alarms so fullscreen video
+        // (Firefox / mpv / vlc) doesn't blank the screen.
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        state.screensaver.suspend_counts.insert(ClientId(99), 1);
+        state.sync_alarms.insert(1, crate::server::SyncAlarm {
+            owner: ClientId(1),
+            counter: x11sync::IDLETIME_COUNTER,
+            wait_value: 60_000,
+            delta: 0,
+            test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+            events: true,
+            state: x11sync::ALARM_STATE_ACTIVE,
+        });
+        assert!(state.idletime_alarm_deadline().is_none());
+    }
+```
+
+(`ClientId` is already imported into the test module from Task 1's tests; if not, add `use yserver_protocol::x11::ClientId;`.)
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+```bash
+cargo test -p yserver-core idletime_alarm_deadline
+```
+
+Expected: compile error — `idletime_alarm_deadline` not defined.
+
+- [ ] **Step 3: Implement `idletime_alarm_deadline`**
+
+In `server.rs`'s `impl ServerState`, append (near `idletime_baseline` from Task 1):
+
+```rust
+    /// Earliest instant any Active IDLETIME alarm could fire from idle
+    /// progression alone. Negative-* alarms fire on input wake (handled
+    /// by the fanouts), so they don't contribute to this deadline.
+    /// Returns `None` when no eligible alarm exists, or when
+    /// `XScreenSaverSuspend` has gated the unified timer (Xorg
+    /// WaitFor.c:519).
+    #[must_use]
+    pub fn idletime_alarm_deadline(&self) -> Option<std::time::Instant> {
+        use yserver_protocol::x11::sync as x11sync;
+        if !self.screensaver.suspend_counts.is_empty() {
+            return None;
+        }
+        let mut earliest: Option<std::time::Instant> = None;
+        for alarm in self.sync_alarms.values() {
+            if alarm.state != x11sync::ALARM_STATE_ACTIVE {
+                continue;
+            }
+            if !matches!(
+                alarm.counter,
+                x11sync::IDLETIME_COUNTER
+                | x11sync::IDLETIME_DEVICE_VCP
+                | x11sync::IDLETIME_DEVICE_VCK
+            ) {
+                continue;
+            }
+            let test_type = u32::from(alarm.test_type);
+            if !matches!(
+                test_type,
+                x11sync::TEST_POSITIVE_TRANSITION | x11sync::TEST_POSITIVE_COMPARISON
+            ) {
+                continue;
+            }
+            if alarm.wait_value < 0 {
+                continue; // negative wait_value can't be reached by idle (unsigned ms)
+            }
+            let baseline = self.idletime_baseline(alarm.counter);
+            #[allow(clippy::cast_sign_loss)]
+            let fire_at =
+                baseline + std::time::Duration::from_millis(alarm.wait_value as u64);
+            earliest = Some(earliest.map_or(fire_at, |e| e.min(fire_at)));
+        }
+        earliest
+    }
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+```bash
+cargo test -p yserver-core idletime_alarm_deadline
+```
+
+Expected: 5 passed.
+
+- [ ] **Step 5: Chain `idletime_alarm_deadline()` into the poll-deadline `.min()`**
+
+In `crates/yserver-core/src/core_loop/run.rs:393-407`, the existing chain (after MIT-SCREEN-SAVER landed) is:
+
+```rust
+            let repeat_deadline = state.repeat_state.as_ref().map(|r| r.next_fire);
+            let backend_deadline = backend.next_wakeup();
+            let dpms_deadline = state.dpms_transition_deadline();
+            let ss_idle_deadline = state.screensaver_idle_deadline();
+            let ss_cycle_deadline = state.screensaver_cycle_deadline();
+            repeat_deadline
+                .into_iter()
+                .chain(backend_deadline)
+                .chain(dpms_deadline)
+                .chain(ss_idle_deadline)
+                .chain(ss_cycle_deadline)
+                .min()
+                .map(|deadline| {
+                    deadline
+                        .checked_duration_since(now)
+                        .unwrap_or(Duration::ZERO)
+                })
+```
+
+Add the IDLETIME deadline:
+
+```rust
+            let repeat_deadline = state.repeat_state.as_ref().map(|r| r.next_fire);
+            let backend_deadline = backend.next_wakeup();
+            let dpms_deadline = state.dpms_transition_deadline();
+            let ss_idle_deadline = state.screensaver_idle_deadline();
+            let ss_cycle_deadline = state.screensaver_cycle_deadline();
+            let idletime_alarm_deadline = state.idletime_alarm_deadline();
+            repeat_deadline
+                .into_iter()
+                .chain(backend_deadline)
+                .chain(dpms_deadline)
+                .chain(ss_idle_deadline)
+                .chain(ss_cycle_deadline)
+                .chain(idletime_alarm_deadline)
+                .min()
+                .map(|deadline| {
+                    deadline
+                        .checked_duration_since(now)
+                        .unwrap_or(Duration::ZERO)
+                })
+```
+
+- [ ] **Step 6: Workspace test + format + lint + commit**
+
+```bash
+cargo +nightly fmt
+cargo clippy -p yserver-core
+cargo test -p yserver-core
+git add crates/yserver-core/src/server.rs crates/yserver-core/src/core_loop/run.rs
+git commit -m "feat(sync): idletime_alarm_deadline + chain into poll-min
+
+ServerState::idletime_alarm_deadline returns the earliest instant
+any Active Positive-* alarm on an IDLETIME counter could fire
+from idle progression. Negative-* alarms only fire on input wake
+(handled in Task 4's fanout integration). Suspended via
+XScreenSaverSuspend → None (mirrors dpms_transition_deadline's
+unified-timer gate).
+
+Chained into run.rs's poll-deadline .min() alongside the existing
+DPMS + SS deadlines. The evaluator that turns this wake into
+AlarmNotify lands in Task 4.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 4: `evaluate_idletime_alarms_post_poll` evaluator + create-time fire path
+
+**Files:**
+- Modify: `crates/yserver-core/src/core_loop/run.rs` (add `evaluate_idletime_alarms_post_poll` + 2 tests + call from outer loop)
+- Modify: `crates/yserver-core/src/core_loop/process_request.rs` (extend `CREATE_ALARM` create-time fire at `:2330` to use `idletime_baseline` for IDLETIME counters)
+
+After this commit, idle-progression PositiveTransition/PositiveComparison alarms fire correctly. NegativeTransition firing on input wake still requires Task 5.
+
+- [ ] **Step 1: Write the failing run-loop tests**
+
+In `crates/yserver-core/src/core_loop/run.rs`'s test module (existing — see the SS evaluator tests added in MIT-SCREEN-SAVER Task 6), append:
+
+```rust
+    #[test]
+    fn idletime_evaluator_fires_pos_transition_when_deadline_elapsed() {
+        use std::time::Duration;
+        use yserver_protocol::x11::{ClientId, sync as x11sync};
+        let mut state = ServerState::new();
+        // Pre-arm: a PositiveTransition alarm at 60_000ms, last_activity 61s ago.
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(61);
+        let alarm_id = 0x2000;
+        state.sync_alarms.insert(alarm_id, crate::server::SyncAlarm {
+            owner: ClientId(1),
+            counter: x11sync::IDLETIME_COUNTER,
+            wait_value: 60_000,
+            delta: 0,
+            test_type: x11sync::TEST_POSITIVE_TRANSITION as u8,
+            events: false,  // skip wire delivery; assert state mutation only
+            state: x11sync::ALARM_STATE_ACTIVE,
+        });
+        let mut backend = RecordingBackend::default();
+
+        super::evaluate_idletime_alarms_post_poll(&mut state, &mut backend);
+
+        // PositiveTransition + delta=0 stays Active (Task 2 fix).
+        let after = &state.sync_alarms[&alarm_id];
+        assert_eq!(after.state, x11sync::ALARM_STATE_ACTIVE);
+        // last_evaluated cache updated for global IDLETIME.
+        assert!(
+            state.idletime_last_evaluated
+                .get(&x11sync::IDLETIME_COUNTER).copied()
+                .unwrap_or(0) >= 60_000,
+            "last_evaluated cache should advance past the trigger value"
+        );
+    }
+
+    #[test]
+    fn idletime_evaluator_skips_when_no_idletime_alarms() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::default();
+        // No alarms at all — must not panic, must not insert spurious cache entries.
+        super::evaluate_idletime_alarms_post_poll(&mut state, &mut backend);
+        assert!(state.idletime_last_evaluated.is_empty());
+    }
+```
+
+If `RecordingBackend` / `ServerState` / `ScreenSaverActive` imports were already added to this test module by MIT-SCREEN-SAVER Task 6, reuse them; otherwise add the same imports as Task 6 used.
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+```bash
+cargo test -p yserver-core idletime_evaluator
+```
+
+Expected: compile error — `evaluate_idletime_alarms_post_poll` not defined.
+
+- [ ] **Step 3: Implement `evaluate_idletime_alarms_post_poll` in `run.rs`**
+
+In `run.rs` (alongside `evaluate_screen_saver_post_poll`):
+
+```rust
+/// Post-poll IDLETIME alarm evaluator. For each IDLETIME counter,
+/// compute the current idle, walk Active alarms referencing the
+/// counter, run the test-type check against the cached
+/// `(last_evaluated, current)` pair, and fire via
+/// `evaluate_alarms_for_counter` (which handles re-arm + emission).
+/// Mirrors Xorg's `IdleTimeBlockHandler` + `IdleTimeWakeupHandler`
+/// (sync.c:2647, :2750).
+pub(crate) fn evaluate_idletime_alarms_post_poll(
+    state: &mut ServerState,
+    _backend: &mut dyn crate::backend::Backend,
+) {
+    use yserver_protocol::x11::sync as x11sync;
+    const IDLETIME_COUNTERS: &[u32] = &[
+        x11sync::IDLETIME_COUNTER,
+        x11sync::IDLETIME_DEVICE_VCP,
+        x11sync::IDLETIME_DEVICE_VCK,
+    ];
+    let now = Instant::now();
+    for &counter in IDLETIME_COUNTERS {
+        // Skip if no alarms reference this counter.
+        let has_alarm = state.sync_alarms.values().any(|a| {
+            a.counter == counter && a.state == x11sync::ALARM_STATE_ACTIVE
+        });
+        if !has_alarm {
+            continue;
+        }
+        let baseline = state.idletime_baseline(counter);
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+        let current_idle = now
+            .duration_since(baseline)
+            .as_millis()
+            .min(u128::from(u32::MAX)) as i64;
+        let old_idle = state
+            .idletime_last_evaluated
+            .get(&counter)
+            .copied()
+            .unwrap_or(0);
+        // Run the existing evaluator helper — it walks Active alarms,
+        // calls trigger_fires, applies the Task 2 state-transition fix,
+        // emits AlarmNotify, and updates wait_value.
+        crate::core_loop::process_request::evaluate_alarms_for_counter(
+            state, counter, old_idle, current_idle,
+        );
+        state.idletime_last_evaluated.insert(counter, current_idle);
+    }
+}
+```
+
+- [ ] **Step 4: Call the evaluator from the outer loop**
+
+In `run.rs`, immediately after the existing `evaluate_screen_saver_post_poll(state, backend);` call (added by MIT-SCREEN-SAVER Task 6 at `:688`), add:
+
+```rust
+        evaluate_idletime_alarms_post_poll(state, backend);
+```
+
+- [ ] **Step 5: Extend the `CREATE_ALARM` create-time fire path**
+
+In `process_request.rs` at `:2329-2330`, the current code is:
+
+```rust
+                // Per the X Synchronization Extension spec the trigger is
+                // tested at creation: a comparison alarm whose condition
+                // already holds fires immediately.
+                let now = state.sync_counters.get(&counter).map_or(0, |c| c.value);
+                evaluate_alarms_for_counter(state, counter, now, now);
+```
+
+That reads `state.sync_counters` which doesn't contain IDLETIME counters — so an IDLETIME alarm created when the user has already been idle past its threshold wouldn't fire at create time. Fix by branching on counter id:
+
+```rust
+                use yserver_protocol::x11::sync as x11sync;
+                // Per the X Synchronization Extension spec the trigger is
+                // tested at creation: a comparison alarm whose condition
+                // already holds fires immediately. For IDLETIME-family
+                // counters the value is derived from last_activity rather
+                // than `sync_counters`.
+                let now_value = if matches!(
+                    counter,
+                    x11sync::IDLETIME_COUNTER
+                    | x11sync::IDLETIME_DEVICE_VCP
+                    | x11sync::IDLETIME_DEVICE_VCK
+                ) {
+                    let baseline = state.idletime_baseline(counter);
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+                    let v = std::time::Instant::now()
+                        .duration_since(baseline)
+                        .as_millis()
+                        .min(u128::from(u32::MAX)) as i64;
+                    v
+                } else {
+                    state.sync_counters.get(&counter).map_or(0, |c| c.value)
+                };
+                evaluate_alarms_for_counter(state, counter, now_value, now_value);
+```
+
+(The duplicate `use yserver_protocol::x11::sync as x11sync;` is fine — the surrounding handler already has it.)
+
+Apply the same change in `CHANGE_ALARM`'s analogous create-time-fire path. Find it via `rg -n "evaluate_alarms_for_counter\(state, counter" crates/yserver-core/src/core_loop/process_request.rs` — should be 2 call sites within ~50 lines of each other.
+
+- [ ] **Step 6: Add a create-time-fire test for IDLETIME**
+
+In `process_request.rs`'s `#[cfg(test)] mod tests`, append:
+
+```rust
+    #[test]
+    fn create_alarm_on_idletime_with_condition_already_true_fires_immediately() {
+        use std::time::Duration;
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // Pre-condition: already idle past the alarm threshold.
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(120);
+
+        // CreateAlarm body: alarm:u32 mask:u32 [attributes]
+        // attrs: COUNTER + VALUE_TYPE(absolute) + VALUE(60_000) +
+        //        TEST_TYPE(PosTransition) + DELTA(0) + EVENTS(true)
+        let alarm_id: u32 = 0x2000_0001;
+        let mut body = Vec::new();
+        body.extend_from_slice(&alarm_id.to_le_bytes());
+        // mask bits: COUNTER=0x01, VALUE_TYPE=0x02, VALUE=0x04,
+        //            TEST_TYPE=0x08, DELTA=0x10, EVENTS=0x20  (XCB convention)
+        let mask: u32 = x11sync::CA_COUNTER | x11sync::CA_VALUE_TYPE | x11sync::CA_VALUE
+            | x11sync::CA_TEST_TYPE | x11sync::CA_DELTA | x11sync::CA_EVENTS;
+        body.extend_from_slice(&mask.to_le_bytes());
+        body.extend_from_slice(&x11sync::IDLETIME_COUNTER.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // value_type = Absolute
+        body.extend_from_slice(&60_000i64.to_le_bytes()); // value = 60_000
+        body.extend_from_slice(&(x11sync::TEST_POSITIVE_TRANSITION as u32).to_le_bytes());
+        body.extend_from_slice(&0i64.to_le_bytes()); // delta = 0
+        body.push(1); // events = true
+        body.extend_from_slice(&[0u8; 3]);
+
+        let header = RequestHeader {
+            opcode: 142,
+            data: x11sync::CREATE_ALARM,
+            length_units: u16::try_from(2 + body.len() / 4).unwrap(),
+        };
+        let _ = handle_sync_request(&mut state, &mut backend, ClientId(1),
+                                    SequenceNumber(1), header, &body);
+
+        let bytes = read_all_available(&mut peer);
+        // AlarmNotify event: type = SYNC_FIRST_EVENT(83) + ALARM_NOTIFY_KIND(1) = 84
+        assert!(
+            bytes.iter().any(|&b| b == 84),
+            "AlarmNotify must fire at create-time for an already-idle PositiveTransition alarm; got {:?}",
+            bytes
+        );
+    }
+```
+
+If `CA_*` constants are not all in `x11sync`, check the existing `parse_alarm_attributes` in `sync.rs` for the actual constant names; the mask bit layout is canonical XSync (XCB calls them `XSyncCA*`).
+
+- [ ] **Step 7: Run all Task 4 tests + workspace test**
+
+```bash
+cargo test -p yserver-core idletime_evaluator create_alarm_on_idletime
+cargo test -p yserver-core
+```
+
+Expected: 3 new tests pass; full crate green.
+
+- [ ] **Step 8: Format, lint, commit**
+
+```bash
+cargo +nightly fmt
+cargo clippy -p yserver-core
+git add crates/yserver-core/src/core_loop/run.rs crates/yserver-core/src/core_loop/process_request.rs
+git commit -m "feat(sync): IDLETIME post-poll evaluator + create-time fire
+
+evaluate_idletime_alarms_post_poll runs each loop iteration after
+evaluate_screen_saver_post_poll. For each IDLETIME counter it
+computes current idle, looks up the cached last-evaluated value,
+and delegates to the existing evaluate_alarms_for_counter
+(extended in Task 2 to handle delta=0 Transitions correctly).
+
+CREATE_ALARM and CHANGE_ALARM's create-time fire paths now branch
+on counter type — IDLETIME counters derive the current value from
+last_activity instead of looking up sync_counters (which never
+contains the system counters). Without this branch, an alarm
+created while the user is already idle past its threshold would
+not fire until the next idle re-arm.
+
+NegativeTransition firing on input wake still requires Task 5.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 5: Fanout-prologue NegativeTransition firing on input wake
+
+**Files:**
+- Modify: `crates/yserver-core/src/core_loop/process_request.rs` (factor a small helper `evaluate_idletime_negative_alarms_on_input` callable from both fanouts)
+- Modify: `crates/yserver-core/src/core_loop/key_fanout.rs` (call the helper in the prologue, BEFORE the SS-off sibling check)
+- Modify: `crates/yserver-core/src/core_loop/pointer_fanout.rs` (same)
+
+After this commit, IDLETIME alarms fire correctly in both directions: idle-progression Pos alarms via the post-poll evaluator (Task 4), input-wake Neg alarms via this task's fanout-prologue handler. End-to-end MATE smoke works.
+
+- [ ] **Step 1: Write the failing fanout tests**
+
+In `key_fanout.rs`'s `#[cfg(test)] mod tests`, append:
+
+```rust
+    #[test]
+    fn key_event_fires_neg_transition_alarm_when_prior_idle_crosses_threshold() {
+        use std::time::Duration;
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        // User idle for 90s, NegativeTransition alarm at 60s.
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(90);
+        state.per_device_last_activity.insert(3,
+            std::time::Instant::now() - Duration::from_secs(90));
+        let alarm_id = 0x2000;
+        state.sync_alarms.insert(alarm_id, crate::server::SyncAlarm {
+            owner: ClientId(1),
+            counter: x11sync::IDLETIME_COUNTER,
+            wait_value: 60_000,
+            delta: 0,
+            test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
+            events: false, // assert state mutation, not wire delivery
+            state: x11sync::ALARM_STATE_ACTIVE,
+        });
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
+
+        // Alarm stays Active (Transition + delta=0 — Task 2 fix), but
+        // last_evaluated cache should advance to 0 (current idle after
+        // last_activity reset).
+        let after = &state.sync_alarms[&alarm_id];
+        assert_eq!(after.state, x11sync::ALARM_STATE_ACTIVE);
+        // last_evaluated[IDLETIME] should now reflect post-wake idle = 0
+        assert_eq!(
+            state.idletime_last_evaluated
+                .get(&x11sync::IDLETIME_COUNTER).copied(),
+            Some(0),
+            "post-wake last_evaluated should be 0"
+        );
+    }
+```
+
+In `pointer_fanout.rs`'s test module, append the pointer analogue (use the file's existing pointer-event fixture; key device id is 3 → swap to 2 for VCP).
+
+- [ ] **Step 2: Run to verify they fail**
+
+```bash
+cargo test -p yserver-core key_event_fires_neg_transition pointer_event_fires_neg_transition
+```
+
+Expected: tests pass on the "state stays Active" assertion (the fanout already exists) but FAIL on the `last_evaluated` assertion (no wake handler yet inserts the entry).
+
+- [ ] **Step 3: Add the helper in `process_request.rs`**
+
+Just below `apply_screen_saver_transition` (or any nearby spot — `process_request.rs` is large, anywhere alongside the other `pub(crate)` helpers is fine):
+
+```rust
+/// Evaluate Negative-* alarms on IDLETIME-family counters after input
+/// wake. Called from the key + pointer fanout prologues immediately
+/// after `last_activity` is updated to "now". The semantic is:
+/// `old_idle = (now - prior_last_activity)`, `new_idle = 0`. Fires any
+/// alarms whose trigger crosses on this transition.
+///
+/// `device_id` identifies which per-device counter to evaluate; pass
+/// 2 for pointer events (drives IDLETIME_DEVICE_VCP), 3 for key events
+/// (drives IDLETIME_DEVICE_VCK). The global IDLETIME counter is
+/// evaluated unconditionally because any input resets the global
+/// last_activity.
+pub(crate) fn evaluate_idletime_negative_alarms_on_input_wake(
+    state: &mut ServerState,
+    device_id: u8,
+    prior_global_idle_ms: i64,
+    prior_device_idle_ms: i64,
+) {
+    use yserver_protocol::x11::sync as x11sync;
+    // Global IDLETIME: always reset on any input.
+    evaluate_alarms_for_counter(
+        state,
+        x11sync::IDLETIME_COUNTER,
+        prior_global_idle_ms,
+        0,
+    );
+    state.idletime_last_evaluated.insert(x11sync::IDLETIME_COUNTER, 0);
+
+    // Per-device IDLETIME: only the affected device resets.
+    let device_counter = match device_id {
+        2 => x11sync::IDLETIME_DEVICE_VCP,
+        3 => x11sync::IDLETIME_DEVICE_VCK,
+        _ => return,
+    };
+    evaluate_alarms_for_counter(state, device_counter, prior_device_idle_ms, 0);
+    state.idletime_last_evaluated.insert(device_counter, 0);
+}
+```
+
+- [ ] **Step 4: Wire the helper into `key_fanout.rs`**
+
+In `key_fanout.rs`, the prologue (added in Task 1, Step 9) now reads approximately:
+
+```rust
+    let now = std::time::Instant::now();
+    state.dpms.last_activity = now;
+    state.per_device_last_activity.insert(XI2_MASTER_KEYBOARD_DEVICE_ID as u8, now);
+    if state.dpms.enabled && state.dpms.power_level != 0 {
+        crate::core_loop::process_request::apply_dpms_transition(state, backend, 0);
+    }
+    if matches!(state.screensaver.active, crate::server::ScreenSaverActive::On) {
+        crate::core_loop::process_request::apply_screen_saver_transition(
+            state, backend, crate::server::ScreenSaverActive::Off, /*forced=*/false,
+        );
+    }
+```
+
+Insert the IDLETIME wake handler RIGHT AFTER the `state.per_device_last_activity.insert(...)` line and BEFORE the DPMS wake check (this places it before SS-off too, per the spec). Capture priors before mutating `last_activity` — wait, that's already done in step 9 of Task 1. Update step 9's edit pattern accordingly. **The correct prologue shape is:**
+
+```rust
+    let now = std::time::Instant::now();
+    // Capture priors BEFORE mutating; needed by the IDLETIME wake handler.
+    let prior_global = now.duration_since(state.dpms.last_activity)
+        .as_millis().min(u128::from(u32::MAX)) as i64;
+    let prior_device = state.per_device_last_activity
+        .get(&(XI2_MASTER_KEYBOARD_DEVICE_ID as u8))
+        .copied()
+        .map(|t| now.duration_since(t).as_millis().min(u128::from(u32::MAX)) as i64)
+        .unwrap_or(0);
+
+    state.dpms.last_activity = now;
+    state.per_device_last_activity.insert(XI2_MASTER_KEYBOARD_DEVICE_ID as u8, now);
+
+    // IDLETIME wake: fires Negative-* alarms before the input event itself
+    // reaches clients (predictable ordering).
+    crate::core_loop::process_request::evaluate_idletime_negative_alarms_on_input_wake(
+        state,
+        XI2_MASTER_KEYBOARD_DEVICE_ID as u8,
+        prior_global,
+        prior_device,
+    );
+
+    if state.dpms.enabled && state.dpms.power_level != 0 {
+        crate::core_loop::process_request::apply_dpms_transition(state, backend, 0);
+    }
+    if matches!(state.screensaver.active, crate::server::ScreenSaverActive::On) {
+        crate::core_loop::process_request::apply_screen_saver_transition(
+            state, backend, crate::server::ScreenSaverActive::Off, /*forced=*/false,
+        );
+    }
+```
+
+(This supersedes the simpler edit in Task 1 Step 9. When implementing Task 1 you can either land the simpler shape and grow it here, OR land the full shape upfront and skip this widening in Task 5. The plan presents them as separate so each commit's diff is self-contained.)
+
+- [ ] **Step 5: Wire the helper into `pointer_fanout.rs`**
+
+Apply the same shape, with `XI2_MASTER_POINTER_DEVICE_ID` (value 2) instead of `XI2_MASTER_KEYBOARD_DEVICE_ID`.
+
+- [ ] **Step 6: Run tests + workspace test**
+
+```bash
+cargo test -p yserver-core key_event_fires_neg_transition pointer_event_fires_neg_transition
+cargo test -p yserver-core
+```
+
+Expected: both new tests pass; full crate green.
+
+- [ ] **Step 7: Smoke-test on `just startx` (user-driven)**
+
+Per [[feedback_hw_recipes_user_only]] the user drives this. Restart yserver to pick up the fix, then:
+
+```bash
+gsettings set org.mate.power-manager sleep-display-ac 60
+gsettings set org.mate.session idle-delay 1
+# (then restart mate-power-manager + mate-screensaver, or relog into MATE)
+# leave keyboard/mouse alone for >60s
+# expect: panel blanks at 1min via mate-power-manager DPMSForceLevel
+#         mate-screensaver lockscreen at 1min
+# move mouse: panel restores AND lockscreen unlocks
+```
+
+If the smoke doesn't trip, capture xtrace and look for `AlarmNotify` events at type 84 — if absent, the fanout-prologue path didn't fire.
+
+- [ ] **Step 8: Format, lint, commit**
+
+```bash
+cargo +nightly fmt
+cargo clippy -p yserver-core
+git add crates/yserver-core/src/core_loop/process_request.rs crates/yserver-core/src/core_loop/key_fanout.rs crates/yserver-core/src/core_loop/pointer_fanout.rs
+git commit -m "feat(sync): IDLETIME NegativeTransition firing on input wake
+
+Key + pointer fanouts now capture the prior idle BEFORE mutating
+last_activity, then call evaluate_idletime_negative_alarms_on_input_wake
+to fire any Negative-* alarms on the global IDLETIME and on the
+affected per-device counter. AlarmNotify arrives on the client wire
+BEFORE the corresponding input event (predictable ordering, same
+shape as the SS-off-on-input sibling check we already ship).
+
+After this lands, MATE's idle-detection (mate-power-manager's
+DPMSForceLevel + mate-screensaver's lockscreen) works on yserver
+for the first time, closing the visible-smoke gap that the DPMS
+and MIT-SCREEN-SAVER work alone could not.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
+```
+
+---
+
+## Final verification
+
+After Task 5 lands:
+
+- [ ] **Step 1: Workspace-wide build, format, lint, test**
+
+```bash
+cargo build --workspace
+cargo +nightly fmt --check
+cargo clippy --workspace
+cargo test --workspace
+```
+
+Expected: clean. Test count should grow by ~22 across the modules.
+
+- [ ] **Step 2: Smoke matrix on `just startx` (user-driven)**
+
+Per [[feedback_hw_recipes_user_only]] and [[feedback_tests_are_not_visible_evidence]]:
+
+| Scenario | Expected |
+|---|---|
+| `xset s 60` + idle 60s with `xev -event screensaver` | `ScreenSaverNotify(state=On)` fires AND any IDLETIME alarm at 60_000 fires AlarmNotify. |
+| Default MATE config (1-min idle in mate-screensaver-preferences, 1-min display sleep in mate-power-preferences) | Lockscreen activates at 1 min; panel blanks (DPMSForceLevel) at 1 min via mate-power-manager. **This is the user-visible bug the whole DPMS + MIT-SS + IDLETIME-fix arc exists for.** |
+| `mpv --loop video.mp4` fullscreen + 1-min MATE display sleep | Panel does NOT blank during playback (XScreenSaverSuspend gates both DPMS firing AND IDLETIME alarm firing via the unified-timer rule). |
+| xtrace recapture | After the fix, `mate.xtrace` should show `Event Sync AlarmNotify` (event type 84) at the configured idle thresholds. Compare against the pre-fix `mate.xtrace` which had zero AlarmNotify. |
+
+- [ ] **Step 3: Update `docs/status.md`**
+
+Add a short bullet to the existing DPMS + MIT-SCREEN-SAVER section noting that the IDLETIME fix closes the visible-smoke gap.
+
+- [ ] **Step 4: Squash and ship**
+
+Per `AGENTS.md`, squash to one PR at merge (ask user for confirmation per [[feedback_confirm_each_master_push]]).
+
+---
+
+## Risk index
+
+- **The fanout prologue widening in Task 1 vs Task 5.** Task 1 lands a simpler prologue (`state.dpms.last_activity = now; per_device_last_activity.insert(...)`); Task 5 widens it to capture priors BEFORE the mutation. If Task 1 is implemented exactly as shown in Task 1 Step 9, Task 5 Step 4 has to refactor the same lines. Cleaner alternative: land Task 5's full prologue shape in Task 1 directly and skip Task 5 Step 4's widening. Either is fine; pick one when implementing and document the choice in the commit message.
+- **`CA_*` mask bit names in the Task 4 create-time-fire test.** The test relies on constants like `CA_COUNTER`, `CA_VALUE_TYPE`, etc. yserver's `parse_alarm_attributes` already decodes these — read its body in `crates/yserver-protocol/src/x11/sync.rs` to confirm the const names match before writing the test. If the constants are private to the parser, expose them as `pub`.
+- **Pre-existing tests for `evaluate_alarms_for_counter` may assert the buggy `delta=0 + Transition → Inactive` behaviour.** Task 2 Step 4 explicitly says to fix any such test; if the existing test was loadbearing for some other code path, investigate before silently changing it. Check `rg "ALARM_STATE_INACTIVE.*test_type|test_type.*ALARM_STATE_INACTIVE" crates/yserver-core/src/` for prior assertions.
+- **Per-device counter advertising in `LIST_SYSTEM_COUNTERS`.** Some clients enumerate the system-counter list once at startup and only use counters they recognise by name. If the advertised name `DEVICEIDLETIME-2` differs from what `mate-power-manager` or another client expects (Xorg uses `DEVICEIDLETIME` with the device id appended as decimal), they'll fall back to global IDLETIME silently. MATE's xtrace only ever uses global IDLETIME (counter 0x107), so this is low risk for the immediate smoke target; verify with a fresh xtrace after the fix.
+- **`idletime_alarm_deadline` returns None when suspended, but the post-poll evaluator runs unconditionally.** This is correct (the evaluator should be cheap when there are no eligible alarms, and `evaluate_alarms_for_counter` is no-op when none match the counter), but if profiling shows the unconditional walk is hot under suspended-with-many-alarms workloads, add a top-of-function suspend short-circuit.
