@@ -393,9 +393,11 @@ pub fn run_core(
             let now = Instant::now();
             let repeat_deadline = state.repeat_state.as_ref().map(|r| r.next_fire);
             let backend_deadline = backend.next_wakeup();
+            let dpms_deadline = state.dpms_transition_deadline();
             repeat_deadline
                 .into_iter()
                 .chain(backend_deadline)
+                .chain(dpms_deadline)
                 .min()
                 .map(|deadline| {
                     deadline
@@ -657,6 +659,25 @@ pub fn run_core(
         if state.repeat_state.is_some() {
             fire_pending_repeats(state, backend);
             backend.mark_dirty();
+        }
+
+        // DPMS: evaluate idle-cascade transitions.
+        if let Some(deadline) = state.dpms_transition_deadline() {
+            let now = Instant::now();
+            if now >= deadline {
+                // Saturate rather than truncate — `as_millis()` returns u128
+                // and idle > 49 days would silently wrap a `as u32` cast,
+                // which would then fall *below* the timeout thresholds.
+                let idle_ms = u32::try_from(state.dpms.last_activity.elapsed().as_millis())
+                    .unwrap_or(u32::MAX);
+                let target =
+                    crate::server::next_dpms_level(state.dpms.power_level, idle_ms, &state.dpms);
+                if target != state.dpms.power_level {
+                    crate::core_loop::process_request::apply_dpms_transition(
+                        state, backend, target,
+                    );
+                }
+            }
         }
 
         // F2: if a `wait_for_reply` (called by `process_request`
