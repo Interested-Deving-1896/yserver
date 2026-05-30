@@ -5133,13 +5133,13 @@ pub(crate) fn apply_dpms_transition(
 pub(crate) fn emit_dpms_notify(state: &mut ServerState) {
     use yserver_protocol::x11::dpms as x11dpms;
     const DPMS_MAJOR_OPCODE: u8 = 134;
+    if state.dpms.selected_by.is_empty() {
+        return;
+    }
     let ts = state.timestamp_now();
     let level = u16::from(state.dpms.power_level);
     let enabled = state.dpms.enabled;
     let subscribers: Vec<ClientId> = state.dpms.selected_by.iter().copied().collect();
-    if subscribers.is_empty() {
-        return;
-    }
     let dropped = crate::core_loop::fanout::fanout_event_to_clients(
         state,
         &subscribers,

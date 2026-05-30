@@ -3408,13 +3408,18 @@ impl KmsBackendV2 {
             0x180, // bit 3 → detail 4 (SYNTH_SCROLL_UP, button 4)
             0x181, // bit 4 → detail 5 (SYNTH_SCROLL_DOWN, button 5)
         ];
+        // Hoist the xid_map clone outside the BUTTON_CODES loop —
+        // process_pointer_button doesn't touch xid_map, so one snapshot
+        // covers all held-button drains. (clone is needed because
+        // pointer_event_fanout_to_state now takes `self` as &mut dyn Backend
+        // while also reading &xid_map; the local releases the borrow.)
+        let xid_map = self.core.xid_map.clone();
         for (n, &code) in BUTTON_CODES.iter().enumerate() {
             if held & (1 << n) != 0 {
                 self.process_pointer_button(code, false, state);
                 // Drain pointer events into fanout after each button
                 // (matches on_host_input's drain-per-event contract).
                 let pending = std::mem::take(&mut self.core.pending_pointer_events);
-                let xid_map = self.core.xid_map.clone();
                 for ev in pending {
                     let _dropped =
                         pointer_event_fanout_to_state(state, self, &xid_map, ev, true, false);
