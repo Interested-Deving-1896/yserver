@@ -67,6 +67,9 @@ const PRESENT_FIRST_ERROR: u8 = 159;
 
 const DPMS_MAJOR_OPCODE: u8 = 134;
 
+const MIT_SCREEN_SAVER_MAJOR_OPCODE: u8 = 150;
+pub(crate) const MIT_SCREEN_SAVER_FIRST_EVENT: u8 = 162;
+
 const MIT_SHM_MAJOR_OPCODE: u8 = 130;
 const MIT_SHM_FIRST_EVENT: u8 = 65; // matches Xorg: ShmCompletion=65
 const MIT_SHM_FIRST_ERROR: u8 = 160;
@@ -227,6 +230,15 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         first_event: 0, // XGE — no sequential event codes
         event_count: 0,
         first_error: 0, // uses core BadValue / BadMatch
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "MIT-SCREEN-SAVER",
+        major_opcode: MIT_SCREEN_SAVER_MAJOR_OPCODE,
+        first_event: MIT_SCREEN_SAVER_FIRST_EVENT,
+        event_count: 1, // ScreenSaverNotify
+        first_error: 0, // uses core BadValue / BadAccess / BadLength
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
     },

@@ -397,6 +397,8 @@ pub fn process_request(
         148 => handle_glx_request(state, client_id, sequence, header, body),
         // ── X-Resource (XRes) extension dispatcher ──
         149 => handle_x_resource_request(state, client_id, sequence, header, body),
+        // ── MIT-SCREEN-SAVER extension dispatcher ──
+        150 => handle_screen_saver_request(state, backend, client_id, sequence, header, body),
         opcode => {
             debug!(
                 "client {} #{} unsupported opcode {} ({} bytes)",
@@ -5263,8 +5265,8 @@ pub(crate) fn emit_screen_saver_notify(
     notify_state: ScreenSaverActive,
     forced: bool,
 ) {
+    use crate::nested::MIT_SCREEN_SAVER_FIRST_EVENT;
     use yserver_protocol::x11::screensaver as x11ss;
-    const SCREEN_SAVER_FIRST_EVENT: u8 = 162;
     let (active_state, deliver_mask) = match notify_state {
         ScreenSaverActive::Off => (x11ss::SCREEN_SAVER_OFF, x11ss::SCREEN_SAVER_NOTIFY_MASK),
         ScreenSaverActive::On => (x11ss::SCREEN_SAVER_ON, x11ss::SCREEN_SAVER_NOTIFY_MASK),
@@ -5293,7 +5295,7 @@ pub(crate) fn emit_screen_saver_notify(
                 buf,
                 order,
                 seq,
-                SCREEN_SAVER_FIRST_EVENT,
+                MIT_SCREEN_SAVER_FIRST_EVENT,
                 active_state,
                 ts,
                 root,
@@ -5507,6 +5509,197 @@ fn handle_dpms_request(
                 0,
                 u16::from(header.data),
                 DPMS_MAJOR_OPCODE,
+            );
+        }
+    }
+    Ok(RequestOutcome::Handled)
+}
+
+fn handle_screen_saver_request(
+    state: &mut ServerState,
+    _backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::{ClientByteOrder, screensaver as x11ss};
+    const MAJOR: u8 = 150;
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
+    let minor = header.data;
+    let minor_u16 = u16::from(minor);
+    debug!(
+        "client {} #{} ScreenSaver::minor={} body_len={}",
+        client_id.0,
+        sequence.0,
+        minor,
+        body.len()
+    );
+
+    match minor {
+        x11ss::QUERY_VERSION => {
+            let reply = x11ss::encode_query_version_reply(
+                byte_order,
+                sequence,
+                x11ss::SERVER_MAJOR_VERSION,
+                x11ss::SERVER_MINOR_VERSION,
+            );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11ss::QUERY_INFO => {
+            if x11ss::parse_query_info_request(body).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    minor_u16,
+                    MAJOR,
+                );
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let last_input = state.dpms.last_activity.elapsed().as_millis() as u32;
+            let timeout = state.screensaver.timeout_ms;
+            let (reply_state, til_or_since) = match state.screensaver.active {
+                ScreenSaverActive::On => {
+                    let ts = last_input.wrapping_sub(timeout);
+                    (x11ss::SCREEN_SAVER_ON, if timeout > 0 { ts } else { 0 })
+                }
+                ScreenSaverActive::Off | ScreenSaverActive::Cycle => {
+                    if timeout == 0 {
+                        (x11ss::SCREEN_SAVER_DISABLED, 0)
+                    } else if timeout < last_input {
+                        (x11ss::SCREEN_SAVER_OFF, 0)
+                    } else {
+                        (x11ss::SCREEN_SAVER_OFF, timeout - last_input)
+                    }
+                }
+            };
+            let event_mask = state
+                .screensaver
+                .selected_by
+                .get(&client_id)
+                .copied()
+                .unwrap_or(0);
+            let kind = if state.screensaver.prefer_blanking {
+                x11ss::SCREEN_SAVER_BLANKED
+            } else {
+                x11ss::SCREEN_SAVER_INTERNAL
+            };
+            let reply = x11ss::encode_query_info_reply(
+                byte_order,
+                sequence,
+                reply_state,
+                0, /*window*/
+                til_or_since,
+                last_input,
+                event_mask,
+                kind,
+            );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11ss::SELECT_INPUT => {
+            let Some((_drawable, mask)) = x11ss::parse_select_input_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    minor_u16,
+                    MAJOR,
+                );
+            };
+            if mask == 0 {
+                state.screensaver.selected_by.remove(&client_id);
+            } else {
+                state.screensaver.selected_by.insert(client_id, mask);
+            }
+        }
+        x11ss::SET_ATTRIBUTES => {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_ACCESS,
+                0,
+                minor_u16,
+                MAJOR,
+            );
+        }
+        x11ss::UNSET_ATTRIBUTES => {
+            if x11ss::parse_unset_attributes_request(body).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    minor_u16,
+                    MAJOR,
+                );
+            }
+        }
+        x11ss::SUSPEND => {
+            let Some(suspend) = x11ss::parse_suspend_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    minor_u16,
+                    MAJOR,
+                );
+            };
+            if suspend {
+                *state
+                    .screensaver
+                    .suspend_counts
+                    .entry(client_id)
+                    .or_insert(0) += 1;
+            } else {
+                let drained = match state.screensaver.suspend_counts.get_mut(&client_id) {
+                    Some(c) if *c > 1 => {
+                        *c -= 1;
+                        false
+                    }
+                    Some(_) => {
+                        state.screensaver.suspend_counts.remove(&client_id);
+                        true
+                    }
+                    None => false,
+                };
+                if drained
+                    && state.screensaver.suspend_counts.is_empty()
+                    && matches!(state.screensaver.active, ScreenSaverActive::Off)
+                    && state.dpms.power_level == 0
+                {
+                    // Mirrors ScreenSaverFreeSuspend (saver.c:343-378):
+                    // restart the idle clock from now. No notify fires.
+                    state.dpms.last_activity = std::time::Instant::now();
+                }
+            }
+        }
+        _ => {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                minor_u16,
+                MAJOR,
             );
         }
     }
@@ -25667,5 +25860,394 @@ mod tests {
         );
         assert_eq!(bytes[12], 0, "prefer_blanking = false");
         assert_eq!(bytes[13], 1, "allow_exposures = true");
+    }
+
+    #[test]
+    fn suspend_per_client_refcount_stacks() {
+        // Two Suspend(true) from the same client stacks the refcount.
+        // It takes two Suspend(false) calls to drain.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        let true_body = [1u8, 0, 0, 0];
+        let false_body = [0u8, 0, 0, 0];
+        let header = RequestHeader {
+            opcode: 150,
+            data: x11screensaver::SUSPEND,
+            length_units: 2,
+        };
+
+        let _ = handle_screen_saver_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &true_body,
+        );
+        let _ = handle_screen_saver_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            header,
+            &true_body,
+        );
+        assert!(state.screensaver_idle_deadline().is_none(), "suspended");
+        assert_eq!(
+            state.screensaver.suspend_counts.get(&ClientId(1)).copied(),
+            Some(2)
+        );
+
+        let _ = handle_screen_saver_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(3),
+            header,
+            &false_body,
+        );
+        assert!(
+            state.screensaver_idle_deadline().is_none(),
+            "still suspended"
+        );
+
+        state.screensaver.timeout_ms = 60_000; // arm the timer
+        let _ = handle_screen_saver_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(4),
+            header,
+            &false_body,
+        );
+        assert!(state.screensaver_idle_deadline().is_some(), "drained");
+        assert!(!state.screensaver.suspend_counts.contains_key(&ClientId(1)));
+    }
+
+    #[test]
+    fn suspend_release_last_resets_last_activity_when_screensaver_off_and_dpms_on() {
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        state.screensaver.timeout_ms = 60_000;
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(120);
+        let stale = state.dpms.last_activity;
+        state.screensaver.suspend_counts.insert(ClientId(1), 1);
+        let mut backend = RecordingBackend::new();
+
+        let header = RequestHeader {
+            opcode: 150,
+            data: x11screensaver::SUSPEND,
+            length_units: 2,
+        };
+        let _ = handle_screen_saver_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[0u8, 0, 0, 0],
+        );
+
+        assert!(
+            state.dpms.last_activity > stale,
+            "last_activity must advance"
+        );
+    }
+
+    #[test]
+    fn force_screen_saver_activate_still_works_while_suspended() {
+        // Xorg saver.c: "suspending it (by design) doesn't prevent it
+        // from being forcibly activated".
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        state.screensaver.suspend_counts.insert(ClientId(2), 1);
+        let mut backend = RecordingBackend::new();
+
+        let header = RequestHeader {
+            opcode: 115,
+            data: 1,
+            length_units: 1,
+        }; // Activate
+        let _ = handle_force_screen_saver(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+        );
+
+        assert_eq!(state.screensaver.active, ScreenSaverActive::On);
+    }
+
+    #[test]
+    fn screen_saver_query_version_returns_one_one() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 150,
+            data: x11screensaver::QUERY_VERSION,
+            length_units: 2,
+        };
+        let _ = handle_screen_saver_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[1, 1, 0, 0],
+        );
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 1, "reply tag");
+        assert_eq!(
+            u16::from_le_bytes([bytes[8], bytes[9]]),
+            x11screensaver::SERVER_MAJOR_VERSION
+        );
+        assert_eq!(
+            u16::from_le_bytes([bytes[10], bytes[11]]),
+            x11screensaver::SERVER_MINOR_VERSION
+        );
+    }
+
+    #[test]
+    fn screen_saver_query_info_returns_disabled_when_timeout_zero() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.screensaver.timeout_ms = 0;
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 150,
+            data: x11screensaver::QUERY_INFO,
+            length_units: 2,
+        };
+        let drawable = ROOT_WINDOW.0.to_le_bytes();
+        let _ = handle_screen_saver_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &drawable,
+        );
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11screensaver::SCREEN_SAVER_DISABLED);
+        assert_eq!(
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            0,
+            "window field is always 0 (no SetAttributes path)"
+        );
+        assert_eq!(
+            u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+            0,
+            "til_or_since = 0 in Disabled"
+        );
+        assert_eq!(
+            bytes[24],
+            x11screensaver::SCREEN_SAVER_BLANKED,
+            "kind = Blanked (prefer_blanking default true)"
+        );
+    }
+
+    #[test]
+    fn screen_saver_query_info_off_carries_til_remaining_and_caller_mask() {
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let _ = install_client(&mut state, 2); // other subscriber; must not influence reply
+        state.screensaver.timeout_ms = 60_000;
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_millis(20_000);
+        state
+            .screensaver
+            .selected_by
+            .insert(ClientId(1), x11screensaver::SCREEN_SAVER_NOTIFY_MASK);
+        state
+            .screensaver
+            .selected_by
+            .insert(ClientId(2), x11screensaver::SCREEN_SAVER_CYCLE_MASK);
+        let mut backend = RecordingBackend::new();
+
+        let header = RequestHeader {
+            opcode: 150,
+            data: x11screensaver::QUERY_INFO,
+            length_units: 2,
+        };
+        let _ = handle_screen_saver_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &ROOT_WINDOW.0.to_le_bytes(),
+        );
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11screensaver::SCREEN_SAVER_OFF, "state Off");
+        let til = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        assert!(
+            til > 30_000 && til <= 40_000,
+            "til_remaining ≈ 60_000 - idle(~20_000); got {til}"
+        );
+        let idle = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        assert!(
+            idle >= 19_000 && idle <= 30_000,
+            "idle≈20_000ms (slack for test scheduling); got {idle}"
+        );
+        let mask = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        assert_eq!(
+            mask,
+            x11screensaver::SCREEN_SAVER_NOTIFY_MASK,
+            "event_mask is caller's only, not union with client 2"
+        );
+    }
+
+    #[test]
+    fn screen_saver_query_info_on_state_uses_til_since_underflow_when_idle_lt_timeout() {
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.screensaver.active = ScreenSaverActive::On;
+        state.screensaver.timeout_ms = 60_000;
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_millis(5_000);
+        let mut backend = RecordingBackend::new();
+
+        let header = RequestHeader {
+            opcode: 150,
+            data: x11screensaver::QUERY_INFO,
+            length_units: 2,
+        };
+        let _ = handle_screen_saver_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &ROOT_WINDOW.0.to_le_bytes(),
+        );
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11screensaver::SCREEN_SAVER_ON);
+        let til = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        assert!(
+            til > 0xff00_0000,
+            "underflow wrap expected when idle < timeout; got 0x{til:08x}"
+        );
+    }
+
+    #[test]
+    fn screen_saver_query_info_kind_reflects_prefer_blanking() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.screensaver.prefer_blanking = false;
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 150,
+            data: x11screensaver::QUERY_INFO,
+            length_units: 2,
+        };
+        let _ = handle_screen_saver_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &ROOT_WINDOW.0.to_le_bytes(),
+        );
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[24], x11screensaver::SCREEN_SAVER_INTERNAL);
+    }
+
+    #[test]
+    fn screen_saver_select_input_accepts_unknown_mask_bits() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 150,
+            data: x11screensaver::SELECT_INPUT,
+            length_units: 3,
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&0x0000_0004u32.to_le_bytes());
+        let _ = handle_screen_saver_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        );
+
+        let bytes = read_all_available(&mut peer);
+        assert!(!bytes.iter().any(|&b| b == 0), "no error reply");
+        assert_eq!(
+            state.screensaver.selected_by.get(&ClientId(1)).copied(),
+            Some(0x04)
+        );
+
+        apply_screen_saver_transition(
+            &mut state,
+            &mut backend,
+            ScreenSaverActive::On,
+            /*forced=*/ false,
+        );
+        let bytes2 = read_all_available(&mut peer);
+        assert!(
+            !bytes2.iter().any(|&b| b == 162),
+            "client without NOTIFY_MASK bit must not receive notify"
+        );
+    }
+
+    #[test]
+    fn screen_saver_set_attributes_returns_bad_access() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 150,
+            data: x11screensaver::SET_ATTRIBUTES,
+            length_units: 4,
+        };
+        let _ = handle_screen_saver_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[0u8; 12],
+        );
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 0, "error reply");
+        assert_eq!(bytes[1], x11::error::BAD_ACCESS);
+    }
+
+    #[test]
+    fn screen_saver_unset_attributes_returns_success_noop() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 150,
+            data: x11screensaver::UNSET_ATTRIBUTES,
+            length_units: 2,
+        };
+        let drawable = ROOT_WINDOW.0.to_le_bytes();
+        let _ = handle_screen_saver_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &drawable,
+        );
+
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.is_empty(), "UnsetAttributes must be a silent no-op");
     }
 }
