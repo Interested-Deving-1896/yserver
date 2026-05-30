@@ -449,19 +449,17 @@ yserver-wmaker-xterm-hw-trace log="debug":
 yserver-picom-hw client="xclock":
     tools/picom-yserver.sh {{client}}
 
-yserver-xfce-hw log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::store=trace":
-    cargo build --bin yserver
+yserver-xfce-hw log="warn":
+    cargo build --release --bin yserver
     bash -c '\
-        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > yserver-hw-xfce.log 2>&1 &\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-xfce.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 YSERVER_V2_SCENE_WALK_ALL=1\
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            XDG_SESSION_TYPE=x11 \
             dbus-run-session xfce4-session --display :7 > xfce.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;\
-        rm -rf "$xdg_rd" 2>/dev/null'
+        wait $yserver_pid 2>/dev/null'
 
 yserver-mate-hw log="warn":
     cargo build --release --bin yserver
