@@ -44,11 +44,17 @@ const XI2_SLAVE_POINTER_DEVICE_ID: u16 = 4;
 /// re-deliver the device event to the natural target.
 pub fn pointer_event_fanout_to_state(
     state: &mut ServerState,
+    backend: &mut dyn crate::backend::Backend,
     xid_map: &HostXidMap,
     event: HostPointerEvent,
     handle_grabs: bool,
     is_replay: bool,
 ) -> Vec<ClientId> {
+    state.dpms.last_activity = std::time::Instant::now();
+    if state.dpms.enabled && state.dpms.power_level != 0 {
+        crate::core_loop::process_request::apply_dpms_transition(state, backend, 0);
+    }
+
     let mut dropped = Vec::new();
 
     // Step 1 — translate host-screen coords to ynest-root coords.
@@ -843,5 +849,110 @@ fn merge_dropped(into: &mut Vec<ClientId>, more: Vec<ClientId>) {
         if !into.contains(&cid) {
             into.push(cid);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::ServerState;
+
+    fn motion_event() -> HostPointerEvent {
+        HostPointerEvent {
+            kind: PointerEventKind::MotionNotify,
+            host_xid: 0,
+            detail: 0,
+            time: 1,
+            root_x: 10,
+            root_y: 20,
+            event_x: 10,
+            event_y: 20,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+        }
+    }
+
+    #[test]
+    fn pointer_event_resets_dpms_last_activity() {
+        use std::time::{Duration, Instant};
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        state.dpms.last_activity = Instant::now() - Duration::from_secs(10);
+        let stale = state.dpms.last_activity;
+        let xid_map = HostXidMap::new();
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            motion_event(),
+            true,
+            false,
+        );
+
+        let elapsed = state.dpms.last_activity.duration_since(stale);
+        assert!(
+            elapsed > Duration::from_secs(9),
+            "last_activity should be ≈now, not stale"
+        );
+    }
+
+    #[test]
+    fn pointer_event_during_off_wakes_via_set_dpms_power_on() {
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        state.dpms.power_level = 3; // Off
+        let xid_map = HostXidMap::new();
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            motion_event(),
+            true,
+            false,
+        );
+
+        let calls = backend.calls.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, crate::backend::recording::RecordedCall::SetDpmsPower(0))),
+            "wake must call set_dpms_power(0); got {calls:?}"
+        );
+        assert_eq!(
+            state.dpms.power_level, 0,
+            "in-memory level should be On after wake"
+        );
+    }
+
+    #[test]
+    fn pointer_event_during_off_with_backend_error_still_advances_state() {
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        state.dpms.power_level = 3;
+        let xid_map = HostXidMap::new();
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+        backend.dpms_set_returns_err = true;
+
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            motion_event(),
+            true,
+            false,
+        );
+
+        assert_eq!(
+            state.dpms.power_level, 0,
+            "state must advance on backend error"
+        );
     }
 }

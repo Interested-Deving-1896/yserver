@@ -36,7 +36,19 @@ const WIRE_MODIFIER_MASK: u16 = 0x004d;
 /// Returns the deduped list of clients whose outbound buffer overflowed
 /// during the fanout — the caller (run_core) issues
 /// `Message::ClientDisconnected` for each.
-pub fn key_event_fanout_to_state(state: &mut ServerState, event: HostKeyEvent) -> Vec<ClientId> {
+pub fn key_event_fanout_to_state(
+    state: &mut ServerState,
+    backend: &mut dyn crate::backend::Backend,
+    event: HostKeyEvent,
+) -> Vec<ClientId> {
+    // DPMS: any key resets the idle timer; from any non-On level
+    // we wake the screen *before* fanning out, so the first event
+    // of the resumed session lands on a visible scanout.
+    state.dpms.last_activity = std::time::Instant::now();
+    if state.dpms.enabled && state.dpms.power_level != 0 {
+        crate::core_loop::process_request::apply_dpms_transition(state, backend, 0);
+    }
+
     match key_route(state, &event) {
         KeyRoute::Drop => Vec::new(),
         KeyRoute::PassiveGrabOwner {
@@ -374,6 +386,7 @@ mod tests {
         let mut state = ServerState::new();
         // Grab owner selects NOTHING (mask 0) — only the grab matters.
         let mut owner = install_kf(&mut state, 7, ROOT_WINDOW, 0, 0);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
         state.key_grabs.push(KeyGrab {
             owner: ClientId(7),
             grab_window: ROOT_WINDOW,
@@ -384,7 +397,7 @@ mod tests {
             keyboard_mode: 0, // synchronous → freeze
         });
 
-        let dropped = key_event_fanout_to_state(&mut state, key_event(true, 33));
+        let dropped = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
         assert!(dropped.is_empty());
         assert!(
             matches!(
@@ -432,6 +445,7 @@ mod tests {
     fn async_passive_key_grab_does_not_freeze() {
         let mut state = ServerState::new();
         let _owner = install_kf(&mut state, 7, ROOT_WINDOW, 0, 0);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
         state.key_grabs.push(KeyGrab {
             owner: ClientId(7),
             grab_window: ROOT_WINDOW,
@@ -441,7 +455,7 @@ mod tests {
             pointer_mode: 1,
             keyboard_mode: 1, // asynchronous → no freeze
         });
-        let _ = key_event_fanout_to_state(&mut state, key_event(true, 33));
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
         assert!(state.active_keyboard_grab.is_some());
         assert!(
             state.frozen_keyboard_event.is_none(),
@@ -454,7 +468,8 @@ mod tests {
         // No clients = no focus = nothing to fan out. Just verify the
         // helper returns an empty drop list cleanly.
         let mut state = ServerState::new();
-        let dropped = key_event_fanout_to_state(&mut state, key_event(true, 38));
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+        let dropped = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 38));
         assert!(dropped.is_empty());
     }
 
@@ -464,6 +479,7 @@ mod tests {
         // No focus is set on any client — find_key_grab walks up from
         // focus. Setting the grab on ROOT exercises the matching path.
         let grab_owner = ClientId(7);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
         state.key_grabs.push(KeyGrab {
             owner: grab_owner,
             grab_window: ROOT_WINDOW,
@@ -474,7 +490,7 @@ mod tests {
             keyboard_mode: 1,
         });
         // Press: activates passive grab.
-        let _ = key_event_fanout_to_state(&mut state, key_event(true, 38));
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 38));
         match state.active_keyboard_grab {
             Some(ActiveKeyboardGrab {
                 owner,
@@ -488,19 +504,20 @@ mod tests {
             other => panic!("expected PassiveKey grab, got {other:?}"),
         }
         // Release with matching keycode clears the grab.
-        let _ = key_event_fanout_to_state(&mut state, key_event(false, 38));
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(false, 38));
         assert!(state.active_keyboard_grab.is_none());
     }
 
     #[test]
     fn explicit_grab_persists_across_release() {
         let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::default();
         state.active_keyboard_grab = Some(ActiveKeyboardGrab {
             owner: ClientId(3),
             grab_window: ResourceId(0x100),
             source: ActiveKeyboardGrabSource::Explicit,
         });
-        let _ = key_event_fanout_to_state(&mut state, key_event(false, 38));
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(false, 38));
         // Explicit grab is NOT cleared by a key release (only passive
         // grabs auto-clear). Persists until UngrabKeyboard.
         assert!(matches!(
@@ -510,5 +527,64 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn key_event_resets_dpms_last_activity() {
+        use std::time::{Duration, Instant};
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        state.dpms.last_activity = Instant::now() - Duration::from_secs(10);
+        let stale = state.dpms.last_activity;
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
+
+        let elapsed = state.dpms.last_activity.duration_since(stale);
+        assert!(
+            elapsed > Duration::from_secs(9),
+            "last_activity should be ≈now, not stale"
+        );
+    }
+
+    #[test]
+    fn key_event_during_off_wakes_via_set_dpms_power_on() {
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        state.dpms.power_level = 3; // Off
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
+
+        let calls = backend.calls.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, crate::backend::recording::RecordedCall::SetDpmsPower(0))),
+            "wake must call set_dpms_power(0); got {calls:?}"
+        );
+        assert_eq!(
+            state.dpms.power_level, 0,
+            "in-memory level should be On after wake"
+        );
+    }
+
+    #[test]
+    fn key_event_during_off_with_backend_error_still_advances_state() {
+        let mut state = ServerState::new();
+        state.dpms.kms_capable = true;
+        state.dpms.enabled = true;
+        state.dpms.power_level = 3;
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+        backend.dpms_set_returns_err = true;
+
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
+
+        assert_eq!(
+            state.dpms.power_level, 0,
+            "state must advance on backend error"
+        );
     }
 }

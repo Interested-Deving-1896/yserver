@@ -5102,6 +5102,68 @@ fn dispatch_fake_input(
     }
 }
 
+/// Apply a DPMS level transition. Updates `state.dpms.power_level`
+/// **first** (so the page-flip gate trips immediately and an
+/// interleaved composite tick can't submit a flip into a CRTC the
+/// kernel is about to disable), then calls the backend, then emits
+/// a notify iff the level actually changed. Backend errors are
+/// logged but do not propagate — matches Xorg's "set it anyway"
+/// posture (`Xext/dpms.c:262-293`).
+pub(crate) fn apply_dpms_transition(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    new_level: u8,
+) {
+    let old = state.dpms.power_level;
+    state.dpms.power_level = new_level;
+    if let Err(e) = backend.set_dpms_power(new_level) {
+        log::error!("set_dpms_power({new_level}) failed: {e}");
+        // Intentionally swallowed: state still advances. See spec
+        // "Backend hook / Error contract".
+    }
+    if new_level != old {
+        emit_dpms_notify(state);
+    }
+}
+
+/// Fan a `DPMSInfoNotify` GenericEvent out to every client
+/// currently subscribed via `DPMSSelectInput(DPMS_INFO_NOTIFY_MASK)`.
+/// Uses the existing `fanout_event_to_clients` helper for sequence
+/// + byte-order + per-client write_or_buffer handling.
+pub(crate) fn emit_dpms_notify(state: &mut ServerState) {
+    use yserver_protocol::x11::dpms as x11dpms;
+    const DPMS_MAJOR_OPCODE: u8 = 134;
+    let ts = state.timestamp_now();
+    let level = u16::from(state.dpms.power_level);
+    let enabled = state.dpms.enabled;
+    let subscribers: Vec<ClientId> = state.dpms.selected_by.iter().copied().collect();
+    if subscribers.is_empty() {
+        return;
+    }
+    let dropped = crate::core_loop::fanout::fanout_event_to_clients(
+        state,
+        &subscribers,
+        |buf, seq, order| {
+            x11dpms::encode_dpms_info_notify_event(
+                buf,
+                order,
+                seq,
+                DPMS_MAJOR_OPCODE,
+                ts,
+                level,
+                enabled,
+            );
+        },
+    );
+    // Reap subscribers whose outbound buffer overflowed — they're
+    // already on a path to disconnect via run.rs::reconcile_client_
+    // writable_interest, and keeping them in selected_by would burn
+    // CPU on every subsequent notify until that finishes.
+    for cid in dropped {
+        state.dpms.selected_by.remove(&cid);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_present_request(
     state: &mut ServerState,
@@ -8189,10 +8251,10 @@ fn handle_xi2_request(
                 {
                     let xid_map = backend.xid_map().clone();
                     let _dropped =
-                        pointer_event_fanout_to_state(state, &xid_map, event, false, false);
+                        pointer_event_fanout_to_state(state, backend, &xid_map, event, false, false);
                     for queued in frozen_queue {
                         let _dropped =
-                            pointer_event_fanout_to_state(state, &xid_map, queued, false, false);
+                            pointer_event_fanout_to_state(state, backend, &xid_map, queued, false, false);
                     }
                 }
             }
@@ -11659,14 +11721,15 @@ fn handle_allow_events(
         // (only XI2 mask, no core mask) saw the queued release
         // but no press → menu clicks dead. Replay needs is_replay=
         // false so XI2 fanout actually runs.
-        let _dropped = pointer_event_fanout_to_state(state, &xid_map, event, false, false);
+        let _dropped = pointer_event_fanout_to_state(state, backend, &xid_map, event, false, false);
         // Drain freeze queue in arrival order. Same is_replay=false
         // rationale: queued events were never delivered to anyone
         // (my queue check at the top of pointer_event_fanout_to_state
         // intercepts them before any delivery), so they need full
         // core + XI2 fanout on replay.
         for queued in frozen_pointer_queue {
-            let _dropped = pointer_event_fanout_to_state(state, &xid_map, queued, false, false);
+            let _dropped =
+                pointer_event_fanout_to_state(state, backend, &xid_map, queued, false, false);
         }
     }
     if keyboard_replay && let Some(event) = frozen_keyboard {
@@ -18952,7 +19015,8 @@ mod tests {
             child: 0,
         };
         let xid_map = backend.xid_map().clone();
-        let _ = pointer_event_fanout_to_state(&mut state, &xid_map, motion, true, false);
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, motion, true, false);
 
         // Read whatever landed on the wire. With the ownership-aware
         // natural-delivery check, the XI2 motion must report against
@@ -19334,7 +19398,8 @@ mod tests {
             child: 0,
         };
         let xid_map = backend.xid_map().clone();
-        let _dropped = pointer_event_fanout_to_state(&mut state, &xid_map, event, true, false);
+        let _dropped =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, event, true, false);
 
         assert!(state.pointer_grab_is_passive);
         assert!(state.frozen_pointer_event.is_some());
@@ -19449,7 +19514,8 @@ mod tests {
             child: 0,
         };
         let xid_map = backend.xid_map().clone();
-        let _dropped = pointer_event_fanout_to_state(&mut state, &xid_map, press, true, false);
+        let _dropped =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
         assert!(state.pointer_grab_is_passive);
         assert!(state.frozen_pointer_event.is_some());
         assert!(state.frozen_pointer_queue.is_empty());
@@ -19461,7 +19527,8 @@ mod tests {
             ..press
         };
         let xid_map = backend.xid_map().clone();
-        let _dropped = pointer_event_fanout_to_state(&mut state, &xid_map, release, true, false);
+        let _dropped =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, release, true, false);
 
         // Grab MUST still be active (waiting for AllowEvents). Press
         // is still frozen. Release is in the queue.
@@ -19578,7 +19645,8 @@ mod tests {
             child: 0,
         };
         let xid_map = backend.xid_map().clone();
-        let _dropped = pointer_event_fanout_to_state(&mut state, &xid_map, press, true, false);
+        let _dropped =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
 
         let mut buf = [0u8; 128];
         let child_read = child_peer.read(&mut buf);
@@ -19703,7 +19771,8 @@ mod tests {
             child: 0,
         };
         let xid_map = backend.xid_map().clone();
-        let _dropped = pointer_event_fanout_to_state(&mut state, &xid_map, release, true, false);
+        let _dropped =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, release, true, false);
 
         let mut buf = [0u8; 256];
 

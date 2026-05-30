@@ -735,7 +735,8 @@ fn dispatch_pending_host_events(state: &mut ServerState, backend: &mut dyn Backe
         match event {
             HostEvent::Pointer(ev) => {
                 use crate::core_loop::pointer_fanout::pointer_event_fanout_to_state;
-                let _dropped = pointer_event_fanout_to_state(state, &xid_map, ev, true, false);
+                let _dropped =
+                    pointer_event_fanout_to_state(state, backend, &xid_map, ev, true, false);
             }
             HostEvent::Expose(ev) => {
                 use crate::core_loop::fanout::expose_event_fanout_to_state;
@@ -743,7 +744,7 @@ fn dispatch_pending_host_events(state: &mut ServerState, backend: &mut dyn Backe
             }
             HostEvent::Key(ev) => {
                 use crate::core_loop::key_fanout::key_event_fanout_to_state;
-                let _dropped = key_event_fanout_to_state(state, ev);
+                let _dropped = key_event_fanout_to_state(state, backend, ev);
             }
             HostEvent::Configure(ev) => {
                 if backend.window_id() == ev.host_xid {

@@ -119,6 +119,7 @@ pub enum RecordedCall {
         host_window_xid: u32,
         cursor_host_xid: u32,
     },
+    SetDpmsPower(u8),
 }
 
 /// Test double for `Backend`. Auto-allocates host xids from a private
@@ -155,6 +156,12 @@ pub struct RecordingBackend {
     /// pointer button — e.g. `Button1Mask = 0x0100` — so the
     /// XIQueryPointer reply's button state can be asserted).
     pub query_pointer_mask: u16,
+    /// Toggled by tests that want to exercise the ynest path
+    /// (kms_capable=false) — default true.
+    pub dpms_capable: bool,
+    /// When set, `set_dpms_power` returns Err; tests assert the
+    /// transition helper advances state anyway.
+    pub dpms_set_returns_err: bool,
 }
 
 impl Default for RecordingBackend {
@@ -175,6 +182,8 @@ impl RecordingBackend {
             cow_next_release_is_final: false,
             redirect_activation_supported: false,
             query_pointer_mask: 0,
+            dpms_capable: true,
+            dpms_set_returns_err: false,
         }
     }
 
@@ -1169,6 +1178,26 @@ impl Backend for RecordingBackend {
         let final_release = self.cow_next_release_is_final;
         self.cow_next_release_is_final = false;
         Ok(final_release)
+    }
+
+    fn dpms_capable(&self) -> bool {
+        // Test default: pretend we can drive DPMS so tests can
+        // exercise the wake/transition path. Individual tests
+        // override by mutating a field on the backend if they need
+        // the ynest path.
+        self.dpms_capable
+    }
+
+    fn set_dpms_power(&mut self, level: u8) -> std::io::Result<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(RecordedCall::SetDpmsPower(level));
+        if self.dpms_set_returns_err {
+            Err(std::io::Error::other("test-injected dpms error"))
+        } else {
+            Ok(())
+        }
     }
 }
 

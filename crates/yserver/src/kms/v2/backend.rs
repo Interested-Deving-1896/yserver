@@ -3382,7 +3382,7 @@ impl KmsBackendV2 {
                 event_y: self.core.cursor_y as i16,
                 state: 0,
             };
-            let _dropped = key_event_fanout_to_state(state, ev);
+            let _dropped = key_event_fanout_to_state(state, self, ev);
         }
 
         // Buttons: held bits live in (button_mask >> 8) & 0x1f,
@@ -3414,9 +3414,10 @@ impl KmsBackendV2 {
                 // Drain pointer events into fanout after each button
                 // (matches on_host_input's drain-per-event contract).
                 let pending = std::mem::take(&mut self.core.pending_pointer_events);
+                let xid_map = self.core.xid_map.clone();
                 for ev in pending {
                     let _dropped =
-                        pointer_event_fanout_to_state(state, &self.core.xid_map, ev, true, false);
+                        pointer_event_fanout_to_state(state, self, &xid_map, ev, true, false);
                 }
             }
         }
@@ -6431,16 +6432,16 @@ impl Backend for KmsBackendV2 {
                 } else {
                     self.core.down_keys.remove(&cooked.keycode);
                 }
-                let _dropped = key_event_fanout_to_state(state, cooked);
+                let _dropped = key_event_fanout_to_state(state, self, cooked);
                 return;
             }
         }
 
         // Drain pointer events queued by the process_pointer_* call.
         let pending = std::mem::take(&mut self.core.pending_pointer_events);
+        let xid_map = self.core.xid_map.clone();
         for ev in pending {
-            let _dropped =
-                pointer_event_fanout_to_state(state, &self.core.xid_map, ev, true, false);
+            let _dropped = pointer_event_fanout_to_state(state, self, &xid_map, ev, true, false);
         }
     }
 
