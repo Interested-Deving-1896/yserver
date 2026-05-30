@@ -846,3 +846,25 @@ rendercheck-yserver timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,t
 # Run rendercheck on host
 rendercheck-yserver-hw timeout="60" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
     tools/yserver-vng-run.sh rendercheck {{timeout}} {{tests}}
+
+# Picks the lowest free X display by scanning /tmp/.X11-unix/, brings
+# yserver up there, then runs ~/.xinitrc (or /etc/X11/xinit/xinitrc
+# fallback) with the matching DISPLAY. When xinitrc exits, yserver is
+# torn down. WAYLAND_* are unset belt-and-braces; a real VT wouldn't
+# have them set anyway. Rejects pty / SSH / graphical-terminal callers
+# via a /dev/ttyN check on stdin — mirrors real `startx`.
+startx log="warn":
+    cargo build --release --bin yserver
+    bash -c '\
+        case "$(tty)" in /dev/tty[0-9]*) ;; *) echo "startx: must be run from a TTY (got: $(tty))" >&2; exit 1;; esac;\
+        display=0;\
+        while [ -e /tmp/.X11-unix/X$display ]; do display=$((display+1)); done;\
+        echo "startx: using DISPLAY=:$display";\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" > yserver-hw-startx.log 2>&1 &\
+        yserver_pid=$!;\
+        for i in $(seq 30); do [ -S /tmp/.X11-unix/X$display ] && break; sleep 1; done;\
+        xinitrc=~/.xinitrc;\
+        [ -f "$xinitrc" ] || xinitrc=/etc/X11/xinit/xinitrc;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET XDG_SESSION_TYPE=x11 DISPLAY=":$display" sh "$xinitrc";\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null'

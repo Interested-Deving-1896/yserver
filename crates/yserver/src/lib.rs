@@ -25,9 +25,7 @@ use yserver_core::{
     server::ServerState,
 };
 
-const DISPLAY: u16 = 7;
-
-pub fn run() -> io::Result<()> {
+pub fn run(display: u16) -> io::Result<()> {
     #[cfg(not(target_os = "linux"))]
     panic!("yserver only supports Linux (DRM/KMS, libinput, evdev, virtual consoles)");
 
@@ -200,7 +198,7 @@ pub fn run() -> io::Result<()> {
             format!("create_dir_all({}): {e}", socket_dir.display()),
         )
     })?;
-    let socket_path = socket_dir.join(format!("X{DISPLAY}"));
+    let socket_path = socket_dir.join(format!("X{display}"));
     match fs::remove_file(&socket_path) {
         Ok(()) => {}
         Err(err) if err.kind() == ErrorKind::NotFound => {}
@@ -225,7 +223,7 @@ pub fn run() -> io::Result<()> {
             format!("set_permissions({}, 0o777): {e}", socket_path.display()),
         )
     })?;
-    log::info!("yserver: listening on unix socket DISPLAY=:{DISPLAY}");
+    log::info!("yserver: listening on unix socket DISPLAY=:{display}");
 
     // Initial composite+flip so the screen has a known frame before any
     // client connects.
