@@ -320,6 +320,13 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
         mm_height: 0,
     };
     let mut state = ServerState::with_randr_outputs(width, height, vec![synthetic]);
+    // Snapshot the backend's DPMS capability into the state. host-X11
+    // inherits the trait default (`false`), so this matches the
+    // ServerState::with_geometry default — but keeping the call here
+    // keeps the two entry points symmetric: if a future host backend
+    // overrides `dpms_capable()`, the snapshot picks it up
+    // automatically.
+    state.dpms = crate::server::DpmsState::new(backend.dpms_capable());
     // Route root-window drawing/clearing to the host container window
     // so clients that paint the root (e.g. fvwm3 setting its desktop
     // bg pixmap) produce visible output in the nested viewport.
