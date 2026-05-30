@@ -202,8 +202,8 @@ pub fn process_request(
         102 => log_void(client_id, sequence, "ChangeKeyboardControl"),
         104 => log_void(client_id, sequence, "Bell"),
         105 => log_void(client_id, sequence, "ChangePointerControl"),
-        107 => log_void(client_id, sequence, "SetScreenSaver"),
-        115 => log_void(client_id, sequence, "ForceScreenSaver"),
+        107 => handle_set_screen_saver(state, client_id, sequence, header, body),
+        115 => handle_force_screen_saver(state, backend, client_id, sequence, header),
         127 => log_void(client_id, sequence, "NoOperation"),
         // ── trivial replies (no state mutation, no body parsing) ──
         43 => handle_get_input_focus(state, client_id, sequence),
@@ -10755,7 +10755,7 @@ fn handle_get_pointer_control(
     Ok(write_to_client(client, client_id, &buf))
 }
 
-/// GetScreenSaver (108): 32-byte reply.
+/// GetScreenSaver (108): reflects ScreenSaverState back to the client.
 fn handle_get_screen_saver(
     state: &mut ServerState,
     client_id: ClientId,
@@ -10766,18 +10766,152 @@ fn handle_get_screen_saver(
         return Ok(RequestOutcome::Handled);
     };
     let byte_order = client.byte_order;
-    // timeout=600 interval=0 prefer_blanking=1 allow_exposures=0.
     let mut buf = x11::fixed_reply(byte_order, sequence, 0, 0);
-    let mut tmp = Vec::with_capacity(2);
-    x11::write_u16(byte_order, &mut tmp, 600);
-    buf.extend_from_slice(&tmp);
-    tmp.clear();
-    x11::write_u16(byte_order, &mut tmp, 0);
-    buf.extend_from_slice(&tmp);
-    buf.push(1); // prefer_blanking
-    buf.push(0); // allow_exposures
+    #[allow(clippy::cast_possible_truncation)]
+    let timeout = (state.screensaver.timeout_ms / 1000) as u16;
+    #[allow(clippy::cast_possible_truncation)]
+    let interval = (state.screensaver.interval_ms / 1000) as u16;
+    x11::write_u16(byte_order, &mut buf, timeout);
+    x11::write_u16(byte_order, &mut buf, interval);
+    buf.push(u8::from(state.screensaver.prefer_blanking));
+    buf.push(u8::from(state.screensaver.allow_exposures));
     buf.resize(32, 0);
     Ok(write_to_client(client, client_id, &buf))
+}
+
+/// SetScreenSaver (107): body is `timeout:i16 interval:i16
+/// prefer_blanking:u8 allow_exposures:u8 pad:u16` (8 bytes).
+///
+/// Sentinel resolution matches Xorg `dix/globals.c:96-99`:
+///   -1 (timeout/interval)            → restore 600s default
+///    2 (prefer_blanking/allow_expo)  → restore the default value
+fn handle_set_screen_saver(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    // Body layout: timeout:i16 interval:i16 prefer_blanking:u8
+    // allow_exposures:u8 pad:u16 = 8 bytes.
+    if body.len() < 8 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_LENGTH,
+            0,
+            header.opcode,
+        );
+    }
+    let timeout = i16::from_le_bytes([body[0], body[1]]);
+    let interval = i16::from_le_bytes([body[2], body[3]]);
+    let prefer_blanking = body[4];
+    let allow_exposures = body[5];
+
+    if !(-1..=0x7fff).contains(&i32::from(timeout)) {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(timeout as u16),
+            header.opcode,
+        );
+    }
+    if !(-1..=0x7fff).contains(&i32::from(interval)) {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(interval as u16),
+            header.opcode,
+        );
+    }
+    if prefer_blanking > 2 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(prefer_blanking),
+            header.opcode,
+        );
+    }
+    if allow_exposures > 2 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(allow_exposures),
+            header.opcode,
+        );
+    }
+
+    state.screensaver.timeout_ms = match timeout {
+        -1 => 600_000,
+        n => u32::from(n as u16) * 1000, // n is already ≥ 0
+    };
+    state.screensaver.interval_ms = match interval {
+        -1 => 600_000,
+        n => u32::from(n as u16) * 1000,
+    };
+    state.screensaver.prefer_blanking = match prefer_blanking {
+        0 => false,
+        1 => true,
+        _ => true, // 2 = Default; Xorg defaultScreenSaverBlanking = PreferBlanking
+    };
+    state.screensaver.allow_exposures = match allow_exposures {
+        0 => false,
+        1 => true,
+        _ => true, // 2 = Default; Xorg defaultScreenSaverAllowExposures = AllowExposures
+    };
+
+    // No last_activity reset — Xorg's ProcSetScreenSaver only calls
+    // SetScreenSaverTimer(), which recomputes the deadline from the
+    // unchanged LastEventTime. yserver computes the deadline lazily
+    // at every poll iteration; the next iteration sees the new
+    // timeout_ms against the unchanged last_activity.
+
+    Ok(RequestOutcome::Handled)
+}
+
+/// ForceScreenSaver (115): `mode` lives in the request header's
+/// `data` byte (Fixed(1) in the core length table — no body bytes).
+/// mode=0 (Reset) → force Off + bump last_activity.
+/// mode=1 (Activate) → force On.
+fn handle_force_screen_saver(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+) -> io::Result<RequestOutcome> {
+    let mode = header.data; // u8 stashed in the request header's data byte
+    if mode > 1 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(mode),
+            header.opcode,
+        );
+    }
+    if mode == 0 {
+        apply_screen_saver_transition(
+            state,
+            backend,
+            ScreenSaverActive::Off,
+            /*forced=*/ true,
+        );
+        state.dpms.last_activity = std::time::Instant::now();
+    } else {
+        apply_screen_saver_transition(state, backend, ScreenSaverActive::On, /*forced=*/ true);
+    }
+    Ok(RequestOutcome::Handled)
 }
 
 /// SetPointerMapping (116): reply with status=0 + MappingNotify fanout.
@@ -25354,5 +25488,158 @@ mod tests {
             state.dpms.last_activity, prior,
             "helper alone must not touch last_activity"
         );
+    }
+
+    #[test]
+    fn force_screen_saver_invalid_mode_returns_bad_value() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 115,
+            data: 2, // mode=2 — only 0 (Reset) and 1 (Activate) are valid
+            length_units: 1,
+        };
+        let _ = handle_force_screen_saver(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+        );
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 0, "error reply tag");
+        assert_eq!(bytes[1], x11::error::BAD_VALUE);
+        // bad_value at offset 4 = 2
+        assert_eq!(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            2
+        );
+    }
+
+    #[test]
+    fn force_screen_saver_reset_via_handler_advances_last_activity() {
+        // Reset is the FORCER+Reset path Xorg runs NoticeTime on
+        // (window.c:3187-3193) — the handler must bump last_activity.
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        state.screensaver.active = ScreenSaverActive::On;
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(120);
+        let stale = state.dpms.last_activity;
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 115,
+            data: 0,
+            length_units: 1,
+        }; // mode=0 (Reset)
+
+        let _ = handle_force_screen_saver(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+        );
+
+        assert_eq!(state.screensaver.active, ScreenSaverActive::Off);
+        assert!(
+            state.dpms.last_activity > stale,
+            "handler must bump last_activity on Reset"
+        );
+    }
+
+    #[test]
+    fn set_screen_saver_stores_fields() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let header = RequestHeader {
+            opcode: 107,
+            data: 0,
+            length_units: 3,
+        };
+        // timeout=300, interval=900, prefer_blanking=0 (no),
+        // allow_exposures=1 (yes), pad:u16
+        let body = [
+            44, 1, // 300 (LE)
+            132, 3, // 900 (LE)
+            0, // prefer_blanking
+            1, // allow_exposures
+            0, 0, // pad
+        ];
+        let _ = handle_set_screen_saver(&mut state, ClientId(1), SequenceNumber(1), header, &body);
+        assert_eq!(state.screensaver.timeout_ms, 300_000);
+        assert_eq!(state.screensaver.interval_ms, 900_000);
+        assert!(!state.screensaver.prefer_blanking);
+        assert!(state.screensaver.allow_exposures);
+    }
+
+    #[test]
+    fn set_screen_saver_minus_one_restores_default() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        state.screensaver.timeout_ms = 12_345;
+        state.screensaver.interval_ms = 67_890;
+        let header = RequestHeader {
+            opcode: 107,
+            data: 0,
+            length_units: 3,
+        };
+        // -1 (0xffff), -1, default(2), default(2), pad
+        let body = [0xff, 0xff, 0xff, 0xff, 2, 2, 0, 0];
+        let _ = handle_set_screen_saver(&mut state, ClientId(1), SequenceNumber(1), header, &body);
+        // defaults: timeout=600s, interval=600s, prefer=true, allow=true
+        assert_eq!(state.screensaver.timeout_ms, 600_000);
+        assert_eq!(state.screensaver.interval_ms, 600_000);
+        assert!(state.screensaver.prefer_blanking);
+        assert!(state.screensaver.allow_exposures);
+    }
+
+    #[test]
+    fn set_screen_saver_invalid_prefer_blanking_returns_bad_value() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let header = RequestHeader {
+            opcode: 107,
+            data: 0,
+            length_units: 3,
+        };
+        // prefer_blanking=3 is invalid (only 0/1/2 valid).
+        let body = [60, 0, 60, 0, 3, 1, 0, 0];
+        let _ = handle_set_screen_saver(&mut state, ClientId(1), SequenceNumber(1), header, &body);
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[1], x11::error::BAD_VALUE);
+        assert_eq!(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            3
+        );
+    }
+
+    #[test]
+    fn get_screen_saver_round_trips_set_screen_saver() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.screensaver.timeout_ms = 120_000;
+        state.screensaver.interval_ms = 240_000;
+        state.screensaver.prefer_blanking = false;
+        state.screensaver.allow_exposures = true;
+        let _ = handle_get_screen_saver(&mut state, ClientId(1), SequenceNumber(1));
+        let bytes = read_all_available(&mut peer);
+        // Reply layout: tag(0) data(1) seq(2-3) length(4-7) timeout(8-9)
+        // interval(10-11) prefer(12) allow(13) pad to 32.
+        assert_eq!(bytes[0], 1, "reply tag");
+        assert_eq!(
+            u16::from_le_bytes([bytes[8], bytes[9]]),
+            120,
+            "timeout in s"
+        );
+        assert_eq!(
+            u16::from_le_bytes([bytes[10], bytes[11]]),
+            240,
+            "interval in s"
+        );
+        assert_eq!(bytes[12], 0, "prefer_blanking = false");
+        assert_eq!(bytes[13], 1, "allow_exposures = true");
     }
 }
