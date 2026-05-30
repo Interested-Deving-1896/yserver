@@ -373,6 +373,44 @@ device.
   logic deterministically).
 - No real-libseat container CI yet (CI is unit + lint).
 
+## DPMS + MIT-SCREEN-SAVER (branch `feat/mit-screen-saver`, 2026-05-30)
+
+DPMS (major opcode 134) shipped earlier on `feat/dpms`; MIT-SCREEN-SAVER
+(major opcode 150, first_event 162) layers on top. Both extensions are
+implemented end-to-end on yserver-hw — protocol, state machines, idle
+timer, input-driven wake, and Xorg-faithful coupling.
+
+Specs: [`2026-05-30-dpms-design.md`](superpowers/specs/2026-05-30-dpms-design.md) +
+[`2026-05-30-mit-screen-saver-design.md`](superpowers/specs/2026-05-30-mit-screen-saver-design.md).
+Plans: [`2026-05-30-dpms.md`](superpowers/plans/2026-05-30-dpms.md) +
+[`2026-05-30-mit-screen-saver.md`](superpowers/plans/2026-05-30-mit-screen-saver.md)
+(both converged with codex review).
+
+**What MIT-SCREEN-SAVER ships:** 6 requests (QueryVersion/QueryInfo/
+SelectInput/SetAttributes/UnsetAttributes/Suspend), one sequential
+event `ScreenSaverNotify` at first_event=162, per-client subscriber
+masks (NOTIFY_MASK + CYCLE_MASK), per-client `Suspend` refcount,
+idle activation, periodic Cycle re-fire, real handlers for the core
+opcodes 107/108/115 (replacing the prior `log_void` stubs), Xorg-
+faithful DPMS↔SS coupling (DPMS-non-On→SS-On forced=true; DPMS-On→
+SS-Off forced=false; SS notify fires BEFORE DPMS notify on the wire),
+and Xorg's unified-timer rule (`XScreenSaverSuspend` inhibits both
+SS and DPMS firing — the Firefox/mpv/vlc fullscreen-video-inhibit
+path). `SetAttributes` returns BadAccess unconditionally (documented
+deviation — xscreensaver falls back to its own override-redirect
+saver window).
+
+**Bug this fixes:** mate-screensaver's lockscreen never activated on
+yserver because there was no MIT-SCREEN-SAVER extension. With this
+landing, the default-config mate-screensaver "blank screen after N"
+fires its lockscreen as expected.
+
+**Visible smoke matrix is user-driven** (per the spec; `xset s 60`
++ `xev -event screensaver`, mate-screensaver default config, mpv
+fullscreen + `xset dpms 60 60 60` no-blank, etc.). Test coverage is
+40 new unit tests across protocol/server/process_request/run/
+disconnect modules — invariants only; the smoke is in the spec.
+
 ## HW cursor drag-lag fix (master, 2026-05-29)
 
 After the VT-switch series landed, `55924b1 feat(kms/v2): flip HW cursor
