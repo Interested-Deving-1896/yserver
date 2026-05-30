@@ -5148,10 +5148,20 @@ pub(crate) fn apply_dpms_transition(
     let dpms_on = new_level == 0;
     match (dpms_on, state.screensaver.active) {
         (false, ScreenSaverActive::Off) => {
-            apply_screen_saver_transition(state, backend, ScreenSaverActive::On, true);
+            apply_screen_saver_transition(
+                state,
+                backend,
+                ScreenSaverActive::On,
+                /*forced=*/ true,
+            );
         }
         (true, ScreenSaverActive::On) => {
-            apply_screen_saver_transition(state, backend, ScreenSaverActive::Off, false);
+            apply_screen_saver_transition(
+                state,
+                backend,
+                ScreenSaverActive::Off,
+                /*forced=*/ false,
+            );
         }
         _ => {}
     }
@@ -5216,7 +5226,7 @@ pub(crate) fn emit_dpms_notify(state: &mut ServerState) {
 /// and is currently unused (SS is purely server-side bookkeeping).
 pub(crate) fn apply_screen_saver_transition(
     state: &mut ServerState,
-    backend: &mut dyn Backend,
+    _backend: &mut dyn Backend, // reserved for future coupling (parity with apply_dpms_transition)
     new: ScreenSaverActive,
     forced: bool,
 ) {
@@ -5231,7 +5241,6 @@ pub(crate) fn apply_screen_saver_transition(
     if state.screensaver.active == new {
         return;
     }
-    let _ = backend; // reserved for future coupling
     state.screensaver.active = new;
     state.screensaver.forced = forced;
     state.screensaver.next_cycle = match new {
