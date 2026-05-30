@@ -330,6 +330,39 @@ Suspend does NOT block `ForceScreenSaver(Activate)` — Xorg's saver.c
 comment is explicit: "suspending it (by design) doesn't prevent it
 from being forcibly activated".
 
+**Suspend also inhibits DPMS firing — Xorg unified-timer rule.** In
+Xorg, both DPMS and the screen-saver are driven by a single
+`SetScreenSaverTimer` (`os/WaitFor.c:493-525`), which is NOT armed
+when `screenSaverSuspended` is true (`WaitFor.c:519`:
+`if (timeout && !screenSaverSuspended)`). This is the mechanism that
+makes `XScreenSaverSuspend(True)` (Firefox's
+fullscreen-video-inhibit, mpv `--stop-screensaver`, etc.) prevent the
+panel from blanking, even though DPMS has no Suspend request of its
+own.
+
+To match this, extend the DPMS Task 3 helper
+`dpms_transition_deadline()` (already shipped in the parent feature
+branch) with one additional clause:
+
+```rust
+// crates/yserver-core/src/server.rs — augment existing dpms_transition_deadline
+pub fn dpms_transition_deadline(&self) -> Option<Instant> {
+    if !self.dpms.enabled || !self.dpms.kms_capable {
+        return None;
+    }
+    if !self.screensaver.suspend_counts.is_empty() {
+        return None; // Xorg WaitFor.c:519 — single suspended-timer gate
+    }
+    // ...existing smallest-non-zero-timeout logic unchanged...
+}
+```
+
+The forward (DPMS → SS) coupling in `apply_dpms_transition` stays
+untouched; only the deadline-gating side adds the suspend check.
+Without this, Firefox / mpv inhibit fails — confirmed during
+dogfooding 2026-05-30: `xset dpms 60` plus fullscreen YouTube playback
+blanked the panel mid-video.
+
 ### Backend hooks
 
 None. ScreenSaver is purely server-side bookkeeping. The
@@ -625,6 +658,26 @@ Add `screensaver_idle_deadline(&self) -> Option<Instant>` and
 `screensaver_cycle_deadline(&self) -> Option<Instant>` methods on the
 existing `impl ServerState` block.
 
+**Also augment the existing `dpms_transition_deadline()` helper** with
+the cross-extension suspend gate (Xorg `WaitFor.c:519`):
+
+```rust
+pub fn dpms_transition_deadline(&self) -> Option<Instant> {
+    if !self.dpms.enabled || !self.dpms.kms_capable {
+        return None;
+    }
+    // NEW — Xorg's SetScreenSaverTimer is gated on !screenSaverSuspended,
+    // which means XScreenSaverSuspend inhibits BOTH the SS timer and the
+    // DPMS cascade (they share one timer). Mirror that.
+    if !self.screensaver.suspend_counts.is_empty() {
+        return None;
+    }
+    // ...existing smallest-non-zero-timeout logic unchanged...
+}
+```
+
+This is the one DPMS-helper change MIT-SCREEN-SAVER drags in.
+
 ### `crates/yserver-core/src/core_loop/process_request.rs`
 
 - Add `apply_screen_saver_transition` and `emit_screen_saver_notify`
@@ -816,10 +869,11 @@ Client disconnect:
 4. `encode_query_info_reply_shape` — assert byte offsets per saverproto.h: state at 1, window at 8, til_or_since at 12, idle at 16, event_mask at 20, kind at 24, pad to 32.
 5. `encode_screen_saver_notify_event_shape` — assert byte offsets per saverproto.h: type at 0, state at 1, sequence at 2-3, timestamp at 4-7, root at 8-11, window at 12-15, kind at 16, forced at 17, pads to 32.
 
-**`crates/yserver-core/src/server.rs::tests`** (8 tests):
+**`crates/yserver-core/src/server.rs::tests`** (9 tests):
 
 6. `screensaver_idle_deadline_none_when_timeout_zero`.
 7. `screensaver_idle_deadline_none_when_suspended` — insert a fake client into `suspend_counts`; deadline → None.
+7a. `dpms_transition_deadline_none_when_screensaver_suspended` — set DPMS enabled + kms_capable + standby_ms; insert a fake client into `screensaver.suspend_counts`; assert `dpms_transition_deadline()` → None. Mirrors Xorg `WaitFor.c:519` (the single-timer-not-armed-when-suspended rule that lets `XScreenSaverSuspend` inhibit DPMS firing).
 8. `screensaver_idle_deadline_none_when_active`.
 9. `screensaver_idle_deadline_none_when_dpms_blanked` — `dpms.power_level = 1` → None (Xorg `WaitFor.c:457`).
 10. `screensaver_idle_deadline_returns_last_activity_plus_timeout` — basic Some-path.
@@ -881,7 +935,7 @@ lockscreen actually appears.
 
 | Crate              | Before | After |
 |--------------------|--------|-------|
-| `yserver-core`     | +13 from DPMS | +27 |
+| `yserver-core`     | +13 from DPMS | +28 |
 | `yserver-protocol` | +11 from DPMS | +5  |
 
 ---
@@ -894,9 +948,13 @@ plain clippy only.
 
 1. **Protocol wire codecs.** Add `yserver-protocol/src/x11/screensaver.rs`
    with parsers, encoders, constants, and tests #1–#5. No callers yet.
-2. **`ScreenSaverState` + `screensaver_idle_deadline` helper.** Add the
-   struct, embed in `ServerState`, init in `with_geometry`, add the
-   deadline helper. Tests #6–#10.
+2. **`ScreenSaverState` + helpers + DPMS-deadline suspend gate.** Add
+   the struct, embed in `ServerState`, init in `with_geometry`, add
+   `screensaver_idle_deadline()` and `screensaver_cycle_deadline()`.
+   **Augment the existing `dpms_transition_deadline()` to also gate on
+   `screensaver.suspend_counts.is_empty()`** — Xorg's unified-timer
+   rule (`WaitFor.c:519`) lets `XScreenSaverSuspend(True)` inhibit
+   DPMS firing, which Firefox / mpv / vlc rely on. Tests #6–#10, #7a.
 3. **`apply_screen_saver_transition` + `emit_screen_saver_notify` +
    DPMS coupling restructure.** Add the helpers; restructure
    `apply_dpms_transition` so SS coupling fires between the in-memory
