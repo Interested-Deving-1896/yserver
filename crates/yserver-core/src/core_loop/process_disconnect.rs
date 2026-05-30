@@ -243,6 +243,25 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         .xkb_select_event_masks
         .retain(|(owner, _), _| *owner != client_id.0);
     state.dpms.selected_by.remove(&client_id);
+    state.screensaver.selected_by.remove(&client_id);
+    let was_suspending = state
+        .screensaver
+        .suspend_counts
+        .remove(&client_id)
+        .is_some();
+    if was_suspending
+        && state.screensaver.suspend_counts.is_empty()
+        && matches!(
+            state.screensaver.active,
+            crate::server::ScreenSaverActive::Off
+        )
+        && state.dpms.power_level == 0
+    {
+        // Mirrors ScreenSaverFreeSuspend (saver.c:343-378): on the
+        // last suspender going away, restart the idle clock so the
+        // saver doesn't immediately fire from a stale baseline.
+        state.dpms.last_activity = std::time::Instant::now();
+    }
     state.button_grabs.retain(|g| g.owner != client_id);
     if state
         .pointer_grab
@@ -618,6 +637,27 @@ mod tests {
         assert!(
             !state.dpms.selected_by.contains(&ClientId(7)),
             "process_disconnect must remove the client from selected_by"
+        );
+    }
+
+    #[test]
+    fn disconnect_removes_client_from_screensaver_state_and_restarts_timer_if_last_suspender() {
+        use std::time::Duration;
+        let mut state = ServerState::new();
+        install_client(&mut state, 7);
+        state.screensaver.selected_by.insert(ClientId(7), 0x01);
+        state.screensaver.suspend_counts.insert(ClientId(7), 1);
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(120);
+        let stale = state.dpms.last_activity;
+
+        let mut backend = RecordingBackend::new();
+        process_disconnect(&mut state, &mut backend, ClientId(7));
+
+        assert!(!state.screensaver.selected_by.contains_key(&ClientId(7)));
+        assert!(!state.screensaver.suspend_counts.contains_key(&ClientId(7)));
+        assert!(
+            state.dpms.last_activity > stale,
+            "last_activity must advance — client 7 was the last suspender"
         );
     }
 
