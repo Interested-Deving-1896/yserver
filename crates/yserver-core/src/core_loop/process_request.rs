@@ -15519,6 +15519,42 @@ fn emit_core_grab_activation_crossings(
         CrossingKind::Keyboard => (10u8, 9u8), // FocusOut / FocusIn
     };
     let emit_to_client = |state: &mut ServerState, evtype: u8, target: ResourceId| {
+        // Per X11 spec (Xorg `dix/enterleave.c:606` →
+        // `CoreEnterLeaveEvents` → `CoreEnterNotifies` →
+        // `DeliverEventsToWindow`): grab-activation crossings flow
+        // through the normal event-mask filter. The crossing fires
+        // to the grabber ONLY if the grabber selected the
+        // corresponding mask on `target`.
+        //
+        //   EnterNotify (7)  → EnterWindowMask  (0x10)
+        //   LeaveNotify (8)  → LeaveWindowMask  (0x20)
+        //   FocusIn     (9)  → FocusChangeMask  (0x20_0000)
+        //   FocusOut    (10) → FocusChangeMask  (0x20_0000)
+        //
+        // marco / GTK3 popups select EnterWindowMask on their popup
+        // and get the crossings; xts test harnesses don't and so
+        // see only the reply on the wire (which is what they
+        // expect — the reply for a sync request must precede any
+        // side-effect events the request triggers, and "no side-
+        // effect events" trivially satisfies that). Pre-fix
+        // yserver fanned the crossings unconditionally, putting
+        // `EnterNotify` on the wire before the GrabPointer reply
+        // and breaking xts's `GrabPointer` / `GrabKeyboard` /
+        // `AllowEvents` / `ChangeActivePointerGrab` tests.
+        let required_mask: u32 = match evtype {
+            7 => 0x10,
+            8 => 0x20,
+            9 | 10 => 0x20_0000,
+            _ => return,
+        };
+        let selected = state
+            .clients
+            .get(&client_id.0)
+            .and_then(|c| c.event_masks.get(&target).copied())
+            .is_some_and(|m| m & required_mask != 0);
+        if !selected {
+            return;
+        }
         let (origin_x, origin_y) = state.resources.window_absolute_position(target);
         let event_x = i16::try_from(i32::from(root_x).saturating_sub(origin_x)).unwrap_or(i16::MAX);
         let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y)).unwrap_or(i16::MAX);
@@ -15602,6 +15638,29 @@ fn emit_core_grab_deactivation_crossing(
     prev_grab_window: ResourceId,
     kind: CrossingKind,
 ) {
+    let evtype: u8 = match kind {
+        CrossingKind::Pointer => 8,   // LeaveNotify
+        CrossingKind::Keyboard => 10, // FocusOut
+    };
+    // Same mask-respecting filter as `emit_core_grab_activation_crossings`
+    // — xts's `UngrabPointer` test (Xproto case 116) verifies that
+    // `UngrabPointer` from a client with NO event mask selected
+    // produces nothing on the wire. Pre-fix yserver fanned
+    // `LeaveNotify` unconditionally to the ungrabber. Xorg filters
+    // through the standard delivery path; we mirror that here.
+    let required_mask: u32 = match evtype {
+        8 => 0x20,       // LeaveWindowMask
+        10 => 0x20_0000, // FocusChangeMask
+        _ => return,
+    };
+    let selected = state
+        .clients
+        .get(&client_id.0)
+        .and_then(|c| c.event_masks.get(&prev_grab_window).copied())
+        .is_some_and(|m| m & required_mask != 0);
+    if !selected {
+        return;
+    }
     let pointer_xy = backend
         .query_pointer(origin)
         .ok()
@@ -15609,10 +15668,6 @@ fn emit_core_grab_deactivation_crossing(
         .unwrap_or((0, 0));
     let (root_x, root_y) = pointer_xy;
     let server_time = state.timestamp_now();
-    let evtype: u8 = match kind {
-        CrossingKind::Pointer => 8,   // LeaveNotify
-        CrossingKind::Keyboard => 10, // FocusOut
-    };
     let (origin_x, origin_y) = state.resources.window_absolute_position(prev_grab_window);
     let event_x = i16::try_from(i32::from(root_x).saturating_sub(origin_x)).unwrap_or(i16::MAX);
     let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y)).unwrap_or(i16::MAX);
@@ -27096,6 +27151,290 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(100),
             "per_device_last_activity[3] must be reset to ~now; got elapsed {elapsed:?}"
+        );
+    }
+
+    /// Per X11 spec (Xorg `dix/enterleave.c:606` →
+    /// `CoreEnterLeaveEvents` → `CoreEnterNotifies` →
+    /// `DeliverEventsToWindow`): grab-activation crossing events
+    /// flow through the normal event-delivery path, which filters
+    /// by the client's per-window event-mask selection. xts's
+    /// `GrabPointer` test opens a fresh connection, creates a
+    /// grab window WITHOUT selecting `EnterWindowMask` (0x10), and
+    /// expects the next thing on the wire after sending GrabPointer
+    /// to be the reply (opcode 1). Pre-fix yserver's
+    /// `emit_core_grab_activation_crossings` fanned `EnterNotify`
+    /// (event type 7) unconditionally to the grabber via
+    /// `fanout_event_to_clients(&[client_id], …)` regardless of
+    /// mask, so the event landed on the wire BEFORE the reply
+    /// and the test reported `wanted REPLY - X_GrabPointer , got
+    /// EVENT - EnterNotify` (xts Xproto run 2026-05-31-11:13:07:
+    /// 1 FAIL on `GrabPointer` + 1 FAIL on `GrabKeyboard` + 8
+    /// UNRESOLVED on `AllowEvents` / `ChangeActivePointerGrab`).
+    /// Marco / GTK3 popups still receive the crossings because
+    /// they select `EnterWindowMask` on their popup windows.
+    #[test]
+    fn grab_pointer_skips_synthesised_crossing_when_mask_unselected() {
+        const CLIENT_ID: u32 = 1;
+        const GRAB_WIN: u32 = 0x100_0007;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        // Create the grab window WITHOUT EnterWindowMask selected
+        // (mirrors xts's fresh CreateWindow).
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(GRAB_WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(GRAB_WIN));
+
+        // GrabPointer body: window(4) event-mask(2) pointer-mode(1)
+        // keyboard-mode(1) confine-to(4) cursor(4) time(4) = 20.
+        // event-mask=0, modes async, confine_to=None, cursor=None,
+        // time=CurrentTime.
+        let mut body = Vec::with_capacity(20);
+        body.extend_from_slice(&GRAB_WIN.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes()); // event-mask
+        body.push(0); // pointer-mode async
+        body.push(0); // keyboard-mode async
+        body.extend_from_slice(&0u32.to_le_bytes()); // confine-to None
+        body.extend_from_slice(&0u32.to_le_bytes()); // cursor None
+        body.extend_from_slice(&0u32.to_le_bytes()); // time CurrentTime
+
+        handle_grab_pointer(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(11),
+            RequestHeader {
+                opcode: 26,
+                data: 0, // owner_events false
+                length_units: 6,
+            },
+            &body,
+        )
+        .expect("handle_grab_pointer");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut tmp = [0u8; 1024];
+        let mut wire = Vec::new();
+        loop {
+            match peer.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => wire.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        // First 32-byte chunk must be the reply (opcode 1), NOT an
+        // EnterNotify (event type 7).
+        assert!(
+            wire.len() >= 32,
+            "GrabPointer must produce at least the reply on the wire",
+        );
+        assert_ne!(
+            wire[0] & 0x7f,
+            7,
+            "Pre-fix: EnterNotify (type 7) landed on the wire before \
+             the GrabPointer reply because crossings were unconditionally \
+             fanned to the grabber regardless of EnterWindowMask. xts \
+             reports this as `wanted REPLY - X_GrabPointer , got EVENT - \
+             EnterNotify` and marks dependent tests UNRESOLVED.",
+        );
+        assert_eq!(
+            wire[0], 1,
+            "GrabPointer must put the reply (opcode 1) first on the wire \
+             when the grabber has not selected EnterWindowMask",
+        );
+        // No EnterNotify anywhere — the grabber didn't select it.
+        let enter_notifies = wire.chunks_exact(32).filter(|c| c[0] & 0x7f == 7).count();
+        assert_eq!(
+            enter_notifies, 0,
+            "EnterNotify must not be delivered to a grabber that didn't \
+             select EnterWindowMask on the grab window",
+        );
+    }
+
+    /// Positive companion to the test above: when the grabber HAS
+    /// selected `EnterWindowMask` on the grab window (the
+    /// marco / GTK3 popup-menu pattern), the synthesised crossing
+    /// must still fire. The grab fix is "respect the event-mask
+    /// filter", not "drop crossings entirely".
+    #[test]
+    fn grab_pointer_emits_crossing_when_grabber_selected_enter_mask() {
+        const CLIENT_ID: u32 = 1;
+        const GRAB_WIN: u32 = 0x100_0008;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(GRAB_WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(GRAB_WIN));
+        // marco/GTK3 popup pattern: select EnterWindowMask (0x10)
+        // on the popup window. Now grab-activation EnterNotify
+        // MUST fire to drive GTK3's hover machinery.
+        state
+            .clients
+            .get_mut(&CLIENT_ID)
+            .unwrap()
+            .event_masks
+            .insert(ResourceId(GRAB_WIN), 0x10);
+
+        let mut body = Vec::with_capacity(20);
+        body.extend_from_slice(&GRAB_WIN.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.push(0);
+        body.push(0);
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+
+        handle_grab_pointer(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(13),
+            RequestHeader {
+                opcode: 26,
+                data: 0,
+                length_units: 6,
+            },
+            &body,
+        )
+        .expect("handle_grab_pointer");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut tmp = [0u8; 1024];
+        let mut wire = Vec::new();
+        loop {
+            match peer.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => wire.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        let enter_notifies = wire.chunks_exact(32).filter(|c| c[0] & 0x7f == 7).count();
+        assert!(
+            enter_notifies >= 1,
+            "EnterNotify must still fire to a grabber that selected \
+             EnterWindowMask (marco/GTK3 popup-menu pattern)",
+        );
+    }
+
+    /// Symmetric to the activation test: xts case 116
+    /// (`pUngrabPointer-1.(A)`) opens a connection with NO event
+    /// mask selected, grabs+ungrabs, and verifies the server
+    /// sends NOTHING. Pre-fix `emit_core_grab_deactivation_crossing`
+    /// fanned `LeaveNotify` unconditionally to the ungrabber; the
+    /// test reported `wanted NOTHING, got EVENT - LeaveNotify`.
+    /// Mirror fix: the deactivation crossing must respect
+    /// `LeaveWindowMask` (0x20) on the prior grab window.
+    #[test]
+    fn ungrab_pointer_skips_synthesised_leave_when_mask_unselected() {
+        const CLIENT_ID: u32 = 1;
+        const GRAB_WIN: u32 = 0x100_0009;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(GRAB_WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(GRAB_WIN));
+
+        // Seed an active grab so handle_ungrab_pointer has
+        // something to deactivate (mirrors xts's GrabPointer →
+        // UngrabPointer sequence).
+        state.pointer_grab = Some((ClientId(CLIENT_ID), ResourceId(GRAB_WIN)));
+        state.active_pointer_grab = Some(crate::server::ActivePointerGrab {
+            owner: ClientId(CLIENT_ID),
+            grab_window: ResourceId(GRAB_WIN),
+            event_mask: 0,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: false,
+        });
+
+        handle_ungrab_pointer(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(17),
+        )
+        .expect("handle_ungrab_pointer");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut tmp = [0u8; 1024];
+        let mut wire = Vec::new();
+        loop {
+            match peer.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => wire.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        let leave_notifies = wire.chunks_exact(32).filter(|c| c[0] & 0x7f == 8).count();
+        assert_eq!(
+            leave_notifies, 0,
+            "UngrabPointer from a client that did not select \
+             LeaveWindowMask must not produce a LeaveNotify on the \
+             wire (xts case 116 / `pUngrabPointer-1.(A)`)",
+        );
+        assert!(
+            wire.is_empty(),
+            "UngrabPointer with no event mask selected must produce \
+             NOTHING on the wire; got {} bytes: {:?}",
+            wire.len(),
+            &wire[..wire.len().min(64)],
         );
     }
 }
