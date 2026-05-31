@@ -12,10 +12,6 @@ design, scope, and phased plan.
 
 ## Status
 
-Both backends run real desktop sessions on a single-threaded core
-(no `Arc<Mutex<ServerState>>`, no per-client pump threads — the core
-thread owns state and a mio poller).
-
 `yserver` (standalone DRM/KMS) can now run full MATE/XFCE/Cinnamon desktops.
 We support the following extensions:
 - BIG-REQUESTS
