@@ -836,6 +836,20 @@ xts-yserver scenario="Xproto" timeout="1200":
         --qemu-opts="-display egl-headless,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true -device virtio-tablet-pci -device virtio-keyboard-pci" \
         -- tools/yserver-vng-run.sh xts {{scenario}} {{timeout}}
 
+xts-yserver-hw scenario="Xproto" timeout="1200":
+    cargo build --release --bin yserver
+    bash -c '\
+        case "$(tty)" in /dev/tty[0-9]*) ;; *) echo "startx: must be run from a TTY (got: $(tty))" >&2; exit 1;; esac;\
+        display=0;\
+        while [ -e /tmp/.X11-unix/X$display ]; do display=$((display+1)); done;\
+        echo "xts: using DISPLAY=:$display";\
+        target/release/yserver "$display" > yserver-hw-xts.log 2>&1 &\
+        yserver_pid=$!;\
+        for i in $(seq 30); do [ -S /tmp/.X11-unix/X$display ] && break; sleep 1; done;\
+        env DISPLAY=":$display" xterm -e "tools/xts-run.sh :$display {{scenario}} {{timeout}}";\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null'
+
 # Run rendercheck against yserver (KMS) inside virtme-ng.
 rendercheck-yserver timeout="600" tests="fill,dcoords,scoords,mcoords,tscoords,tmcoords,blend,composite,cacomposite,gradients,repeat,triangles,bug7366":
     cargo build --release --bin yserver
