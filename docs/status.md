@@ -386,6 +386,26 @@ Plans: [`2026-05-30-dpms.md`](superpowers/plans/2026-05-30-dpms.md) +
 [`2026-05-30-mit-screen-saver.md`](superpowers/plans/2026-05-30-mit-screen-saver.md)
 (both converged with codex review).
 
+**What DPMS ships:** 8 requests (GetVersion / Capable / GetTimeouts /
+SetTimeouts / Enable / Disable / ForceLevel / Info — opcodes 0–7),
+DPMS power levels On/Standby/Suspend/Off (0–3), per-output
+`set_dpms_power` KMS hook, page-flip gating on `kms_outputs_active`
+so suspended outputs don't get blits, input-driven wake to On,
+idle-cascade evaluation in the poll loop, VT-leave reset + VT-return
+cache restore, and `dpms_capable` snapshotted onto `ServerState` on
+both KMS and ynest paths. Wake/notify hot path is allocation-free.
+Error replies emit real `bad_value` (matching Xorg) rather than
+generic zeros. **Post-landing EINVAL fix chain (2026-05-30,
+`feat/dpms` `0b9221d`/`797e32a`/`bf4f0d8`):** the DPMS path missed
+VT-switching's drain+rearm sequence AND `maybe_composite` had no
+`kms_outputs_active` gate, which produced an atomic-commit EINVAL
+storm that wedged bee/MATE on the wake path. Fix mirrors
+`run_suspend`/`run_resume` drain+rearm around `set_dpms_power`,
+always rearms the cursor on wake (restoring the retry-via-reissue
+path), and gates `maybe_composite` on `kms_outputs_active` so a
+suspended cycle no longer races a queued atomic. 8 verification
+cycles on bee/MATE post-fix, zero EINVAL.
+
 **What MIT-SCREEN-SAVER ships:** 6 requests (QueryVersion/QueryInfo/
 SelectInput/SetAttributes/UnsetAttributes/Suspend), one sequential
 event `ScreenSaverNotify` at first_event=162, per-client subscriber
