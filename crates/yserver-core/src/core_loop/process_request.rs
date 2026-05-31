@@ -11842,13 +11842,35 @@ fn handle_map_window(
     let Some(window) = x11::map_window_id(body) else {
         return Ok(RequestOutcome::Handled);
     };
-    let Some((parent, override_redirect)) = state
+    let Some((parent, override_redirect, current_map_state)) = state
         .resources
         .window(window)
-        .map(|w| (w.parent, w.override_redirect))
+        .map(|w| (w.parent, w.override_redirect, w.map_state))
     else {
         return Ok(RequestOutcome::Handled);
     };
+
+    // Per X11 protocol (Xorg `dix/window.c:2661`): "If the window is
+    // already mapped, this request has no effect." This MUST guard
+    // the MapRequest dispatch below, not just the local mapping —
+    // otherwise (a) the root window, which is permanently
+    // `Viewable` and whose `parent` field points to itself, fans a
+    // phantom MapRequest(parent=root, window=root) to any WM with
+    // SubstructureRedirect on root (mate-screensaver hits this on
+    // activation; marco's panic-response drops its substructure
+    // subscription and breaks compositing of every subsequent
+    // top-level); and (b) brisk-menu's ~50 Hz
+    // `gtk_window_present`/`XMapRaised` loop on its already-viewable
+    // popup re-fans MapNotify → Expose → full-extent damage,
+    // triggering marco's per-MapNotify `COMPOSITE::NameWindowPixmap`
+    // + recomposite (visible as menu flicker on KMS).
+    if current_map_state != MapState::Unmapped {
+        debug!(
+            "client {} #{} MapWindow 0x{:x} (already mapped — no-op)",
+            client_id.0, sequence.0, window.0
+        );
+        return Ok(RequestOutcome::Handled);
+    }
 
     // SubstructureRedirect on the parent: forward MapRequest to the
     // first subscriber that isn't the requester (the WM), and skip
@@ -11879,21 +11901,12 @@ fn handle_map_window(
         return Ok(RequestOutcome::Handled);
     }
 
-    // Per X11 protocol: "If the window is already mapped, this request
-    // has no effect." Without this guard a client that pounds MapWindow
-    // on an already-viewable popup (brisk-menu's GTK3
-    // `gtk_window_present` loop hits this at ~50 Hz) causes a fresh
-    // MapNotify → Expose → full-extent damage cascade every call. Marco
-    // reacts to each MapNotify with a `COMPOSITE::NameWindowPixmap` and
-    // full recomposite, which is visible as menu flicker on KMS.
     let was_unmapped = state.resources.map_window(window);
-    if !was_unmapped {
-        debug!(
-            "client {} #{} MapWindow 0x{:x} (already mapped — no-op)",
-            client_id.0, sequence.0, window.0
-        );
-        return Ok(RequestOutcome::Handled);
-    }
+    debug_assert!(
+        was_unmapped,
+        "current_map_state == Unmapped guard above was checked; \
+         map_window should now transition",
+    );
     let host_xid = state.resources.window(window).and_then(|w| w.host_xid);
     let map_info = state
         .resources
@@ -18872,6 +18885,87 @@ mod tests {
             "MapWindow on an already-mapped window must NOT accumulate \
              additional damage — full-extent damage on every redundant \
              call is what drives the recompositing flicker storm.",
+        );
+    }
+
+    /// Per X11 protocol (Xorg `dix/window.c:2661`): `if (pWin->mapped)
+    /// return Success;` — `MapWindow` on an already-mapped window is a
+    /// no-op BEFORE any MapRequest dispatch. The root window is always
+    /// mapped (initialised `Viewable` at `resources.rs:204`) AND in
+    /// yserver root's `parent` field points to itself
+    /// (`resources.rs:194`), so a client calling `MapWindow(root)`
+    /// pre-fix matched the SubstructureRedirect-on-parent path: the
+    /// requester wasn't the WM, marco had SubstructureRedirect
+    /// (`0x0010_0000`) on root, so yserver dispatched a phantom
+    /// MapRequest event with `parent=root, window=root` to marco.
+    /// Marco's response (seen on hardware via xtrace seq `0x35e5a`
+    /// during a mate-screensaver activation): GrabServer →
+    /// ChangeWindowAttributes(root, event_mask=...) DROPPING
+    /// SubstructureNotify+SubstructureRedirect → UngrabServer. After
+    /// that marco no longer receives MapNotify for new top-levels →
+    /// no `COMPOSITE::NameWindowPixmap` → newly-mapped windows
+    /// (mate-screensaver overlay, dialogs) are invisible while the
+    /// cursor still moves. Match Xorg: hoist the "already mapped"
+    /// short-circuit above the MapRequest emission.
+    #[test]
+    fn map_window_on_root_does_not_emit_phantom_map_request() {
+        use std::io::Read;
+
+        const WM_ID: u32 = 1;
+        const SAVER_ID: u32 = 2;
+
+        let mut state = ServerState::new();
+        let mut wm_peer = install_client(&mut state, WM_ID);
+        let _saver_peer = install_client(&mut state, SAVER_ID);
+        let mut backend = RecordingBackend::new();
+
+        // Marco-like WM: SubstructureRedirect (0x0010_0000) on root.
+        state
+            .clients
+            .get_mut(&WM_ID)
+            .unwrap()
+            .event_masks
+            .insert(ROOT_WINDOW, 0x0010_0000);
+
+        // mate-screensaver-like activation: client 2 calls
+        // `MapWindow(root)`. Per X11 spec this must be a silent
+        // no-op (root is always mapped).
+        let mut body = Vec::with_capacity(4);
+        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        handle_map_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(SAVER_ID),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_map_window root");
+
+        wm_peer.set_nonblocking(true).unwrap();
+        let mut tmp = [0u8; 1024];
+        let mut wm_wire = Vec::new();
+        loop {
+            match wm_peer.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => wm_wire.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        let map_requests = wm_wire
+            .chunks_exact(32)
+            .filter(|chunk| chunk[0] & 0x7f == 20)
+            .count();
+        assert_eq!(
+            map_requests, 0,
+            "MapWindow(root) must NOT generate a phantom MapRequest \
+             event to the WM. Pre-fix yserver dispatched a bogus \
+             MapRequest(parent=root, window=root) because root's parent \
+             field points to itself; marco reacted by dropping its \
+             SubstructureRedirect subscription, which broke compositing \
+             of every subsequent top-level (mate-screensaver overlay \
+             and dialogs went invisible while cursor still moved).",
         );
     }
 
