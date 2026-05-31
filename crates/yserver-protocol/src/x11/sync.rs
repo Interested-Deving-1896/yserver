@@ -455,6 +455,18 @@ mod tests {
             SERVERTIME_COUNTER,
             "first entry counter id"
         );
+        // Probe encoder correctness on SERVERTIME entry (offsets 36-45):
+        // write_i64 encodes as hi(INT32 LE) || lo(CARD32 LE).
+        // For value=4: hi=0 at [36..40], lo=4 at [40..44].
+        let resolution_hi = i32::from_le_bytes([reply[36], reply[37], reply[38], reply[39]]);
+        let resolution_lo = u32::from_le_bytes([reply[40], reply[41], reply[42], reply[43]]);
+        let resolution = (i64::from(resolution_hi) << 32) | i64::from(resolution_lo);
+        assert_eq!(resolution, 4, "SERVERTIME resolution_ms");
+        assert_eq!(
+            u16::from_le_bytes([reply[44], reply[45]]),
+            10,
+            "SERVERTIME name length"
+        );
         // each entry: counter(4) resolution(8) name_len(2) name(padded to 4)
         // SERVERTIME entry: 14 + 10 = 24 bytes, padded to 24.
         // IDLETIME entry starts at byte 32 + 24 = 56.

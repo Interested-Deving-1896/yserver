@@ -2294,16 +2294,15 @@ fn handle_sync_request(
                 x11sync::IDLETIME_COUNTER
                 | x11sync::IDLETIME_DEVICE_VCP
                 | x11sync::IDLETIME_DEVICE_VCK => {
-                    let baseline = state.idletime_baseline(counter);
                     // X11 timestamps are 32-bit ms; saturate at u32::MAX
-                    // (~49 days idle) per X11 spec.
+                    // (~49 days idle) per X11 spec. After saturation the
+                    // value fits in i64 without sign-loss or truncation.
+                    #[allow(clippy::cast_possible_truncation)]
                     let elapsed_ms = std::time::Instant::now()
-                        .duration_since(baseline)
+                        .duration_since(state.idletime_baseline(counter))
                         .as_millis()
-                        .min(u128::from(u32::MAX)) as u64;
-                    #[allow(clippy::cast_possible_wrap)]
-                    let v = elapsed_ms as i64;
-                    v
+                        .min(u128::from(u32::MAX)) as i64;
+                    elapsed_ms
                 }
                 _ => state.sync_counters.get(&counter).map_or(0, |c| c.value),
             };
@@ -2344,13 +2343,7 @@ fn handle_sync_request(
                         | x11sync::IDLETIME_DEVICE_VCP
                         | x11sync::IDLETIME_DEVICE_VCK
                 ) {
-                    let baseline = state.idletime_baseline(counter);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let v = std::time::Instant::now()
-                        .duration_since(baseline)
-                        .as_millis()
-                        .min(u128::from(u32::MAX)) as i64;
-                    v
+                    idletime_current_idle(state, counter)
                 } else {
                     state.sync_counters.get(&counter).map_or(0, |c| c.value)
                 };
@@ -2376,13 +2369,7 @@ fn handle_sync_request(
                         | x11sync::IDLETIME_DEVICE_VCP
                         | x11sync::IDLETIME_DEVICE_VCK
                 ) {
-                    let baseline = state.idletime_baseline(counter);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let v = std::time::Instant::now()
-                        .duration_since(baseline)
-                        .as_millis()
-                        .min(u128::from(u32::MAX)) as i64;
-                    v
+                    idletime_current_idle(state, counter)
                 } else {
                     state.sync_counters.get(&counter).map_or(0, |c| c.value)
                 };
@@ -2589,22 +2576,18 @@ fn apply_alarm_attributes(
         let value = attrs.value.unwrap_or(0);
         let relative = attrs.value_type == Some(x11sync::VALUE_TYPE_RELATIVE);
         alarm.wait_value = if relative {
-            let current = match alarm.counter {
+            let current = if matches!(
+                alarm.counter,
                 x11sync::IDLETIME_COUNTER
-                | x11sync::IDLETIME_DEVICE_VCP
-                | x11sync::IDLETIME_DEVICE_VCK => {
-                    let baseline = state.idletime_baseline(alarm.counter);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let v = std::time::Instant::now()
-                        .duration_since(baseline)
-                        .as_millis()
-                        .min(u128::from(u32::MAX)) as i64;
-                    v
-                }
-                _ => state
+                    | x11sync::IDLETIME_DEVICE_VCP
+                    | x11sync::IDLETIME_DEVICE_VCK
+            ) {
+                idletime_current_idle(state, alarm.counter)
+            } else {
+                state
                     .sync_counters
                     .get(&alarm.counter)
-                    .map_or(0, |c| c.value),
+                    .map_or(0, |c| c.value)
             };
             current.saturating_add(value)
         } else {
@@ -2658,7 +2641,7 @@ pub(crate) fn evaluate_alarms_for_counter(
         let delta = a.delta;
 
         // Per Xorg sync.c:548-555: state → Inactive when
-        // (counter==None) OR (delta==0 AND test_type is Comparison).
+        // delta==0 AND test_type is Comparison.
         // Transitions with delta=0 stay Active — once the edge passes,
         // the alarm sits quiescent waiting for the next crossing.
         // Per Xorg sync.c:589-597: re-arm overflow → state Inactive
@@ -2685,7 +2668,7 @@ pub(crate) fn evaluate_alarms_for_counter(
                         w = next;
                         guard += 1;
                     }
-                    Some(_) => break, // delta=0 inside this branch can't happen, defensive
+                    Some(_) => break, // unreachable: delta != 0 (outer branch) + no overflow ⇒ next != w; defensive
                     None => {
                         overflowed = true;
                         break;
@@ -5402,6 +5385,21 @@ pub(crate) fn emit_screen_saver_notify(
     for cid in dropped {
         state.screensaver.selected_by.remove(&cid);
     }
+}
+
+/// Current idle value for an IDLETIME-family counter, expressed as
+/// milliseconds since `state.idletime_baseline(counter)`. Used by
+/// CREATE_ALARM, CHANGE_ALARM, and apply_alarm_attributes' Relative
+/// branch for resolving counter values that aren't stored in
+/// `state.sync_counters`.
+pub(crate) fn idletime_current_idle(state: &ServerState, counter: u32) -> i64 {
+    let baseline = state.idletime_baseline(counter);
+    #[allow(clippy::cast_possible_truncation)]
+    let v = std::time::Instant::now()
+        .duration_since(baseline)
+        .as_millis()
+        .min(u128::from(u32::MAX)) as i64;
+    v
 }
 
 /// Evaluate Negative-* alarms on IDLETIME-family counters after input
@@ -16080,10 +16078,7 @@ mod tests {
     fn counter_value_body(counter: u32, value: i64) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&counter.to_le_bytes());
-        #[allow(clippy::cast_possible_truncation)]
-        b.extend_from_slice(&((value >> 32) as i32).to_le_bytes());
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        b.extend_from_slice(&(value as u32).to_le_bytes());
+        b.extend_from_slice(&xsync_i64(value));
         b
     }
 
@@ -26507,9 +26502,10 @@ mod tests {
         let mut backend = RecordingBackend::new();
         // Global was idle 60s ago, but the pointer device is fresh.
         state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(60);
-        state
-            .per_device_last_activity
-            .insert(2, std::time::Instant::now() - Duration::from_millis(500));
+        state.per_device_last_activity.insert(
+            2, /* VCP */
+            std::time::Instant::now() - Duration::from_millis(500),
+        );
 
         let header = RequestHeader {
             opcode: 142,
@@ -26541,9 +26537,10 @@ mod tests {
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
         state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(60);
-        state
-            .per_device_last_activity
-            .insert(3, std::time::Instant::now() - Duration::from_millis(200));
+        state.per_device_last_activity.insert(
+            3, /* VCK */
+            std::time::Instant::now() - Duration::from_millis(200),
+        );
 
         let header = RequestHeader {
             opcode: 142,

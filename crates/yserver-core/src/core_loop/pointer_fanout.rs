@@ -57,6 +57,7 @@ pub fn pointer_event_fanout_to_state(
         .duration_since(state.dpms.last_activity)
         .as_millis()
         .min(u128::from(u32::MAX)) as i64;
+    // XI2 master device IDs are always small (2 here); cast u16 → u8 is safe.
     // Per-device prior: fall back to global if no per-device entry yet.
     // Matches `idletime_baseline`'s fallback (server.rs Task 1) — without
     // this, the very first input event for a device whose baseline isn't
@@ -909,6 +910,58 @@ mod tests {
     use crate::server::{ScreenSaverActive, ServerState};
     use yserver_protocol::x11::ClientId;
 
+    use crate::server::ClientState;
+    use std::{
+        collections::{HashMap, HashSet, VecDeque},
+        io::Read,
+        os::unix::net::UnixStream,
+        sync::{Arc, Mutex, atomic::AtomicU16},
+    };
+
+    // Duplicated from process_request.rs::tests. If you change one,
+    // change both. A shared test_fixtures module is the right home
+    // long-term; tracked as a follow-up.
+    fn install_client(state: &mut ServerState, id: u32) -> UnixStream {
+        use crate::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::ClientByteOrder;
+        let (a, b) = UnixStream::pair().unwrap();
+        state.clients.insert(
+            id,
+            ClientState {
+                writer: Arc::new(Mutex::new(a)),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0,
+                resource_id_mask: u32::MAX,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: ROOT_WINDOW,
+                reader_control: None,
+            },
+        );
+        b
+    }
+
+    fn read_all_available(peer: &mut UnixStream) -> Vec<u8> {
+        peer.set_nonblocking(true).expect("set_nonblocking");
+        let mut out = Vec::new();
+        let mut buf = [0u8; 512];
+        loop {
+            match peer.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("read failed: {err}"),
+            }
+        }
+        peer.set_nonblocking(false).expect("unset_nonblocking");
+        out
+    }
+
     fn motion_event() -> HostPointerEvent {
         HostPointerEvent {
             kind: PointerEventKind::MotionNotify,
@@ -1111,6 +1164,67 @@ mod tests {
                 .copied(),
             Some(0),
             "post-wake last_evaluated should be 0"
+        );
+    }
+
+    #[test]
+    fn pointer_event_fires_neg_transition_alarm_on_per_device_idletime_vcp() {
+        use std::time::Duration;
+        use yserver_protocol::x11::sync as x11sync;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(90);
+        state
+            .per_device_last_activity
+            .insert(2, std::time::Instant::now() - Duration::from_secs(90));
+        let alarm_id = 0x5000;
+        state.sync_alarms.insert(
+            alarm_id,
+            crate::server::SyncAlarm {
+                owner: ClientId(1),
+                counter: x11sync::IDLETIME_DEVICE_VCP,
+                wait_value: 60_000,
+                delta: 0,
+                test_type: x11sync::TEST_NEGATIVE_TRANSITION as u8,
+                events: true, // load-bearing
+                state: x11sync::ALARM_STATE_ACTIVE,
+            },
+        );
+        let xid_map = HostXidMap::new();
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            motion_event(),
+            true,
+            false,
+        );
+
+        // PRIMARY: AlarmNotify event type 84.
+        let bytes = read_all_available(&mut peer);
+        // AlarmNotify is a 32-byte sequential event; type byte at offset 0.
+        assert!(
+            bytes.len() >= 32,
+            "expected AlarmNotify event (32B); got {} bytes",
+            bytes.len()
+        );
+        assert_eq!(
+            bytes[0], 84,
+            "AlarmNotify event type (SYNC_FIRST_EVENT + 1)"
+        );
+        assert_eq!(bytes[1], 1, "AlarmNotify kind = AlarmNotify (1)");
+        assert_eq!(
+            state.sync_alarms[&alarm_id].state,
+            x11sync::ALARM_STATE_ACTIVE
+        );
+        assert_eq!(
+            state
+                .idletime_last_evaluated
+                .get(&x11sync::IDLETIME_DEVICE_VCP)
+                .copied(),
+            Some(0)
         );
     }
 }

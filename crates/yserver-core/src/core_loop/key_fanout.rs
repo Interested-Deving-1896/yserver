@@ -51,6 +51,7 @@ pub fn key_event_fanout_to_state(
         .duration_since(state.dpms.last_activity)
         .as_millis()
         .min(u128::from(u32::MAX)) as i64;
+    // XI2 master device IDs are always small (3 here); cast u16 → u8 is safe.
     // Per-device prior: fall back to global if no per-device entry yet.
     // Matches `idletime_baseline`'s fallback (server.rs Task 1) — without
     // this, the very first input event for a device whose baseline isn't
@@ -379,6 +380,9 @@ mod tests {
     };
     use yserver_protocol::x11::ClientByteOrder;
 
+    // Duplicated from process_request.rs::tests. If you change one,
+    // change both. A shared test_fixtures module is the right home
+    // long-term; tracked as a follow-up.
     fn install_client(state: &mut ServerState, id: u32) -> UnixStream {
         use crate::resources::ROOT_WINDOW;
         let (a, b) = UnixStream::pair().unwrap();
@@ -804,11 +808,17 @@ mod tests {
 
         // PRIMARY: AlarmNotify event type 84.
         let bytes = read_all_available(&mut peer);
+        // AlarmNotify is a 32-byte sequential event; type byte at offset 0.
         assert!(
-            bytes.iter().any(|&b| b == 84),
-            "AlarmNotify (type=84) must reach client; got {:?}",
-            bytes
+            bytes.len() >= 32,
+            "expected AlarmNotify event (32B); got {} bytes",
+            bytes.len()
         );
+        assert_eq!(
+            bytes[0], 84,
+            "AlarmNotify event type (SYNC_FIRST_EVENT + 1)"
+        );
+        assert_eq!(bytes[1], 1, "AlarmNotify kind = AlarmNotify (1)");
         assert_eq!(
             state.sync_alarms[&alarm_id].state,
             x11sync::ALARM_STATE_ACTIVE

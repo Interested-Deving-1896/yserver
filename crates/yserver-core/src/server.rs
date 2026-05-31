@@ -411,6 +411,7 @@ pub struct ServerState {
     /// pass. Lets the post-poll evaluator compute `(old, new)`
     /// transitions for `trigger_fires`. Keyed by counter id (one of
     /// `IDLETIME_COUNTER` / `IDLETIME_DEVICE_VCP` / `IDLETIME_DEVICE_VCK`).
+    /// Populated by `evaluate_idletime_alarms_post_poll` (Task 4) and the input-wake handler (Task 5).
     pub idletime_last_evaluated: HashMap<u32, i64>,
     /// XSync `Fence` resources (Phase 4.2.2). Phase 4.2.2 first cut
     /// stores only the triggered bit + owner; the underlying
