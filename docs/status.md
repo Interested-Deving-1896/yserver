@@ -669,7 +669,66 @@ allowed-but-different field is a candidate; cumulative pressure on a
 strictly-parsing client (Chrome's Ozone X11 layer) needs all of them
 matched, not just the ones spec-language calls "MUST."
 
-## Systray applet loop — parked branch `fix/applet` (2026-05-31, 2026-06-01)
+## Systray applet loop — RESOLVED (2026-06-01, branch `clip-by-children`)
+
+**Status: FIXED and HW-verified on silence.** Both symptoms — the
+per-vsync mate-panel notification-area damage storm AND invisible tray
+icons — were a single root cause: **yserver never applied
+`ClipByChildren` to RENDER paint or the damage it emits.** Tray icons
+now render (first time ever) and the loop is gone.
+
+The fix is at the RENDER FillRectangles site
+(`process_request.rs`, opcode 26) and clips BOTH halves to the
+window's effective region (geometry MINUS mapped `InputOutput`
+children), matching Xorg:
+
+- **paint** — `clip_fill_rects_by_children` subtracts mapped child
+  rects from the requested fill rects (`nested::subtract_regions`),
+  re-encodes wire bytes; an empty result skips the whole op (no
+  backend fill, no damage). This is what stops the Clear from wiping
+  the embedded icon's backing → icons stay visible.
+- **damage** — `accumulate_damage_clip_by_children_to_state`.
+
+Shared child-region helper: `mapped_child_clip_rects` in
+`damage_fanout.rs`. Pixmaps and childless windows pass through
+unchanged.
+
+**Measured on silence (`yserver-mate-hw-trace`), yserver before → after:**
+
+| Metric | Before | After | Xorg |
+|---|---|---|---|
+| Total DAMAGE-Notify | 1486 | 146 | (29 to panel) |
+| DAMAGE-Notify → panel applet | 1486 | 21 | 29 |
+| FillRectangles per tray socket | ~485 | 5–8 | <14 |
+| Total FillRectangles | 3114 | 521 | — |
+| Trace lines (session traffic) | 91 983 | 43 294 | — |
+
+Roughly half the session's protocol traffic was this one dead loop;
+killing it also recovers idle CPU and lowers latency (the
+single-threaded core was being woken ~per vsync to service a no-op).
+
+**Open follow-ups (not blocking; the tray is fixed):**
+
+1. The other RENDER paint sites — Composite (~`1592`), CompositeGlyphs
+   (~`1414`/`1488`), Trapezoids/Triangles (~`1764`) — still
+   `accumulate_damage_full_to_state` with no ClipByChildren on paint.
+   Same latent bug class; just not exercised by the tray. Generalize
+   the shared helper across them.
+2. The CopyArea "skip ClipByChildren subtraction for manually-
+   redirected children" workaround at `process_request.rs:~13462` is a
+   tray-specific patch reflecting the same gap — review for
+   consistency now that the proper machinery exists.
+3. Remove the `YSERVER_DAMAGE_BACKTRACE=1` diagnostic in
+   `accumulate_damage_to_state` (its emitter-hunt is complete).
+
+The parked `fix/applet` source-picture-redirect branch (10 commits,
+tip `b76a537`) is a real Xorg-spec asymmetry but was NOT load-bearing
+for either symptom; it stays parked for a future workload that
+surfaces it.
+
+---
+
+### Investigation history (preserved)
 
 Long-standing mate-panel notification-area-applet bug:
 mate `mate-bee.xtrace` baseline (2026-05-31) — applet receives ~61
