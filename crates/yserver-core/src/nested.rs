@@ -87,7 +87,13 @@ const PRESENT_FIRST_ERROR: u8 = 0; // Present defines no errors
 pub(crate) const DPMS_MAJOR_OPCODE: u8 = 134;
 
 pub(crate) const MIT_SCREEN_SAVER_MAJOR_OPCODE: u8 = 150;
-pub(crate) const MIT_SCREEN_SAVER_FIRST_EVENT: u8 = 162;
+// MUST be <= 127: X event codes are 7-bit (2..=127); bit 0x80 is the
+// SendEvent/synthetic flag, so a base first_event with the high bit set is
+// illegal and strict clients (Google Chrome's X11 layer) abort on it. 92 is
+// the free slot after DAMAGE=91, before GLX=95. (Was 162 — an error-range
+// value mistakenly used here; it crashed google-chrome with SIGILL/ud2 right
+// after the QueryExtension batch.)
+pub(crate) const MIT_SCREEN_SAVER_FIRST_EVENT: u8 = 92;
 
 const MIT_SHM_MAJOR_OPCODE: u8 = 130;
 const MIT_SHM_FIRST_EVENT: u8 = 65; // matches Xorg: ShmCompletion=65

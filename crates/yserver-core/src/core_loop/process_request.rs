@@ -29714,10 +29714,10 @@ mod tests {
         assert!(state.screensaver.forced);
 
         let bytes = read_all_available(&mut peer);
-        // Sequential event tag is first_event + 0 = 162.
+        // Sequential event tag is first_event + 0 = 92.
         let idx = bytes
             .iter()
-            .position(|&b| b == 162)
+            .position(|&b| b == 92)
             .expect("ScreenSaverNotify must be present");
         assert_eq!(bytes[idx + 1], x11screensaver::SCREEN_SAVER_ON, "state=On");
         assert_eq!(bytes[idx + 17], 1, "forced byte = 1");
@@ -29753,14 +29753,14 @@ mod tests {
         assert_eq!(state.dpms.last_activity, prior, "coupling must NOT reset");
 
         let bytes = read_all_available(&mut peer);
-        let idx = bytes.iter().position(|&b| b == 162).unwrap();
+        let idx = bytes.iter().position(|&b| b == 92).unwrap();
         assert_eq!(bytes[idx + 1], x11screensaver::SCREEN_SAVER_OFF);
         assert_eq!(bytes[idx + 17], 0, "forced byte = 0");
     }
 
     #[test]
     fn dpms_coupling_emits_screensaver_notify_before_dpms_notify() {
-        // SS notify (sequential event tag 162) must appear at a lower
+        // SS notify (sequential event tag 92) must appear at a lower
         // wire offset than the DPMS XGE notify (GenericEvent tag 35)
         // — matches Xorg ordering in DPMSSet (dpms.c:262-293).
         let mut state = ServerState::new();
@@ -29777,7 +29777,7 @@ mod tests {
         apply_dpms_transition(&mut state, &mut backend, 3);
 
         let bytes = read_all_available(&mut peer);
-        let ss_pos = bytes.iter().position(|&b| b == 162).unwrap();
+        let ss_pos = bytes.iter().position(|&b| b == 92).unwrap();
         let dpms_pos = bytes.iter().position(|&b| b == 35).unwrap();
         assert!(
             ss_pos < dpms_pos,
@@ -29803,7 +29803,7 @@ mod tests {
         );
 
         let bytes = read_all_available(&mut peer);
-        let idx = bytes.iter().position(|&b| b == 162).unwrap();
+        let idx = bytes.iter().position(|&b| b == 92).unwrap();
         assert_eq!(bytes[idx + 1], x11screensaver::SCREEN_SAVER_ON);
         assert_eq!(bytes[idx + 17], 1, "forced=1");
     }
@@ -30349,7 +30349,7 @@ mod tests {
         );
         let bytes2 = read_all_available(&mut peer);
         assert!(
-            !bytes2.iter().any(|&b| b == 162),
+            !bytes2.iter().any(|&b| b == 92),
             "client without NOTIFY_MASK bit must not receive notify"
         );
     }
@@ -30436,7 +30436,7 @@ mod tests {
             "Cycle must NOT deliver to NOTIFY_MASK subscriber"
         );
         let b = read_all_available(&mut peer_b);
-        let idx = b.iter().position(|&x| x == 162).expect("B receives Cycle");
+        let idx = b.iter().position(|&x| x == 92).expect("B receives Cycle");
         assert_eq!(b[idx + 1], x11screensaver::SCREEN_SAVER_CYCLE);
     }
 
