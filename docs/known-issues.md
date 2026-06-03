@@ -549,6 +549,60 @@ from.
          2026-05-22 as a separate correctness win, see
          [feedback_dpi_hardcoded_matters.md].
 
+      **2026-06-04 RESOLVED (HW-verified) — branch
+      `fix/render-trapezoids-src-origin`.** Three stacked fixes landed:
+      (1) honor `xSrc`/`ySrc` in Trapezoids/Triangles source sampling
+      (`e806f6e`); (2) subtract the first trap origin from `xSrc`/`ySrc`
+      like Xorg `fbTrapezoids` (`24ba53b`); and (3) the final piece — for
+      `op=Src`/full-dst trap ops, clear the **whole** `mask_scratch`, not
+      just the bbox. The two-stage GPU trap path reuses a power-of-two-grown
+      `mask_scratch`; a full-dst composite samples the coverage mask across
+      the entire destination (offset by `-bbox`), so texels OUTSIDE the
+      (bbox-only-cleared) region returned **stale coverage from a prior
+      trap-op**. The GTK CSD base shadow is an `op=Src` solid (α=`0x2e2e`=46)
+      rounded-rect; stale margin coverage (~50%) leaked through as
+      `46×0.5 = 23` → a 2px α≈23 line at the tooltip's low-coordinate
+      (left/top) edges. Clearing the full scratch (draw still scissored to
+      the bbox) zeroes the margin; HW-verified the line is gone on both
+      edges and the shadow is otherwise intact. (Historical diagnosis was in
+      `docs/wip-tooltip-shadow-trapezoid-src-origin-2026-06-03.md`, now
+      removed.)
+      The "denser dark band / α too high" *is* a yserver render bug,
+      reproduced as an opaque **black bar below the yellow MATE
+      tooltip** (over the dark desktop). Confirmed yserver-side:
+      the bar is baked into the redirect backing (not the composite),
+      absent under Xorg, while marco's protocol (`NameWindowPixmap`
+      → `CreatePicture format=ARGB32` → `Composite Over, mask=None`)
+      is byte-identical on both servers.
+
+      Mechanism: GTK builds the CSD drop-shadow in an offscreen ARGB
+      pixmap, then `CopyArea`s it to the window. The shadow is a
+      `CreateSolidFill` 50%-black source (`α=0x80` — the source of the
+      observed α≈128/151 plateau) feathered *only* by A8 blur-mask
+      gradients built via `RENDER Trapezoids op=Src
+      src=<1×92 blur-ramp picture, repeat> ySrc=23/25`. yserver's
+      `render_trapezoids`/`render_triangles_op` took `_src_x`/`_src_y`
+      **unused** and the trap composite emit hardcoded
+      `src_x/src_y = 0`, so the ramp was sampled from the wrong row →
+      the gradient collapsed toward solid → near-uniform 50%-black
+      slab instead of a feathered shadow. (This is why "ruled out
+      item 1" held — marco's compose *was* correct; the corruption
+      was upstream, in how yserver rasterized the app's own
+      shadow-mask Trapezoids into the backing.)
+
+      Fix: thread the client `xSrc`/`ySrc` (shifted by the same
+      redirect/`x_off` pixel delta as the primitive coords) through
+      `render_traps_or_tris` → the `RecordedTrap` payload → the emit,
+      applied via `trap_composite_src_origin_axis(base, bbox,
+      needs_full_dst)` (mirrors Xorg `miTrapezoids`: src at
+      `xSrc + dst_px`). Confined to `Drawable` sources (`Solid` is a
+      constant colour, `Gradient` positions via its intrinsic
+      transform). Unit-tested; needs HW smoke (`just yserver-mate-hw`,
+      hover tooltip, dump the backing, confirm the bottom shadow
+      feathers). Once verified, close this entry and the
+      NameWindowPixmap→BadAlloc entry above (both stale — v2 allocates
+      the backing and the bar was never a NameWindowPixmap failure).
+
       Candidates not yet ruled out — where the divergence likely
       lives in yserver:
       - **Visual / PictFormat advertisement shape** — yserver

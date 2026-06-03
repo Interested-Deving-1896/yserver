@@ -2809,8 +2809,10 @@ impl KmsBackendV2 {
                 None,
                 crate::kms::cpu_types::Repeat::Pad,
                 None,
-                0,
-                0,
+                0, // src_origin_x
+                0, // src_origin_y
+                0, // src_pict_format
+                0, // dst_pict_format
             )
             .map(|_| ())
             .map_err(|e| {
@@ -2899,8 +2901,10 @@ impl KmsBackendV2 {
                 None,
                 crate::kms::cpu_types::Repeat::Pad,
                 None,
-                0,
-                0,
+                0, // src_origin_x
+                0, // src_origin_y
+                0, // src_pict_format
+                0, // dst_pict_format
             )
             .map(|_| ())
             .map_err(|e| {
@@ -10756,8 +10760,8 @@ impl Backend for KmsBackendV2 {
         host_src: u32,
         host_dst: u32,
         _host_mask_format: u32,
-        _src_x: i16,
-        _src_y: i16,
+        src_x: i16,
+        src_y: i16,
         traps: &[u8],
         x_off: i16,
         y_off: i16,
@@ -10788,6 +10792,20 @@ impl Backend for KmsBackendV2 {
                 right_p2: (read_i32(32), read_i32(36)),
             });
         }
+        // Xorg's `fbTrapezoids` (fb/fbtrap.c:164-165) subtracts the
+        // first trapezoid's `left.p1` from xSrc/ySrc before forwarding
+        // to pixman. This anchors the src origin at the first trap's
+        // top-left, regardless of where the trap is in dst space. For
+        // GTK CSD shadows (which pass `xSrc=20 ySrc=-25` for the BR
+        // corner with `traps[0].left.p1 = (20, -25)`), the subtraction
+        // resolves to src=(0,0) → no out-of-bounds sampling. Without
+        // it, REPEAT_NONE returns transparent for the OOB rows and the
+        // corner shadow has an 8-row α=0 gap.
+        // Captured pre-shift; the dx/dy fold below moves the live trap
+        // coords into the redirect-target space, but the *adjustment*
+        // is from the client-supplied geometry.
+        let first_trap_left_p1_x = decoded[0].left_p1.0 >> 16;
+        let first_trap_left_p1_y = decoded[0].left_p1.1 >> 16;
         // Resolve src + dst via the same helpers render_composite
         // uses. The trap path doesn't read GC clip — picture clip
         // (from dst) is what scopes the draw (plan §4).
@@ -10856,6 +10874,17 @@ impl Backend for KmsBackendV2 {
         // xRGB32 sources must pin α=ONE on the sample view.
         let src_pict_format = picture_pict_format(&self.core, host_src);
         let dst_pict_format = picture_pict_format(&self.core, host_dst);
+        // Source origin in src-pixel space. Two adjustments stacked:
+        //   - subtract `(x_off + redirect_offset)` to undo the dx/dy
+        //     fold applied to the trap coords above;
+        //   - subtract `traps[0].left.p1.{x,y}` to mirror Xorg's
+        //     `fbTrapezoids` pixman pre-step (fb/fbtrap.c:164-165) —
+        //     anchors src @ (0,0) at the first trap's top-left.
+        // The emit folds in bbox for the non-full-dst branch.
+        let src_origin_x =
+            i32::from(src_x) - (i32::from(x_off) + dst_target.offset.0) - first_trap_left_p1_x;
+        let src_origin_y =
+            i32::from(src_y) - (i32::from(y_off) + dst_target.offset.1) - first_trap_left_p1_y;
         let stats = self.engine.render_traps_or_tris(
             &mut self.store,
             &mut self.platform,
@@ -10872,6 +10901,8 @@ impl Backend for KmsBackendV2 {
             dst_clip.as_deref(),
             src_repeat,
             src_transform,
+            src_origin_x,
+            src_origin_y,
             src_pict_format,
             dst_pict_format,
         );
@@ -10913,8 +10944,8 @@ impl Backend for KmsBackendV2 {
         host_src: u32,
         host_dst: u32,
         _host_mask_format: u32,
-        _src_x: i16,
-        _src_y: i16,
+        src_x: i16,
+        src_y: i16,
         primitives: &[u8],
         x_off: i16,
         y_off: i16,
@@ -11038,6 +11069,17 @@ impl Backend for KmsBackendV2 {
         // the trapezoid path; see that call site for rationale.
         let src_pict_format = picture_pict_format(&self.core, host_src);
         let dst_pict_format = picture_pict_format(&self.core, host_dst);
+        // Source origin shifted by the same delta the triangle coords
+        // were (x_off + redirect offset). Also subtract the first
+        // triangle's `p1.{x,y}` to mirror Xorg's `fbTriangles` pixman
+        // pre-step (fb/fbtrap.c:179-180) — anchors src @ (0,0) at the
+        // first triangle's p1 regardless of where it sits in dst space.
+        let first_tri_p1_x = tris[0].p1.0 >> 16;
+        let first_tri_p1_y = tris[0].p1.1 >> 16;
+        let src_origin_x =
+            i32::from(src_x) - (i32::from(x_off) + dst_target.offset.0) - first_tri_p1_x;
+        let src_origin_y =
+            i32::from(src_y) - (i32::from(y_off) + dst_target.offset.1) - first_tri_p1_y;
         let stats = self.engine.render_traps_or_tris(
             &mut self.store,
             &mut self.platform,
@@ -11054,6 +11096,8 @@ impl Backend for KmsBackendV2 {
             dst_clip.as_deref(),
             src_repeat,
             src_transform,
+            src_origin_x,
+            src_origin_y,
             src_pict_format,
             dst_pict_format,
         );

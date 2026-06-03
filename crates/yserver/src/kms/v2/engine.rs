@@ -6747,6 +6747,13 @@ impl RenderEngine {
         clip_rects: Option<&[Rectangle16]>,
         src_repeat: Repeat,
         src_transform: Option<PictTransform>,
+        // Client xSrc/ySrc source-sampling origin, already shifted by
+        // the caller's dst redirect / x_off delta (xSrc-dx, ySrc-dy).
+        // Recorded into the payload; the emit folds in bbox for the
+        // non-full-dst branch. Fixes RENDER Trapezoids/Triangles
+        // dropping xSrc/ySrc (GTK CSD shadow blur-mask sampling).
+        src_origin_x: i32,
+        src_origin_y: i32,
         // Audit #4 (2026-05-19) — src/dst PictFormat IDs. Mirrors the
         // render_composite wiring: pict_format-aware α swizzle on the
         // sample view, pict_format-aware dst_has_alpha for pipeline +
@@ -7163,6 +7170,8 @@ impl RenderEngine {
             src_repeat: src_repeat_const,
             src_force_opaque,
             user_src_xform,
+            src_origin_x,
+            src_origin_y,
             prim_kind,
             bbox_x,
             bbox_y,
@@ -7432,6 +7441,26 @@ fn sampler_config_for_repeat(r: Repeat) -> SamplerConfig {
         Repeat::Normal => SamplerConfig::Repeat,
         Repeat::Pad => SamplerConfig::Pad,
         Repeat::Reflect => SamplerConfig::Reflect,
+    }
+}
+
+/// Map the pre-resolved shader repeat constant (see
+/// `crate::kms::backend::repeat_to_shader_const`) back to the matching
+/// `SamplerConfig`. The deferred trap/tri emit stores the repeat as the
+/// shader constant in its payload, so the src view's Vk sampler must be
+/// derived from it — mirroring how every non-deferred composite path
+/// derives the sampler from the picture's `Repeat`. Defaults to `Clamp`
+/// (REPEAT_NONE) for any unrecognised value.
+fn sampler_config_for_shader_repeat(c: u32) -> SamplerConfig {
+    use crate::kms::vk::render_pipeline::{REPEAT_NORMAL, REPEAT_PAD, REPEAT_REFLECT};
+    if c == REPEAT_NORMAL as u32 {
+        SamplerConfig::Repeat
+    } else if c == REPEAT_PAD as u32 {
+        SamplerConfig::Pad
+    } else if c == REPEAT_REFLECT as u32 {
+        SamplerConfig::Reflect
+    } else {
+        SamplerConfig::Clamp
     }
 }
 
@@ -8747,6 +8776,19 @@ fn emit_recorded_image_text_into_cb(
 /// `inner.mask_scratch.set_current_layout(SHADER_READ_ONLY_OPTIMAL)` after
 /// the composite-close barrier — without this the NEXT trap op's pre-barrier
 /// reads a stale old_layout (VUID-class bug).
+/// Per-axis source sampling origin for the RENDER `Trapezoids`/
+/// `Triangles` composite stage. `base` is the client `xSrc`/`ySrc`
+/// already shifted by the caller's dst redirect / `x_off` delta. When
+/// the op renders over the full dst (`needs_full_dst`) the coverage
+/// mask carries the bbox offset, so the source aligns directly at
+/// `base`; otherwise the composite renders at the bbox origin and the
+/// source must add it back. Mirrors Xorg `miTrapezoids`, where the
+/// source is sampled at `xSrc + dst_px`.
+#[inline]
+fn trap_composite_src_origin_axis(base: i32, bbox: i32, needs_full_dst: bool) -> i32 {
+    if needs_full_dst { base } else { base + bbox }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_recorded_render_traps_or_tris_into_cb(
     inner: &mut RenderEngineInner,
@@ -8773,7 +8815,14 @@ fn emit_recorded_render_traps_or_tris_into_cb(
             let info =
                 drawable_for_render_view(store, *id).ok_or(RenderError::UnknownDrawable(*id))?;
             // Use the snapshot swizzle_class (append-time stable, per N5).
-            let sampler = sampler_config_for_repeat(crate::kms::cpu_types::Repeat::Pad);
+            // Mirror the non-deferred composite paths: derive the src
+            // view's sampler from the picture's repeat mode (REPEAT_NONE
+            // → clamp-to-border, not the previously hardcoded
+            // clamp-to-edge). The in-shader `apply_repeat` already zeroes
+            // out-of-bounds samples for REPEAT_NONE, so this is mostly
+            // hygiene/consistency — but it removes a latent edge-texel
+            // leak at the exact-`uv==1.0` boundary.
+            let sampler = sampler_config_for_shader_repeat(rt.src_repeat);
             ensure_drawable_view(
                 &inner.vk,
                 &mut inner.drawable_view_cache,
@@ -8924,6 +8973,33 @@ fn emit_recorded_render_traps_or_tris_into_cb(
             height: rt.bbox_h,
         },
     };
+    // For ops that composite the coverage mask over the FULL dst
+    // (`needs_full_dst`: op=Src and friends), the composite below samples
+    // `mask_scratch` at texels OUTSIDE the trap bbox (the mask is offset
+    // by `-bbox` and read across the whole destination). `mask_scratch`
+    // is a persistent, power-of-two-grown, reused image (256² minimum),
+    // so those out-of-bbox texels hold STALE coverage from a prior
+    // trap-op. Clearing only the bbox region leaves that stale data,
+    // which a full-dst composite reads as nonzero coverage → a spurious
+    // alpha ridge (observed as a 2px alpha~=23 line at GTK CSD tooltip
+    // box edges, where `solid_alpha(46) * stale_coverage(~50%) = 23`).
+    // Clear the WHOLE scratch for these ops so out-of-bbox samples read
+    // 0; the draw stays scissored to the bbox (`cmd_set_scissor` below),
+    // so coverage is unchanged — only the previously-stale margin is
+    // now zeroed. Non-full-dst ops render only within the bbox, never
+    // sample the margin, and keep the cheaper bbox-only clear.
+    let needs_full_dst_clear = matches!(
+        rt.op_byte,
+        0 | 1 | 5 | 6 | 7 | 10 | 13 | 16..=27 | 32..=43
+    );
+    let clear_render_area = if needs_full_dst_clear {
+        vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: mask_extent,
+        }
+    } else {
+        bbox_render_area
+    };
     let clear = vk::ClearValue {
         color: vk::ClearColorValue {
             float32: [0.0, 0.0, 0.0, 0.0],
@@ -8936,7 +9012,7 @@ fn emit_recorded_render_traps_or_tris_into_cb(
         .store_op(vk::AttachmentStoreOp::STORE)
         .clear_value(clear)];
     let rendering_info = vk::RenderingInfo::default()
-        .render_area(bbox_render_area)
+        .render_area(clear_render_area)
         .layer_count(1)
         .color_attachments(&color_attachment);
 
@@ -9051,9 +9127,28 @@ fn emit_recorded_render_traps_or_tris_into_cb(
         mask_xform: vk_render::AffineXform::IDENTITY,
     };
 
+    // Source sampling origin. Mirrors Xorg `miTrapezoids`: the src is
+    // sampled at `xSrc + dst_px`. `rt.src_origin_{x,y}` already carries
+    // the redirect/x_off-shifted `xSrc`/`ySrc`. For the `needs_full_dst`
+    // branch the composite renders over the whole dst (the mask carries
+    // the bbox offset via `mask_off`), so the src aligns directly at the
+    // recorded origin; otherwise the composite renders at the bbox
+    // origin and the src must add it back. Confined to `Drawable`
+    // sources — `Solid` is a constant colour (origin irrelevant) and
+    // `Gradient` is positioned by its intrinsic transform — so the only
+    // behaviour change vs the prior hardcoded `0` is the picture-source
+    // case (e.g. GTK CSD shadow blur-mask ramps sampled at `ySrc != 0`).
+    let (src_org_x, src_org_y) = match &rt.src_kind {
+        super::frame_builder::RecordedTrapSrcKind::Drawable { .. } => (
+            trap_composite_src_origin_axis(rt.src_origin_x, rt.bbox_x, needs_full_dst),
+            trap_composite_src_origin_axis(rt.src_origin_y, rt.bbox_y, needs_full_dst),
+        ),
+        _ => (0, 0),
+    };
+
     let rects = [vk_render::CompositeRect {
-        src_x: 0,
-        src_y: 0,
+        src_x: src_org_x,
+        src_y: src_org_y,
         mask_x: mask_off_x,
         mask_y: mask_off_y,
         dst_x: render_dst_x,
@@ -13976,5 +14071,30 @@ mod tests {
              (USER-codex U-R6.F1 LOAD-BEARING invariant)",
         );
         engine.drain_all(&mut platform);
+    }
+
+    /// RENDER `Trapezoids`/`Triangles` must honour the client's
+    /// `xSrc`/`ySrc` source origin when the source is a picture (e.g.
+    /// GTK CSD shadow blur-ramp masks sampled at `ySrc != 0`). The
+    /// trap composite hardcoded `src_x/src_y = 0`, collapsing the ramp
+    /// to a solid slab → opaque black bar below tooltips. This locks
+    /// the origin convention the emit now applies.
+    #[test]
+    fn trap_composite_src_origin_honours_xsrc_ysrc() {
+        // full-dst branch (op=Src builds the A8 mask): the coverage
+        // mask carries the bbox offset, so the source aligns directly
+        // at the shifted client origin (ySrc=25 in the tooltip trace).
+        assert_eq!(trap_composite_src_origin_axis(25, 18, true), 25);
+        assert_eq!(trap_composite_src_origin_axis(0, 18, true), 0);
+        // non-full-dst branch: composite renders at the bbox origin, so
+        // the source adds it back (Xorg miTrapezoids: src at xSrc+dst).
+        assert_eq!(trap_composite_src_origin_axis(25, 18, false), 43);
+        // shifted-negative base (redirect/x_off pushed the origin left)
+        // composes linearly with the bbox add.
+        assert_eq!(trap_composite_src_origin_axis(-4, 10, false), 6);
+        // The pre-fix behaviour (origin always 0) is now only correct
+        // for a zero client origin on the full-dst path — proving the
+        // hardcoded 0 was wrong for every nonzero xSrc/ySrc.
+        assert_ne!(trap_composite_src_origin_axis(25, 18, true), 0);
     }
 }

@@ -711,6 +711,17 @@ pub(crate) struct RecordedRenderTrapsOrTris {
     pub(crate) src_repeat: u32, // pre-resolved shader constant.
     pub(crate) src_force_opaque: bool,
     pub(crate) user_src_xform: crate::kms::vk::ops::render::AffineXform,
+    /// Source-picture sampling origin in src-pixel space, already
+    /// shifted by the dst redirect / `x_off` delta (i.e. `xSrc - dx`,
+    /// `ySrc - dy`). The composite emit adds `bbox_x`/`bbox_y` for the
+    /// non-`needs_full_dst` branch. Only consulted for `Drawable`
+    /// sources — `Solid` is a constant colour and `Gradient` is
+    /// positioned by its intrinsic transform. Honouring the client's
+    /// `xSrc`/`ySrc` here is what lets GTK CSD drop-shadows (a black
+    /// solid masked by a blur-ramp picture sampled at `ySrc != 0`)
+    /// render with the correct feather instead of a solid slab.
+    pub(crate) src_origin_x: i32,
+    pub(crate) src_origin_y: i32,
     // Trap raster phase inputs.
     pub(crate) prim_kind: super::engine::TrapPrimKind,
     pub(crate) bbox_x: i32,
@@ -1245,6 +1256,8 @@ mod op_tests {
             src_repeat: 0,
             src_force_opaque: false,
             user_src_xform: crate::kms::vk::ops::render::AffineXform::IDENTITY,
+            src_origin_x: 0,
+            src_origin_y: 0,
             prim_kind: crate::kms::v2::engine::TrapPrimKind::Trapezoid,
             bbox_x: 0,
             bbox_y: 0,
