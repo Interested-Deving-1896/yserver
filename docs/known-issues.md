@@ -1105,6 +1105,35 @@ that the host hides for us.
       to probe each font's `FcCharSet` in `build_font_catalog` and
       emit jisx*/gb2312*/ksc*/big5 entries when a real CJK font is
       installed. Defer until a CJK rendering client matters.
+- [ ] **Chromium/ANGLE GL init fails: "failed to create drawable" /
+      "Could not create the initialization pbuffer" (2026-06-03,
+      silence, Mesa libgallium-26.1.1).** Chrome's GPU process can't
+      initialize GL on yserver; it worked 2026-05-29 (status.md dogfood),
+      broke after a rolling-Arch Mesa+chromium update — **not a yserver
+      regression** (see memory `project_chromium_glx_pbuffer_gap`). Two
+      GLX gaps were found and FIXED on branch `fix/glx-pbuffer-attributes`
+      (`225037a` server-string extension list + `082a5b5`
+      GetDrawableAttributes geometry / pbuffer parse), both verified
+      byte-for-byte against an Xorg xtrace of the same launch. Those advance Chrome past the GLX-attribute stage but it
+      **still fails further in**, now client-side in Mesa's DRI3 drawable
+      creation. Boundary established with the Xorg-vs-yserver diff +
+      `tools/chromium-yserver-debug.sh`: yserver is correct at *every*
+      observable point — GLX extensions/attribs match Xorg, DRI3 version
+      1.2 matches, DRI3::Open hands out the right render node (radeonsi
+      RX580, `pci id 1002:67df`), the 1×1 init buffer imports with no
+      error, and all DRI3 opcodes are implemented. Mesa prints
+      `Using DRI3 for screen 0` then `failed to create drawable` with
+      **no further server round-trip**, and Xorg's Mesa does the
+      identical sequence successfully. Prime suspect: yserver
+      **synthesizes** GLX FBConfigs (`synthesise_glx_fb_configs`) rather
+      than mirroring radeonsi's real `__DRIconfig`s, so a config Mesa-26
+      picks may not map to a driver config at `createNewDrawable`. Next
+      step needs Mesa-level debugging (debug Mesa build, or
+      `strace -f -e ioctl,openat` on the GPU-process render-node fd) — X
+      protocol analysis is exhausted. Low priority if Chrome runs via
+      SwiftShader fallback; revisit if HW GL in Chrome becomes
+      load-bearing. Repro: `tools/chromium-yserver-debug.sh` from a
+      terminal on the yserver session.
 ## Core loop fairness
 
 - [~] **Listener accept starves under high-volume per-client request
