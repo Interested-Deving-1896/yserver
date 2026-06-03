@@ -7630,13 +7630,41 @@ fn drawable_attributes_for(state: &ServerState, xid: u32) -> Vec<(u32, u32)> {
     const GLX_Y_INVERTED_EXT: u32 = 0x20D4;
     let drawable = state.glx_drawables.get(&xid);
     let fbconfig = drawable.map_or(0, |d| d.fbconfig);
-    let mut attribs: Vec<(u32, u32)> = Vec::with_capacity(8);
+    // Resolve drawable geometry. For a pbuffer the size lives in the
+    // GlxDrawable record (from CreatePbuffer); otherwise the XID is a
+    // naked X window/pixmap used directly as a GLX drawable (e.g. ANGLE's
+    // 1×1 init window), so read its real geometry from the resource store.
+    // Mesa's loader_dri3 reads GLX_WIDTH/GLX_HEIGHT here to size the buffer;
+    // without them it gets 0×0 and fails with "failed to create drawable".
+    // Xorg reports the same from pDraw->width/height (glxcmds.c).
+    let is_pbuffer = matches!(drawable, Some(d) if d.width != 0 || d.height != 0);
+    let (width, height) = match drawable {
+        Some(d) if is_pbuffer => (d.width, d.height),
+        _ => state
+            .resources
+            .window(ResourceId(xid))
+            .map(|w| (u32::from(w.width), u32::from(w.height)))
+            .or_else(|| {
+                state
+                    .resources
+                    .pixmap(ResourceId(xid))
+                    .map(|p| (u32::from(p.width), u32::from(p.height)))
+            })
+            .unwrap_or((0, 0)),
+    };
+    let mut attribs: Vec<(u32, u32)> = Vec::with_capacity(10);
     attribs.push((g::GLX_FBCONFIG_ID, fbconfig));
     attribs.push((GLX_TEXTURE_TARGET_EXT, GLX_TEXTURE_2D_EXT));
     attribs.push((GLX_Y_INVERTED_EXT, 0));
     // GLX_RENDER_TYPE — direct-render clients tag this off the
     // FBConfig they chose; report RGBA for our synthesized configs.
     attribs.push((g::GLX_RENDER_TYPE, g::GLX_RGBA_BIT));
+    attribs.push((g::GLX_WIDTH, width));
+    attribs.push((g::GLX_HEIGHT, height));
+    attribs.push((g::GLX_SCREEN, 0));
+    if is_pbuffer {
+        attribs.push((g::GLX_PRESERVED_CONTENTS, 1));
+    }
     if let Some(d) = drawable {
         // Layer in any client-supplied overrides last so they win.
         for (id, value) in &d.attributes {
@@ -7999,7 +8027,7 @@ fn handle_glx_request(
                 if minor == x11glx::WAIT_GL { "GL" } else { "X" }
             );
         }
-        x11glx::CREATE_WINDOW | x11glx::CREATE_PIXMAP | x11glx::CREATE_PBUFFER => {
+        x11glx::CREATE_WINDOW | x11glx::CREATE_PIXMAP => {
             let parsed = x11glx::parse_create_glx_window(body);
             if let Some(req) = parsed {
                 state.glx_drawables.insert(
@@ -8008,6 +8036,8 @@ fn handle_glx_request(
                         owner: client_id,
                         x_drawable: req.x_window,
                         fbconfig: req.fbconfig,
+                        width: 0,
+                        height: 0,
                         attributes: Vec::new(),
                     },
                 );
@@ -8019,6 +8049,37 @@ fn handle_glx_request(
             } else {
                 debug!(
                     "client {} #{} GLX::CreateDrawable minor={minor} (parse failed)",
+                    client_id.0, sequence.0
+                );
+            }
+        }
+        x11glx::CREATE_PBUFFER => {
+            // Pbuffers have NO parent X drawable and carry their size in
+            // the request attribs — parse them with the dedicated parser
+            // (parse_create_glx_window would mis-read the layout). The
+            // stored width/height are reported back as GLX_WIDTH/GLX_HEIGHT
+            // from GetDrawableAttributes so Mesa can size the buffer; key
+            // the record by the pbuffer XID itself (it is its own drawable).
+            if let Some(req) = x11glx::parse_create_pbuffer(body) {
+                state.glx_drawables.insert(
+                    req.pbuffer,
+                    crate::server::GlxDrawable {
+                        owner: client_id,
+                        x_drawable: req.pbuffer,
+                        fbconfig: req.fbconfig,
+                        width: req.width,
+                        height: req.height,
+                        attributes: Vec::new(),
+                    },
+                );
+                debug!(
+                    "client {} #{} GLX::CreatePbuffer pbuffer=0x{:x} \
+                     fbconfig=0x{:x} {}x{}",
+                    client_id.0, sequence.0, req.pbuffer, req.fbconfig, req.width, req.height
+                );
+            } else {
+                debug!(
+                    "client {} #{} GLX::CreatePbuffer (parse failed)",
                     client_id.0, sequence.0
                 );
             }

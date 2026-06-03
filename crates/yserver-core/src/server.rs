@@ -575,6 +575,13 @@ pub struct GlxDrawable {
     pub owner: ClientId,
     pub x_drawable: u32,
     pub fbconfig: u32,
+    /// Drawable size. For pbuffers this is the `GLX_PBUFFER_WIDTH`/`HEIGHT`
+    /// from `CreatePbuffer`, reported back via `GetDrawableAttributes` as
+    /// `GLX_WIDTH`/`GLX_HEIGHT` so Mesa can size the buffer. 0 for
+    /// window/pixmap drawables (Mesa sizes those from the X drawable /
+    /// `Present::ConfigureNotify`).
+    pub width: u32,
+    pub height: u32,
     pub attributes: Vec<(u32, u32)>,
 }
 

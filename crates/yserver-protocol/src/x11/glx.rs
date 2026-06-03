@@ -226,10 +226,22 @@ pub const GLX_X_VISUAL_TYPE: u32 = 0x22;
 pub const GLX_TRANSPARENT_TYPE: u32 = 0x23;
 
 pub const GLX_VISUAL_ID: u32 = 0x800B;
+pub const GLX_SCREEN: u32 = 0x800C;
 pub const GLX_DRAWABLE_TYPE: u32 = 0x8010;
 pub const GLX_RENDER_TYPE: u32 = 0x8011;
 pub const GLX_X_RENDERABLE: u32 = 0x8012;
 pub const GLX_FBCONFIG_ID: u32 = 0x8013;
+
+// Drawable geometry / pbuffer tokens (glxtokens.h, GLX 1.3). `GLX_WIDTH`/
+// `GLX_HEIGHT` are what `GetDrawableAttributes` reports (Xorg glxcmds.c
+// `ATTRIB(GLX_WIDTH, pDraw->width)`); `GLX_PBUFFER_WIDTH`/`HEIGHT` are the
+// *request* attribs `CreatePbuffer` carries the requested size in.
+pub const GLX_PRESERVED_CONTENTS: u32 = 0x801B;
+pub const GLX_LARGEST_PBUFFER: u32 = 0x801C;
+pub const GLX_WIDTH: u32 = 0x801D;
+pub const GLX_HEIGHT: u32 = 0x801E;
+pub const GLX_PBUFFER_HEIGHT: u32 = 0x8040;
+pub const GLX_PBUFFER_WIDTH: u32 = 0x8041;
 
 pub const GLX_SAMPLE_BUFFERS: u32 = 100_000;
 pub const GLX_SAMPLES: u32 = 100_001;
@@ -483,6 +495,51 @@ pub fn parse_create_glx_window(body: &[u8]) -> Option<CreateGlxWindowRequest> {
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreatePbufferRequest {
+    pub screen: u32,
+    pub fbconfig: u32,
+    pub pbuffer: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Parse a `CreatePbuffer` (minor 27) request body. Layout differs from
+/// `CreateGLXWindow`: `screen, fbconfig, pbuffer_id, num_attribs` followed
+/// by `num_attribs` (attrib, value) `u32` pairs. The pbuffer has **no**
+/// parent X drawable; its requested size lives in the `GLX_PBUFFER_WIDTH`/
+/// `GLX_PBUFFER_HEIGHT` attribs. Mirrors Xorg `__glXDisp_CreatePbuffer`.
+#[must_use]
+pub fn parse_create_pbuffer(body: &[u8]) -> Option<CreatePbufferRequest> {
+    if body.len() < 16 {
+        return None;
+    }
+    let num_attribs = read_u32_le(&body[12..]) as usize;
+    let mut width = 0;
+    let mut height = 0;
+    let mut p = 16;
+    for _ in 0..num_attribs {
+        if p + 8 > body.len() {
+            break;
+        }
+        let id = read_u32_le(&body[p..]);
+        let value = read_u32_le(&body[p + 4..]);
+        match id {
+            GLX_PBUFFER_WIDTH => width = value,
+            GLX_PBUFFER_HEIGHT => height = value,
+            _ => {}
+        }
+        p += 8;
+    }
+    Some(CreatePbufferRequest {
+        screen: read_u32_le(body),
+        fbconfig: read_u32_le(&body[4..]),
+        pbuffer: read_u32_le(&body[8..]),
+        width,
+        height,
+    })
+}
+
 /// `CreateGLXWindow` request fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CreateGlxWindowRequest {
@@ -541,6 +598,31 @@ mod tests {
         // BadCurrentDrawable.
         assert_eq!(ERROR_GLX_BAD_RENDER_REQUEST, 6);
         assert_eq!(ERROR_GLX_UNSUPPORTED_PRIVATE_REQUEST, 8);
+    }
+
+    #[test]
+    fn parse_create_pbuffer_extracts_size_from_attribs() {
+        // screen=0, fbconfig=0x104, pbuffer=0x3600001, num_attribs=2,
+        // then (GLX_PBUFFER_WIDTH, 16)(GLX_PBUFFER_HEIGHT, 32) — the wire
+        // layout Mesa sends (cf. trace `glXCreatePbuffer ... num_attribs=2`).
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes()); // screen
+        body.extend_from_slice(&0x104u32.to_le_bytes()); // fbconfig
+        body.extend_from_slice(&0x0360_0001u32.to_le_bytes()); // pbuffer
+        body.extend_from_slice(&2u32.to_le_bytes()); // num_attribs
+        body.extend_from_slice(&GLX_PBUFFER_WIDTH.to_le_bytes());
+        body.extend_from_slice(&16u32.to_le_bytes());
+        body.extend_from_slice(&GLX_PBUFFER_HEIGHT.to_le_bytes());
+        body.extend_from_slice(&32u32.to_le_bytes());
+        let req = parse_create_pbuffer(&body).expect("parse");
+        assert_eq!(req.fbconfig, 0x104);
+        assert_eq!(req.pbuffer, 0x0360_0001);
+        assert_eq!(req.width, 16);
+        assert_eq!(req.height, 32);
+        // The CreateGLXWindow parser would mis-read this: it would treat
+        // the pbuffer id as x_window and num_attribs as the glx_window id.
+        let wrong = parse_create_glx_window(&body).expect("parse");
+        assert_ne!(wrong.glx_window, req.pbuffer);
     }
 
     #[test]
