@@ -846,7 +846,8 @@ xts-yserver-hw scenario="Xproto" timeout="1200":
         target/release/yserver "$display" > yserver-hw-xts.log 2>&1 &\
         yserver_pid=$!;\
         for i in $(seq 30); do [ -S /tmp/.X11-unix/X$display ] && break; sleep 1; done;\
-        env DISPLAY=":$display" xterm -e "tools/xts-run.sh :$display {{scenario}} {{timeout}}";\
+        env DISPLAY=":$display" xset s off -dpms; \
+        env DISPLAY=":$display" xterm -geometry 100x80+300+0 -e "tools/xts-run.sh :$display {{scenario}} {{timeout}}";\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null'
 
