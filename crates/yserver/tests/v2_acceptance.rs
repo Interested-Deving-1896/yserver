@@ -3596,9 +3596,6 @@ fn v2_frame_builder_composite_glyphs_one_submit() {
     b.engine_flush_submit_group_for_tests()
         .expect("setup drain");
 
-    // Flip the FrameBuilder gate ON for the duration of this test.
-    b.set_frame_builder_enabled_for_tests(true);
-
     // Build a small dst pixmap + SolidFill source + glyphset with one
     // 4×4 A8 glyph, mirroring the structure used by
     // `v2_composite_glyphs_clip_intersects_picture`.
@@ -3761,7 +3758,6 @@ fn acquire_descriptor_uses_frame_generation_when_open() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
 
     // (1) Seed a known baseline so the assertions below are
     //     deterministic and don't depend on test ordering.
@@ -3844,8 +3840,6 @@ fn v2_frame_builder_render_composite_via_fb_opens_frame() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
-    be.set_frame_builder_render_composite_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(64, 64)
@@ -3855,12 +3849,9 @@ fn v2_frame_builder_render_composite_via_fb_opens_frame() {
     // before opening the frame. No flush, no asset init, no open.
     let result = be.render_composite_empty_for_tests(dst);
 
-    // Reset the process-level sub-gate IMMEDIATELY so neighbouring
-    // tests in the same cargo-test binary are not routed through the
     // (still partially-stubbed for non-empty rects) frame-builder
     // composite path. Done before assertions so any later panic
     // still leaves the global in a clean state.
-    be.set_frame_builder_render_composite_enabled_for_tests(false);
 
     result.expect("render_composite_empty_for_tests");
     assert!(
@@ -3892,8 +3883,6 @@ fn v2_frame_builder_render_composite_via_fb_second_op_dst_old_layout_is_shader_r
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
-    be.set_frame_builder_render_composite_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(64, 64)
@@ -3909,11 +3898,6 @@ fn v2_frame_builder_render_composite_via_fb_second_op_dst_old_layout_is_shader_r
     // BEFORE flipping the sub-gate back, because the peek walks the
     // current open frame.
     let layouts = be.frame_builder_peek_render_composite_dst_old_layouts_for_tests();
-
-    // Reset the process-level sub-gate IMMEDIATELY so neighbouring
-    // tests in the same cargo-test binary are not routed through the
-    // frame-builder composite path.
-    be.set_frame_builder_render_composite_enabled_for_tests(false);
 
     r1.expect("first render_composite_for_tests");
     r2.expect("second render_composite_for_tests");
@@ -3969,8 +3953,6 @@ fn v2_frame_builder_render_composite_collapses_two_in_one_frame() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
-    be.set_frame_builder_render_composite_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(128, 128)
@@ -3994,11 +3976,6 @@ fn v2_frame_builder_render_composite_collapses_two_in_one_frame() {
     // end + submit the CB, drain pending_group_ops → submitted, then
     // call flush_submit_group → vkQueueSubmit2 exactly once.
     let close_result = be.engine_close_open_frame_for_timeout_for_tests();
-
-    // Reset the process-level sub-gate IMMEDIATELY so neighbouring tests
-    // in the same cargo-test binary are not routed through the frame-
-    // builder composite path.
-    be.set_frame_builder_render_composite_enabled_for_tests(false);
 
     r1.expect("first render_composite_for_tests");
     r2.expect("second render_composite_for_tests");
@@ -4050,8 +4027,6 @@ fn v2_frame_builder_mixed_render_and_glyphs_one_submit() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
-    be.set_frame_builder_render_composite_enabled_for_tests(true);
 
     // Build a real pixmap + dst picture so the wire-level
     // `render_composite_glyphs` resolves dst through the picture map
@@ -4133,10 +4108,6 @@ fn v2_frame_builder_mixed_render_and_glyphs_one_submit() {
     // Force frame close via the Timeout helper (unconditional close).
     let close_result = be.engine_close_open_frame_for_timeout_for_tests();
 
-    // Reset the process-level sub-gate IMMEDIATELY so a later panic
-    // doesn't contaminate neighbouring tests (Task 11 pattern).
-    be.set_frame_builder_render_composite_enabled_for_tests(false);
-
     r1.expect("first render_composite_for_tests");
     r2.expect("second render_composite_for_tests");
     r3.expect("third render_composite_for_tests");
@@ -4181,8 +4152,6 @@ fn v2_frame_builder_render_fill_rectangles_via_frame_builder() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
-    be.set_frame_builder_render_composite_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(64, 64)
@@ -4255,9 +4224,6 @@ fn v2_frame_builder_render_fill_rectangles_via_frame_builder() {
 
     let close_result = be.engine_close_open_frame_for_timeout_for_tests();
 
-    // Reset the sub-gate BEFORE assertions (Task 11 pattern).
-    be.set_frame_builder_render_composite_enabled_for_tests(false);
-
     r1.expect("first render_fill_rectangles_for_tests");
     r2.expect("second render_fill_rectangles_for_tests");
     close_result.expect("engine_close_open_frame_for_timeout_for_tests");
@@ -4300,8 +4266,6 @@ fn v2_frame_builder_render_composite_renderer_failed_on_submit_failure() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
-    be.set_frame_builder_render_composite_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(64, 64)
@@ -4317,9 +4281,6 @@ fn v2_frame_builder_render_composite_renderer_failed_on_submit_failure() {
 
     let r = be.render_composite_for_tests(dst, [1.0, 0.0, 0.0, 1.0], 64, 64);
     let close_result = be.engine_close_open_frame_for_timeout_for_tests();
-
-    // Reset the sub-gate BEFORE assertions (Task 11 pattern).
-    be.set_frame_builder_render_composite_enabled_for_tests(false);
 
     // The render_composite itself records into the frame builder
     // without submitting; it should succeed (no error visible until
@@ -4372,8 +4333,6 @@ fn b3_close_path_scratch_walk_yields_empty_for_no_copy_area_frames() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
-    be.set_frame_builder_render_composite_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(64, 64)
@@ -4395,11 +4354,6 @@ fn b3_close_path_scratch_walk_yields_empty_for_no_copy_area_frames() {
     //   2. push a SubmittedOp with scratch = that local vec.
     //   3. flush_submit_group -> vkQueueSubmit2 once.
     let close_result = be.engine_close_open_frame_for_timeout_for_tests();
-
-    // Reset the sub-gate IMMEDIATELY (Task 11 pattern) so neighbouring tests
-    // in the same cargo-test binary are not routed through the frame-builder
-    // composite path.
-    be.set_frame_builder_render_composite_enabled_for_tests(false);
 
     r.expect("render_composite_for_tests");
     close_result.expect("engine_close_open_frame_for_timeout_for_tests");
@@ -4447,7 +4401,6 @@ fn v2_frame_builder_copy_area_collapses_two_in_one_frame() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
 
     let src = be
         .allocate_test_pixmap_bgra(64, 64)
@@ -4531,7 +4484,6 @@ fn v2_frame_builder_cow_copy_area_collapses_two_in_one_frame() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
 
     // Allocate the COW drawable (get_overlay_window registers it at the
     // well-known COMPOSITE_OVERLAY_WINDOW xid; backend wires cow_id to it).
@@ -4602,7 +4554,6 @@ fn v2_frame_builder_cow_copy_area_delivers_present_completion() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
 
     // Allocate the COW drawable.
     be.get_overlay_window(None).expect("get_overlay_window");
@@ -4688,7 +4639,6 @@ fn v2_frame_builder_put_image_collapses_two_in_one_frame() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(64, 64)
@@ -4779,7 +4729,6 @@ fn v2_frame_builder_fill_rect_batch_collapses_two_in_one_frame() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(128, 128)
@@ -4862,7 +4811,6 @@ fn v2_frame_builder_logic_fill_collapses_two_in_one_frame() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(64, 64)
@@ -4957,7 +4905,6 @@ fn v2_frame_builder_image_text_collapses_two_in_one_frame() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(64, 64)
@@ -5024,7 +4971,6 @@ fn v2_frame_builder_image_text_close_failure_rolls_back_atlas() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(64, 64)
@@ -5083,7 +5029,6 @@ fn v2_frame_builder_image_text_non_bgra8_target_drops_run() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
 
     // Allocate an R8_UNORM (depth-8) pixmap — text pipeline requires
     // B8G8R8A8_UNORM; this triggers the N7 format gate.
@@ -5142,7 +5087,6 @@ fn v2_frame_builder_image_text_delivers_present_completion() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(64, 64)
@@ -5204,7 +5148,6 @@ fn v2_frame_builder_render_traps_or_tris_collapses_two_in_one_frame() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(128, 128)
@@ -5270,7 +5213,6 @@ fn v2_frame_builder_render_traps_or_tris_cross_frame_mask_grow() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(512, 512)
@@ -5339,7 +5281,6 @@ fn v2_frame_builder_render_traps_or_tris_solid_source_replays_color() {
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(64, 64)
@@ -5391,7 +5332,6 @@ fn v2_frame_builder_render_traps_or_tris_close_frame_does_not_panic_on_frame_gen
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(64, 64)
@@ -5451,7 +5391,6 @@ fn v2_frame_builder_render_traps_or_tris_gradient_picture_freed_mid_frame_still_
             return;
         }
     };
-    be.set_frame_builder_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(64, 64)
@@ -5544,7 +5483,6 @@ fn v2_frame_builder_render_traps_or_tris_after_prior_dst_paint_uses_recorded_old
         be.engine_close_open_frame_for_timeout_for_tests()
             .expect("force-close init_root_storage frame");
     }
-    be.set_frame_builder_enabled_for_tests(true);
 
     let dst = be
         .allocate_test_pixmap_bgra(64, 64)

@@ -1984,25 +1984,6 @@ impl KmsBackendV2 {
         self.engine.most_recent_submitted_op_scratch_len_for_tests()
     }
 
-    /// Phase B.1 Task 15: flip the engine's `frame_builder` gate at
-    /// runtime. Production reads `YSERVER_FRAME_BUILDER` env var at
-    /// engine construction; tests flip via this wrapper.
-    pub fn set_frame_builder_enabled_for_tests(&mut self, enabled: bool) {
-        self.engine.set_frame_builder_enabled(enabled);
-    }
-
-    /// Phase B.2 Task 5: flip the process-level
-    /// `YSERVER_FRAME_BUILDER_RENDER_COMPOSITE` sub-gate at runtime.
-    /// Independent of the B.1 main gate above. Production reads the
-    /// env var on first access; tests flip via this wrapper.
-    ///
-    /// Task 9 widened visibility from `pub(crate) #[cfg(test)]` to
-    /// `pub` (no cfg) so the `v2_acceptance` integration test crate
-    /// can flip the gate for the render-composite frame-builder path.
-    pub fn set_frame_builder_render_composite_enabled_for_tests(&self, on: bool) {
-        super::engine::set_frame_builder_render_composite_enabled_for_tests(on);
-    }
-
     /// Phase B.2 Task 9: allocate a fresh BGRA8 pixmap via the
     /// engine's `create_pixmap`. Returns the host xid the test code
     /// uses as an opaque drawable handle; the integration crate
@@ -17792,8 +17773,6 @@ mod tests {
                 return;
             }
         };
-        be.set_frame_builder_enabled_for_tests(true);
-        be.set_frame_builder_render_composite_enabled_for_tests(true);
 
         let dst = be
             .allocate_test_pixmap_bgra(64, 64)
@@ -17817,7 +17796,6 @@ mod tests {
         // Reset the process-level sub-gate IMMEDIATELY so neighbouring
         // tests in the same cargo-test binary are not routed through
         // the frame-builder composite path.
-        be.set_frame_builder_render_composite_enabled_for_tests(false);
 
         r1.expect("first render_composite_for_tests");
         r2.expect("second render_composite_for_tests");
