@@ -192,7 +192,8 @@ pub fn pointer_event_fanout_to_state(
 
     // Step 2 — active-grab redirection (core events only).
     if handle_grabs
-        && let Some((grab_window, grab_client, gx, gy, owner_events)) = active_grab_target(state)
+        && let Some((grab_window, grab_client, gx, gy, owner_events, _via_xi2)) =
+            active_grab_target(state)
     {
         // With `owner_events=true`, pointer events on windows owned
         // by the grab client are reported normally (to the deepest
@@ -483,7 +484,8 @@ pub fn pointer_event_fanout_to_state(
             event.kind,
             PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
         )
-        && let Some((grab_window, grab_client, gx, gy, owner_events)) = active_grab_target(state)
+        && let Some((grab_window, grab_client, gx, gy, owner_events, via_xi2)) =
+            active_grab_target(state)
     {
         // Same ownership-aware natural-delivery test as the Step-2
         // core path: `owner_events=true` keeps motion on whichever
@@ -495,11 +497,22 @@ pub fn pointer_event_fanout_to_state(
             || state.resources.is_descendant_of(target, grab_window)
             || state.resources.window_owner(target) == Some(grab_client);
         if !owner_events || !target_qualifies_for_natural {
+            // The grab is exclusive either way; whether the OWNER gets
+            // an XI2 copy depends on the protocol the grab was
+            // established with. A core GrabPointer owner receives core
+            // events only (Step-2 above) — pushing it here sent XI2
+            // XGE events to plain-Xlib clients, and libXi's wire
+            // handler NULL-derefs when the client linked libXi without
+            // ever calling XIQueryVersion (xts5 Xlib11/ButtonPress
+            // TP10 crashed in exactly that state, poisoning the
+            // display mutex and hanging the rest of the TCM).
             xi2_targets.clear();
-            xi2_targets.push(grab_client);
-            nested_id = grab_window;
-            event_x = clamp_grab_coord(event.root_x, gx);
-            event_y = clamp_grab_coord(event.root_y, gy);
+            if via_xi2 {
+                xi2_targets.push(grab_client);
+                nested_id = grab_window;
+                event_x = clamp_grab_coord(event.root_x, gx);
+                event_y = clamp_grab_coord(event.root_y, gy);
+            }
         }
     }
 
@@ -698,30 +711,37 @@ fn translate_host_event(
 
 fn active_grab_target(
     state: &ServerState,
-) -> Option<(yserver_protocol::x11::ResourceId, ClientId, i32, i32, bool)> {
+) -> Option<(
+    yserver_protocol::x11::ResourceId,
+    ClientId,
+    i32,
+    i32,
+    bool,
+    bool,
+)> {
     let (client_id, grab_window) = state.pointer_grab?;
     let target = client_target_id(state, client_id)?;
     let (gx, gy) = state.resources.window_absolute_position(grab_window);
-    // `owner_events` from the active grab record. Passive button-grabs
-    // (activated via try_match_passive_grab) do not populate
-    // `active_pointer_grab`, so look up the matching passive grab and
-    // preserve its `owner_events` flag; otherwise default to false
-    // (X11 implicit grab semantics — events report against the grab
-    // window).
-    let owner_events = if state.pointer_grab_is_passive {
+    // `owner_events` / `via_xi2` from the active grab record. Passive
+    // button-grabs (activated via try_match_passive_grab) do not
+    // populate `active_pointer_grab`, so look up the matching passive
+    // grab and preserve its flags; otherwise default to false (X11
+    // implicit grab semantics — events report against the grab
+    // window, core protocol).
+    let (owner_events, via_xi2) = if state.pointer_grab_is_passive {
         state
             .button_grabs
             .iter()
             .rev()
             .find(|g| g.owner == client_id && g.grab_window == grab_window)
-            .is_some_and(|g| g.owner_events)
+            .map_or((false, false), |g| (g.owner_events, g.via_xi2))
     } else {
         state
             .active_pointer_grab
             .filter(|g| g.owner == client_id)
-            .is_some_and(|g| g.owner_events)
+            .map_or((false, false), |g| (g.owner_events, g.via_xi2))
     };
-    Some((grab_window, target, gx, gy, owner_events))
+    Some((grab_window, target, gx, gy, owner_events, via_xi2))
 }
 
 /// Xorg `DeliverGrabbedEvent`'s `owner_events=true` natural-delivery
@@ -1146,6 +1166,7 @@ mod tests {
             owner_events: true,
             event_mask: 0x0000_0004, // ButtonPressMask
             pointer_mode: 0,         // GrabModeSync
+            via_xi2: false,
         });
 
         let mut xid_map = HostXidMap::new();

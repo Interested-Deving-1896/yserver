@@ -12290,11 +12290,21 @@ impl Backend for KmsBackendV2 {
         _dst_x: i16,
         _dst_y: i16,
     ) -> io::Result<()> {
-        // Stage 1b doesn't process pointer events meaningfully —
-        // just log + accept. v2 pointer-state lives in KmsCore but
-        // wiring it to scene/input dispatch lands in Stage 2.
-        self.log_v2_gap("warp_pointer");
+        // The window-relative form is unused on KMS — the handler
+        // resolves the destination to root coords (only ServerState
+        // knows window positions) and calls `warp_pointer_root`.
         Ok(())
+    }
+
+    fn warp_pointer_root(&mut self, state: &mut ServerState, x: i32, y: i32) {
+        // Route through the absolute-motion input path: updates the
+        // tracked cursor (and HW cursor plane) and fans out the
+        // motion/crossing events WarpPointer is specified to generate
+        // ("as if the user had instantaneously moved the pointer").
+        self.on_host_input(
+            state,
+            yserver_core::core_loop::HostInputEvent::PointerMotion { x, y, time: 0 },
+        );
     }
 
     fn query_pointer(&mut self, _origin: Option<OriginContext>) -> io::Result<PointerPosition> {
@@ -15396,6 +15406,28 @@ mod tests {
             b.core.button_mask & 0x0100,
             0,
             "button_mask cleared post-release"
+        );
+    }
+
+    /// `warp_pointer_root` (the WarpPointer path on KMS) must move
+    /// the tracked cursor and fan the resulting motion out — the
+    /// fanout caches the position in `state.pointer_root`. Pre-fix
+    /// `warp_pointer` was a `log_v2_gap` stub, so XWarpPointer never
+    /// moved the pointer and every xts5 Xlib11 event-delivery test
+    /// pressed buttons at the stale center position, missing its
+    /// test window ("Expected event not received" en masse).
+    #[test]
+    fn warp_pointer_root_moves_cursor_and_fans_out_motion() {
+        use yserver_core::server::ServerState;
+        let mut b = KmsBackendV2::for_tests();
+        let mut state = ServerState::new();
+        Backend::warp_pointer_root(&mut b, &mut state, 123, 45);
+        assert_eq!(b.core.cursor_x, 123.0);
+        assert_eq!(b.core.cursor_y, 45.0);
+        assert_eq!(
+            state.pointer_root,
+            (123, 45),
+            "the warp motion must reach the pointer fanout",
         );
     }
 

@@ -9217,6 +9217,7 @@ fn handle_xi2_request(
                     owner: client_id,
                     grab_window: ResourceId(grab_window),
                     source: crate::server::ActiveKeyboardGrabSource::Explicit,
+                    via_xi2: true,
                 });
             } else {
                 state.pointer_grab = Some((client_id, ResourceId(grab_window)));
@@ -9228,6 +9229,7 @@ fn handle_xi2_request(
                     cursor: ResourceId(cursor),
                     time,
                     owner_events,
+                    via_xi2: true,
                 });
             }
             debug!(
@@ -9576,6 +9578,7 @@ fn handle_xi2_request(
                             owner_events,
                             event_mask: 0xFFFF_FFFF,
                             pointer_mode: grab_mode,
+                            via_xi2: true,
                         });
                     }
                 }
@@ -9597,6 +9600,7 @@ fn handle_xi2_request(
                             owner_events: false,
                             pointer_mode: paired_device_mode,
                             keyboard_mode: grab_mode,
+                            via_xi2: true,
                         });
                     }
                 }
@@ -16156,16 +16160,26 @@ fn handle_warp_pointer(
         let dst_window = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
         let dst_x = i16::from_le_bytes([body[16], body[17]]);
         let dst_y = i16::from_le_bytes([body[18], body[19]]);
-        let host_target = if dst_window.0 == 0 {
-            None
+        if dst_window.0 == 0 {
+            // dst=None: move relative to the current pointer position.
+            if let Ok(p) = backend.query_pointer(origin) {
+                let abs_x = i32::from(p.win_x) + i32::from(dst_x);
+                let abs_y = i32::from(p.win_y) + i32::from(dst_y);
+                backend.warp_pointer_root(state, abs_x, abs_y);
+            }
         } else {
-            state
+            let host_target = state
                 .resources
                 .host_drawable_target(dst_window)
-                .map(|t| (t.host_xid(), dst_x, dst_y))
-        };
-        if let Some((host_xid, x, y)) = host_target {
-            let _ = backend.warp_pointer(origin, host_xid, x, y);
+                .map(|t| (t.host_xid(), dst_x, dst_y));
+            if let Some((host_xid, x, y)) = host_target {
+                let _ = backend.warp_pointer(origin, host_xid, x, y);
+            }
+            // Resolve the destination to root-absolute coordinates for
+            // self-contained backends (KMS) — see
+            // `Backend::warp_pointer_root`. No-op for proxy backends.
+            let (wx, wy) = state.resources.window_absolute_position(dst_window);
+            backend.warp_pointer_root(state, wx + i32::from(dst_x), wy + i32::from(dst_y));
         }
     }
     debug!("client {} #{} WarpPointer", client_id.0, sequence.0);
@@ -16668,6 +16682,7 @@ fn handle_grab_pointer(
             cursor,
             time,
             owner_events,
+            via_xi2: false,
         });
         // Synthesised crossings on grab activation — marco's title-bar
         // popup menu uses core GrabPointer/GrabKeyboard (not XI2). GTK3
@@ -16934,6 +16949,7 @@ fn handle_grab_button(
             owner_events,
             event_mask,
             pointer_mode,
+            via_xi2: false,
         });
         debug!(
             "client {} GrabButton window=0x{:x} button={} modifiers=0x{:x}",
@@ -17013,6 +17029,7 @@ fn handle_grab_keyboard(
             owner: client_id,
             grab_window,
             source: crate::server::ActiveKeyboardGrabSource::Explicit,
+            via_xi2: false,
         });
         emit_core_grab_activation_crossings(
             state,
@@ -17088,6 +17105,7 @@ fn handle_grab_key(
             owner_events: req.owner_events,
             pointer_mode: req.pointer_mode,
             keyboard_mode: req.keyboard_mode,
+            via_xi2: false,
         });
         debug!(
             "client {} GrabKey window=0x{:x} keycode={} modifiers=0x{:x}",
@@ -23848,6 +23866,7 @@ mod tests {
             cursor: ResourceId(0),
             time: 0,
             owner_events: true,
+            via_xi2: true,
         });
         // Sanity: sibling is NOT a descendant of grab window.
         assert!(
@@ -24149,6 +24168,7 @@ mod tests {
             cursor: ResourceId(0),
             time: 0,
             owner_events: false,
+            via_xi2: true,
         });
         Backend::register_top_level(&mut backend, None, ResourceId(TARGET_WIN), HOST_XID)
             .expect("register host xid");
@@ -24243,6 +24263,7 @@ mod tests {
             owner_events: false,
             event_mask: 0xFFFF_FFFF,
             pointer_mode: 0,
+            via_xi2: true,
         });
         Backend::register_top_level(&mut backend, None, ResourceId(TARGET_WIN), HOST_XID)
             .expect("register host xid");
@@ -24359,6 +24380,7 @@ mod tests {
             owner_events: true,
             event_mask: 0xFFFF_FFFF,
             pointer_mode: 0, // Synchronous → triggers freeze
+            via_xi2: true,
         });
         Backend::register_top_level(&mut backend, None, ResourceId(WINDOW_XID), HOST_XID)
             .expect("register host xid");
@@ -24501,6 +24523,7 @@ mod tests {
             owner_events: true,
             event_mask: 0xFFFF_FFFF,
             pointer_mode: 0,
+            via_xi2: true,
         });
         Backend::register_top_level(&mut backend, None, ResourceId(GRAB_WIN), HOST_XID)
             .expect("register host xid");
@@ -24639,6 +24662,7 @@ mod tests {
             cursor: ResourceId(0),
             time: 0,
             owner_events: false,
+            via_xi2: true,
         });
 
         Backend::register_top_level(&mut backend, None, ResourceId(OTHER_WIN), OTHER_HOST_XID)
@@ -24689,6 +24713,113 @@ mod tests {
             5,
             "the grabbed XI2 event must be a ButtonRelease (evtype 5)",
         );
+    }
+
+    /// A *core* `XGrabPointer` grab must NOT funnel XI2 XGE events to
+    /// the grab owner — the owner asked for core delivery only (Xorg's
+    /// `DeliverGrabbedEvent` consults the grab's own xi2mask, which is
+    /// empty for core grabs). Regression: the XI2 active-grab redirect
+    /// pushed the grab client unconditionally; a plain-Xlib client that
+    /// linked libXi without calling XIQueryVersion (every xts5 Xlib11
+    /// TCM) NULL-derefs inside libXi's wire handler on the XGE event,
+    /// and TET's longjmp out of the SIGSEGV poisons the display mutex —
+    /// the rest of the test case hangs forever (Xlib11/ButtonPress
+    /// scenario 890-0 on eiger HW, 2026-06-04).
+    #[test]
+    fn core_pointer_grab_does_not_send_xi2_to_grab_owner() {
+        use crate::{
+            backend::Backend,
+            host_x11::{HostPointerEvent, PointerEventKind},
+            resources::ROOT_VISUAL,
+            server::ActivePointerGrab,
+        };
+
+        const GRAB_CLIENT_ID: u32 = 1;
+        const GRAB_WIN: u32 = 0x0010_0021;
+        const HOST_XID: u32 = 0xCAFE_0016;
+
+        let mut state = ServerState::new();
+        let mut grab_peer = install_client(&mut state, GRAB_CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+        grab_peer.set_nonblocking(true).unwrap();
+
+        state.resources.create_window(
+            ClientId(GRAB_CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(GRAB_WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(GRAB_WIN));
+        // Select core ButtonPress on the grab window so the core
+        // redirect has a delivery target.
+        state
+            .clients
+            .get_mut(&GRAB_CLIENT_ID)
+            .expect("grab client")
+            .event_masks
+            .insert(ResourceId(GRAB_WIN), 0x0000_0004);
+
+        // Core XGrabPointer, owner_events=false — the xts5 TP10 shape.
+        state.pointer_grab = Some((ClientId(GRAB_CLIENT_ID), ResourceId(GRAB_WIN)));
+        state.pointer_grab_is_passive = false;
+        state.active_pointer_grab = Some(ActivePointerGrab {
+            owner: ClientId(GRAB_CLIENT_ID),
+            grab_window: ResourceId(GRAB_WIN),
+            event_mask: 0xFFFF,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: false,
+            via_xi2: false,
+        });
+
+        Backend::register_top_level(&mut backend, None, ResourceId(GRAB_WIN), HOST_XID)
+            .expect("register host xid");
+
+        let press = HostPointerEvent {
+            kind: PointerEventKind::ButtonPress,
+            host_xid: HOST_XID,
+            detail: 1,
+            time: 0x3000,
+            root_x: 25,
+            root_y: 25,
+            event_x: 25,
+            event_y: 25,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+        };
+        let xid_map = backend.xid_map().clone();
+        let _dropped =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
+
+        // The grab owner gets the core ButtonPress (type 4) and nothing
+        // else — scan every 32-byte event for an XI2 GenericEvent (35).
+        let mut buf = [0u8; 512];
+        let n = match grab_peer.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => panic!("grab owner must receive the core press; got {e:?}"),
+        };
+        let mut saw_core_press = false;
+        for off in (0..n).step_by(32) {
+            assert_ne!(
+                buf[off], 35,
+                "core grab owner must not receive XI2 GenericEvents",
+            );
+            if buf[off] == 4 {
+                saw_core_press = true;
+            }
+        }
+        assert!(saw_core_press, "core ButtonPress must reach the grab owner");
     }
 
     /// `XIQueryPointer` must report currently-held pointer buttons in
@@ -24950,6 +25081,7 @@ mod tests {
             owner: ClientId(GRAB_CLIENT_ID),
             grab_window: ROOT_WINDOW,
             source: ActiveKeyboardGrabSource::PassiveKey { keycode: 33 },
+            via_xi2: true,
         });
         state.frozen_keyboard_event = Some(HostKeyEvent {
             pressed: true,
@@ -31215,6 +31347,7 @@ mod tests {
             cursor: ResourceId(0),
             time: 0,
             owner_events: false,
+            via_xi2: false,
         });
 
         handle_ungrab_pointer(

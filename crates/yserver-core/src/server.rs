@@ -143,6 +143,15 @@ pub struct PassiveButtonGrab {
     pub owner_events: bool,
     pub event_mask: u32,
     pub pointer_mode: u8,
+    /// True when the grab was established through the XI2 protocol
+    /// (XIPassiveGrabDevice) rather than core GrabButton. Grab
+    /// redirection delivers to the owner in the protocol the grab
+    /// was established with (Xorg `DeliverGrabbedEvent` consults the
+    /// grab's own xi2mask, which is empty for core grabs) — sending
+    /// XI2 XGE events to a core-only Xlib client NULL-derefs libXi's
+    /// wire handler when the client linked libXi without ever doing
+    /// XIQueryVersion (xts5 Xlib11/ButtonPress TP10 crashed there).
+    pub via_xi2: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +167,10 @@ pub struct KeyGrab {
     pub pointer_mode: u8,
     /// 0 = Synchronous, 1 = Asynchronous
     pub keyboard_mode: u8,
+    /// True when established via XI2 (XIPassiveGrabDevice keycode
+    /// grab) rather than core GrabKey — see
+    /// [`PassiveButtonGrab::via_xi2`] for the delivery-protocol rule.
+    pub via_xi2: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -173,6 +186,10 @@ pub struct ActiveKeyboardGrab {
     pub owner: ClientId,
     pub grab_window: ResourceId,
     pub source: ActiveKeyboardGrabSource,
+    /// True when established via XI2 (XIGrabDevice on the master
+    /// keyboard, or an activated XI2 passive key grab) — see
+    /// [`PassiveButtonGrab::via_xi2`] for the delivery-protocol rule.
+    pub via_xi2: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -194,6 +211,10 @@ pub struct ActivePointerGrab {
     /// state. With `owner_events=false`, every event is reported
     /// against `grab_window` with no propagation.
     pub owner_events: bool,
+    /// True when established via XI2 (XIGrabDevice) rather than core
+    /// GrabPointer — see [`PassiveButtonGrab::via_xi2`] for the
+    /// delivery-protocol rule.
+    pub via_xi2: bool,
 }
 
 /// XComposite redirect mode. Both wire constants are accepted —
@@ -2878,6 +2899,7 @@ mod tests {
                 owner_events: true,
                 event_mask: 0xFFFF_FFFF,
                 pointer_mode: 0,
+                via_xi2: true,
             });
         }
 
@@ -3021,6 +3043,7 @@ mod tests {
                 owner_events: true,
                 event_mask: 0xFFFF_FFFF,
                 pointer_mode: 0,
+                via_xi2: true,
             });
         }
 
@@ -3379,6 +3402,7 @@ mod tests {
             owner_events: false,
             pointer_mode: 1,
             keyboard_mode: 1,
+            via_xi2: false,
         });
         let hit = s.find_key_grab(win, 24, 0x0040);
         assert!(hit.is_some());
@@ -3397,6 +3421,7 @@ mod tests {
             owner_events: false,
             pointer_mode: 1,
             keyboard_mode: 1,
+            via_xi2: false,
         });
         assert!(s.find_key_grab(win, 24, 0x0040).is_some());
         assert!(s.find_key_grab(win, 24, 0x0000).is_some());
@@ -3415,6 +3440,7 @@ mod tests {
             owner_events: false,
             pointer_mode: 1,
             keyboard_mode: 1,
+            via_xi2: false,
         });
         assert!(s.find_key_grab(win, 24, 0x0040).is_some());
         assert!(s.find_key_grab(win, 99, 0x0040).is_some());
@@ -3429,6 +3455,7 @@ mod tests {
             owner: ClientId(7),
             grab_window: ResourceId(0xff),
             source: ActiveKeyboardGrabSource::Explicit,
+            via_xi2: false,
         });
         assert_eq!(s.active_keyboard_grab.unwrap().owner, ClientId(7));
         s.active_keyboard_grab = None;

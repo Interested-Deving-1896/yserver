@@ -4253,3 +4253,50 @@ no signals. Residual FAILs are content-level (depth-4/15/16 pixmap
 formats advertised but unreadable by the engine → zeroed fallback
 data; no BadValue for invalid format) — tracked as follow-ups, they
 don't block full runs.
+
+## Grab-protocol XI2 gate — second XTS hang fix (branch `fix/grab-xi2-protocol-gate`, 2026-06-04)
+
+**Symptom (eiger HW, full xts5 run):** after the GetImage fix the run
+advanced to `Xlib11/ButtonPress` scenario 890-0 and wedged the same
+way — TP10 "unexpected signal 11", TP11 hung until the harness kill.
+gdb-shim backtrace: SIGSEGV inside libXi's XGE wire handler, reached
+from `XSync` ← `buttonpress` (devcntl.c:159).
+
+**Root cause:** grab redirection delivered XI2 events to the grab
+owner unconditionally (pointer_fanout XI2 redirect pushed the owner;
+key-grab delivery always sent core + XI2). A core `XGrabPointer` /
+`GrabKey` owner never asked for XI2; the xts5 TCMs link libXi without
+calling XIQueryVersion, and libXi NULL-derefs on the unsolicited XGE
+event. TET longjmps out of the SIGSEGV with the display mutex held →
+the rest of the TCM deadlocks (same poisoned-mutex mechanism as the
+GetImage crash).
+
+**Fix (`9177ec3`):** `via_xi2` flag on ActivePointerGrab /
+PassiveButtonGrab / KeyGrab / ActiveKeyboardGrab — core grab requests
+set false, XIGrabDevice / XIPassiveGrabDevice set true. Redirection
+still makes the grab exclusive, but the owner only receives the XI2
+form when the grab was established via XI2 (Xorg DeliverGrabbedEvent
+consults the grab's own xi2mask, empty for core grabs). GTK popup /
+window-move behavior (XI2 grabs) unchanged.
+
+**Verified on eiger HW:** ButtonPress scenario completes in 3 s, no
+signals (was: SIGSEGV + ~3 min hang). 1 PASS / 8 FAIL / 1 UNTESTED /
+2 UNSUPPORTED.
+
+**~~Still open~~ — WarpPointer fixed (`37d1aa1`, same branch):**
+the "events don't reach test windows" follow-up was
+`KmsBackendV2::warp_pointer` being a log_v2_gap stub — the pointer
+stayed at the screen-center start position (1280,800 on the
+2560×1600 panel) and every synthesized press missed its test window.
+New `Backend::warp_pointer_root(state, x, y)` (default no-op): the
+handler resolves the destination to root coords; KMS routes through
+`on_host_input(PointerMotion)` so the warp updates the tracked
+cursor and generates the spec'd motion/crossing events; ynest keeps
+the host forward. Relative warps (dst=None) now work on KMS too.
+ButtonPress on eiger HW: 7 PASS / 2 FAIL (was 1/8). Remaining FAILs
+are finer grab semantics, filed under known-issues territory:
+- TP2: passive-grab activation must search ancestors ROOT-DOWN
+  (oldest ancestor's grab wins) + synthesize
+  EnterNotify(mode=NotifyGrab) crossings on activation.
+- TP7: an over-delivery during an active grab ("Unexpected event
+  (ButtonPress) received").

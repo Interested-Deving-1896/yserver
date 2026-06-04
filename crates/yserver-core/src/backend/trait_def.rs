@@ -1614,6 +1614,22 @@ pub trait Backend: Send {
         dst_y: i16,
     ) -> io::Result<()>;
 
+    /// Move the logical pointer to root-absolute coordinates,
+    /// generating motion/crossing events exactly as if the user had
+    /// instantaneously moved the pointer there (X11 §WarpPointer).
+    /// The handler resolves the destination window to root coords
+    /// (only `ServerState` knows window positions) and calls this
+    /// alongside [`Backend::warp_pointer`]. Backends that forward
+    /// WarpPointer to a host server keep the default no-op — the host
+    /// echoes the resulting motion back as input events. The KMS
+    /// backend implements it through its absolute-motion input path,
+    /// which updates the tracked cursor and fans out the events.
+    /// Without this, WarpPointer was a silent no-op on KMS and every
+    /// xts5 event-delivery test (Xlib11 ButtonPress/MotionNotify/…)
+    /// pressed buttons at the never-moved pointer position, missing
+    /// its test window ("Expected event not received" en masse).
+    fn warp_pointer_root(&mut self, _state: &mut ServerState, _x: i32, _y: i32) {}
+
     fn query_pointer(&mut self, origin: Option<OriginContext>) -> io::Result<PointerPosition>;
 
     fn list_fonts_proxy(

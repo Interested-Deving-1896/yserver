@@ -107,6 +107,7 @@ pub fn key_event_fanout_to_state(
             owner,
             grab_window,
             freeze,
+            via_xi2,
         } => {
             // Synchronous passive key grab: hold the activating press
             // so AllowEvents(ReplayKeyboard) can replay it to the
@@ -115,7 +116,7 @@ pub fn key_event_fanout_to_state(
             if freeze && event.pressed {
                 state.frozen_keyboard_event = Some(event);
             }
-            deliver_key_to_grab_owner(state, &event, owner, grab_window)
+            deliver_key_to_grab_owner(state, &event, owner, grab_window, via_xi2)
         }
         KeyRoute::Window(window) => deliver_key_to_window(state, &event, window),
     }
@@ -209,22 +210,29 @@ fn deliver_key_to_window(
 /// grab window. yserver previously delivered via window selection, so
 /// a grab owner that registered the grab via `XIPassiveGrabDevice`
 /// (without a matching `XISelectEvents` on the root) received nothing
-/// and the key was lost. Both core and XI2 forms are sent (the owner
-/// uses whichever protocol it grabbed with), mirroring the passive
-/// button-grab delivery in `pointer_fanout`.
+/// and the key was lost. The core form is always sent; the XI2 form
+/// only when the grab was established via XI2 (`via_xi2`) — sending
+/// XI2 XGE events to a core GrabKey owner NULL-derefs libXi in
+/// clients that linked it without ever calling XIQueryVersion (the
+/// xts5 Xlib11 TCMs crash exactly there; Xorg's
+/// `DeliverGrabbedEvent` consults the grab's own xi2mask, which is
+/// empty for core grabs).
 fn deliver_key_to_grab_owner(
     state: &mut ServerState,
     event: &HostKeyEvent,
     owner: ClientId,
     grab_window: ResourceId,
+    via_xi2: bool,
 ) -> Vec<ClientId> {
     let mut dropped = fanout_event_to_clients(state, &[owner], |buf, seq, order| {
         x11::encode_key_event(buf, order, key_event_wire(event, seq, grab_window));
     });
-    let xi2_dropped = fanout_event_to_clients(state, &[owner], |buf, seq, order| {
-        encode_key_xi2(buf, order, seq, event, grab_window);
-    });
-    merge_dropped(&mut dropped, xi2_dropped);
+    if via_xi2 {
+        let xi2_dropped = fanout_event_to_clients(state, &[owner], |buf, seq, order| {
+            encode_key_xi2(buf, order, seq, event, grab_window);
+        });
+        merge_dropped(&mut dropped, xi2_dropped);
+    }
     dropped
 }
 
@@ -300,10 +308,14 @@ enum KeyRoute {
     /// A passive key grab is active — deliver only to the grab owner.
     /// `freeze` is set for a synchronous grab on the activating press,
     /// signalling that the event must be held for possible replay.
+    /// `via_xi2` carries the grab's protocol so delivery can match it
+    /// (XI2 key events to a core GrabKey owner NULL-deref libXi in
+    /// clients that linked it without XIQueryVersion).
     PassiveGrabOwner {
         owner: ClientId,
         grab_window: ResourceId,
         freeze: bool,
+        via_xi2: bool,
     },
     /// Normal delivery to a window's subscribers (focus window, or an
     /// explicit-grab window).
@@ -330,6 +342,7 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
                 owner: g.owner,
                 grab_window: g.grab_window,
                 freeze: false,
+                via_xi2: g.via_xi2,
             };
         }
         // Explicit grab (GrabKeyboard): keep existing window delivery.
@@ -340,9 +353,9 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
 
     // Press: try to match a passive key grab, activating it.
     if event.pressed
-        && let Some((owner, grab_window, keyboard_mode)) = state
+        && let Some((owner, grab_window, keyboard_mode, via_xi2)) = state
             .find_key_grab(focus, event.keycode, event.state)
-            .map(|g| (g.owner, g.grab_window, g.keyboard_mode))
+            .map(|g| (g.owner, g.grab_window, g.keyboard_mode, g.via_xi2))
     {
         state.active_keyboard_grab = Some(ActiveKeyboardGrab {
             owner,
@@ -350,12 +363,14 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
             source: ActiveKeyboardGrabSource::PassiveKey {
                 keycode: event.keycode,
             },
+            via_xi2,
         });
         return KeyRoute::PassiveGrabOwner {
             owner,
             grab_window,
             // keyboard_mode 0 == Synchronous → freeze for replay.
             freeze: keyboard_mode == 0,
+            via_xi2,
         };
     }
 
@@ -511,6 +526,7 @@ mod tests {
             owner_events: false,
             pointer_mode: 1,
             keyboard_mode: 0, // synchronous → freeze
+            via_xi2: true,
         });
 
         let dropped = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
@@ -570,6 +586,7 @@ mod tests {
             owner_events: false,
             pointer_mode: 1,
             keyboard_mode: 1, // asynchronous → no freeze
+            via_xi2: true,
         });
         let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
         assert!(state.active_keyboard_grab.is_some());
@@ -604,6 +621,7 @@ mod tests {
             owner_events: false,
             pointer_mode: 1,
             keyboard_mode: 1,
+            via_xi2: false,
         });
         // Press: activates passive grab.
         let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 38));
@@ -612,6 +630,7 @@ mod tests {
                 owner,
                 grab_window,
                 source: ActiveKeyboardGrabSource::PassiveKey { keycode },
+                ..
             }) => {
                 assert_eq!(owner, grab_owner);
                 assert_eq!(grab_window, ROOT_WINDOW);
@@ -632,6 +651,7 @@ mod tests {
             owner: ClientId(3),
             grab_window: ResourceId(0x100),
             source: ActiveKeyboardGrabSource::Explicit,
+            via_xi2: false,
         });
         let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(false, 38));
         // Explicit grab is NOT cleared by a key release (only passive
