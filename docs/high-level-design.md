@@ -194,7 +194,7 @@ independently. The root window does not imply a global
 framebuffer. COMPOSITE redirect (both Automatic and Manual mode)
 is supported; the Composite Overlay Window (COW) is a
 first-class scene participant so external compositors (xfwm4
-composited, picom, marco) draw to it and see their output on
+composited, marco) draw to it and see their output on
 screen.
 
 Per-output presentation scheduling is in place. Tear-free is the
