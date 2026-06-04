@@ -4182,17 +4182,35 @@ pool-ineligible dims @ MAX_POOLED_DIM=128 still bad) → fix verified
 probe-green in vng + e16 menu/pager HW-verified on silence.
 
 **Still open (characterized, separate fixes):**
-- SHAPE depth-1 masks: v2 has no `read_depth1_pixmap` impl (the v1
-  one died with `035cc9b`); all ShapeMask requests degrade to a
-  bounding-box rect AND `2a31500` now clips window draws to that
-  degraded shape. e16 detects the wrong GetRectangles reply and
-  clears the shape (recovery path).
+- ~~SHAPE depth-1 masks~~ — RESOLVED (`a69c873`, 2026-06-04):
+  `KmsBackendV2::read_depth1_pixmap` override (engine.get_image
+  depth-1 readback + LSBFirst bit-unpack to the byte-per-pixel
+  triple `bitmap_to_yx_banded_rects` consumes). Acceptance tests
+  Vk-gated; e16 shaped popups HW-verified on silence. Same squash
+  repaired the 9 stale/born-broken v2_acceptance tests (76/76 on
+  RADV; 5 broke at `926a01a` when fill ops moved into the frame
+  builder, 2 were born failing, 1 test-helper never drained FB
+  close events, 1 pinned the pre-`b5c5f16` COW-registration
+  design).
 - ~~`YSERVER_FRAME_BUILDER=off` kill-switch is bit-rotted~~ —
   RESOLVED by removal (`04d90c4`): both kill-switches + the legacy
   per-op-submit bodies they gated are deleted (-1170 LOC); the
   frame builder is the only composite/glyph path.
-- XkbGetNames reply stuffs zero atoms + bits the client didn't
-  request; libX11 clients GetAtomName(0) → BadAtom → exit (kills
-  xdotool; blocks e16-under-vng repros).
-- Connection setup advertises `max-keycode=0`; Composite
-  GetOverlayWindow returns 0.
+- ~~XkbGetNames zero atoms~~ — RESOLVED (`0f9de9c`, 2026-06-04):
+  real interned atoms (resolved KcCGST for the compiled RMLVO,
+  canonical type/level names) + per-key names via
+  `xkb_keymap_key_get_name`. Negative control reproduced the
+  libX11 `BadAtom, X_GetAtomName, 0x0` exit; xdotool now works in
+  vng (`tools/xkb-names-vng-test.sh`).
+- ~~Composite GetOverlayWindow returns 0~~ — NOT A BUG: x11trace
+  mis-decodes this reply (Xephyr traces `overlayWin=0` too while
+  e16 parents onto the real overlay xid on both servers).
+- **e16 silent vng exit root-caused (`fff5d2a` probes):**
+  `XCreateFontSet("fixed")` returns NULL — our ListFontsWithInfo
+  sends a bare `fixed` name with no XLFD/properties, so libX11
+  XLC can't bind the C-locale ISO8859-1 charset (Xephyr resolves
+  the alias to full XLFD entries; e16-on-Xephyr-in-the-same-guest
+  stays alive → yserver-specific). Fix = synthesize XLFD names
+  (+ CHARSET_REGISTRY/ENCODING properties) in the font replies.
+- Connection setup advertises `max-keycode=0` (min=0x08); derive
+  from the real keymap.
