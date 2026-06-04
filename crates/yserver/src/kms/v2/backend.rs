@@ -6396,6 +6396,98 @@ fn wrap_get_image_reply(depth: u8, pixel_bytes: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// X11 GetImage `format` wire value for XYPixmap (ZPixmap is 2).
+const GET_IMAGE_FORMAT_XY_PIXMAP: u8 = 1;
+
+/// All-planes mask for a drawable of `depth` (1 ≤ depth ≤ 32).
+fn depth_plane_mask(depth: u8) -> u32 {
+    if depth >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << depth) - 1
+    }
+}
+
+/// Apply a ZPixmap `plane_mask` in place to wire-format pixel rows as
+/// produced by `pack_from_storage`: depth 1 = 1bpp bitmap rows, depth 8
+/// = byte rows padded to 4, depth 24/32 = BGRA u32 LE. Per the X11
+/// spec, GetImage ZPixmap returns zero bits in all planes not in
+/// `plane_mask` (the full pixel grid is still transmitted). `mask` is
+/// already truncated to the drawable depth, so for depth 24 the X byte
+/// gets cleared too — its content is undefined on the wire.
+fn apply_z_plane_mask(bytes: &mut [u8], depth: u8, mask: u32) {
+    match depth {
+        1 => {
+            if mask & 1 == 0 {
+                bytes.fill(0);
+            }
+        }
+        8 => {
+            let m = (mask & 0xff) as u8;
+            for b in bytes.iter_mut() {
+                *b &= m;
+            }
+        }
+        24 | 32 => {
+            for px in bytes.chunks_exact_mut(4) {
+                let v = u32::from_le_bytes([px[0], px[1], px[2], px[3]]) & mask;
+                px.copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        // Depths the engine can't read back never get here (the
+        // engine already errored and the handler sent the fallback).
+        _ => bytes.fill(0),
+    }
+}
+
+/// Repack Z-layout wire bytes (per `pack_from_storage`) into XYPixmap
+/// wire format: one 1-bit plane per set bit in `mask`, most-significant
+/// plane first (X11 §GetImage), scanlines padded to 32 bits, LSBFirst
+/// bit order matching the advertised bitmap-format-bit-order (and the
+/// depth-1 packing in `pack_from_storage`).
+fn z_to_xy_planes(z: &[u8], w: u32, h: u32, depth: u8, mask: u32) -> Vec<u8> {
+    let w_us = w as usize;
+    let h_us = h as usize;
+    let out_stride = w.div_ceil(32) as usize * 4;
+    let n_planes = mask.count_ones() as usize;
+    let mut out = vec![0u8; out_stride * h_us * n_planes];
+    if w_us == 0 || h_us == 0 || n_planes == 0 {
+        return out;
+    }
+    let pixel = |x: usize, y: usize| -> u32 {
+        match depth {
+            1 => {
+                // Already bitmap rows padded to 32 bits.
+                let byte = z[y * out_stride + x / 8];
+                u32::from((byte >> (x % 8)) & 1)
+            }
+            8 => {
+                // Byte rows padded to 4 bytes.
+                let stride = (w_us + 3) & !3;
+                u32::from(z[y * stride + x])
+            }
+            // 24/32: tightly packed BGRA u32 LE.
+            _ => {
+                let off = (y * w_us + x) * 4;
+                u32::from_le_bytes([z[off], z[off + 1], z[off + 2], z[off + 3]])
+            }
+        }
+    };
+    let mut plane_base = 0;
+    for p in (0..32).rev().filter(|p| mask & (1 << p) != 0) {
+        for y in 0..h_us {
+            let row = plane_base + y * out_stride;
+            for x in 0..w_us {
+                if (pixel(x, y) >> p) & 1 != 0 {
+                    out[row + x / 8] |= 1 << (x % 8);
+                }
+            }
+        }
+        plane_base += out_stride * h_us;
+    }
+    out
+}
+
 fn depth_for_visual(visual: HostSubwindowVisual, parent_depth: Option<u8>) -> u8 {
     match visual {
         HostSubwindowVisual::CopyFromParent => parent_depth.unwrap_or(24),
@@ -9196,12 +9288,12 @@ impl Backend for KmsBackendV2 {
         &mut self,
         _origin: Option<OriginContext>,
         host_xid: u32,
-        _format: u8,
+        format: u8,
         x: i16,
         y: i16,
         width: u16,
         height: u16,
-        _plane_mask: u32,
+        plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>> {
         // Stage 4a — resolve through redirect routing per spec Risk 1
         // ("GetImage reads what the X server considers W's content,
@@ -9212,10 +9304,20 @@ impl Backend for KmsBackendV2 {
             self.log_v2_gap("get_image_unknown_xid");
             return Ok(None);
         };
-        let depth = match self.store.get(target.id) {
-            Some(d) => d.depth,
+        let (depth, storage_extent) = match self.store.get(target.id) {
+            Some(d) => (d.depth, d.storage.extent),
             None => return Ok(None),
         };
+        let mask = plane_mask & depth_plane_mask(depth);
+        if format == GET_IMAGE_FORMAT_XY_PIXMAP && mask == 0 {
+            // No planes requested: Xorg replies with zero data. This
+            // path is load-bearing for Xlib — libX11's _XGetImage has
+            // a NULL deref (`planes = image->depth` before the NULL
+            // check) when an XYPixmap reply with plane_mask=0 carries
+            // a non-zero length (xts5 Xlib9/XGetImage TP2 crashes,
+            // poisons the display mutex, and hangs the whole TCM).
+            return Ok(Some(wrap_get_image_reply(depth, Vec::new())));
+        }
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D {
                 x: i32::from(x) + target.offset.0,
@@ -9226,13 +9328,27 @@ impl Backend for KmsBackendV2 {
                 height: u32::from(height),
             },
         };
+        // Mirror the engine's clamp so the XY repack below knows the
+        // row geometry of the bytes it gets back.
+        let clipped = crate::kms::v2::engine::clamp_rect(rect, storage_extent);
         let start = std::time::Instant::now();
         let result =
             match self
                 .engine
                 .get_image(&mut self.store, &mut self.platform, target.id, rect, depth)
             {
-                Ok(pixel_bytes) => {
+                Ok(mut pixel_bytes) => {
+                    if format == GET_IMAGE_FORMAT_XY_PIXMAP {
+                        pixel_bytes = z_to_xy_planes(
+                            &pixel_bytes,
+                            clipped.extent.width,
+                            clipped.extent.height,
+                            depth,
+                            mask,
+                        );
+                    } else if mask != depth_plane_mask(depth) {
+                        apply_z_plane_mask(&mut pixel_bytes, depth, mask);
+                    }
                     let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                     self.telemetry.record_one_shot_submit();
                     self.telemetry.record_fence_wait(ns);
@@ -12718,6 +12834,74 @@ mod tests {
         properties::{PropertyFormat, PropertyValue},
         server::ServerState,
     };
+
+    mod get_image_planes {
+        use super::super::{apply_z_plane_mask, depth_plane_mask, z_to_xy_planes};
+
+        #[test]
+        fn depth_plane_mask_truncates_to_depth() {
+            assert_eq!(depth_plane_mask(1), 0x1);
+            assert_eq!(depth_plane_mask(8), 0xff);
+            assert_eq!(depth_plane_mask(24), 0x00ff_ffff);
+            assert_eq!(depth_plane_mask(32), u32::MAX);
+        }
+
+        #[test]
+        fn z_mask_depth24_zeroes_unrequested_planes() {
+            // One BGRA pixel 0x00ff_80ff (LE bytes B=0xff G=0x80 R=0xff X=0).
+            let mut px = vec![0xff, 0x80, 0xff, 0x00];
+            apply_z_plane_mask(&mut px, 24, 0x0000_00ff); // blue planes only
+            assert_eq!(px, vec![0xff, 0x00, 0x00, 0x00]);
+        }
+
+        #[test]
+        fn z_mask_depth8_masks_bytes() {
+            let mut bytes = vec![0xab, 0x0f, 0xf0, 0x00];
+            apply_z_plane_mask(&mut bytes, 8, 0x0f);
+            assert_eq!(bytes, vec![0x0b, 0x0f, 0x00, 0x00]);
+        }
+
+        #[test]
+        fn z_mask_depth1_empty_mask_zeroes() {
+            let mut bytes = vec![0xff, 0xff, 0xff, 0xff];
+            apply_z_plane_mask(&mut bytes, 1, 0);
+            assert_eq!(bytes, vec![0, 0, 0, 0]);
+        }
+
+        #[test]
+        fn xy_planes_msb_first_lsb_bit_order() {
+            // 2x1 depth-24 image: pixel0 = 0x000001 (bit 0 set),
+            // pixel1 = 0x800000 (bit 23 set). Request planes 23 and 0.
+            let z = [
+                0x01, 0x00, 0x00, 0x00, // pixel (0,0) BGRA LE
+                0x00, 0x00, 0x80, 0x00, // pixel (1,0)
+            ];
+            let mask = (1 << 23) | 1;
+            let out = z_to_xy_planes(&z, 2, 1, 24, mask);
+            // Two planes, scanline pad 32 bits → 4 bytes per row.
+            assert_eq!(out.len(), 2 * 4);
+            // Plane 23 first (most significant): pixel1 → bit 1 LSBFirst.
+            assert_eq!(out[0], 0b0000_0010);
+            // Plane 0 second: pixel0 → bit 0.
+            assert_eq!(out[4], 0b0000_0001);
+        }
+
+        #[test]
+        fn xy_planes_depth1_is_identity_for_plane0() {
+            // 40x2 depth-1 bitmap: stride = ceil(40/32)*4 = 8 bytes.
+            let mut z = vec![0u8; 16];
+            z[0] = 0xa5;
+            z[9] = 0x3c;
+            let out = z_to_xy_planes(&z, 40, 2, 1, 0x1);
+            assert_eq!(out, z);
+        }
+
+        #[test]
+        fn xy_planes_empty_mask_is_empty() {
+            let z = [0u8; 16];
+            assert!(z_to_xy_planes(&z, 2, 2, 24, 0).is_empty());
+        }
+    }
 
     /// Stage 1b acceptance gate (synthetic): v2 constructs through
     /// `for_tests` and answers the capability accessors with the

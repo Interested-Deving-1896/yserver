@@ -3719,12 +3719,14 @@ impl RenderEngine {
     /// sync path on the v2 paint surface; protocol design makes
     /// `GetImage` an RPC, so a host wait is unavoidable.
     ///
-    /// Returns bytes in **wire format**: for depth-32/24,
-    /// `rect_w * rect_h * 4` BGRA-order bytes (alpha undefined for
-    /// depth-24). For depth-8, `rect_w * rect_h` bytes. For
-    /// depth-1, `bytes_per_row * rect_h` with the scanline padded
-    /// to 32 bits and bits packed MSB-first per byte; storage is
-    /// `R8` and each non-zero byte sets one bit.
+    /// Returns bytes in **wire format** (see `pack_from_storage`):
+    /// for depth-32/24, `rect_w * rect_h * 4` BGRA-order bytes
+    /// (alpha undefined for depth-24). For depth-8, byte rows
+    /// padded to 32 bits. For depth-1, bitmap rows padded to 32
+    /// bits, LSBFirst bit order; storage is `R8` and each non-zero
+    /// byte sets one bit. All layouts keep the total a multiple of
+    /// 4, which `wrap_get_image_reply` relies on for the reply
+    /// length field.
     ///
     /// # Errors
     ///
@@ -8512,7 +8514,7 @@ fn build_render_clip_scissors(
     }
 }
 
-fn clamp_rect(rect: vk::Rect2D, extent: vk::Extent2D) -> vk::Rect2D {
+pub(crate) fn clamp_rect(rect: vk::Rect2D, extent: vk::Extent2D) -> vk::Rect2D {
     let max_x = i32::try_from(extent.width).unwrap_or(i32::MAX);
     let max_y = i32::try_from(extent.height).unwrap_or(i32::MAX);
     let x0 = rect.offset.x.max(0).min(max_x);

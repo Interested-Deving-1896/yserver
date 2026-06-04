@@ -2614,8 +2614,15 @@ pub fn get_image_request(format: u8, body: &[u8]) -> Option<GetImageRequest> {
     })
 }
 
-/// Return a blank (zeroed) image of the requested size.
-/// ZPixmap at 32 bpp is the common case; other formats get 0 bytes of data.
+/// Return a blank (zeroed) image of the requested size at depth 24
+/// (used when the backend can't resolve the drawable, so the true
+/// depth is unknown). The data size must be consistent with the
+/// format + plane_mask the client asked for, or Xlib misbehaves:
+/// - ZPixmap: full pixel grid at 32 bpp.
+/// - XYPixmap: one bitmap plane (scanline pad 32) per plane_mask bit;
+///   an empty mask gets a 0-length reply (Xorg behavior — libX11's
+///   `_XGetImage` NULL-derefs on a non-empty reply to a plane_mask=0
+///   XYPixmap request).
 pub fn write_get_image_reply(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
@@ -2631,7 +2638,13 @@ pub fn write_get_image_reply(
             .saturating_mul(4);
         (raw + 3) & !3 // round up to 4-byte boundary
     } else {
-        0
+        // XYPixmap: planes truncated to the reply depth, each plane a
+        // 1bpp bitmap with scanlines padded to 32 bits.
+        let planes = (request.plane_mask & ((1u32 << DEPTH) - 1)).count_ones();
+        let stride = u32::from(request.width).div_ceil(32) * 4;
+        planes
+            .saturating_mul(stride)
+            .saturating_mul(u32::from(request.height))
     };
     let mut reply = fixed_reply(byte_order, sequence, DEPTH, data_bytes / 4);
     write_u32(byte_order, &mut reply, visual_id);
@@ -3365,6 +3378,49 @@ pub fn write_get_modifier_mapping_reply_with_keycodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fallback GetImage reply must keep its length field and
+    /// payload consistent with the requested format + plane_mask:
+    /// XYPixmap carries popcount(mask) bitmap planes, and an empty
+    /// mask yields a 0-length reply (libX11 NULL-derefs otherwise).
+    #[test]
+    fn get_image_fallback_reply_sizes_match_format() {
+        let req = |format: u8, plane_mask: u32| GetImageRequest {
+            format,
+            drawable: ResourceId(1),
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 2,
+            plane_mask,
+        };
+        let write = |r: &GetImageRequest| {
+            let mut buf = Vec::new();
+            write_get_image_reply(
+                &mut buf,
+                ClientByteOrder::LittleEndian,
+                SequenceNumber(1),
+                r,
+                0x21,
+            )
+            .unwrap();
+            buf
+        };
+
+        // XYPixmap, plane_mask=0 → header only, length 0.
+        let buf = write(&req(1, 0));
+        assert_eq!(buf.len(), 32);
+        assert_eq!(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]), 0);
+
+        // XYPixmap, 3 planes → 3 × stride(40px→8B) × 2 rows = 48 bytes.
+        let buf = write(&req(1, 0b111));
+        assert_eq!(buf.len(), 32 + 48);
+        assert_eq!(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]), 12);
+
+        // ZPixmap → full 32bpp grid regardless of mask.
+        let buf = write(&req(2, 0));
+        assert_eq!(buf.len(), 32 + 40 * 2 * 4);
+    }
 
     #[test]
     fn encode_shm_completion_event_wire_layout() {

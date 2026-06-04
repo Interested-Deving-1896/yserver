@@ -27,6 +27,14 @@ if ! DISPLAY="$DISPLAY_ARG" timeout 5 xdpyinfo >/dev/null 2>&1; then
 fi
 
 cd "$XTS_DIR"
+
+# check.sh only generates tetexec.cfg when it's missing, and a stale
+# one bakes in the DISPLAY it was generated against (xts-config probes
+# xdpyinfo). A leftover cfg from an interrupted/manual run then makes
+# every TCM abort with "Could not open display :N" mid-run. Always
+# regenerate against the display we're actually targeting.
+rm -f xts5/tetexec.cfg
+
 DISPLAY="$DISPLAY_ARG" timeout "$TIMEOUT" ./check.sh "$SCENARIO"
 status=$?
 

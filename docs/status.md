@@ -4214,3 +4214,37 @@ probe-green in vng + e16 menu/pager HW-verified on silence.
   (+ CHARSET_REGISTRY/ENCODING properties) in the font replies.
 - Connection setup advertises `max-keycode=0` (min=0x08); derive
   from the real keymap.
+
+## GetImage format/plane_mask — XTS hang fix (branch `fix/get-image-format-plane-mask`, 2026-06-04)
+
+**Symptom (eiger HW, full xts5 run):** every full run died at test
+400 `Xlib9/XGetImage` scenario 810-0 — TP2 reported "unexpected
+signal 11", TP4 then hung ~5 min until the harness SIGTERM
+("sigtrap.c" in the journal is TET's handler file, not a SIGTRAP).
+Orphaned TCM processes survived forever, deadlocked in their own
+SIGTERM handler.
+
+**Root cause (gdb core of the crashing TCM):** v2 `get_image`
+ignored both `format` and `plane_mask` — XYPixmap requests got
+ZPixmap-layout bytes. For TP2's first call (`plane_mask=0`,
+XYPixmap) the non-empty reply walks into a latent libX11 NULL deref:
+`_XGetImage` runs `planes = image->depth` *before* its NULL check,
+and `XCreateImage(depth=Ones(0)=0)` returns NULL. Xorg never trips
+it (it replies length-0 there). The deref fires with the display
+mutex held; TET catches the SIGSEGV and longjmps, so every later
+Xlib call in that TCM blocks on the poisoned mutex — that's the
+5-minute "hang". Upstream libX11 bug worth filing.
+
+**Fix (`8fb4ff2`):** backend truncates `plane_mask` to drawable
+depth; XYPixmap + empty mask → length-0 reply (Xorg behavior);
+XYPixmap repacks the engine's Z bytes into bitmap planes (MSB plane
+first, pad-32, LSBFirst); partial-mask ZPixmap masks pixels in
+place. Protocol fallback (unknown drawable) sizes XYPixmap zeros as
+`popcount(mask)` planes instead of 0 bytes.
+
+**Verified on eiger HW:** scenario completes in 5 s (was: SIGSEGV +
+300 s timeout). 17 TPs: 1 PASS / 10 FAIL / 3 NOTINUSE / 3 UNTESTED,
+no signals. Residual FAILs are content-level (depth-4/15/16 pixmap
+formats advertised but unreadable by the engine → zeroed fallback
+data; no BadValue for invalid format) — tracked as follow-ups, they
+don't block full runs.
