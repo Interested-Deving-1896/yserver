@@ -647,6 +647,14 @@ impl DrawableStore {
         self.by_xid.get(&xid).copied()
     }
 
+    /// Diagnostic-only: iterate every `(host_xid, DrawableId)` pair
+    /// currently registered. Used by the SIGUSR2 drawables dump to
+    /// sweep pixmaps that aren't reachable through `windows_v2` /
+    /// backings (e.g. e16's menu-item background pixmaps).
+    pub(crate) fn xid_entries(&self) -> impl Iterator<Item = (u32, DrawableId)> + '_ {
+        self.by_xid.iter().map(|(&xid, &id)| (xid, id))
+    }
+
     /// Shutdown-only: destroy every remaining drawable's Vk
     /// storage. The runtime release path (`destroy_now`) walks
     /// from `decref` → `poll_pending_retire`, so any drawable

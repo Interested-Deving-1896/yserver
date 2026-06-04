@@ -5901,6 +5901,68 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
                 geom.height,
             );
         }
+        // Per-window leaf storage. This is what the scene composite
+        // samples for unredirected windows, so a "storage right /
+        // screen wrong" vs "storage already wrong" split (e16 menu
+        // hover items, 2026-06-04) needs these dumped alongside the
+        // manifest. Dedup against root/cow/backings pushed above.
+        {
+            let seen: std::collections::HashSet<super::store::DrawableId> =
+                targets.iter().map(|t| t.id).collect();
+            let mut win_xids: Vec<u32> = backend.windows_v2.keys().copied().collect();
+            win_xids.sort_unstable();
+            for w_xid in win_xids {
+                let Some(leaf_id) = backend.store.lookup(w_xid) else {
+                    continue;
+                };
+                if seen.contains(&leaf_id) {
+                    continue;
+                }
+                let Some(d) = backend.store.get(leaf_id) else {
+                    continue;
+                };
+                if d.storage.extent.width == 0 || d.storage.extent.height == 0 {
+                    continue;
+                }
+                targets.push(DumpTarget {
+                    label: format!("win-0x{w_xid:x}"),
+                    id: leaf_id,
+                    depth: d.depth,
+                    width: d.storage.extent.width,
+                    height: d.storage.extent.height,
+                });
+            }
+        }
+        // Optional full-store sweep (YSERVER_DUMP_ALL_DRAWABLES=1):
+        // every xid-registered drawable, which adds the pixmaps no
+        // other walk reaches (client bg/tile pixmaps — e16's menu
+        // item images live ONLY here). Off by default to keep the
+        // normal dump lean.
+        if std::env::var("YSERVER_DUMP_ALL_DRAWABLES").is_ok_and(|v| v == "1") {
+            let seen: std::collections::HashSet<super::store::DrawableId> =
+                targets.iter().map(|t| t.id).collect();
+            let mut xid_pairs: Vec<(u32, super::store::DrawableId)> =
+                backend.store.xid_entries().collect();
+            xid_pairs.sort_unstable_by_key(|(xid, _)| *xid);
+            for (xid, id) in xid_pairs {
+                if seen.contains(&id) {
+                    continue;
+                }
+                let Some(d) = backend.store.get(id) else {
+                    continue;
+                };
+                if d.storage.extent.width == 0 || d.storage.extent.height == 0 {
+                    continue;
+                }
+                targets.push(DumpTarget {
+                    label: format!("xid-0x{xid:x}"),
+                    id,
+                    depth: d.depth,
+                    width: d.storage.extent.width,
+                    height: d.storage.extent.height,
+                });
+            }
+        }
         // Recent COW-targeted PresentPixmap sources — the bisect
         // dump for "is marco's offscreen broken, or only the
         // copy-to-COW step?" Walk in submission order (oldest

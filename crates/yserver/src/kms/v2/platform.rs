@@ -222,10 +222,10 @@ impl Drop for FenceTicketInner {
             // VkFences leaked at SIGTERM on bee/MATE. `None` is
             // the `for_tests_stub` shape (no real device); also
             // no-op for `vk::Fence::null()`.
-            if let Some(vk) = self.vk.as_ref() {
-                if self.fence != vk::Fence::null() {
-                    unsafe { vk.device.destroy_fence(self.fence, None) };
-                }
+            if let Some(vk) = self.vk.as_ref()
+                && self.fence != vk::Fence::null()
+            {
+                unsafe { vk.device.destroy_fence(self.fence, None) };
             }
             return;
         };
