@@ -2350,16 +2350,18 @@ fn v2_cow_paint_appears_on_scanout() {
 /// scanout. User-visible symptom: opaque dark borders where soft
 /// shadows should be.
 ///
-/// Trigger semantics: lazy-register on the first paint into COW.
-/// Allocating COW without ever painting (xfwm4 case) leaves the
+/// Trigger semantics (b5c5f16, May 21): register on the first
+/// overlay `PresentPixmap` (`note_present_pixmap`), NOT on the
+/// first paint. The earlier paint-trigger (138ef3d) regressed MATE:
+/// marco PAINTS the zero-filled COW before publishing a complete
+/// frame, so paint-time registration black-screened toplevels.
+/// Allocating COW without ever presenting (xfwm4 case) leaves the
 /// scene entry off, so the depth-24 force-opaque initial fill does
 /// not cover scene content.
 ///
-/// Oracle: `get_overlay_window` → `put_image` against the COW xid →
-/// scene reports the COW is registered. Pre-fix this assertion is
-/// the failing one — every other observable (store lookup, refcount,
-/// presentation damage) is correct because the bug is exclusively
-/// at the scene-registration boundary.
+/// Oracle: `get_overlay_window` → paint does NOT register →
+/// `note_present_pixmap` onto the COW xid registers → final
+/// release unregisters.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn v2_paint_into_cow_registers_scene_entry() {
@@ -2372,7 +2374,7 @@ fn v2_paint_into_cow_registers_scene_entry() {
     };
 
     // Allocation alone must NOT register: xfwm4-style compositors
-    // allocate COW but never paint into it; registering eagerly
+    // allocate COW but never present into it; registering eagerly
     // would force-opaque-cover the entire scene with the initial
     // zero-fill (depth-24 padding byte → α=1.0 through the
     // sample-side swizzle).
@@ -2385,20 +2387,32 @@ fn v2_paint_into_cow_registers_scene_entry() {
          depth-24 force-opaque initial fill",
     );
 
-    // First paint into COW (Present-Pixmap path goes through
-    // `copy_area`; `put_image` is the test-fixture-friendly
-    // equivalent paint vector). After this, the scene MUST see
-    // the COW registered so `build_scene` emits it at the top of z.
-    let cow_xid = 0x103u32;
+    // Paint into COW must NOT register either (b5c5f16): marco
+    // paints the COW during compositor warm-up before the first
+    // complete frame is presented; registering here black-screens
+    // the desktop behind the zero-fill.
+    let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
     let pixels: Vec<u8> = vec![0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF];
     b.put_image(None, cow_xid, 24, 2, 1, 0, 0, &pixels)
         .expect("put_image into COW xid");
     assert!(
+        !b.test_scene_cow_registered(),
+        "paint into COW must not register the scene entry — \
+         registration is deferred to the first overlay PresentPixmap \
+         (b5c5f16 'restore marco compositor visibility under MATE')",
+    );
+
+    // First overlay PresentPixmap is the registration trigger: the
+    // compositor has published a complete frame, so the COW becomes
+    // the top-of-z scene entry and `build_scene` emits it.
+    let src = b.create_pixmap(None, 32, 2, 2).expect("present src");
+    b.note_present_pixmap(src.as_raw(), cow_xid);
+    assert!(
         b.test_scene_cow_registered(),
-        "after the first client paint into COW, the scene must have \
-         the COW registered as a top-of-z entry — otherwise the \
-         compositor's painted content lives in storage but never \
-         reaches the scanout (the active 'no shadows' bug)",
+        "first overlay PresentPixmap (note_present_pixmap onto the COW \
+         xid) must register the COW as a top-of-z scene entry — \
+         otherwise the compositor's presented frames live in storage \
+         but never reach the scanout (the 'no shadows' bug)",
     );
 
     // Final release unregisters the scene entry so a subsequent
@@ -3168,7 +3182,13 @@ fn submit_group_flushes_before_non_cow_present_completion_signal() {
         }
     };
 
-    // Drain any CBs buffered during construction (layout transitions etc.).
+    // Close the construction frame (init_root_storage's fill keeps a
+    // frame — and with it the group ticket — open since B.3 ported
+    // fill_rect to the frame builder), then drain buffered CBs.
+    if b.frame_builder_is_open_for_tests() {
+        b.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close construction frame");
+    }
     b.engine_flush_submit_group_for_tests()
         .expect("baseline drain");
     assert!(
@@ -3184,15 +3204,17 @@ fn submit_group_flushes_before_non_cow_present_completion_signal() {
     b.engine_flush_submit_group_for_tests()
         .expect("post-create drain");
 
-    // Issue a paint op (fill_rectangle) that parks a CB in the group.
+    // Issue a paint op (fill_rectangle). Since B.3 it records into an
+    // open frame-builder frame (deferred CB) rather than parking a
+    // one-shot CB directly in the group — either form counts as
+    // "paint buffered but not yet on the queue".
     b.fill_rectangle(None, dst_xid, 0xFF0000FF, 0, 0, 4, 4)
         .expect("fill_rectangle");
-
-    // The CB should now be buffered in the group.
     assert!(
-        b.platform_submit_group_size_for_tests() >= 1
+        b.frame_builder_is_open_for_tests()
+            || b.platform_submit_group_size_for_tests() >= 1
             || b.engine_pending_group_ops_count_for_tests() >= 1,
-        "paint CB buffered before enqueue_present_completion"
+        "paint buffered (open frame or parked CB) before enqueue_present_completion"
     );
 
     // Invoke the non-COW PRESENT enqueue path.  cow_id is unset on
@@ -3209,8 +3231,13 @@ fn submit_group_flushes_before_non_cow_present_completion_signal() {
         dst_xid,
     );
 
-    // After the call the PresentCompletionSignal flush must have
-    // graduated all parked ops to `submitted` and closed the group.
+    // After the call the close-frame (B.1 trigger 1b) +
+    // PresentCompletionSignal flush must have graduated all deferred
+    // paint to `submitted` and closed the group.
+    assert!(
+        !b.frame_builder_is_open_for_tests(),
+        "open frame closed before the signal-only submit (B.1 trigger 1b)"
+    );
     assert_eq!(
         b.platform_submit_group_size_for_tests(),
         0,
@@ -3223,14 +3250,22 @@ fn submit_group_flushes_before_non_cow_present_completion_signal() {
     );
 }
 
-/// Phase A T8 regression gate: the SubmitGroup max-size cap auto-flushes
-/// after the cap is reached, and op N+1 lands in a new empty group.
+/// Phase A T8 successor: the SubmitGroup must never accumulate
+/// unsubmitted paint across frame closes.
 ///
-/// Invariant pinned: "Whatever the cap is, exceeding it forces an extra submit."
+/// History: T8 originally pinned "16 paint ops park 16 CBs; the 16th
+/// append crosses cap=16 and auto-flushes". Since B.3 ported the paint
+/// surface to the frame builder, paint ops coalesce into ONE frame CB
+/// and `close_open_frame` ends with an unconditional
+/// `flush_submit_group(FrameBuilder)` — group entries can no longer
+/// grow toward the cap through the Backend surface at all (the
+/// `MaxSize` auto-flush boundary itself is unit-covered in
+/// `submit_group.rs` / `maybe_auto_flush_submit_group`).
 ///
-/// Setup: cap=16. Issue 16 paint ops — the 16th append crosses the threshold
-/// and triggers an auto-flush. The group is empty after op 16. Op 17 opens a
-/// fresh group with size=1.
+/// Invariant pinned now: with the cap raised far above the workload
+/// (16), 17 paint+close cycles still leave the group empty and closed
+/// after EVERY close — the close-time flush is reason-driven, not
+/// cap-driven, so no growth path exists for parked paint.
 #[test]
 #[ignore = "lavapipe vk"]
 fn submit_group_max_size_caps_growth_at_seventeen_paint_ops() {
@@ -3244,14 +3279,16 @@ fn submit_group_max_size_caps_growth_at_seventeen_paint_ops() {
         }
     };
 
-    // Force the cap to 16 explicitly so the test doesn't drift if
-    // someone tunes the default.
-    b.platform_submit_group_set_max_size_for_tests(16);
-
     let dst = b.create_pixmap(None, 32, 16, 16).expect("dst pixmap");
     let dst_xid = dst.as_raw();
 
-    // Drain setup CBs so we start from an empty group.
+    // Close the construction frame + drain setup CBs so we start from
+    // an empty, closed group — BEFORE raising the cap, so the close's
+    // own append flushes out under the default cap.
+    if b.frame_builder_is_open_for_tests() {
+        b.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close construction frame");
+    }
     b.engine_flush_submit_group_for_tests()
         .expect("setup drain");
     assert!(
@@ -3259,41 +3296,38 @@ fn submit_group_max_size_caps_growth_at_seventeen_paint_ops() {
         "setup drained"
     );
 
-    // Issue 16 paint ops. The 16th append → size reaches cap → auto-flush.
-    for i in 0..16u32 {
+    // Force the cap to 16 explicitly so the test doesn't drift if
+    // someone tunes the default (production runs max_size=1 during
+    // B.1–B.4; see v2_platform_open_pins_submit_group_max_size_to_one).
+    b.platform_submit_group_set_max_size_for_tests(16);
+
+    // Since B.3, fill_rectangle records into the frame builder, so a
+    // bare fill never appends to the group. Each (fill + close-frame)
+    // cycle submits exactly one frame CB — and the close-time
+    // FrameBuilder flush must drain it immediately even though the
+    // cap (16) is never reached.
+    for i in 0..17u32 {
         b.fill_rectangle(None, dst_xid, i, 0, 0, 4, 4)
             .expect("fill");
+        b.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close frame");
+        assert_eq!(
+            b.platform_submit_group_size_for_tests(),
+            0,
+            "close-time FrameBuilder flush drains the group (cycle {i})",
+        );
+        assert!(
+            !b.platform_submit_group_is_open_for_tests(),
+            "group closed after close-time flush (cycle {i})",
+        );
+        assert_eq!(
+            b.engine_pending_group_ops_count_for_tests(),
+            0,
+            "parked ops graduated at close (cycle {i})",
+        );
     }
-    // After 16 ops: cap fired exactly once, group is empty.
-    assert_eq!(
-        b.platform_submit_group_size_for_tests(),
-        0,
-        "after 16 ops, cap flushed the group",
-    );
-    assert!(
-        !b.platform_submit_group_is_open_for_tests(),
-        "group closed after cap flush",
-    );
-    assert_eq!(
-        b.engine_pending_group_ops_count_for_tests(),
-        0,
-        "parked ops graduated",
-    );
 
-    // Op 17 lands in a new (empty) group.
-    b.fill_rectangle(None, dst_xid, 16, 0, 0, 4, 4)
-        .expect("17th fill");
-    assert_eq!(
-        b.platform_submit_group_size_for_tests(),
-        1,
-        "op 17 in new empty group, size=1",
-    );
-    assert!(
-        b.platform_submit_group_is_open_for_tests(),
-        "group open with op 17 CB buffered",
-    );
-
-    // Explicit flush — group drains.
+    // Explicit flush on the already-drained group is a no-op.
     b.engine_flush_submit_group_for_tests()
         .expect("final flush");
     assert_eq!(b.platform_submit_group_size_for_tests(), 0);
@@ -3327,27 +3361,37 @@ fn submit_group_failure_drops_pending_ops_and_short_circuits() {
     let dst = b.create_pixmap(None, 32, 4, 4).expect("dst pixmap");
     let dst_xid = dst.as_raw();
 
-    // Drain setup CBs so pending_group_ops and submitted start clean.
+    // Close the construction frame + drain setup CBs so
+    // pending_group_ops and submitted start clean.
+    if b.frame_builder_is_open_for_tests() {
+        b.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close construction frame");
+    }
     b.engine_flush_submit_group_for_tests().expect("drain");
 
-    // Buffer two paint ops (cap=16 means they stay parked).
+    // Buffer two paint ops. Since B.3 they coalesce as recorded ops
+    // in ONE open frame-builder frame (nothing parks in
+    // pending_group_ops until the close replays the frame).
     b.fill_rectangle(None, dst_xid, 0xFF_00_00_00, 0, 0, 4, 4)
         .expect("fill 1");
     b.fill_rectangle(None, dst_xid, 0xFF_00_00_01, 0, 0, 4, 4)
         .expect("fill 2");
-
-    let parked_before = b.engine_pending_group_ops_count_for_tests();
-    assert_eq!(parked_before, 2, "two ops parked before failure");
+    assert!(
+        b.frame_builder_is_open_for_tests(),
+        "two fills buffered in an open frame before failure"
+    );
 
     let in_flight_before = b.engine_pending_count_for_tests();
 
-    // Scenario 1: inject failure → flush → pending_group_ops cleared,
+    // Scenario 1: inject failure → close the frame (its replay CB
+    // appends to the group and the close-time FrameBuilder flush hits
+    // the injected queue_submit2 failure) → pending_group_ops cleared,
     // submitted count unchanged.
     b.platform_force_next_submit_failure_for_tests();
-    let flush_result = b.engine_flush_submit_group_for_tests();
+    let close_result = b.engine_close_open_frame_for_timeout_for_tests();
     assert!(
-        flush_result.is_err(),
-        "flush must return Err on injected failure"
+        close_result.is_err(),
+        "frame close must return Err on injected submit failure"
     );
 
     assert!(
@@ -3425,26 +3469,33 @@ fn submit_group_mixed_sequence_smoke_exact_submit_count() {
     let dst = b.create_pixmap(None, 32, 32, 32).expect("dst pixmap");
     let dst_xid = dst.as_raw();
 
-    // Drain all setup CBs (cow zero-fill, pixmap zero-fills) so the
-    // baseline group is clean, then capture the initial flush count.
+    // Close the construction frame (init_root_storage fill) and drain
+    // all setup CBs so the baseline group is clean, then capture the
+    // initial flush count.
+    if b.frame_builder_is_open_for_tests() {
+        b.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close construction frame");
+    }
     b.engine_flush_submit_group_for_tests()
         .expect("setup drain");
     let initial_flushes = b.telemetry_submit_group_flushes_for_tests();
 
     // ── Mixed sequence ────────────────────────────────────────────
-    // Step 1: copy_area into COW xid → routes to cow_copy_area →
-    // opens a cow_batch (CB deferred in batch state, not yet in group).
+    // Since B.3 the whole paint surface below records into ONE open
+    // frame-builder frame; nothing parks in the group until get_image
+    // closes the frame.
+    // Step 1: copy_area into COW xid → cow_copy_area records into the
+    // frame (opens it).
     b.copy_area(None, src_xid, cow_xid, 0, 0, 0, 0, 8, 8)
         .expect("cow copy_area");
 
-    // Step 2: fill_rectangle on non-cow dst → flush_render_batch fires
-    // (appends any pending CB to group), then the fill CB appends after it.
+    // Step 2: fill_rectangle on non-cow dst → records into the same
+    // open frame.
     b.fill_rectangle(None, dst_xid, 0xFF_00_00_FF, 0, 0, 8, 8)
         .expect("fill_rectangle");
 
     // Step 3: render_composite (SolidFill src → dst picture) →
-    // opens render_batch, parks composite CB in group on flush_render_batch
-    // (fired at the next non-composite op or explicit flush).
+    // records into the same open frame.
     let dst_pic = b
         .render_create_picture(None, AnyHandle::Pixmap(dst), 0, 0, &[])
         .expect("render_create_picture dst")
@@ -3499,9 +3550,11 @@ fn submit_group_mixed_sequence_smoke_exact_submit_count() {
     let _ = font_set; // suppress unused-variable warning
 
     // Step 5: get_image — sync barrier.
-    // Internally: flush_render_batch (closes the render batch CB →
-    // appends to group), then two flush_submit_group calls:
-    //   [A] SyncBoundary — drains all buffered CBs (fill+composite+glyph*)
+    // Internally: flush_render_batch (no-op here), then
+    // close_open_frame(SyncWait) — whose close path ends with its own
+    // flush_submit_group(FrameBuilder) submitting the frame CB — then
+    // two SyncBoundary flush_submit_group calls:
+    //   [A] SyncBoundary — drains anything still buffered
     //   [B] SyncBoundary — submits the readback CB itself
     let _ = b
         .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 8, 8, !0)
@@ -3510,13 +3563,18 @@ fn submit_group_mixed_sequence_smoke_exact_submit_count() {
     // ── Assertions ────────────────────────────────────────────────
     let after_flushes = b.telemetry_submit_group_flushes_for_tests();
     let delta = after_flushes - initial_flushes;
-    // Exact count: 2. One SyncBoundary drains the buffered paint chain;
-    // the second SyncBoundary submits get_image's own readback CB.
-    // These are the only two flush_submit_group call sites inside
-    // engine.rs::get_image (verified at lines 3219 and 3309).
+    // Exact count: 3, all inside get_image —
+    //   1. close_open_frame(SyncWait)'s internal FrameBuilder flush
+    //      (submits the cow→fill→composite→glyph frame CB),
+    //   2. SyncBoundary [A],
+    //   3. SyncBoundary [B] (readback CB).
+    // Every engine flush_submit_group call queues an outcome (even a
+    // 0-entry fast-path), so the counter counts calls, not entries.
+    // Pre-B.3 this was 2 — there was no deferred frame to close.
     assert_eq!(
-        delta, 2,
-        "expected exactly 2 submit_group flushes from get_image SyncBoundary pair; got {delta}",
+        delta, 3,
+        "expected exactly 3 submit_group flushes from get_image \
+         (FrameBuilder close + SyncBoundary pair); got {delta}",
     );
 
     // End state: group fully drained, no parked ops, renderer healthy.
@@ -3759,6 +3817,15 @@ fn acquire_descriptor_uses_frame_generation_when_open() {
         }
     };
 
+    // Construction (init_root_storage's fill) leaves a frame open
+    // since B.3 ported fill_rect to the frame builder; close it or
+    // open_frame_for_paint_for_tests trips its "frame already open"
+    // debug_assert.
+    if be.frame_builder_is_open_for_tests() {
+        be.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close construction frame");
+    }
+
     // (1) Seed a known baseline so the assertions below are
     //     deterministic and don't depend on test ordering.
     be.engine_acquire_generation_set_for_tests(10);
@@ -3844,6 +3911,14 @@ fn v2_frame_builder_render_composite_via_fb_opens_frame() {
     let dst = be
         .allocate_test_pixmap_bgra(64, 64)
         .expect("allocate_test_pixmap_bgra");
+
+    // Close the construction frame (init_root_storage fill) — the
+    // assert below checks the empty composite didn't OPEN a frame,
+    // which needs a closed-frame baseline.
+    if be.frame_builder_is_open_for_tests() {
+        be.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close construction frame");
+    }
 
     // Empty rects — the via_frame_builder body returns Ok(empty stats)
     // before opening the frame. No flush, no asset init, no open.
@@ -5032,11 +5107,21 @@ fn v2_frame_builder_image_text_non_bgra8_target_drops_run() {
 
     // Allocate an R8_UNORM (depth-8) pixmap — text pipeline requires
     // B8G8R8A8_UNORM; this triggers the N7 format gate.
+    // NB create_pixmap is (origin, DEPTH, w, h) — this test shipped
+    // with (32, 32, 8) = a depth-32 32×8 pixmap, so the gate never
+    // fired and the glyph was interned (born-failing test).
     let dst_r8 = be
-        .create_pixmap(None, 32, 32, 8)
+        .create_pixmap(None, 8, 32, 32)
         .expect("create_pixmap depth-8");
     let dst_xid = dst_r8.as_raw();
 
+    // Close the construction frame (init_root_storage fill) so the
+    // "no frame open after a format-gated drop" assert below sees
+    // only this test's effect.
+    if be.frame_builder_is_open_for_tests() {
+        be.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close construction frame");
+    }
     be.engine_flush_submit_group_for_tests()
         .expect("setup drain");
     let pre_flushes = be.telemetry_submit_group_flushes_for_tests();
@@ -5218,6 +5303,13 @@ fn v2_frame_builder_render_traps_or_tris_cross_frame_mask_grow() {
         .allocate_test_pixmap_bgra(512, 512)
         .expect("allocate_test_pixmap_bgra 512x512");
 
+    // Construction (init_root_storage's fill) leaves a frame open
+    // since B.3 ported fill_rect to the frame builder; close it so
+    // F1 below contains exactly op 1.
+    if be.frame_builder_is_open_for_tests() {
+        be.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close construction frame");
+    }
     be.engine_flush_submit_group_for_tests()
         .expect("setup drain");
     let pre_flushes = be.telemetry_submit_group_flushes_for_tests();
@@ -5647,4 +5739,83 @@ fn v2_free_pixmap_invalidates_engine_view_cache() {
          cached views accumulated until engine Drop (process exit), so \
          long sessions grew unboundedly.",
     );
+}
+
+/// `read_depth1_pixmap` — the SHAPE::Mask introspection hook.
+/// PutImage a staircase bitmap into a depth-1 pixmap (width 10,
+/// deliberately not byte-aligned; wire rows are LSBFirst bits
+/// with 32-bit scanline pad), then read it back as the
+/// byte-per-pixel `(w, h, bytes)` triple the YX-bander consumes.
+/// The trait default returns `Ok(None)` — v2 must override it or
+/// every ShapeMask degrades to a bounding-box rect.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_read_depth1_pixmap_returns_mask_bytes() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    const W: u16 = 10;
+    const H: u16 = 6;
+    let xid = b
+        .create_pixmap(None, 1, W, H)
+        .expect("create_pixmap")
+        .as_raw();
+
+    // Staircase: row y sets pixels x <= y. Wire format: LSBFirst
+    // bit order, ceil(10/32)*4 = 4 bytes per row.
+    let mut bits = vec![0u8; 4 * H as usize];
+    for y in 0..H as usize {
+        bits[y * 4] = (1u16 << (y + 1)).wrapping_sub(1) as u8;
+    }
+    b.put_image(None, xid, 1, W, H, 0, 0, &bits)
+        .expect("put_image depth-1");
+
+    let (w, h, bytes) = b
+        .read_depth1_pixmap(None, xid)
+        .expect("read_depth1_pixmap")
+        .expect(
+            "v2 must introspect depth-1 pixmaps (trait default None = ShapeMask degrades to bbox)",
+        );
+    assert_eq!(
+        (w, h),
+        (u32::from(W), u32::from(H)),
+        "dims match the pixmap"
+    );
+    assert_eq!(
+        bytes.len(),
+        (w * h) as usize,
+        "byte per pixel, tightly packed"
+    );
+    for y in 0..H as usize {
+        for x in 0..W as usize {
+            let set = bytes[y * W as usize + x] != 0;
+            assert_eq!(set, x <= y, "pixel ({x},{y}) staircase membership");
+        }
+    }
+}
+
+/// `read_depth1_pixmap` on a non-depth-1 drawable must return
+/// `None` (best-effort decline), not misread BGRA bytes as mask
+/// coverage.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn v2_read_depth1_pixmap_declines_depth32() {
+    let mut b = match KmsBackendV2::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let xid = b
+        .create_pixmap(None, 32, 4, 4)
+        .expect("create_pixmap")
+        .as_raw();
+    let got = b.read_depth1_pixmap(None, xid).expect("read_depth1_pixmap");
+    assert!(got.is_none(), "depth-32 drawable must decline, got {got:?}");
 }

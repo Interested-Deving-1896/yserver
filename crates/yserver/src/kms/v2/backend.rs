@@ -2486,6 +2486,10 @@ impl KmsBackendV2 {
                     .record_submit_group_flush(outcome.flushed_entries, outcome.reason);
             }
         }
+        // Close-REASON counters accumulate from frame-builder close
+        // EVENTS, not flush outcomes — without this drain the counter
+        // stays 0 no matter how many closes fired in the engine.
+        self.drain_frame_builder_telemetry();
         self.telemetry
             .lifetime
             .frame_builder_close_reason_non_ported_paint_op
@@ -2909,6 +2913,11 @@ impl KmsBackendV2 {
                     .record_submit_group_flush(outcome.flushed_entries, outcome.reason);
             }
         }
+        // Close-REASON counters accumulate from frame-builder close
+        // EVENTS, not flush outcomes — without this drain the counter
+        // stays 0 no matter how many ScratchGrow closes fired (the
+        // cross-frame mask-grow test was born failing because of it).
+        self.drain_frame_builder_telemetry();
         self.telemetry
             .lifetime
             .frame_builder_close_reason_scratch_grow
@@ -9250,6 +9259,77 @@ impl Backend for KmsBackendV2 {
         // Phase B.1 Task 21: engine.get_image calls close_open_frame
         // (SyncWait reason) before blocking on the fence; drain the
         // resulting close event into telemetry.
+        self.drain_frame_builder_telemetry();
+        result
+    }
+
+    fn read_depth1_pixmap(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<Option<(u32, u32, Vec<u8>)>> {
+        // SHAPE::Mask introspection — read a depth-1 mask pixmap
+        // back as the tightly packed byte-per-pixel triple
+        // `bitmap_to_yx_banded_rects` consumes. Mirrors v1's
+        // `read_mirror_pixels` path (commit c5959af); without this
+        // override the trait default returns `None` and every
+        // ShapeMask degrades to a bounding-box rect — and since
+        // the scene clips window draws to the bounding shape,
+        // shaped popups render wrong (e16 hover clouds).
+        let Some(target) = self.resolve_paint_target(host_xid) else {
+            self.log_v2_gap("read_depth1_pixmap_unknown_xid");
+            return Ok(None);
+        };
+        let (depth, extent) = match self.store.get(target.id) {
+            Some(d) => (d.depth, d.storage.extent),
+            None => return Ok(None),
+        };
+        if depth != 1 {
+            return Ok(None);
+        }
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: target.offset.0,
+                y: target.offset.1,
+            },
+            extent,
+        };
+        let start = std::time::Instant::now();
+        let result =
+            match self
+                .engine
+                .get_image(&mut self.store, &mut self.platform, target.id, rect, 1)
+            {
+                Ok(packed) => {
+                    let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    self.telemetry.record_one_shot_submit();
+                    self.telemetry.record_fence_wait(ns);
+                    self.trace_simple(SubmitKind::GetImage, target.id, 1);
+                    // engine.get_image returns wire-format depth-1
+                    // rows (LSBFirst bits, 32-bit scanline pad);
+                    // unpack to one byte per pixel, 0xFF = set.
+                    let w = extent.width as usize;
+                    let row_bytes = extent.width.div_ceil(32) as usize * 4;
+                    let mut bytes = vec![0u8; w * extent.height as usize];
+                    for row in 0..extent.height as usize {
+                        let src = &packed[row * row_bytes..];
+                        for col in 0..w {
+                            if src[col / 8] & (1 << (col % 8)) != 0 {
+                                bytes[row * w + col] = 0xFF;
+                            }
+                        }
+                    }
+                    Ok(Some((extent.width, extent.height, bytes)))
+                }
+                Err(e) => {
+                    log::warn!(
+                        "v2 read_depth1_pixmap: engine.get_image failed for xid \
+                         {host_xid:#x}: {e:?}",
+                    );
+                    Ok(None)
+                }
+            };
+        // Same SyncWait close-event drain as get_image above.
         self.drain_frame_builder_telemetry();
         result
     }
