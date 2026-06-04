@@ -4187,8 +4187,10 @@ probe-green in vng + e16 menu/pager HW-verified on silence.
   bounding-box rect AND `2a31500` now clips window draws to that
   degraded shape. e16 detects the wrong GetRectangles reply and
   clears the shape (recovery path).
-- `YSERVER_FRAME_BUILDER=off` kill-switch is bit-rotted: assert in
-  `close_open_frame` (engine.rs:1437) at startup.
+- ~~`YSERVER_FRAME_BUILDER=off` kill-switch is bit-rotted~~ —
+  RESOLVED by removal (`04d90c4`): both kill-switches + the legacy
+  per-op-submit bodies they gated are deleted (-1170 LOC); the
+  frame builder is the only composite/glyph path.
 - XkbGetNames reply stuffs zero atoms + bits the client didn't
   request; libX11 clients GetAtomName(0) → BadAtom → exit (kills
   xdotool; blocks e16-under-vng repros).
