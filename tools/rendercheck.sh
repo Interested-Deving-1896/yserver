@@ -42,6 +42,7 @@ if ! DISPLAY="$DISPLAY_ARG" timeout 5 xdpyinfo >/dev/null 2>&1; then
     exit 2
 fi
 
+xset s off -dpms
 declare -i total_pass=0 total_seen=0 incomplete=0
 
 printf "%-14s %8s %8s %s\n" "test" "pass" "total" "status"
