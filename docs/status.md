@@ -4205,13 +4205,18 @@ probe-green in vng + e16 menu/pager HW-verified on silence.
 - ~~Composite GetOverlayWindow returns 0~~ — NOT A BUG: x11trace
   mis-decodes this reply (Xephyr traces `overlayWin=0` too while
   e16 parents onto the real overlay xid on both servers).
-- **e16 silent vng exit root-caused (`fff5d2a` probes):**
-  `XCreateFontSet("fixed")` returns NULL — our ListFontsWithInfo
-  sends a bare `fixed` name with no XLFD/properties, so libX11
-  XLC can't bind the C-locale ISO8859-1 charset (Xephyr resolves
-  the alias to full XLFD entries; e16-on-Xephyr-in-the-same-guest
-  stays alive → yserver-specific). Fix = synthesize XLFD names
-  (+ CHARSET_REGISTRY/ENCODING properties) in the font replies.
+- ~~e16 silent vng exit / XCreateFontSet NULL~~ — RESOLVED
+  (`28f42d1`, 2026-06-04): alias catalog entries now go out under a
+  real-metrics XLFD (`FontLoader::alias_to_xlfd`) AND every
+  ListFontsWithInfo entry carries the `FONT` property (XA_FONT=18 →
+  interned XLFD atom, interner threaded like `xkb_proxy`). Key
+  libX11 fact (omGeneric.c `get_prop_name`): for non-XLFD base
+  names XLC resolves the charset EXCLUSIVELY via the FONT property
+  of the first reply — the reply name is not consulted on that
+  path. vng-verified (probe conversation matches Xephyr shape; e16
+  ALIVE headless; `tools/e16-hover-repro.sh` runs end-to-end) +
+  silence HW (xlsfonts/xfd/xterm/wmaker/e16 normal). **Headless
+  e16-in-vng repros are unblocked.**
 - Connection setup advertises `max-keycode=0` (min=0x08); derive
   from the real keymap.
 
