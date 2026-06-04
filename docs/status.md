@@ -4300,3 +4300,33 @@ are finer grab semantics, filed under known-issues territory:
   EnterNotify(mode=NotifyGrab) crossings on activation.
 - TP7: an over-delivery during an active grab ("Unexpected event
   (ButtonPress) received").
+
+## First full XTS run on HW — baseline (master, 2026-06-04)
+
+`just xts-yserver-hw all 21600` on eiger completed for the first time:
+**1078 test cases / 5987 test purposes in 53 min, zero crashes, zero
+hangs.** Result: **2784 PASS (46.5%)** / 1871 FAIL / 730 UNTESTED /
+273 NOTINUSE / 168 UNRES / 139 UNSUP / 15 ABORT. Journal + summary:
+`xts/results/2026-06-04-15:48:44/`.
+
+Per-section: Xproto 358/389 PASS; Xt sections strong (Xt3 73/73,
+Xt14 18/18, Xt11 245/285). Largest FAIL buckets: Xlib9 974 (drawing /
+GetImage content — depth-4/15/16 pixmap formats advertised but
+unreadable, plane semantics), XI 200, Xlib4 176, Xlib13 140 (WM /
+visibility), Xlib11 73 (residual grab semantics).
+
+**New bug found by the run's tail (15 XIproto ABORTs):** client
+resource-ID bases are allocated monotonically (`client# × 0x100000`)
+and never recycled — the 32-bit base overflows at client 4096 and
+connection setup fails ("Could not open display"). This run alone
+consumed 4102 client slots. Strictly, bases past client ~512 already
+exceed the X11 29-bit resource-ID space. Fix: recycle bases of
+disconnected clients (Xorg model).
+
+Unblocked by this session's chain: stale-tetexec.cfg aborts →
+xts-run.sh regeneration; Xlib9/XGetImage libX11 NULL-deref →
+GetImage format/plane_mask; Xlib11/ButtonPress libXi NULL-deref →
+grab-protocol XI2 gate; mass event-delivery FAILs → WarpPointer on
+KMS. The earlier "20-min timeout" mystery at Xlib12/XMaskEvent was
+the recipe's default `timeout=1200` budget for the WHOLE run, not a
+yserver bug.
