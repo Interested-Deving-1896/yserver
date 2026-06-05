@@ -481,6 +481,63 @@ impl KmsBackendV2 {
         self.fill_rectangle(None, host_xid, background_pixel, x, y, width, height)
     }
 
+    /// True when every ancestor of `host_xid` up to the root is mapped
+    /// (the root itself is always viewable). `host_xid` must already
+    /// have its own `mapped` flag set by the caller.
+    fn window_viewable(&self, host_xid: u32) -> bool {
+        let mut cursor = self.windows_v2.get(&host_xid).and_then(|g| g.parent);
+        while let Some(parent_xid) = cursor {
+            let Some(parent) = self.windows_v2.get(&parent_xid) else {
+                // Parent not tracked (root container) — treat as mapped.
+                return true;
+            };
+            if !parent.mapped {
+                return false;
+            }
+            cursor = parent.parent;
+        }
+        true
+    }
+
+    /// Collect `host_xid` plus every descendant whose path down from it
+    /// is fully mapped — i.e. the subtree that becomes viewable when
+    /// `host_xid` maps — along with the background each window should be
+    /// tiled with. Windows with neither bg pixel nor bg pixmap are
+    /// skipped (X11 background None = contents stay undefined).
+    fn collect_viewable_bg_paint_targets(
+        &self,
+        host_xid: u32,
+    ) -> Vec<(u32, u32, Option<u32>, u16, u16)> {
+        let mut out = Vec::new();
+        let mut stack = vec![host_xid];
+        while let Some(xid) = stack.pop() {
+            let Some(geom) = self.windows_v2.get(&xid) else {
+                continue;
+            };
+            if xid != host_xid && !geom.mapped {
+                // Unmapped child: neither it nor its inferiors become
+                // viewable through this map.
+                continue;
+            }
+            if geom.bg_pixel.is_some() || geom.bg_pixmap.is_some() {
+                out.push((
+                    xid,
+                    geom.bg_pixel.unwrap_or(0),
+                    geom.bg_pixmap,
+                    geom.width.max(1),
+                    geom.height.max(1),
+                ));
+            }
+            stack.extend(
+                self.windows_v2
+                    .iter()
+                    .filter(|(_, g)| g.parent == Some(xid))
+                    .map(|(child, _)| *child),
+            );
+        }
+        out
+    }
+
     fn restack_subwindow(&mut self, host_xid: u32, stack_mode: u8, sibling: Option<u32>) {
         let Some(current) = self.windows_v2.get(&host_xid).copied() else {
             return;
@@ -8140,6 +8197,27 @@ impl Backend for KmsBackendV2 {
         }
         if let Some(id) = self.store.lookup(host_xid) {
             self.store.set_scene_participating(id, true);
+        }
+        // X11 map semantics (Xorg dix/window.c MapWindow → RealizeTree →
+        // HandleExposures → miPaintWindow): when a window becomes
+        // viewable and no earlier contents are remembered, the server
+        // tiles it with its background — bg pixmap or bg pixel — and the
+        // same applies to every inferior that becomes viewable with it.
+        // v2 keeps storage across unmap/remap, but X11 says unmapped
+        // contents are NOT remembered, so remap must repaint bg too.
+        // Without this, XTS Xlib4 XMapWindow-9 et al. read fresh/stale
+        // storage where the bg tile belongs ("Bad pixel in tiled area
+        // at (2, 0)"). Windows with bg None keep undefined contents —
+        // no paint, matching miPaintWindow's None early-out.
+        if self.window_viewable(host_xid) {
+            let targets = self.collect_viewable_bg_paint_targets(host_xid);
+            for (xid, bg_pixel, bg_pixmap, w, h) in targets {
+                if let Err(e) =
+                    self.clear_window_area_with_background(xid, bg_pixel, bg_pixmap, 0, 0, w, h)
+                {
+                    log::debug!("v2 map_subwindow: bg paint failed for 0x{xid:x}: {e:?}");
+                }
+            }
         }
         self.scene.mark_scene_structure_dirty();
         Ok(())
