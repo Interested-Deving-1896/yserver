@@ -13767,9 +13767,19 @@ mod tests {
 
         #[test]
         fn z_mask_depth4_masks_bytes() {
+            // Depth-4 wire ZPixmap is nibble-PACKED (two pixels per
+            // byte, low nibble first — see pack_from_storage), so the
+            // mask applies to BOTH nibbles independently. The original
+            // expectation here predated the a2d5480 nibble packing and
+            // assumed one pixel per byte.
+            // Full mask is the identity.
             let mut bytes = vec![0xab, 0x0f, 0xf0, 0x00];
             apply_z_plane_mask(&mut bytes, 4, 0x0f);
-            assert_eq!(bytes, vec![0x0b, 0x0f, 0x00, 0x00]);
+            assert_eq!(bytes, vec![0xab, 0x0f, 0xf0, 0x00]);
+            // Partial mask 0b0011 keeps the low two planes of each pixel.
+            let mut bytes = vec![0xab, 0x0f, 0xf0, 0x00];
+            apply_z_plane_mask(&mut bytes, 4, 0x03);
+            assert_eq!(bytes, vec![0x23, 0x03, 0x30, 0x00]);
         }
 
         #[test]
