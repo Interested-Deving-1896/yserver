@@ -37,6 +37,18 @@ pub(crate) const XI_FIRST_EVENT: u8 = crate::nested::XI2_FIRST_EVENT;
 #[derive(Debug)]
 pub struct IdAllocator {
     next_base: u32,
+    /// Bases of fully-disconnected clients whose resources were torn
+    /// down (`close_mode = DestroyAll`). Reused before bumping
+    /// `next_base` so XID-heavy workloads (xts5 XIproto opens a fresh
+    /// connection per protocol-validation TP and burned through bases
+    /// after ~4096 reconnects, hitting the u32 ceiling) keep going.
+    /// `Vec` rather than `VecDeque` because allocate/release strict
+    /// LIFO order is fine — Xorg's `clientPrivates` reuses MRU bases
+    /// similarly. Released bases of *retained* clients (CloseDownMode
+    /// `RetainPermanent`/`RetainTemporary`) are NOT pushed here — the
+    /// resources owned by those bases stay live in the resource table
+    /// and a fresh client reusing the base would collide with them.
+    free_bases: Vec<u32>,
 }
 
 impl IdAllocator {
@@ -44,16 +56,40 @@ impl IdAllocator {
     pub fn new() -> Self {
         Self {
             next_base: FIRST_CLIENT_BASE,
+            free_bases: Vec::new(),
         }
     }
 
     /// Returns `(resource_id_base, resource_id_mask)` for a new client.
-    /// Returns `None` when the next base would overflow `u32`.
+    /// Reuses a previously-released base if one is available; otherwise
+    /// bumps the monotonic counter. Returns `None` only when the free
+    /// list is empty AND the next monotonic base would overflow `u32`
+    /// — in practice unreachable for any realistic workload now that
+    /// disconnect recycles bases.
     pub fn allocate(&mut self) -> Option<(u32, u32)> {
+        if let Some(base) = self.free_bases.pop() {
+            return Some((base, PER_CLIENT_MASK));
+        }
         let base = self.next_base;
         let next = base.checked_add(FIRST_CLIENT_BASE)?;
         self.next_base = next;
         Some((base, PER_CLIENT_MASK))
+    }
+
+    /// Return a previously-allocated base to the free list for reuse
+    /// by future `allocate` calls. The caller is responsible for
+    /// ensuring all resources owned by `base` are destroyed first —
+    /// see [`crate::core_loop::process_disconnect`] for the
+    /// retain-aware caller.
+    pub fn release(&mut self, base: u32) {
+        // Sanity: only recycle bases we actually handed out.
+        // `(base & !PER_CLIENT_MASK) == base` (mask-aligned) and
+        // `base >= FIRST_CLIENT_BASE` (above the server's own range).
+        if (base & PER_CLIENT_MASK) != 0 || base < FIRST_CLIENT_BASE {
+            log::warn!("IdAllocator::release: ignoring invalid base 0x{base:x}");
+            return;
+        }
+        self.free_bases.push(base);
     }
 
     /// `id` is owned by the holder of `(base, mask)` iff `(id & !mask) == base`.
@@ -190,6 +226,213 @@ pub struct ActiveKeyboardGrab {
     /// keyboard, or an activated XI2 passive key grab) — see
     /// [`PassiveButtonGrab::via_xi2`] for the delivery-protocol rule.
     pub via_xi2: bool,
+}
+
+/// XI 1.x passive device grab (GrabDeviceKey / GrabDeviceButton).
+#[derive(Debug, Clone, Copy)]
+pub struct Xi1PassiveGrab {
+    pub owner: ClientId,
+    pub deviceid: u16,
+    pub grab_window: ResourceId,
+    /// keycode or button; 0 == AnyKey / AnyButton
+    pub detail: u8,
+    /// 0x8000 == AnyModifier; otherwise the literal modifier mask
+    pub modifiers: u16,
+    pub owner_events: bool,
+    /// 0 = Synchronous, 1 = Asynchronous (this device)
+    pub this_mode: u8,
+    /// 0 = Synchronous, 1 = Asynchronous (other devices)
+    pub other_mode: u8,
+    /// true: key grab; false: button grab
+    pub is_key: bool,
+}
+
+/// XI 1.x active device grab (GrabDevice, or an activated passive
+/// device grab).
+#[derive(Debug, Clone, Copy)]
+pub struct Xi1ActiveGrab {
+    pub owner: ClientId,
+    pub deviceid: u16,
+    pub grab_window: ResourceId,
+    pub owner_events: bool,
+    pub this_mode: u8,
+    pub other_mode: u8,
+    /// Some(detail) when activated from a passive key/button grab —
+    /// auto-released when that detail is released.
+    pub passive_detail: Option<u8>,
+}
+
+/// XI 1.x per-device freeze bookkeeping for synchronous grabs.
+#[derive(Debug, Default)]
+pub struct Xi1Freeze {
+    /// Per-device sync state — Xorg `GrabInfoRec.sync.state`
+    /// (include/inputstr.h:504-511). `FrozenNoEvent`/`FrozenWithEvent`
+    /// freeze the device outright; `FreezeNextEvent`/`FreezeBothNextEvent`
+    /// arm a re-freeze on the next key/button event delivered through
+    /// the grab (`FreezeThisEventIfNeededForSyncGrab`,
+    /// dix/events.c:4420-4447).
+    pub state: Xi1SyncState,
+    /// Frozen on behalf of ANOTHER device's sync grab — Xorg
+    /// `sync.other != NullGrab`. Stores that grab's owning client; in
+    /// the two-device model the source grab is always the paired
+    /// device's (or its bridged core grab), so owner identity is exact.
+    pub other: Option<ClientId>,
+    /// The event stored when `state == FrozenWithEvent` — the replay
+    /// source for AllowDeviceEvents(ReplayThisDevice) (Xorg
+    /// `sync.event`).
+    pub stored: Option<Xi1QueuedEvent>,
+    /// Device events queued while frozen, replayed on thaw (Xorg
+    /// `syncEvents.pending`, kept per-device here).
+    pub queue: std::collections::VecDeque<Xi1QueuedEvent>,
+    /// CORE key events withheld while the keyboard device is frozen —
+    /// in Xorg the freeze switches the whole device to the enqueue
+    /// proc, so core delivery stops too. Only the keyboard device uses
+    /// this (core POINTER events deliberately keep flowing for now —
+    /// desktop interactivity risk outweighs XTS fidelity there).
+    pub core_key_queue: std::collections::VecDeque<crate::host_x11::HostKeyEvent>,
+}
+
+impl Xi1Freeze {
+    /// Xorg `ComputeFreezes` predicate: a device is frozen when it is
+    /// directly frozen OR held on behalf of another device's grab.
+    #[must_use]
+    pub fn frozen(&self) -> bool {
+        self.other.is_some() || self.state >= Xi1SyncState::FrozenNoEvent
+    }
+}
+
+/// Xorg `GrabInfoRec.sync.state` values (include/inputstr.h:504-511).
+/// `NOT_GRABBED`/`THAWED` collapse to [`Xi1SyncState::Thawed`] — both
+/// mean "not frozen, nothing armed". Ordering is load-bearing:
+/// `>= FrozenNoEvent` is Xorg's `>= FROZEN` check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Xi1SyncState {
+    #[default]
+    Thawed,
+    /// AllowDeviceEvents(SyncThisDevice): thawed until the next
+    /// key/button event delivered via the grab, then FrozenWithEvent.
+    FreezeNextEvent,
+    /// AllowDeviceEvents(SyncAll): like FreezeNextEvent, but the next
+    /// delivered event also re-freezes the paired device.
+    FreezeBothNextEvent,
+    /// Sync grab established, no event stored (active GrabDevice).
+    FrozenNoEvent,
+    /// Frozen with the triggering event stored (passive sync grab
+    /// activation, or FreezeNextEvent tripping) — Replay material.
+    FrozenWithEvent,
+}
+
+/// XI 1.x per-device focus state (SetDeviceFocus / GetDeviceFocus).
+///
+/// `focus` is the raw wire value: `0` = None, `1` = PointerRoot, `3` =
+/// FollowKeyboard (XI.h), anything else a window xid. Keyboard devices
+/// default to PointerRoot / RevertToNone, matching Xorg
+/// `InitFocusClassDeviceStruct` (dix/devices.c:1494-1495).
+#[derive(Debug, Clone, Copy)]
+pub struct Xi1DeviceFocus {
+    pub focus: u32,
+    /// 0 = RevertToNone, 1 = RevertToPointerRoot, 2 = RevertToParent,
+    /// 3 = RevertToFollowKeyboard.
+    pub revert_to: u8,
+    /// Last-focus-change time (server ms).
+    pub time: u32,
+}
+
+impl Default for Xi1DeviceFocus {
+    fn default() -> Self {
+        Self {
+            focus: 1, // PointerRoot
+            revert_to: 0,
+            time: 0,
+        }
+    }
+}
+
+/// XI 1.x per-device input state reported by DeviceStateNotify — the
+/// port of Xorg's `dev->key->down` / `dev->button->down` bitmasks and
+/// the valuator mode set via SetDeviceMode. Maintained by
+/// `xi1_route_device_event` (the single point every XI1 key/button
+/// event flows through, frozen-queue replays included).
+/// Default: nothing down, Relative mode (0) — matches the
+/// ListInputDevices valuator class.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Xi1DeviceInputState {
+    /// Key-down bitmask, one bit per keycode (keycode N → byte N/8,
+    /// bit N%8) — Xorg `KeyClassRec.down`.
+    pub keys_down: [u8; 32],
+    /// Button-down bitmask, same layout — Xorg `ButtonClassRec.down`.
+    pub buttons_down: [u8; 32],
+    /// Valuator mode: Relative=0 / Absolute=1 (XI.h). Set by
+    /// SetDeviceMode; reported in DeviceStateNotify `classes_reported`
+    /// bits above `ModeBitsShift`.
+    pub valuator_mode: u8,
+    /// Current axis values — Xorg `ValuatorClassRec.axisVal`. Real
+    /// motion writes the sprite position into axes 0/1; device-motion
+    /// fakes write their explicit axis payload (device fakes do NOT
+    /// move the sprite — verified against Xephyr). Reported by
+    /// DeviceStateNotify / QueryDeviceState / motion deviceValuator
+    /// chains.
+    pub valuators: [i32; 4],
+}
+
+/// How the final SelectExtensionEvent step of `xi1_route_device_event`
+/// resolves its target — the XI1 analogue of Xorg's
+/// `DeliverFocusedEvent` (dix/events.c:4202). Grab/freeze handling is
+/// unaffected by this; only the no-grab selection delivery is gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Xi1FocusRoute {
+    /// Unbounded selection walk up from `natural_target` (pointer
+    /// events; keyboard focus PointerRoot).
+    Walk,
+    /// Selection walk from `natural_target` bounded at (inclusive) the
+    /// focus window — the focus is an ancestor of the pointer window,
+    /// so propagation must stop at the focus boundary.
+    WalkUpTo(ResourceId),
+    /// Deliver to exactly this window's selectors, no propagation —
+    /// the pointer is outside the focus subtree, so the event reports
+    /// relative to the focus window itself.
+    WindowOnly(ResourceId),
+    /// Device focus is None: discard (no selection delivery).
+    Drop,
+}
+
+/// A device input event in delivery-ready form — what the XI1 fanout
+/// needs to route one event, and what freeze queues hold for replay.
+#[derive(Debug, Clone, Copy)]
+pub struct Xi1QueuedEvent {
+    pub deviceid: u16,
+    /// Absolute XI1 wire event code (XI_FIRST_EVENT + offset).
+    pub evcode: u8,
+    pub detail: u8,
+    pub time: u32,
+    pub root_x: i16,
+    pub root_y: i16,
+    pub event_x: i16,
+    pub event_y: i16,
+    pub state_mask: u16,
+    /// Natural (hit/focus) target the selection walk starts from.
+    pub natural_target: ResourceId,
+    /// Device-focus gating for the selection-walk step.
+    pub focus_route: Xi1FocusRoute,
+    /// Explicit axis payload for device-motion fakes
+    /// (XTestFakeDeviceMotionEvent): carried into the deviceValuator
+    /// chain and written to the device's stored axis values. `None`
+    /// for real motion (axes 0/1 = sprite position).
+    pub axes: Option<Xi1MotionAxes>,
+    /// AllowDeviceEvents(ReplayThisDevice) reprocessing hint: passive
+    /// grabs at or above this window are skipped, "as though they were
+    /// not present" (Xorg replays via CheckDeviceGrabs starting one
+    /// below `syncEvents.replayWin`). `None` for normal routing.
+    pub replay_floor: Option<ResourceId>,
+}
+
+/// Axis payload of a faked device motion (first_valuator, count,
+/// values) — Xorg keeps these in the event's valuator mask.
+#[derive(Debug, Clone, Copy)]
+pub struct Xi1MotionAxes {
+    pub first: u8,
+    pub count: u8,
+    pub values: [i32; 6],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -423,6 +666,28 @@ pub struct ServerState {
     pub frozen_pointer_queue: std::collections::VecDeque<crate::host_x11::HostPointerEvent>,
     /// Registered passive key grabs.
     pub key_grabs: Vec<KeyGrab>,
+    /// XI 1.x passive device grabs (GrabDeviceKey / GrabDeviceButton).
+    pub xi1_passive_grabs: Vec<Xi1PassiveGrab>,
+    /// XI 1.x active device grabs, keyed by deviceid. Established by
+    /// GrabDevice or by a passive grab activating.
+    pub xi1_active_grabs: HashMap<u16, Xi1ActiveGrab>,
+    /// XI 1.x last-device-grab time (GrabDevice timestamp validation +
+    /// passive-grab activation updates it — XTS XGrabDeviceKey-3).
+    pub xi1_last_grab_time: u32,
+    /// Most recent input event timestamp seen by either fanout —
+    /// stands in for "current server time" in XI1 grab time checks.
+    pub xi1_last_input_time: u32,
+    /// XI 1.x per-device freeze state for synchronous device grabs
+    /// (AllowDeviceEvents). Only the XI1 fanout freezes — core / XI2
+    /// delivery is unaffected, bounding the blast radius.
+    pub xi1_frozen: HashMap<u16, Xi1Freeze>,
+    /// XI 1.x per-device focus (SetDeviceFocus). Missing entry =
+    /// device default (PointerRoot / RevertToNone).
+    pub xi1_device_focus: HashMap<u16, Xi1DeviceFocus>,
+    /// XI 1.x per-device key/button-down bitmasks + valuator mode
+    /// (DeviceStateNotify source data). Missing entry = nothing down,
+    /// Relative mode.
+    pub xi1_device_input_state: HashMap<u16, Xi1DeviceInputState>,
     /// Active keyboard grab (explicit or passive-induced).
     pub active_keyboard_grab: Option<ActiveKeyboardGrab>,
     /// Frozen key event held by a sync passive key grab, awaiting
@@ -654,6 +919,13 @@ impl ServerState {
             frozen_pointer_queue: std::collections::VecDeque::new(),
             frozen_pointer_event: None,
             key_grabs: Vec::new(),
+            xi1_passive_grabs: Vec::new(),
+            xi1_active_grabs: HashMap::new(),
+            xi1_last_grab_time: 0,
+            xi1_last_input_time: 0,
+            xi1_frozen: HashMap::new(),
+            xi1_device_focus: HashMap::new(),
+            xi1_device_input_state: HashMap::new(),
             active_keyboard_grab: None,
             frozen_keyboard_event: None,
             xfixes_regions: HashMap::new(),
@@ -1196,10 +1468,16 @@ pub struct ClientState {
     /// `SelectExtensionEvent` (XInput minor 6). Each class encodes
     /// `(deviceid << 8) | event_code` where `event_code` is one of the
     /// 17 XInput event types at `XI_FIRST_EVENT..=XI_FIRST_EVENT + 16`.
-    /// Classes are stored verbatim — the XI1 events we deliver
-    /// (currently only `DevicePropertyNotify`) are device-scoped, not
+    /// Classes are stored verbatim — the XI1 events delivered from this
+    /// set (`DevicePropertyNotify`) are device-scoped, not
     /// window-scoped, so the request's `window` argument is ignored.
     pub xi1_event_classes: HashSet<u32>,
+    /// XI1 *input*-event classes per window — DeviceKeyPress through
+    /// DeviceMotionNotify select like core input events: per window,
+    /// delivered by walking the event window's ancestor chain
+    /// (Xorg dix `DeliverDeviceEvents`). Key: window; value: the
+    /// selected `XEventClass` values for it.
+    pub xi1_window_event_classes: HashMap<ResourceId, HashSet<u32>>,
     /// Outbound bytes buffered when the client write fd would block.
     /// Populated in D2.
     pub outbound: std::collections::VecDeque<u8>,
@@ -2240,6 +2518,72 @@ mod tests {
     }
 
     #[test]
+    fn release_recycles_base_for_next_allocate() {
+        let mut a = IdAllocator::new();
+        let (b1, _) = a.allocate().unwrap();
+        let (b2, _) = a.allocate().unwrap();
+        a.release(b1);
+        let (b3, _) = a.allocate().unwrap();
+        assert_eq!(
+            b3, b1,
+            "released base must be reused before bumping next_base"
+        );
+        let (b4, _) = a.allocate().unwrap();
+        assert_eq!(
+            b4,
+            b2 + FIRST_CLIENT_BASE,
+            "fresh base resumes from next_base"
+        );
+    }
+
+    #[test]
+    fn release_ignores_unaligned_or_below_first_base() {
+        let mut a = IdAllocator::new();
+        let (b1, _) = a.allocate().unwrap();
+        a.release(b1 | 0x42); // unaligned (low bits set)
+        a.release(0); // below FIRST_CLIENT_BASE
+        a.release(0x1234); // below FIRST_CLIENT_BASE
+        // Free list rejected all three; next allocate falls through to monotonic.
+        let (b2, _) = a.allocate().unwrap();
+        assert_eq!(b2, b1 + FIRST_CLIENT_BASE);
+    }
+
+    #[test]
+    fn release_survives_u32_overflow_threshold() {
+        // Drain the monotonic counter to the verge of overflow, then
+        // confirm a release-and-reallocate keeps working past the
+        // point where a non-recycling allocator would return None.
+        let mut a = IdAllocator::new();
+        let mut bases = Vec::new();
+        while let Some((b, _)) = a.allocate() {
+            bases.push(b);
+        }
+        // u32::MAX / FIRST_CLIENT_BASE = 4095, but `checked_add` rejects the
+        // step that *would* land on 4095 * FCB because the *next* base would
+        // overflow. Net successful allocates = 4094 (bases 1*FCB through
+        // 4094*FCB).
+        assert_eq!(
+            bases.len(),
+            4094,
+            "successful monotonic allocates before overflow"
+        );
+        assert!(
+            a.allocate().is_none(),
+            "next monotonic allocate must overflow"
+        );
+        let recycled = bases.pop().unwrap();
+        a.release(recycled);
+        let (reused, _) = a
+            .allocate()
+            .expect("recycled base allocates after overflow");
+        assert_eq!(reused, recycled);
+        assert!(
+            a.allocate().is_none(),
+            "no more free + monotonic overflowed"
+        );
+    }
+
+    #[test]
     fn validate_owned_accepts_ids_in_range() {
         let (base, mask) = (0x0020_0000, 0x000F_FFFF);
         assert!(IdAllocator::validate_owned(base, base, mask));
@@ -2320,6 +2664,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2339,6 +2684,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2366,6 +2712,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2390,6 +2737,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::from([((ResourceId(0x100), deviceid), 1 << 4)]),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2417,6 +2765,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::from([((ResourceId(0x100), deviceid), 1 << 2)]),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2446,6 +2795,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2473,6 +2823,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2492,6 +2843,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2534,6 +2886,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2573,6 +2926,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2592,6 +2946,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2638,6 +2993,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
@@ -2719,6 +3075,7 @@ mod tests {
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
                     xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -2738,6 +3095,7 @@ mod tests {
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
                     xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -2864,6 +3222,7 @@ mod tests {
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
                     xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -2883,6 +3242,7 @@ mod tests {
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
                     xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -3008,6 +3368,7 @@ mod tests {
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
                     xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -3027,6 +3388,7 @@ mod tests {
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
                     xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -3111,6 +3473,7 @@ mod tests {
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
                     xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -3130,6 +3493,7 @@ mod tests {
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
                     xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -3149,6 +3513,7 @@ mod tests {
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
                     xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -3245,6 +3610,7 @@ mod tests {
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
                     xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -3264,6 +3630,7 @@ mod tests {
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
                     xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -3358,6 +3725,7 @@ mod tests {
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
                     xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
@@ -3476,6 +3844,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,

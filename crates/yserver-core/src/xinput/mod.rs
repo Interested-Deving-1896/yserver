@@ -79,6 +79,34 @@ pub const XI2_PROPERTY_EVENT_MASK: u32 = 1 << 12;
 /// device-property notifications.
 pub const XI_DEVICE_PROPERTY_NOTIFY_OFFSET: u8 = 16;
 
+/// XI 1.x event-code offsets within the XInput event block
+/// (`XI_FIRST_EVENT + offset`), per Xorg `Xi/extinit.c` event order:
+/// DeviceValuator(0), DeviceKeyPress(1), DeviceKeyRelease(2),
+/// DeviceButtonPress(3), DeviceButtonRelease(4), DeviceMotionNotify(5),
+/// DeviceFocusIn(6), DeviceFocusOut(7), ProximityIn(8), ProximityOut(9),
+/// DeviceStateNotify(10), DeviceMappingNotify(11), ChangeDeviceNotify(12).
+pub const XI_DEVICE_VALUATOR_OFFSET: u8 = 0;
+pub const XI_DEVICE_KEY_PRESS_OFFSET: u8 = 1;
+pub const XI_DEVICE_KEY_RELEASE_OFFSET: u8 = 2;
+pub const XI_DEVICE_BUTTON_PRESS_OFFSET: u8 = 3;
+pub const XI_DEVICE_BUTTON_RELEASE_OFFSET: u8 = 4;
+pub const XI_DEVICE_MOTION_NOTIFY_OFFSET: u8 = 5;
+pub const XI_DEVICE_FOCUS_IN_OFFSET: u8 = 6;
+pub const XI_DEVICE_FOCUS_OUT_OFFSET: u8 = 7;
+pub const XI_DEVICE_STATE_NOTIFY_OFFSET: u8 = 10;
+/// DeviceKeyStateNotify(13) / DeviceButtonStateNotify(14) — the
+/// "reserved space of 3" continuation codes after ChangeDeviceNotify
+/// (XIproto.h:114-118). Only ever sent as MORE_EVENTS continuations of
+/// a DeviceStateNotify, never selected directly.
+pub const XI_DEVICE_KEY_STATE_NOTIFY_OFFSET: u8 = 13;
+pub const XI_DEVICE_BUTTON_STATE_NOTIFY_OFFSET: u8 = 14;
+
+/// `deviceid` high bit marking "another event of this logical event
+/// follows" in DeviceStateNotify / DeviceValuator chains
+/// (XIproto.h:67). libXi buffers a chain until it sees a deviceid
+/// without this bit, then enqueues one reassembled client event.
+pub const XI1_MORE_EVENTS: u8 = 0x80;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -1135,6 +1163,174 @@ fn write_u32(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: u32) {
     match byte_order {
         ClientByteOrder::LittleEndian => out.extend_from_slice(&value.to_le_bytes()),
         ClientByteOrder::BigEndian => out.extend_from_slice(&value.to_be_bytes()),
+    }
+}
+
+fn write_i16(byte_order: ClientByteOrder, out: &mut Vec<u8>, value: i16) {
+    match byte_order {
+        ClientByteOrder::LittleEndian => out.extend_from_slice(&value.to_le_bytes()),
+        ClientByteOrder::BigEndian => out.extend_from_slice(&value.to_be_bytes()),
+    }
+}
+
+/// Encode an XI 1.x `deviceKeyButtonPointer` wire event (XIproto.h):
+/// DeviceKeyPress/Release, DeviceButtonPress/Release and
+/// DeviceMotionNotify all share this 32-byte layout. `event_type` is
+/// the absolute wire code (`first_event + offset`). The deviceid top
+/// bit (MORE_EVENTS) stays clear — we never append deviceValuator
+/// follow-ups.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_xi1_device_input_event(
+    out: &mut Vec<u8>,
+    byte_order: ClientByteOrder,
+    event_type: u8,
+    detail: u8,
+    sequence: SequenceNumber,
+    time: u32,
+    root: u32,
+    event_window: u32,
+    child: u32,
+    root_x: i16,
+    root_y: i16,
+    event_x: i16,
+    event_y: i16,
+    state: u16,
+    deviceid: u16,
+) {
+    out.push(event_type); // byte 0: type
+    out.push(detail); // byte 1: detail (button / keycode)
+    write_u16(byte_order, out, sequence.0); // bytes 2-3
+    write_u32(byte_order, out, time); // bytes 4-7
+    write_u32(byte_order, out, root); // bytes 8-11
+    write_u32(byte_order, out, event_window); // bytes 12-15
+    write_u32(byte_order, out, child); // bytes 16-19
+    write_i16(byte_order, out, root_x); // bytes 20-21
+    write_i16(byte_order, out, root_y); // bytes 22-23
+    write_i16(byte_order, out, event_x); // bytes 24-25
+    write_i16(byte_order, out, event_y); // bytes 26-27
+    write_u16(byte_order, out, state); // bytes 28-29
+    out.push(1); // byte 30: same_screen = true
+    #[allow(clippy::cast_possible_truncation)]
+    out.push((deviceid as u8) & 0x7f); // byte 31: deviceid, MORE_EVENTS clear
+}
+
+/// Encode an XI 1.x `deviceFocus` wire event (XIproto.h:1590-1603):
+/// DeviceFocusIn and DeviceFocusOut share this 32-byte layout.
+/// `event_type` is the absolute wire code (`first_event + 6/7`);
+/// `detail` is a `Notify*` constant; `mode` is NotifyNormal /
+/// NotifyGrab / NotifyUngrab / NotifyWhileGrabbed.
+/// ```text
+///   0  type      4  time (CARD32)   12  mode (BYTE)
+///   1  detail    8  window (CARD32) 13  deviceid (CARD8)
+///   2  sequence                     14  pad (18 bytes)
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn encode_xi1_device_focus_event(
+    out: &mut Vec<u8>,
+    byte_order: ClientByteOrder,
+    event_type: u8,
+    detail: u8,
+    sequence: SequenceNumber,
+    time: u32,
+    window: u32,
+    mode: u8,
+    deviceid: u16,
+) {
+    out.push(event_type); // byte 0: type
+    out.push(detail); // byte 1: detail (Notify*)
+    write_u16(byte_order, out, sequence.0); // bytes 2-3
+    write_u32(byte_order, out, time); // bytes 4-7
+    write_u32(byte_order, out, window); // bytes 8-11
+    out.push(mode); // byte 12: mode
+    #[allow(clippy::cast_possible_truncation)]
+    out.push(deviceid as u8); // byte 13: deviceid (CARD8)
+    out.extend_from_slice(&[0u8; 18]); // bytes 14-31: pad
+}
+
+/// XI 1.x `deviceStateNotify` wire event (XIproto.h:1615-1630). The
+/// first 32-byte event of a device-state chain: up to 32 button bits,
+/// 32 key bits and 3 valuator values; continuation events (key state /
+/// button state / deviceValuator) follow when `deviceid` carries
+/// `XI1_MORE_EVENTS`.
+///
+/// `classes_reported` packs the class bits (`1 << KeyClass(0)` /
+/// `ButtonClass(1)` / `ValuatorClass(2)`) in the low 6 bits and the
+/// valuator mode (Relative=0 / Absolute=1) at `ModeBitsShift` (= 6),
+/// per XIproto.h:70-71 — libXi reads `num_classes` and the per-class
+/// blocks straight out of these fields (XExtInt.c `XI_DeviceStateNotify`).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_xi1_device_state_notify(
+    out: &mut Vec<u8>,
+    byte_order: ClientByteOrder,
+    event_type: u8,
+    deviceid: u8,
+    sequence: SequenceNumber,
+    time: u32,
+    num_keys: u8,
+    num_buttons: u8,
+    num_valuators: u8,
+    classes_reported: u8,
+    buttons: [u8; 4],
+    keys: [u8; 4],
+    valuators: [i32; 3],
+) {
+    out.push(event_type); // byte 0: type
+    out.push(deviceid); // byte 1: deviceid (| XI1_MORE_EVENTS)
+    write_u16(byte_order, out, sequence.0); // bytes 2-3
+    write_u32(byte_order, out, time); // bytes 4-7
+    out.push(num_keys); // byte 8
+    out.push(num_buttons); // byte 9
+    out.push(num_valuators); // byte 10
+    out.push(classes_reported); // byte 11
+    out.extend_from_slice(&buttons); // bytes 12-15
+    out.extend_from_slice(&keys); // bytes 16-19
+    for v in valuators {
+        write_u32(byte_order, out, v.cast_unsigned()); // bytes 20-31
+    }
+}
+
+/// XI 1.x `deviceKeyStateNotify` continuation (XIproto.h:1638-1644):
+/// key-down bits for keycodes 32..=255 (the first 32 ride in the
+/// leading deviceStateNotify). libXi memcpys these 28 bytes into
+/// `XKeyStatus.keys[4..]` and forces `num_keys = 256`.
+pub fn encode_xi1_device_key_state_notify(
+    out: &mut Vec<u8>,
+    byte_order: ClientByteOrder,
+    event_type: u8,
+    deviceid: u8,
+    sequence: SequenceNumber,
+    keys: &[u8; 28],
+) {
+    out.push(event_type); // byte 0: type
+    out.push(deviceid); // byte 1: deviceid (| XI1_MORE_EVENTS)
+    write_u16(byte_order, out, sequence.0); // bytes 2-3
+    out.extend_from_slice(keys); // bytes 4-31
+}
+
+/// XI 1.x `deviceValuator` event (XIproto.h:1538-1552). As a
+/// DeviceStateNotify continuation it carries valuators
+/// `first_valuator..first_valuator+num_valuators` (libXi appends at
+/// most 3 per continuation onto `XValuatorStatus.valuators`).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_xi1_device_valuator(
+    out: &mut Vec<u8>,
+    byte_order: ClientByteOrder,
+    event_type: u8,
+    deviceid: u8,
+    sequence: SequenceNumber,
+    device_state: u16,
+    num_valuators: u8,
+    first_valuator: u8,
+    valuators: [i32; 6],
+) {
+    out.push(event_type); // byte 0: type
+    out.push(deviceid); // byte 1: deviceid (| XI1_MORE_EVENTS)
+    write_u16(byte_order, out, sequence.0); // bytes 2-3
+    write_u16(byte_order, out, device_state); // bytes 4-5: KeyButMask
+    out.push(num_valuators); // byte 6
+    out.push(first_valuator); // byte 7
+    for v in valuators {
+        write_u32(byte_order, out, v.cast_unsigned()); // bytes 8-31
     }
 }
 

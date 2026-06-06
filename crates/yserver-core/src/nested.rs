@@ -58,7 +58,7 @@ const XI2_MAJOR_OPCODE: u8 = 137;
 /// (re-exported as [`crate::server::XI_FIRST_EVENT`]) and the XI2 event
 /// fan-outs.
 pub(crate) const XI2_FIRST_EVENT: u8 = 66;
-const XI2_FIRST_ERROR: u8 = 157;
+pub(crate) const XI2_FIRST_ERROR: u8 = 157;
 
 const XFIXES_MAJOR_OPCODE: u8 = 140;
 pub(crate) const XFIXES_FIRST_EVENT: u8 = 87; // matches Xorg: Selection=87, Cursor=88
@@ -1334,6 +1334,7 @@ mod tests {
                     big_requests_enabled: false,
                     xi2_masks: HashMap::new(),
                     xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,

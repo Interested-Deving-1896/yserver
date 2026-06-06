@@ -436,6 +436,61 @@ pub fn pointer_event_fanout_to_state(
     if is_replay {
         return dropped;
     }
+
+    // ── XI 1.x device-event fanout ──────────────────────────────────
+    //
+    // Legacy XInput events (DeviceButtonPress/Release,
+    // DeviceMotionNotify) for clients that selected the matching
+    // `XEventClass` via SelectExtensionEvent. XI1 events propagate up
+    // the ancestor chain like core events (Xorg dix
+    // DeliverDeviceEvents) and report the slave/extension pointer (4),
+    // matching the device XTS opens (masters are not XI1-openable).
+    //
+    // Deliberately BEFORE the `top_level_id_opt` gate below: XI1
+    // routing resolves its own target from `natural_target` and its
+    // own grab state, so a cursor over the bare root (host_xid not in
+    // xid_map — no top-level under it) must still route. The XTS
+    // AllowDeviceEvents probes are exactly that shape: the fake device
+    // motion parks the cursor at x=0 off every window, and the grab
+    // owner still expects its DeviceMotionNotify.
+    let xi1_offset = match event.kind {
+        PointerEventKind::ButtonPress => Some(crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET),
+        PointerEventKind::ButtonRelease => Some(crate::xinput::XI_DEVICE_BUTTON_RELEASE_OFFSET),
+        PointerEventKind::MotionNotify => Some(crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET),
+        _ => None,
+    };
+    if let Some(offset) = xi1_offset {
+        let evcode = crate::server::XI_FIRST_EVENT + offset;
+        let detail = if event.kind == PointerEventKind::MotionNotify {
+            0
+        } else {
+            event.detail
+        };
+        let extras = xi1_route_device_event(
+            state,
+            crate::server::Xi1QueuedEvent {
+                deviceid: crate::xinput::DEVICEID_SLAVE_POINTER,
+                evcode,
+                detail,
+                time: event.time,
+                root_x: event.root_x,
+                root_y: event.root_y,
+                event_x: target_x,
+                event_y: target_y,
+                state_mask: event.state,
+                natural_target: target,
+                // Pointer devices have no focus class — always the
+                // plain selection walk (Xorg ProcessOtherEvent only
+                // routes keyboard events through DeliverFocusedEvent).
+                focus_route: crate::server::Xi1FocusRoute::Walk,
+                axes: None,
+                replay_floor: None,
+            },
+            true,
+        );
+        merge_dropped(&mut dropped, extras);
+    }
+
     let Some(top_level_id) = top_level_id_opt else {
         log::debug!(
             "pointer_fanout: kind={:?} host_xid=0x{:x} not in xid_map — XI2 fanout skipped",
@@ -685,6 +740,602 @@ pub fn pointer_event_fanout_to_state(
     merge_dropped(&mut dropped, extras);
 
     dropped
+}
+
+/// Route one XI 1.x device input event through grab + freeze + selection
+/// semantics. The single entry point shared by the pointer/key fanouts
+/// and the AllowDeviceEvents thaw path:
+///
+/// 1. Frozen device → queue the event, deliver nothing.
+/// 2. Active device grab → deliver to the grab owner addressed to the
+///    grab window (owner_events keeps natural delivery when the natural
+///    target would already report to the owner); a synchronous grab
+///    re-freezes after each key/button event (`allow_freeze`).
+///    A passive-activated grab auto-releases on its matching release.
+/// 3. Otherwise a press may activate a matching passive grab
+///    (GrabDeviceKey / GrabDeviceButton): sets the active grab, updates
+///    last-device-grab time (XTS XGrabDeviceKey-3), delivers to the
+///    owner, and freezes when synchronous.
+/// 4. Otherwise: SelectExtensionEvent selection walk.
+///
+/// NOTE: deliberately NO implicit grab from a plain DeviceButtonPress
+/// selection — per the XInput 1.x spec (XTS XSelectExtensionEvent-5)
+/// automatic grabs are opt-in via the DeviceButtonPressGrab class.
+pub(crate) fn xi1_route_device_event(
+    state: &mut ServerState,
+    q: crate::server::Xi1QueuedEvent,
+    allow_freeze: bool,
+) -> Vec<ClientId> {
+    use crate::xinput::{
+        XI_DEVICE_BUTTON_PRESS_OFFSET, XI_DEVICE_BUTTON_RELEASE_OFFSET, XI_DEVICE_KEY_PRESS_OFFSET,
+        XI_DEVICE_KEY_RELEASE_OFFSET,
+    };
+    let first = crate::server::XI_FIRST_EVENT;
+    state.xi1_last_input_time = state.xi1_last_input_time.max(q.time);
+    let is_press = q.evcode == first + XI_DEVICE_KEY_PRESS_OFFSET
+        || q.evcode == first + XI_DEVICE_BUTTON_PRESS_OFFSET;
+    let is_release = q.evcode == first + XI_DEVICE_KEY_RELEASE_OFFSET
+        || q.evcode == first + XI_DEVICE_BUTTON_RELEASE_OFFSET;
+
+    // 1. Frozen → queue (Xorg FreezeThaw switching processInputProc
+    // to the enqueue proc: NOTHING is delivered while frozen, not
+    // even to the grab owner).
+    if state
+        .xi1_frozen
+        .get(&q.deviceid)
+        .is_some_and(crate::server::Xi1Freeze::frozen)
+    {
+        state
+            .xi1_frozen
+            .entry(q.deviceid)
+            .or_default()
+            .queue
+            .push_back(q);
+        log::debug!(
+            "xi1_route: device {} frozen — queued evcode={} detail={}",
+            q.deviceid,
+            q.evcode,
+            q.detail,
+        );
+        return Vec::new();
+    }
+
+    // Maintain the per-device axis values (Xorg `axisVal`): real
+    // motion writes the sprite position into axes 0/1; faked device
+    // motion writes its explicit payload. After the frozen check, like
+    // the bitmask updates below.
+    if q.evcode == first + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET {
+        let entry = state.xi1_device_input_state.entry(q.deviceid).or_default();
+        if let Some(axes) = q.axes {
+            for i in 0..usize::from(axes.count.min(6)) {
+                if let Some(slot) = entry.valuators.get_mut(usize::from(axes.first) + i) {
+                    *slot = axes.values[i];
+                }
+            }
+        } else {
+            entry.valuators[0] = i32::from(q.root_x);
+            entry.valuators[1] = i32::from(q.root_y);
+        }
+    }
+
+    // Maintain the per-device key/button-down bitmasks consumed by
+    // DeviceStateNotify (Xorg `dev->key->down` / `dev->button->down`).
+    // After the frozen check: queued events come back through here on
+    // thaw, so updating at queue time would double-count them.
+    if is_press || is_release {
+        let is_key = q.evcode == first + XI_DEVICE_KEY_PRESS_OFFSET
+            || q.evcode == first + XI_DEVICE_KEY_RELEASE_OFFSET;
+        let entry = state.xi1_device_input_state.entry(q.deviceid).or_default();
+        let bits = if is_key {
+            &mut entry.keys_down
+        } else {
+            &mut entry.buttons_down
+        };
+        let (byte, bit) = (usize::from(q.detail) / 8, q.detail % 8);
+        if is_press {
+            bits[byte] |= 1 << bit;
+        } else {
+            bits[byte] &= !(1 << bit);
+        }
+    }
+
+    // 2. Active grab.
+    if let Some(grab) = state.xi1_active_grabs.get(&q.deviceid).copied() {
+        // owner_events: natural delivery when the natural target's
+        // selection walk would report to the grab owner anyway.
+        let natural = compute_xi1_route_targets(state, &q);
+        let (targets, event_window) = match natural {
+            Some((clients, w)) if grab.owner_events && clients.contains(&grab.owner) => {
+                (vec![grab.owner], w)
+            }
+            _ => (vec![grab.owner], grab.grab_window),
+        };
+        log::debug!(
+            "xi1_route: evcode={} GRAB owner={} window=0x{:x} detail={}",
+            q.evcode,
+            grab.owner.0,
+            event_window.0,
+            q.detail,
+        );
+        let dropped = xi1_fan_device_event(state, &targets, event_window, &q);
+        // Sync-state transition on a delivered key/button event (Xorg
+        // FreezeThisEventIfNeededForSyncGrab) — the FreezeNextEvent /
+        // FreezeBothNextEvent armed states trip to FrozenWithEvent
+        // here. A plain sync grab does NOT re-freeze on every press:
+        // CheckGrabForSyncs froze it once at activation.
+        if allow_freeze && (is_press || is_release) {
+            xi1_freeze_this_event_if_needed(state, q.deviceid, grab.owner, &q);
+        }
+        if is_release && grab.passive_detail == Some(q.detail) {
+            xi1_deactivate_device_grab(state, q.deviceid);
+        }
+        return dropped;
+    }
+
+    // 3. Passive grab activation on press. A ReplayThisDevice
+    // reprocessing pass skips grabs at or above the released grab's
+    // window — "as though they were not present" (the replay floor).
+    if is_press {
+        let matched = state
+            .xi1_passive_grabs
+            .iter()
+            .find(|g| {
+                g.deviceid == q.deviceid
+                    && (g.detail == 0 || g.detail == q.detail)
+                    && (g.modifiers == 0x8000 || g.modifiers == q.state_mask & 0x00ff)
+                    && xi1_window_in_chain(state, q.natural_target, g.grab_window)
+                    && !q
+                        .replay_floor
+                        .is_some_and(|floor| xi1_window_in_chain(state, floor, g.grab_window))
+            })
+            .copied();
+        if let Some(g) = matched {
+            state.xi1_active_grabs.insert(
+                q.deviceid,
+                crate::server::Xi1ActiveGrab {
+                    owner: g.owner,
+                    deviceid: q.deviceid,
+                    grab_window: g.grab_window,
+                    owner_events: g.owner_events,
+                    this_mode: g.this_mode,
+                    other_mode: g.other_mode,
+                    passive_detail: Some(q.detail),
+                },
+            );
+            state.xi1_last_grab_time = q.time;
+            // CheckGrabForSyncs at activation, then deliver the
+            // activating press; a sync grab stores it for Replay
+            // (FROZEN_NO_EVENT → FROZEN_WITH_EVENT, Xorg
+            // DeliverGrabbedEvent / ActivateGrabNoDelivery tail).
+            if allow_freeze {
+                xi1_check_grab_for_syncs(
+                    state,
+                    q.deviceid,
+                    g.owner,
+                    g.this_mode == 0,
+                    g.other_mode == 0,
+                );
+            }
+            let dropped = xi1_fan_device_event(state, &[g.owner], g.grab_window, &q);
+            if allow_freeze {
+                let sync = state.xi1_frozen.entry(q.deviceid).or_default();
+                if sync.state == crate::server::Xi1SyncState::FrozenNoEvent {
+                    sync.state = crate::server::Xi1SyncState::FrozenWithEvent;
+                    sync.stored = Some(q);
+                }
+            }
+            return dropped;
+        }
+    }
+
+    // 4. Selection delivery, gated by the device-focus route
+    // (DeliverFocusedEvent for keyboard devices; plain walk for
+    // pointer devices).
+    let hit = compute_xi1_route_targets(state, &q);
+    log::debug!(
+        "xi1_route: evcode={} target=0x{:x} route={:?} hit={:?}",
+        q.evcode,
+        q.natural_target.0,
+        q.focus_route,
+        hit.as_ref()
+            .map(|(t, w)| (t.iter().map(|c| c.0).collect::<Vec<_>>(), w.0)),
+    );
+    let dropped = match hit {
+        Some((targets, w)) => xi1_fan_device_event(state, &targets, w, &q),
+        None => Vec::new(),
+    };
+    // A BRIDGED core grab (no XI1 grab, but the core pointer/keyboard
+    // grab controls this device) must still trip an armed
+    // FreezeNextEvent / FreezeBothNextEvent on key/button events —
+    // Xorg delivers through that one grab slot and trips there.
+    if allow_freeze
+        && (is_press || is_release)
+        && let Some(owner) = xi1_device_grab_owner(state, q.deviceid)
+    {
+        xi1_freeze_this_event_if_needed(state, q.deviceid, owner, &q);
+    }
+    dropped
+}
+
+/// Apply the event's [`Xi1FocusRoute`] to find selection-delivery
+/// targets — the XI1 analogue of Xorg `DeliverFocusedEvent`
+/// (dix/events.c:4202): unbounded walk, walk bounded at the focus
+/// window, focus-window-only, or none (focus = None).
+fn compute_xi1_route_targets(
+    state: &ServerState,
+    q: &crate::server::Xi1QueuedEvent,
+) -> Option<(Vec<ClientId>, ResourceId)> {
+    match q.focus_route {
+        crate::server::Xi1FocusRoute::Walk => {
+            compute_xi1_targets_bounded(state, q.natural_target, q.evcode, q.deviceid, None)
+        }
+        crate::server::Xi1FocusRoute::WalkUpTo(stop) => {
+            compute_xi1_targets_bounded(state, q.natural_target, q.evcode, q.deviceid, Some(stop))
+        }
+        crate::server::Xi1FocusRoute::WindowOnly(w) => {
+            let targets = xi1_window_selectors(state, w, q.evcode, q.deviceid);
+            if targets.is_empty() {
+                None
+            } else {
+                Some((targets, w))
+            }
+        }
+        crate::server::Xi1FocusRoute::Drop => None,
+    }
+}
+
+/// Clients that selected `(deviceid << 8) | evcode` on exactly `window`.
+fn xi1_window_selectors(
+    state: &ServerState,
+    window: ResourceId,
+    evcode: u8,
+    deviceid: u16,
+) -> Vec<ClientId> {
+    let class = (u32::from(deviceid) << 8) | u32::from(evcode);
+    state
+        .clients
+        .iter()
+        .filter(|(_, c)| {
+            c.xi1_window_event_classes
+                .get(&window)
+                .is_some_and(|set| set.contains(&class))
+        })
+        .map(|(id, _)| ClientId(*id))
+        .collect()
+}
+
+/// True when `grab_window` is `target` or one of its ancestors.
+fn xi1_window_in_chain(state: &ServerState, target: ResourceId, grab_window: ResourceId) -> bool {
+    let mut window = target;
+    loop {
+        if window == grab_window {
+            return true;
+        }
+        if window == ROOT_WINDOW {
+            return false;
+        }
+        match state.resources.window(window).map(|w| w.parent) {
+            Some(parent) if parent != window => window = parent,
+            _ => return false,
+        }
+    }
+}
+
+fn xi1_fan_device_event(
+    state: &mut ServerState,
+    targets: &[ClientId],
+    event_window: ResourceId,
+    q: &crate::server::Xi1QueuedEvent,
+) -> Vec<ClientId> {
+    // DeviceMotionNotify MUST be a MORE_EVENTS chain with a trailing
+    // deviceValuator: libXi's XInputWireToEvent returns DONT_ENQUEUE
+    // unconditionally for the leading motion event and only enqueues
+    // when the valuator continuation lands (XExtInt.c) — a bare motion
+    // event silently vanishes inside every libXi client. Key/button
+    // events enqueue standalone. The valuator payload mirrors the
+    // device's X/Y axes (the sprite position), matching Xorg's
+    // getValuatorEvents for a 2-axis motion.
+    let is_motion =
+        q.evcode == crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET;
+    fanout_event_to_clients(state, targets, |buf, seq, order| {
+        crate::xinput::encode_xi1_device_input_event(
+            buf,
+            order,
+            q.evcode,
+            q.detail,
+            seq,
+            q.time,
+            ROOT_WINDOW.0,
+            event_window.0,
+            0,
+            q.root_x,
+            q.root_y,
+            q.event_x,
+            q.event_y,
+            q.state_mask,
+            if is_motion {
+                q.deviceid | u16::from(crate::xinput::XI1_MORE_EVENTS)
+            } else {
+                q.deviceid
+            },
+        );
+        if is_motion {
+            // Faked motion carries its explicit axis payload; real
+            // motion reports the X/Y axes (= sprite position).
+            let (num, first_v, values) = match q.axes {
+                Some(a) => (a.count.min(6), a.first, a.values),
+                None => (2, 0, [i32::from(q.root_x), i32::from(q.root_y), 0, 0, 0, 0]),
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            crate::xinput::encode_xi1_device_valuator(
+                buf,
+                order,
+                crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_VALUATOR_OFFSET,
+                q.deviceid as u8,
+                seq,
+                q.state_mask,
+                num,
+                first_v,
+                values,
+            );
+        }
+    })
+}
+
+/// The paired input device: pointer (4) <-> keyboard (5). Used for
+/// other_devices_mode freeze bookkeeping.
+pub(crate) fn xi1_other_input_device(deviceid: u16) -> u16 {
+    if deviceid == crate::xinput::DEVICEID_SLAVE_POINTER {
+        crate::xinput::DEVICEID_SLAVE_KEYBOARD
+    } else {
+        crate::xinput::DEVICEID_SLAVE_POINTER
+    }
+}
+
+/// Force-thaw a device: reset its sync state outright and flush. Used
+/// by teardown paths (client disconnect with no grabs left) where no
+/// grab semantics apply — NOT by AllowDeviceEvents, which manipulates
+/// the sync state per Xorg `AllowSome` and then calls
+/// [`xi1_compute_freezes`].
+pub(crate) fn xi1_thaw_device(state: &mut ServerState, deviceid: u16) {
+    if let Some(freeze) = state.xi1_frozen.get_mut(&deviceid) {
+        freeze.state = crate::server::Xi1SyncState::Thawed;
+        freeze.other = None;
+    }
+    xi1_compute_freezes(state);
+}
+
+/// Port of Xorg `ComputeFreezes` (dix/events.c:1320) over the
+/// two-device model: re-derive each device's frozen flag from its sync
+/// state and flush the queued events of every no-longer-frozen device.
+/// Re-freezing mid-flush (a queued press activating a sync passive
+/// grab) leaves the remainder queued, exactly like Xorg's restart loop.
+pub(crate) fn xi1_compute_freezes(state: &mut ServerState) {
+    for dev in [
+        crate::xinput::DEVICEID_SLAVE_POINTER,
+        crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+    ] {
+        while let Some(freeze) = state.xi1_frozen.get_mut(&dev) {
+            if freeze.frozen() {
+                break;
+            }
+            // Withheld CORE keys replay first (they were withheld at
+            // fanout entry, before the XI1 form was queued).
+            if let Some(ev) = freeze.core_key_queue.pop_front() {
+                log::debug!("xi1_compute_freezes: device {dev} replaying core key");
+                let _ = crate::core_loop::key_fanout::deliver_routed_key(state, ev);
+                continue;
+            }
+            let Some(q) = freeze.queue.pop_front() else {
+                break;
+            };
+            log::debug!(
+                "xi1_compute_freezes: device {dev} replaying evcode={}",
+                q.evcode
+            );
+            let _ = xi1_route_device_event(state, q, true);
+        }
+    }
+}
+
+/// Port of Xorg `CheckGrabForSyncs` (dix/events.c:1424-1450): set the
+/// sync state at grab activation. A sync `this_mode` freezes the
+/// grabbed device ONCE (FrozenNoEvent); a sync `other_mode` holds the
+/// paired device on behalf of this grab (`sync.other`). Async modes
+/// release the same-client holds.
+pub(crate) fn xi1_check_grab_for_syncs(
+    state: &mut ServerState,
+    deviceid: u16,
+    owner: ClientId,
+    this_sync: bool,
+    other_sync: bool,
+) {
+    {
+        let sync = state.xi1_frozen.entry(deviceid).or_default();
+        if this_sync {
+            sync.state = crate::server::Xi1SyncState::FrozenNoEvent;
+        } else {
+            sync.state = crate::server::Xi1SyncState::Thawed;
+            if sync.other == Some(owner) {
+                sync.other = None;
+            }
+        }
+    }
+    let other_dev = xi1_other_input_device(deviceid);
+    let other = state.xi1_frozen.entry(other_dev).or_default();
+    if other_sync {
+        other.other = Some(owner);
+    } else if other.other == Some(owner) {
+        other.other = None;
+    }
+    xi1_compute_freezes(state);
+}
+
+/// Port of Xorg `FreezeThisEventIfNeededForSyncGrab`
+/// (dix/events.c:4420-4447): after a key/button event is delivered
+/// through the active grab, an armed FreezeNextEvent /
+/// FreezeBothNextEvent state trips to FrozenWithEvent (storing the
+/// event for Replay); FreezeBothNextEvent also re-holds the paired
+/// device.
+pub(crate) fn xi1_freeze_this_event_if_needed(
+    state: &mut ServerState,
+    deviceid: u16,
+    owner: ClientId,
+    q: &crate::server::Xi1QueuedEvent,
+) {
+    use crate::server::Xi1SyncState;
+    let st = state
+        .xi1_frozen
+        .get(&deviceid)
+        .map_or(Xi1SyncState::Thawed, |f| f.state);
+    match st {
+        Xi1SyncState::FreezeBothNextEvent => {
+            let other_dev = xi1_other_input_device(deviceid);
+            let other_owner = xi1_device_grab_owner(state, other_dev);
+            let other = state.xi1_frozen.entry(other_dev).or_default();
+            if other.state == Xi1SyncState::FreezeBothNextEvent && other_owner == Some(owner) {
+                other.state = Xi1SyncState::FrozenNoEvent;
+            } else {
+                other.other = Some(owner);
+            }
+            let sync = state.xi1_frozen.entry(deviceid).or_default();
+            sync.state = Xi1SyncState::FrozenWithEvent;
+            sync.stored = Some(*q);
+        }
+        Xi1SyncState::FreezeNextEvent => {
+            let sync = state.xi1_frozen.entry(deviceid).or_default();
+            sync.state = Xi1SyncState::FrozenWithEvent;
+            sync.stored = Some(*q);
+        }
+        _ => {}
+    }
+}
+
+/// Deactivate the active XI1 grab on `deviceid` (UngrabDevice, passive
+/// release auto-end, disconnect teardown): reset its sync state,
+/// release the paired device if it was held on this grab's behalf, and
+/// flush (Xorg DeactivateKeyboard/PointerGrab tail).
+pub(crate) fn xi1_deactivate_device_grab(state: &mut ServerState, deviceid: u16) {
+    let Some(grab) = state.xi1_active_grabs.remove(&deviceid) else {
+        return;
+    };
+    if let Some(sync) = state.xi1_frozen.get_mut(&deviceid) {
+        sync.state = crate::server::Xi1SyncState::Thawed;
+        sync.stored = None;
+    }
+    let other_dev = xi1_other_input_device(deviceid);
+    if let Some(other) = state.xi1_frozen.get_mut(&other_dev)
+        && other.other == Some(grab.owner)
+    {
+        other.other = None;
+    }
+    xi1_compute_freezes(state);
+}
+
+/// Release the core-grab bridge hold on `deviceid` at GRAB
+/// DEACTIVATION (core UngrabPointer / UngrabKeyboard, passive key-grab
+/// auto-release): thaw the device's sync state when no XI1 grab
+/// controls it and release the paired device if held on `owner`'s
+/// behalf — Xorg DeactivateKeyboard/PointerGrab clears every
+/// `sync.other` pointing at the dying grab.
+pub(crate) fn xi1_core_grab_bridge_release(
+    state: &mut ServerState,
+    deviceid: u16,
+    owner: ClientId,
+) {
+    if !state.xi1_active_grabs.contains_key(&deviceid)
+        && let Some(sync) = state.xi1_frozen.get_mut(&deviceid)
+    {
+        sync.state = crate::server::Xi1SyncState::Thawed;
+        sync.stored = None;
+    }
+    let other_dev = xi1_other_input_device(deviceid);
+    if let Some(other) = state.xi1_frozen.get_mut(&other_dev)
+        && other.other == Some(owner)
+    {
+        other.other = None;
+    }
+    xi1_compute_freezes(state);
+}
+
+/// Core AllowEvents → XI1-side `THAWED` for one device (Xorg
+/// AllowSome with newState=THAWED): thaw the device's own state when
+/// the client's grab controls it, and clear the device's own
+/// on-behalf hold — the PAIRED device is NOT touched (XTS
+/// XAllowDeviceEvents-18: AsyncPointer must not release a frozen
+/// keyboard). Grab deactivation paths use
+/// [`xi1_core_grab_bridge_release`] instead.
+pub(crate) fn xi1_core_allow_events_thaw(state: &mut ServerState, deviceid: u16, client: ClientId) {
+    if xi1_device_grab_owner(state, deviceid) == Some(client)
+        && let Some(sync) = state.xi1_frozen.get_mut(&deviceid)
+    {
+        sync.state = crate::server::Xi1SyncState::Thawed;
+    }
+    if let Some(sync) = state.xi1_frozen.get_mut(&deviceid)
+        && sync.other == Some(client)
+    {
+        sync.other = None;
+    }
+    xi1_compute_freezes(state);
+}
+
+/// The client owning the grab that controls `deviceid`'s sync state:
+/// the XI1 device grab, or the bridged core grab (core pointer grab ↔
+/// slave pointer, core keyboard grab ↔ slave keyboard) — in Xorg these
+/// are one `deviceGrab.grab` slot.
+pub(crate) fn xi1_device_grab_owner(state: &ServerState, deviceid: u16) -> Option<ClientId> {
+    if let Some(g) = state.xi1_active_grabs.get(&deviceid) {
+        return Some(g.owner);
+    }
+    if deviceid == crate::xinput::DEVICEID_SLAVE_POINTER {
+        state.active_pointer_grab.as_ref().map(|g| g.owner)
+    } else {
+        state.active_keyboard_grab.as_ref().map(|g| g.owner)
+    }
+}
+
+/// Find the clients receiving an XI 1.x device input event: starting
+/// at the hit target, walk up the ancestor chain; the first window
+/// where at least one client selected `(deviceid << 8) | evcode`
+/// becomes the event window, and all clients selecting there receive
+/// it. Mirrors core propagation (Xorg dix DeliverDeviceEvents); the
+/// XI1 dont-propagate list is not honoured yet.
+///
+/// `stop_at` is the last window checked (inclusive) — Xorg
+/// `DeliverDeviceEvents`'s `stopAt` argument, used when a focus window
+/// caps the walk (dix/events.c:4220).
+fn compute_xi1_targets_bounded(
+    state: &ServerState,
+    target: ResourceId,
+    evcode: u8,
+    deviceid: u16,
+    stop_at: Option<ResourceId>,
+) -> Option<(Vec<ClientId>, ResourceId)> {
+    let class = (u32::from(deviceid) << 8) | u32::from(evcode);
+    let mut window = target;
+    loop {
+        let targets: Vec<ClientId> = state
+            .clients
+            .iter()
+            .filter(|(_, c)| {
+                c.xi1_window_event_classes
+                    .get(&window)
+                    .is_some_and(|set| set.contains(&class))
+            })
+            .map(|(id, _)| ClientId(*id))
+            .collect();
+        if !targets.is_empty() {
+            return Some((targets, window));
+        }
+        if window == ROOT_WINDOW || stop_at == Some(window) {
+            return None;
+        }
+        let parent = state.resources.window(window).map(|w| w.parent)?;
+        if parent == window {
+            return None;
+        }
+        window = parent;
+    }
 }
 
 fn translate_host_event(
@@ -1017,6 +1668,71 @@ mod tests {
     use crate::server::{ScreenSaverActive, ServerState};
     use yserver_protocol::x11::ClientId;
 
+    /// AllowSome state machine pins (Xorg dix/events.c semantics):
+    /// grab activation freezes ONCE; FreezeNextEvent re-arms; trips to
+    /// FrozenWithEvent on a delivered key/button; deactivation clears
+    /// the paired device's on-behalf hold.
+    #[test]
+    fn xi1_sync_state_machine_pins() {
+        use crate::{
+            server::{Xi1ActiveGrab, Xi1SyncState},
+            xinput::{DEVICEID_SLAVE_KEYBOARD as KBD, DEVICEID_SLAVE_POINTER as PTR},
+        };
+        let mut state = ServerState::new();
+        let owner = ClientId(7);
+        state.xi1_active_grabs.insert(
+            PTR,
+            Xi1ActiveGrab {
+                owner,
+                deviceid: PTR,
+                grab_window: crate::resources::ROOT_WINDOW,
+                owner_events: false,
+                this_mode: 0,
+                other_mode: 0,
+                passive_detail: None,
+            },
+        );
+        // Sync grab activation: this device FrozenNoEvent, paired
+        // device held on the grab's behalf.
+        xi1_check_grab_for_syncs(&mut state, PTR, owner, true, true);
+        assert_eq!(
+            state.xi1_frozen[&PTR].state,
+            Xi1SyncState::FrozenNoEvent,
+            "sync this_mode freezes once at activation"
+        );
+        assert_eq!(state.xi1_frozen[&KBD].other, Some(owner));
+        assert!(state.xi1_frozen[&PTR].frozen());
+        assert!(state.xi1_frozen[&KBD].frozen(), "held via sync.other");
+
+        // FreezeNextEvent arming + trip on a delivered button event.
+        state.xi1_frozen.get_mut(&PTR).unwrap().state = Xi1SyncState::FreezeNextEvent;
+        assert!(!state.xi1_frozen[&PTR].frozen(), "armed ≠ frozen");
+        let q = crate::server::Xi1QueuedEvent {
+            deviceid: PTR,
+            evcode: crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_BUTTON_PRESS_OFFSET,
+            detail: 1,
+            time: 1,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            state_mask: 0,
+            natural_target: crate::resources::ROOT_WINDOW,
+            focus_route: crate::server::Xi1FocusRoute::Walk,
+            axes: None,
+            replay_floor: None,
+        };
+        xi1_freeze_this_event_if_needed(&mut state, PTR, owner, &q);
+        assert_eq!(state.xi1_frozen[&PTR].state, Xi1SyncState::FrozenWithEvent);
+        assert!(state.xi1_frozen[&PTR].stored.is_some(), "Replay material");
+
+        // Deactivation thaws this device AND releases the paired hold.
+        xi1_deactivate_device_grab(&mut state, PTR);
+        assert!(!state.xi1_frozen[&PTR].frozen());
+        assert_eq!(state.xi1_frozen[&KBD].other, None);
+        assert!(!state.xi1_frozen[&KBD].frozen());
+    }
+
     use crate::server::ClientState;
     use std::{
         collections::{HashMap, HashSet, VecDeque},
@@ -1045,6 +1761,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 focused_window: ROOT_WINDOW,

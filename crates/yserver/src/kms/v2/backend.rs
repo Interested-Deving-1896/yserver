@@ -19327,6 +19327,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 focused_window: ROOT_WINDOW,

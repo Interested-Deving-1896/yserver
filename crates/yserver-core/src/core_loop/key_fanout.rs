@@ -101,8 +101,41 @@ pub fn key_event_fanout_to_state(
         );
     }
 
+    // Unified device freeze (Xorg FreezeThaw switches the whole
+    // device to the enqueue proc): while the keyboard device is
+    // frozen, the WHOLE key event is withheld in core_key_queue.
+    // The replay (`xi1_compute_freezes` → `deliver_routed_key`)
+    // regenerates both the core and the XI1 form — queueing the XI1
+    // form separately here would double-deliver it on thaw (XTS
+    // XUngrabDevice-1: "expecting two events, got 4").
+    if state
+        .xi1_frozen
+        .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+        .is_some_and(crate::server::Xi1Freeze::frozen)
+    {
+        state
+            .xi1_frozen
+            .entry(crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+            .or_default()
+            .core_key_queue
+            .push_back(event);
+        return Vec::new();
+    }
+
+    deliver_routed_key(state, event)
+}
+
+/// The routing+delivery tail of [`key_event_fanout_to_state`] —
+/// callable without a backend so `xi1_compute_freezes` can replay
+/// withheld core keys on thaw.
+pub(crate) fn deliver_routed_key(state: &mut ServerState, event: HostKeyEvent) -> Vec<ClientId> {
     match key_route(state, &event) {
-        KeyRoute::Drop => Vec::new(),
+        // Core delivery has nowhere to go (focus on root, no grab) —
+        // but the XI1 fanout routes by the extension keyboard's own
+        // device focus (default PointerRoot → window under pointer),
+        // so SelectExtensionEvent subscribers still receive DeviceKey
+        // events.
+        KeyRoute::Drop => deliver_xi1_focused_key(state, &event),
         KeyRoute::PassiveGrabOwner {
             owner,
             grab_window,
@@ -116,9 +149,20 @@ pub fn key_event_fanout_to_state(
             if freeze && event.pressed {
                 state.frozen_keyboard_event = Some(event);
             }
-            deliver_key_to_grab_owner(state, &event, owner, grab_window, via_xi2)
+            let mut dropped = deliver_key_to_grab_owner(state, &event, owner, grab_window, via_xi2);
+            // XI1 leg runs under grabs too — the router handles its
+            // own grab/freeze semantics, including the armed
+            // FreezeNextEvent / FreezeBothNextEvent trip that a key
+            // event delivered through the (bridged) grab must fire
+            // (XTS XAllowDeviceEvents-11/-12 SyncAll re-freeze).
+            merge_dropped(&mut dropped, deliver_xi1_focused_key(state, &event));
+            dropped
         }
-        KeyRoute::Window(window) => deliver_key_to_window(state, &event, window),
+        KeyRoute::Window(window) => {
+            let mut dropped = deliver_key_to_window(state, &event, window);
+            merge_dropped(&mut dropped, deliver_xi1_focused_key(state, &event));
+            dropped
+        }
     }
 }
 
@@ -132,7 +176,9 @@ pub fn replay_frozen_key_to_focus(state: &mut ServerState, event: HostKeyEvent) 
     if focus == ROOT_WINDOW {
         return Vec::new();
     }
-    deliver_key_to_window(state, &event, focus)
+    let mut dropped = deliver_key_to_window(state, &event, focus);
+    merge_dropped(&mut dropped, deliver_xi1_focused_key(state, &event));
+    dropped
 }
 
 /// Deliver a key event to a single window's subscribers — the normal
@@ -200,6 +246,7 @@ fn deliver_key_to_window(
         });
         merge_dropped(&mut dropped, xi2_dropped);
     }
+
     dropped
 }
 
@@ -336,6 +383,12 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
         {
             state.active_keyboard_grab = None;
             state.frozen_keyboard_event = None;
+            // Release the XI1-side holds the activation placed.
+            crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
+                state,
+                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                g.owner,
+            );
         }
         if passive {
             return KeyRoute::PassiveGrabOwner {
@@ -345,17 +398,36 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
                 via_xi2: g.via_xi2,
             };
         }
-        // Explicit grab (GrabKeyboard): keep existing window delivery.
-        return KeyRoute::Window(g.grab_window);
+        // Explicit grab (GrabKeyboard): key events go to the grabbing
+        // client UNCONDITIONALLY, reported against the grab window —
+        // Xorg DeliverGrabbedEvent; XGrabKeyboard implies KeyPress/
+        // KeyRelease selection regardless of the owner's event masks
+        // (xterm secure-keyboard, XTS AllowDeviceEvents iskfrozen
+        // probes). Window delivery here silently dropped keys when
+        // the grabber had no KeyPressMask on the grab window.
+        return KeyRoute::PassiveGrabOwner {
+            owner: g.owner,
+            grab_window: g.grab_window,
+            freeze: false,
+            via_xi2: g.via_xi2,
+        };
     }
 
     let focus = current_focus(state);
 
     // Press: try to match a passive key grab, activating it.
     if event.pressed
-        && let Some((owner, grab_window, keyboard_mode, via_xi2)) = state
+        && let Some((owner, grab_window, pointer_mode, keyboard_mode, via_xi2)) = state
             .find_key_grab(focus, event.keycode, event.state)
-            .map(|g| (g.owner, g.grab_window, g.keyboard_mode, g.via_xi2))
+            .map(|g| {
+                (
+                    g.owner,
+                    g.grab_window,
+                    g.pointer_mode,
+                    g.keyboard_mode,
+                    g.via_xi2,
+                )
+            })
     {
         state.active_keyboard_grab = Some(ActiveKeyboardGrab {
             owner,
@@ -365,6 +437,19 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
             },
             via_xi2,
         });
+        // Core↔XI bridge (Xorg ActivateKeyboardGrab →
+        // CheckGrabForSyncs): a sync keyboard_mode freezes the
+        // keyboard device's XI1 stream; a sync pointer_mode holds the
+        // pointer device on this grab's behalf (XTS
+        // XAllowDeviceEvents-10 freezes the pointer "twice" exactly
+        // this way).
+        crate::core_loop::pointer_fanout::xi1_check_grab_for_syncs(
+            state,
+            crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+            owner,
+            keyboard_mode == 0,
+            pointer_mode == 0,
+        );
         return KeyRoute::PassiveGrabOwner {
             owner,
             grab_window,
@@ -386,13 +471,68 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
 /// Per-client `focused_window` is intended to be a global value
 /// mirrored across clients. Pick the first non-ROOT focus we see; if
 /// every client is rooted, return `ROOT_WINDOW`.
-fn current_focus(state: &ServerState) -> ResourceId {
+pub(crate) fn current_focus(state: &ServerState) -> ResourceId {
     state
         .clients
         .values()
         .map(|c| c.focused_window)
         .find(|f| *f != ROOT_WINDOW)
         .unwrap_or(ROOT_WINDOW)
+}
+
+/// XI1 DeviceKeyPress/Release delivery for the slave keyboard —
+/// independent of the core key route. The natural target and the
+/// selection-walk gating come from the device's own focus
+/// (`xi1_focus::key_delivery_route`, the XI1 port of Xorg
+/// `DeliverFocusedEvent`); grab/freeze handling inside
+/// `xi1_route_device_event` is unaffected by the focus.
+fn deliver_xi1_focused_key(state: &mut ServerState, event: &HostKeyEvent) -> Vec<ClientId> {
+    let xi1_offset = if event.pressed {
+        crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET
+    } else {
+        crate::xinput::XI_DEVICE_KEY_RELEASE_OFFSET
+    };
+    let evcode = crate::server::XI_FIRST_EVENT + xi1_offset;
+    let (natural, focus_route) = crate::core_loop::xi1_focus::key_delivery_route(
+        state,
+        crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+    );
+    crate::core_loop::pointer_fanout::xi1_route_device_event(
+        state,
+        crate::server::Xi1QueuedEvent {
+            deviceid: crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+            evcode,
+            detail: event.keycode,
+            time: event.time,
+            root_x: event.root_x,
+            root_y: event.root_y,
+            event_x: event.event_x,
+            event_y: event.event_y,
+            state_mask: event.state,
+            natural_target: natural,
+            focus_route,
+            axes: None,
+            replay_floor: None,
+        },
+        true,
+    )
+}
+
+/// Deepest mapped window containing the cached pointer position —
+/// the PointerRoot key-delivery target. Descends `direct_child_at`
+/// from the root using `state.pointer_root`.
+pub(crate) fn deepest_window_at_pointer(state: &ServerState) -> ResourceId {
+    let (root_x, root_y) = state.pointer_root;
+    let mut window = ROOT_WINDOW;
+    loop {
+        let (ox, oy) = state.resources.window_absolute_position(window);
+        let wx = i16::try_from(i32::from(root_x).saturating_sub(ox)).unwrap_or(i16::MAX);
+        let wy = i16::try_from(i32::from(root_y).saturating_sub(oy)).unwrap_or(i16::MAX);
+        match state.direct_child_at(window, wx, wy) {
+            Some(child) if child != window => window = child,
+            _ => return window,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +571,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 focused_window: ROOT_WINDOW,
@@ -491,6 +632,7 @@ mod tests {
             big_requests_enabled: false,
             xi2_masks: HashMap::from([((window, 3u16), xi2_mask)]),
             xi1_event_classes: HashSet::new(),
+            xi1_window_event_classes: HashMap::new(),
             outbound: VecDeque::new(),
             watching_writable: false,
             focused_window: ROOT_WINDOW,

@@ -121,6 +121,11 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     let mut pending: Vec<PendingDestroy> = Vec::new();
     let mut all_destroyed: Vec<ResourceId> = Vec::new();
     for root in owned_roots {
+        // XI1 device focus on a window in this dying subtree reverts
+        // while the tree is still intact (RevertToParent walks the
+        // surviving ancestors). A leaked focus on a destroyed window
+        // would silently eat all later DeviceKey events.
+        crate::core_loop::xi1_focus::revert_focus_for_dying_subtree(state, root);
         let mut order: Vec<ResourceId> = Vec::new();
         collect_destroy_order(&state.resources, root, &mut order);
         for w in &order {
@@ -162,7 +167,15 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
             .resources
             .remove_non_window_resources_owned_by(client_id)
     };
+    // Snapshot the resource-id base before the client entry is removed.
+    // Recycled below only for `!retain` clients — see IdAllocator::release.
+    let released_base = state.clients.get(&client_id.0).map(|c| c.resource_id_base);
     state.clients.remove(&client_id.0);
+    if !retain {
+        if let Some(base) = released_base {
+            state.id_allocator.release(base);
+        }
+    }
 
     let dead_windows: std::collections::HashSet<ResourceId> =
         all_destroyed.iter().copied().collect();
@@ -272,6 +285,38 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         state.pointer_grab_is_passive = false;
         state.frozen_pointer_event = None;
         state.frozen_pointer_queue.clear();
+    }
+    // XI 1.x grab teardown: drop the client's passive grabs, release
+    // its active device grabs, and thaw any devices its grabs froze —
+    // a leaked freeze queues device events forever and hangs every
+    // later test/client waiting on input.
+    state.xi1_passive_grabs.retain(|g| g.owner != client_id);
+    let released: Vec<u16> = state
+        .xi1_active_grabs
+        .iter()
+        .filter(|(_, g)| g.owner == client_id)
+        .map(|(d, _)| *d)
+        .collect();
+    for dev in &released {
+        // Deactivation resets the device's sync state, releases the
+        // paired device if it was held on this grab's behalf
+        // (other_devices_mode), and flushes the queues.
+        crate::core_loop::pointer_fanout::xi1_deactivate_device_grab(state, *dev);
+    }
+    if released.is_empty() && state.xi1_active_grabs.is_empty() {
+        // No active grabs anywhere, yet freezes linger (e.g. a sync
+        // passive grab's owner died between activation and release):
+        // clear them, or device events queue forever and every later
+        // client waiting on input hangs.
+        let devs: Vec<u16> = state
+            .xi1_frozen
+            .iter()
+            .filter(|(_, f)| f.frozen())
+            .map(|(d, _)| *d)
+            .collect();
+        for dev in devs {
+            crate::core_loop::pointer_fanout::xi1_thaw_device(state, dev);
+        }
     }
     state
         .selections
@@ -384,6 +429,11 @@ pub fn destroy_zombie_resources(
     let mut pending: Vec<PendingDestroy> = Vec::new();
     let mut all_destroyed: Vec<ResourceId> = Vec::new();
     for root in owned_roots {
+        // XI1 device focus on a window in this dying subtree reverts
+        // while the tree is still intact (RevertToParent walks the
+        // surviving ancestors). A leaked focus on a destroyed window
+        // would silently eat all later DeviceKey events.
+        crate::core_loop::xi1_focus::revert_focus_for_dying_subtree(state, root);
         let mut order: Vec<ResourceId> = Vec::new();
         collect_destroy_order(&state.resources, root, &mut order);
         for w in &order {
@@ -477,6 +527,7 @@ mod tests {
                 big_requests_enabled: false,
                 xi2_masks: HashMap::new(),
                 xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 focused_window: ROOT_WINDOW,

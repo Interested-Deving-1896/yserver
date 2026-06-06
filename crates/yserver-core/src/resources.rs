@@ -72,6 +72,12 @@ pub struct Colormap {
     pub id: ResourceId,
     pub visual: ResourceId,
     pub host_colormap_xid: Option<crate::backend::ColormapHandle>,
+    /// Client that created this colormap, used by
+    /// `remove_non_window_resources_owned_by` so disconnect cleanup
+    /// frees the entry. Server-allocated default colormaps
+    /// (`ROOT_COLORMAP`, `ARGB_COLORMAP`) use `ClientId(0)` as the
+    /// sentinel owner — they outlive every client connection.
+    pub owner: yserver_protocol::x11::ClientId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -312,6 +318,7 @@ impl Default for ResourceTable {
                 id: ROOT_COLORMAP,
                 visual: ROOT_VISUAL,
                 host_colormap_xid: None,
+                owner: yserver_protocol::x11::ClientId(0),
             },
         );
         colormaps.insert(
@@ -320,6 +327,7 @@ impl Default for ResourceTable {
                 id: ARGB_COLORMAP,
                 visual: ARGB_VISUAL,
                 host_colormap_xid: None,
+                owner: yserver_protocol::x11::ClientId(0),
             },
         );
 
@@ -381,13 +389,19 @@ impl ResourceTable {
         }
     }
 
-    pub fn create_colormap(&mut self, id: ResourceId, visual: ResourceId) {
+    pub fn create_colormap(
+        &mut self,
+        owner: yserver_protocol::x11::ClientId,
+        id: ResourceId,
+        visual: ResourceId,
+    ) {
         self.colormaps.insert(
             id.0,
             Colormap {
                 id,
                 visual,
                 host_colormap_xid: None,
+                owner,
             },
         );
     }
@@ -1482,7 +1496,13 @@ impl ResourceTable {
         self.gcs.insert(request.gc.0, gc);
     }
 
-    pub fn change_gc(&mut self, request: GcChange) {
+    /// Apply a ChangeGC. Caller MUST have validated `request.gc`
+    /// exists in the resource table first (handler-side BadGC gate);
+    /// otherwise this is a silent no-op. Xorg's `ProcChangeGC`
+    /// (`dix/dispatch.c:1580`) emits BadGC via `dixLookupGC` before
+    /// any state mutation — yserver mirrors that with the handler-
+    /// side check + `get_mut` here.
+    pub fn change_gc(&mut self, _requester: ClientId, request: GcChange) {
         let clip_pixmap_host_xid = request
             .clip_mask
             .flatten()
@@ -1496,10 +1516,9 @@ impl ResourceTable {
             .stipple
             .and_then(|pixmap| self.pixmaps.get(&pixmap.0))
             .and_then(|p| p.host_xid);
-        let gc = self
-            .gcs
-            .entry(request.gc.0)
-            .or_insert_with(|| Gc::with_defaults(request.gc, ResourceId(0), SERVER_OWNER));
+        let Some(gc) = self.gcs.get_mut(&request.gc.0) else {
+            return;
+        };
         Self::apply_gc_change(
             gc,
             GcChangeView {
@@ -1629,11 +1648,19 @@ impl ResourceTable {
     /// effectively concatenated with itself to produce an even-length
     /// list", so callers normalize before storing — we do it here so
     /// every read site sees an even-length cycle.
-    pub fn set_dashes(&mut self, gc_id: ResourceId, dash_offset: u16, dashes: &[u8]) {
-        let gc = self
-            .gcs
-            .entry(gc_id.0)
-            .or_insert_with(|| Gc::with_defaults(gc_id, ResourceId(0), SERVER_OWNER));
+    /// SetDashes — silent no-op if `gc_id` is unknown (caller MUST
+    /// have BadGC-gated; Xorg's `ProcSetDashes` (`dix/dispatch.c:1626`)
+    /// emits BadGC via `dixLookupGC` first).
+    pub fn set_dashes(
+        &mut self,
+        _requester: ClientId,
+        gc_id: ResourceId,
+        dash_offset: u16,
+        dashes: &[u8],
+    ) {
+        let Some(gc) = self.gcs.get_mut(&gc_id.0) else {
+            return;
+        };
         gc.dash_offset = dash_offset as i16;
         if dashes.is_empty() {
             return;
@@ -1648,11 +1675,13 @@ impl ResourceTable {
         }
     }
 
-    pub fn set_clip_rectangles(&mut self, request: SetClipRectanglesRequest) {
-        let gc = self
-            .gcs
-            .entry(request.gc.0)
-            .or_insert_with(|| Gc::with_defaults(request.gc, ResourceId(0), SERVER_OWNER));
+    /// SetClipRectangles — silent no-op if `request.gc` is unknown
+    /// (caller MUST have BadGC-gated; Xorg's `ProcSetClipRectangles`
+    /// (`dix/dispatch.c:1651`) emits BadGC via `dixLookupGC` first).
+    pub fn set_clip_rectangles(&mut self, _requester: ClientId, request: SetClipRectanglesRequest) {
+        let Some(gc) = self.gcs.get_mut(&request.gc.0) else {
+            return;
+        };
         // SetClipRectangles supersedes any prior clip-mask pixmap.
         gc.clip_pixmap = None;
         gc.clip_pixmap_host_xid = None;
@@ -2127,6 +2156,17 @@ impl ResourceTable {
             }
         });
         self.gcs.retain(|_, g| g.owner != client);
+        let mut freed_colormaps = Vec::new();
+        self.colormaps.retain(|_, c| {
+            if c.owner == client {
+                if let Some(host) = c.host_colormap_xid {
+                    freed_colormaps.push(host.as_raw());
+                }
+                false
+            } else {
+                true
+            }
+        });
         let mut freed_cursors = Vec::new();
         self.cursors.retain(|_, c| {
             if c.owner == client {
@@ -2724,6 +2764,149 @@ mod tests {
             Just(InitialState::Unviewable),
             Just(InitialState::Unmapped),
         ]
+    }
+
+    /// Regression for the "leaked XID → BadIDChoice after recycling"
+    /// family. `xid_in_use` walks every core resource map; for the
+    /// IdAllocator recycle path to be sound, EVERY map it checks must
+    /// be drained by `remove_non_window_resources_owned_by` (windows
+    /// go through `destroy_window` separately).
+    ///
+    /// Populates one entry per map for `ClientId(K)`, runs the
+    /// disconnect cleanup, and asserts each test XID reads
+    /// `xid_in_use == false`. Adding a new map to `xid_in_use` should
+    /// be accompanied by a new line in this test + cleanup logic in
+    /// `remove_non_window_resources_owned_by`; without that the test
+    /// stays passing for the existing maps but a new leak ships silent.
+    #[test]
+    fn disconnect_cleanup_drains_every_xid_in_use_map_for_owner() {
+        use crate::backend::{
+            ColormapHandle, CursorHandle, FontHandle, GlyphSetHandle, PictureHandle, PixmapHandle,
+        };
+
+        let mut table = ResourceTable::new();
+        let owner = ClientId(7);
+        let other = ClientId(8);
+
+        // Windows handled separately via destroy_window; this test
+        // focuses on the non-window family that `remove_non_window_
+        // resources_owned_by` is responsible for.
+
+        // Pixmap
+        let pix_id = ResourceId(0x0700_0001);
+        table.pixmaps.insert(
+            pix_id.0,
+            Pixmap {
+                id: pix_id,
+                drawable: ROOT_WINDOW,
+                width: 1,
+                height: 1,
+                depth: 24,
+                owner,
+                host_xid: Some(PixmapHandle::from_raw_for_test(0xa01)),
+            },
+        );
+
+        // GC
+        let gc_id = ResourceId(0x0700_0002);
+        table
+            .gcs
+            .insert(gc_id.0, Gc::with_defaults(gc_id, ROOT_WINDOW, owner));
+
+        // Font
+        let font_id = ResourceId(0x0700_0003);
+        table.fonts.insert(
+            font_id.0,
+            Font {
+                id: font_id,
+                name: "fixed".to_string(),
+                host_xid: FontHandle::from_raw_for_test(0xa03),
+                metrics: FontMetrics::default(),
+                owner,
+            },
+        );
+
+        // Cursor
+        let cur_id = ResourceId(0x0700_0004);
+        table.cursors.insert(
+            cur_id.0,
+            Cursor {
+                id: cur_id,
+                owner,
+                host_xid: Some(CursorHandle::from_raw_for_test(0xa04)),
+                name_atom: None,
+            },
+        );
+
+        // Colormap
+        let cmap_id = ResourceId(0x0700_0005);
+        table.colormaps.insert(
+            cmap_id.0,
+            Colormap {
+                id: cmap_id,
+                visual: ROOT_VISUAL,
+                host_colormap_xid: Some(ColormapHandle::from_raw_for_test(0xa05)),
+                owner,
+            },
+        );
+
+        // Picture
+        let pic_id = ResourceId(0x0700_0006);
+        table.pictures.insert(
+            pic_id.0,
+            PictureState {
+                client: owner,
+                host_picture_xid: PictureHandle::from_raw_for_test(0xa06),
+                host_owned_pixmap: None,
+                kind: PictureKind::Sourceless,
+                drawable: None,
+            },
+        );
+
+        // GlyphSet
+        let gs_id = ResourceId(0x0700_0007);
+        table.glyphsets.insert(
+            gs_id.0,
+            GlyphSetState {
+                client: owner,
+                host_glyphset_xid: GlyphSetHandle::from_raw_for_test(0xa07),
+            },
+        );
+
+        // Sanity: everything is currently in use, and a resource
+        // owned by a DIFFERENT client (not the disconnecting one)
+        // should survive cleanup.
+        let other_gc = ResourceId(0x0800_0001);
+        table
+            .gcs
+            .insert(other_gc.0, Gc::with_defaults(other_gc, ROOT_WINDOW, other));
+
+        for id in [
+            pix_id, gc_id, font_id, cur_id, cmap_id, pic_id, gs_id, other_gc,
+        ] {
+            assert!(
+                table.xid_in_use(id),
+                "pre-cleanup: xid 0x{:x} should be in use",
+                id.0,
+            );
+        }
+
+        // Run the disconnect cleanup for `owner`.
+        let _ = table.remove_non_window_resources_owned_by(owner);
+
+        // Every map drained for `owner`; `other`'s GC survived.
+        for id in [pix_id, gc_id, font_id, cur_id, cmap_id, pic_id, gs_id] {
+            assert!(
+                !table.xid_in_use(id),
+                "post-cleanup: xid 0x{:x} still in use — \
+                 a resource map is missing from remove_non_window_resources_owned_by",
+                id.0,
+            );
+        }
+        assert!(
+            table.xid_in_use(other_gc),
+            "other client's GC must survive cleanup of `owner`",
+        );
     }
 
     #[test]
@@ -3951,20 +4134,23 @@ mod tests {
             ClientId(1),
             empty_create_gc_request(ResourceId(0x500), ROOT_WINDOW),
         );
-        t.set_clip_rectangles(SetClipRectanglesRequest {
-            gc: ResourceId(0x500),
-            clip: ClipRectangles {
-                ordering: 0,
-                x_origin: 0,
-                y_origin: 0,
-                rectangles: vec![0, 0, 0, 0, 10, 0, 10, 0],
+        t.set_clip_rectangles(
+            yserver_protocol::x11::ClientId(1),
+            SetClipRectanglesRequest {
+                gc: ResourceId(0x500),
+                clip: ClipRectangles {
+                    ordering: 0,
+                    x_origin: 0,
+                    y_origin: 0,
+                    rectangles: vec![0, 0, 0, 0, 10, 0, 10, 0],
+                },
             },
-        });
+        );
         assert!(t.gc_clip_rectangles(ResourceId(0x500)).is_some());
 
         let mut clear = empty_change_gc(ResourceId(0x500));
         clear.clip_mask = Some(None);
-        t.change_gc(clear);
+        t.change_gc(yserver_protocol::x11::ClientId(1), clear);
 
         assert!(t.gc_clip_rectangles(ResourceId(0x500)).is_none());
     }
@@ -3997,7 +4183,7 @@ mod tests {
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.function = Some(GcFunction::Xor.protocol_value());
         chg.plane_mask = Some(0x00ff_00ff);
-        t.change_gc(chg);
+        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
         // Copy GCFunction (1<<0) + GCPlaneMask (1<<1).
         t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0x0000_0003);
         let dst = t.gc(ResourceId(0x501)).unwrap();
@@ -4014,7 +4200,7 @@ mod tests {
         chg.line_style = Some(LineStyle::OnOffDash.protocol_value());
         chg.cap_style = Some(CapStyle::Round.protocol_value());
         chg.join_style = Some(JoinStyle::Bevel.protocol_value());
-        t.change_gc(chg);
+        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
         // line_style (1<<5) | cap_style (1<<6) | join_style (1<<7) = 0xE0
         t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0x0000_00E0);
         let dst = t.gc(ResourceId(0x501)).unwrap();
@@ -4031,7 +4217,7 @@ mod tests {
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.fill_rule = Some(FillRule::Winding.protocol_value());
         chg.subwindow_mode = Some(SubwindowMode::IncludeInferiors.protocol_value());
-        t.change_gc(chg);
+        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
         // fill_rule (1<<9) | subwindow_mode (1<<15) = 0x8200
         t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0x0000_8200);
         let dst = t.gc(ResourceId(0x501)).unwrap();
@@ -4047,7 +4233,7 @@ mod tests {
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.graphics_exposures = Some(false);
         chg.dash_offset = Some(7);
-        t.change_gc(chg);
+        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
         // graphics_exposures (1<<16) | dash_offset (1<<20) = 0x0011_0000
         t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0x0011_0000);
         let dst = t.gc(ResourceId(0x501)).unwrap();
@@ -4063,7 +4249,7 @@ mod tests {
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.dashes = Some(9);
         chg.arc_mode = Some(ArcMode::Chord.protocol_value());
-        t.change_gc(chg);
+        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
         // dashes (1<<21) | arc_mode (1<<22) = 0x00600000
         t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0x0060_0000);
         let dst = t.gc(ResourceId(0x501)).unwrap();
@@ -4078,7 +4264,7 @@ mod tests {
         install_dummy_gc(&mut t, 0x501);
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.function = Some(GcFunction::Xor.protocol_value());
-        t.change_gc(chg);
+        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
         t.copy_gc(ResourceId(0x500), ResourceId(0x501), 0);
         let dst = t.gc(ResourceId(0x501)).unwrap();
         assert_eq!(dst.function, GcFunction::Copy);
@@ -4124,7 +4310,7 @@ mod tests {
         chg.tile = Some(ResourceId(0x600));
         chg.tile_x_origin = Some(3);
         chg.tile_y_origin = Some(5);
-        t.change_gc(chg);
+        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
         match state.fill {
             FillState::Tiled { pixmap, origin } => {
@@ -4143,7 +4329,7 @@ mod tests {
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.fill_style = Some(FillStyle::Stippled.protocol_value());
         chg.stipple = Some(ResourceId(0x600));
-        t.change_gc(chg);
+        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
         match state.fill {
             FillState::Stippled { pixmap, origin } => {
@@ -4159,19 +4345,22 @@ mod tests {
         let mut t = ResourceTable::new();
         install_dummy_gc(&mut t, 0x500);
         let rect_bytes = vec![0u8, 0, 0, 0, 10, 0, 10, 0];
-        t.set_clip_rectangles(SetClipRectanglesRequest {
-            gc: ResourceId(0x500),
-            clip: ClipRectangles {
-                ordering: 0,
-                x_origin: 4,
-                y_origin: 7,
-                rectangles: rect_bytes.clone(),
+        t.set_clip_rectangles(
+            yserver_protocol::x11::ClientId(1),
+            SetClipRectanglesRequest {
+                gc: ResourceId(0x500),
+                clip: ClipRectangles {
+                    ordering: 0,
+                    x_origin: 4,
+                    y_origin: 7,
+                    rectangles: rect_bytes.clone(),
+                },
             },
-        });
+        );
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.clip_x_origin = Some(11);
         chg.clip_y_origin = Some(13);
-        t.change_gc(chg);
+        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
         match state.clip {
             ClipState::Rectangles { origin, rects } => {
@@ -4196,7 +4385,7 @@ mod tests {
         chg.clip_mask = Some(Some(ResourceId(0x600)));
         chg.clip_x_origin = Some(2);
         chg.clip_y_origin = Some(3);
-        t.change_gc(chg);
+        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
         match state.clip {
             ClipState::Pixmap { origin, pixmap } => {
@@ -4221,7 +4410,7 @@ mod tests {
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.fill_style = Some(FillStyle::Tiled.protocol_value());
         chg.tile = Some(ResourceId(0x600));
-        t.change_gc(chg);
+        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
         // Freeing the source pixmap must not clear the GC's retained tile.
         let _ = t.free_pixmap(ResourceId(0x600));
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
@@ -4244,7 +4433,7 @@ mod tests {
         chg.stipple = Some(ResourceId(0x600));
         chg.tile_x_origin = Some(9);
         chg.tile_y_origin = Some(17);
-        t.change_gc(chg);
+        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
         let _ = t.free_pixmap(ResourceId(0x600));
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
         assert_eq!(
@@ -4263,7 +4452,7 @@ mod tests {
         install_pixmap_with_host_xid(&mut t, 0x600, 0xcafe);
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.clip_mask = Some(Some(ResourceId(0x600)));
-        t.change_gc(chg);
+        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
         let _ = t.free_pixmap(ResourceId(0x600));
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
         assert_eq!(
@@ -4287,7 +4476,7 @@ mod tests {
         chg.clip_mask = Some(Some(ResourceId(0x601)));
         chg.tile = Some(ResourceId(0x602));
         chg.stipple = Some(ResourceId(0x603));
-        t.change_gc(chg);
+        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
 
         let _ = t.free_pixmap(ResourceId(0x601));
         let _ = t.free_pixmap(ResourceId(0x602));
@@ -4311,7 +4500,7 @@ mod tests {
         install_font_with_host_xid(&mut t, 0x700, 0x4242);
         let mut chg = empty_change_gc(ResourceId(0x500));
         chg.font = Some(ResourceId(0x700));
-        t.change_gc(chg);
+        t.change_gc(yserver_protocol::x11::ClientId(1), chg);
         let state = t.resolve_draw_state(ResourceId(0x500)).unwrap();
         let f = state.font.expect("font handle");
         assert_eq!(f.as_raw(), 0x4242);
