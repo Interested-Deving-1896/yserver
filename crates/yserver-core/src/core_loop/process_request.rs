@@ -8394,6 +8394,7 @@ const XI1_ERROR_BAD_CLASS: u8 = crate::nested::XI2_FIRST_ERROR + 4;
 /// KEY_MIN/KEY_MAX/NUM_BUTTONS/POINTER_AXES). Validation must agree
 /// with what enumeration promised the client.
 const XI1_KEY_MIN: u8 = 8;
+const XI1_KEY_MAX: u8 = 255;
 const XI1_NUM_BUTTONS: u8 = 7;
 const XI1_POINTER_AXES: u8 = 4;
 /// XIproto `UseXKeyboard` — the "default modifier device" sentinel
@@ -11943,9 +11944,19 @@ fn handle_xi2_request(
             if !xi1_device_has_keys(dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
-            let (kpm, keycodes) = backend
-                .get_modifier_mapping(origin)
-                .unwrap_or((0, Vec::new()));
+            // Prefer the per-device override stored by
+            // `XSetDeviceModifierMapping`; fall back to the backend's
+            // shared core map. xts5 SetDeviceModifierMapping-1 sets
+            // the map and immediately reads it back.
+            let (kpm, keycodes) = state
+                .xi1_modifier_map
+                .get(&dev)
+                .cloned()
+                .unwrap_or_else(|| {
+                    backend
+                        .get_modifier_mapping(origin)
+                        .unwrap_or((0, Vec::new()))
+                });
             debug_assert_eq!(keycodes.len(), 8 * usize::from(kpm));
             let length_words = u32::from(kpm) * 2; // 8*kpm bytes / 4
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, length_words);
@@ -11958,9 +11969,11 @@ fn handle_xi2_request(
             );
             buf.extend_from_slice(&reply);
         }
-        // SetDeviceModifierMapping: { deviceid, numKeyPerModifier }.
+        // SetDeviceModifierMapping: { deviceid, numKeyPerModifier,
+        //   pad1, 8 × numKeyPerModifier keycodes }.
         27 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
+            let kpm = *body.get(1).unwrap_or(&0);
             if !xi1_device_valid(dev) {
                 return xi1_error(
                     state,
@@ -11971,9 +11984,34 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            // SetDeviceModifierMapping: xts5 does `Expect_Event` then
-            // `Expect_Reply`, so emit event BEFORE the reply.
-            // request_kind=0 = MappingModifier.
+            if !xi1_device_has_keys(dev) {
+                return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
+            }
+            // Xorg `BadDeviceMap` rejects any keycode outside
+            // `[min_keycode, max_keycode]` UNLESS it's the special
+            // `0` sentinel (slot has no key). xts5
+            // SetDeviceModifierMapping-8 probes both MinKeyCode-1
+            // and MaxKeyCode+1 expecting BadValue.
+            let need = 8usize * usize::from(kpm);
+            let keycodes: Vec<u8> = (0..need).filter_map(|i| body.get(4 + i).copied()).collect();
+            if keycodes.len() != need {
+                return xi1_error(state, client_id, sequence, x11::error::BAD_LENGTH, 0, minor);
+            }
+            for &kc in &keycodes {
+                if kc != 0 && !(XI1_KEY_MIN..=XI1_KEY_MAX).contains(&kc) {
+                    return xi1_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        u32::from(kc),
+                        minor,
+                    );
+                }
+            }
+            state.xi1_modifier_map.insert(dev, (kpm, keycodes));
+            // xts5 does `Expect_Event` then `Expect_Reply`, so emit
+            // event BEFORE the reply. request_kind=0 = MappingModifier.
             if crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
                 state, client_id, dev,
             ) {
@@ -12017,11 +12055,19 @@ fn handle_xi2_request(
             }
             // nElts lives at byte 8 (first byte after the reply header);
             // map bytes follow the 32-byte header, padded to 4 bytes.
+            // Use the device's stored map if set (xts5
+            // SetDeviceButtonMapping-1 verifies that a custom map
+            // round-trips); otherwise identity.
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 2);
             reply.push(XI1_NUM_BUTTONS);
             reply.extend_from_slice(&[0u8; 23]);
-            for b in 1..=XI1_NUM_BUTTONS {
-                reply.push(b);
+            let stored = state.xi1_button_map.get(&dev).cloned();
+            for i in 0..XI1_NUM_BUTTONS {
+                let mapped = stored
+                    .as_ref()
+                    .and_then(|m| m.get(usize::from(i)).copied())
+                    .unwrap_or(i + 1);
+                reply.push(mapped);
             }
             reply.push(0); // pad 7 -> 8
             buf.extend_from_slice(&reply);
@@ -12064,6 +12110,32 @@ fn handle_xi2_request(
                     minor,
                 );
             }
+            // Read the map bytes from the body (after the 4-byte
+            // header that holds deviceid/map_length/pad). xts5
+            // SetDeviceButtonMapping-7 sets map[0] = map[1] (a
+            // non-zero duplicate) and expects a BadValue X error;
+            // Xorg `BadDeviceMap` (dix/devices.c) rejects any
+            // duplicate non-zero value. Zero (disabled button) may
+            // repeat.
+            let map_bytes: Vec<u8> = (0..usize::from(map_length))
+                .filter_map(|i| body.get(4 + i).copied())
+                .collect();
+            let mut seen = std::collections::HashSet::new();
+            for &b in &map_bytes {
+                if b != 0 && !seen.insert(b) {
+                    return xi1_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        u32::from(b),
+                        minor,
+                    );
+                }
+            }
+            // Persist the map so xts5 SetDeviceButtonMapping-1 sees
+            // it round-trip through GetDeviceButtonMapping.
+            state.xi1_button_map.insert(dev, map_bytes);
             // Reply first, then DeviceMappingNotify event in the same
             // outbound write. request_kind=2 = MappingPointer.
             buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));

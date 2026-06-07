@@ -697,6 +697,19 @@ pub struct ServerState {
     /// `OtherInputMasks.dontPropagateMask[deviceid]`
     /// (xserver.git Xi/getprop.c, exevents.c:2959).
     pub xi1_window_dont_propagate: HashMap<ResourceId, HashSet<u32>>,
+    /// XI 1.x per-device pointer-button mapping
+    /// (`XSetDeviceButtonMapping`). Index i (0-based) → physical button
+    /// (1-based); 0 disables. Missing entry = identity (i → i+1). Xorg
+    /// `Xi/setbmap.c::ProcXSetDeviceButtonMapping` keeps this on
+    /// `dev->button->map`; we keep it per-device on the server because
+    /// the mapping is server state, not connection state.
+    pub xi1_button_map: HashMap<u16, Vec<u8>>,
+    /// XI 1.x per-device modifier mapping
+    /// (`XSetDeviceModifierMapping`). Stores `numKeyPerModifier` and
+    /// the 8 × numKeyPerModifier keycode array. Missing entry =
+    /// inherit from the backend keymap. Xorg
+    /// `Xi/setmmap.c::ProcXSetDeviceModifierMapping`.
+    pub xi1_modifier_map: HashMap<u16, (u8, Vec<u8>)>,
     /// Active keyboard grab (explicit or passive-induced).
     pub active_keyboard_grab: Option<ActiveKeyboardGrab>,
     /// Frozen key event held by a sync passive key grab, awaiting
@@ -936,6 +949,8 @@ impl ServerState {
             xi1_device_focus: HashMap::new(),
             xi1_device_input_state: HashMap::new(),
             xi1_window_dont_propagate: HashMap::new(),
+            xi1_button_map: HashMap::new(),
+            xi1_modifier_map: HashMap::new(),
             active_keyboard_grab: None,
             frozen_keyboard_event: None,
             xfixes_regions: HashMap::new(),
