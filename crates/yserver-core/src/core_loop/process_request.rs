@@ -12120,20 +12120,59 @@ fn handle_xi2_request(
                 );
             }
             // Per Xorg `Xi/sendexev.c::ProcXSendExtensionEvent` →
-            // `Xi/exevents.c::SendEvent`: deliver ALL supplied events
-            // to clients whose selection intersects ANY of the
-            // request's class list. This preserves XI1 event chains
+            // `Xi/exevents.c::SendEvent`: resolve the destination,
+            // then deliver each supplied event to (a) clients whose
+            // XI1 selection on the destination window intersects the
+            // request's class list, and (b) the window's CREATOR when
+            // the per-device mask is empty (the `noextensioneventclass`
+            // case — Xorg `DeliverToWindowOwner` short-circuits on
+            // `filter == CantBeFiltered` = `NoEventMask` = 0). The
+            // class-intersection rule preserves XI1 event chains
             // (DeviceKeyPress + DeviceValuator continuation), which
-            // the client selects via the head class only — per-event
-            // filtering would drop the continuation, breaking xts5
-            // XSendExtensionEvent and any real chain consumer.
-            // Propagate semantics not yet honoured — direct-window
+            // the client selects via the head class only.
+            // Propagate semantics are not yet honoured — direct-window
             // match only, like core SendEvent with propagate=False.
-            let dest_window = match dest {
-                // PointerWindow / InputFocus specials are rare in
-                // practice and need pointer/focus resolution; skip
-                // delivery for them for now.
-                0 | 1 => None,
+            //
+            // Specials (xserver.git Xi/exevents.c:2915-2944):
+            //  - PointerWindow → sprite window (deepest mapped window
+            //    under the pointer);
+            //  - InputFocus → device's focus window, with PointerRoot
+            //    falling back to the sprite and FollowKeyboard chasing
+            //    the core focus inside `resolve_focus`.
+            let dest_window: Option<ResourceId> = match dest {
+                0 => Some(crate::core_loop::key_fanout::deepest_window_at_pointer(
+                    state,
+                )),
+                1 => {
+                    let focus = crate::core_loop::xi1_focus::device_focus(state, dev).focus;
+                    match crate::core_loop::xi1_focus::resolve_focus(state, focus) {
+                        crate::core_loop::xi1_focus::Xi1FocusTarget::None => None,
+                        crate::core_loop::xi1_focus::Xi1FocusTarget::PointerRoot => Some(
+                            crate::core_loop::key_fanout::deepest_window_at_pointer(state),
+                        ),
+                        crate::core_loop::xi1_focus::Xi1FocusTarget::Window(f) => {
+                            // Xorg `effectiveFocus` rule (xserver.git
+                            // Xi/exevents.c:2936-2941): if the focus is
+                            // an ancestor of (or equal to) the sprite,
+                            // deliver to the sprite — the focus
+                            // bounds propagation but the deepest
+                            // pointer window is the actual target.
+                            // Otherwise the sprite is outside the focus
+                            // subtree and delivery goes to the focus
+                            // directly. xts5 XSendExtensionEvent-3
+                            // probes the inferior-of-focus case.
+                            let sprite =
+                                crate::core_loop::key_fanout::deepest_window_at_pointer(state);
+                            if f == sprite
+                                || crate::core_loop::xi1_focus::is_ancestor(state, f, sprite)
+                            {
+                                Some(sprite)
+                            } else {
+                                Some(f)
+                            }
+                        }
+                    }
+                }
                 w => Some(ResourceId(w)),
             };
             if let Some(dest_window) = dest_window {
@@ -12151,16 +12190,40 @@ fn handle_xi2_request(
                     };
                     request_classes.push(class);
                 }
-                let targets: Vec<ClientId> = state
-                    .clients
-                    .iter()
-                    .filter(|(_, c)| {
-                        c.xi1_window_event_classes
-                            .get(&dest_window)
-                            .is_some_and(|set| request_classes.iter().any(|cl| set.contains(cl)))
-                    })
-                    .map(|(id, _)| ClientId(*id))
-                    .collect();
+                // Xorg `Xi/grabdev.c::CreateMaskFromList` walks the
+                // class list and OR's per-class mask bits into the
+                // per-device mask. `noextensioneventclass` (low byte
+                // `_noExtensionEvent = 9` per XI.h:260) has no
+                // associated mask bit, so it contributes nothing —
+                // a request whose only classes are noextensioneventclass
+                // entries (or an empty list) ends up with an
+                // all-zero mask, which `DeliverToWindowOwner` treats
+                // as `CantBeFiltered` and delivers to the window
+                // creator unconditionally. Without this fall-through
+                // xts5 XSendExtensionEvent 1–4 (which always pass
+                // `noextensioneventclass`) fail because the test
+                // process never calls XSelectExtensionEvent first.
+                const XI1_NO_EXTENSION_EVENT_OFFSET: u8 = 9;
+                #[allow(clippy::cast_possible_truncation)]
+                let mask_is_zero = request_classes.is_empty()
+                    || request_classes
+                        .iter()
+                        .all(|c| (c & 0xff) as u8 == XI1_NO_EXTENSION_EVENT_OFFSET);
+                let mut targets: std::collections::HashSet<ClientId> =
+                    std::collections::HashSet::new();
+                if mask_is_zero {
+                    if let Some(owner) = state.resources.window_owner(dest_window) {
+                        targets.insert(owner);
+                    }
+                } else {
+                    for (cid, c) in &state.clients {
+                        if let Some(set) = c.xi1_window_event_classes.get(&dest_window)
+                            && request_classes.iter().any(|cl| set.contains(cl))
+                        {
+                            targets.insert(ClientId(*cid));
+                        }
+                    }
+                }
                 if !targets.is_empty() {
                     // Pre-snapshot all event bytes so the fanout
                     // closure can borrow them per-recipient.
@@ -12172,23 +12235,25 @@ fn handle_xi2_request(
                         };
                         events_bytes.push(ev.try_into().expect("32-byte slice"));
                     }
-                    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-                        for ev_bytes in &events_bytes {
-                            let mut out = *ev_bytes;
-                            out[0] |= 0x80; // send_event
-                            let seq_bytes = match order {
-                                yserver_protocol::x11::ClientByteOrder::LittleEndian => {
-                                    seq.0.to_le_bytes()
-                                }
-                                yserver_protocol::x11::ClientByteOrder::BigEndian => {
-                                    seq.0.to_be_bytes()
-                                }
-                            };
-                            out[2] = seq_bytes[0];
-                            out[3] = seq_bytes[1];
-                            buf.extend_from_slice(&out);
-                        }
-                    });
+                    let targets_vec: Vec<ClientId> = targets.into_iter().collect();
+                    let _dropped =
+                        fanout_event_to_clients(state, &targets_vec, |buf, seq, order| {
+                            for ev_bytes in &events_bytes {
+                                let mut out = *ev_bytes;
+                                out[0] |= 0x80; // send_event
+                                let seq_bytes = match order {
+                                    yserver_protocol::x11::ClientByteOrder::LittleEndian => {
+                                        seq.0.to_le_bytes()
+                                    }
+                                    yserver_protocol::x11::ClientByteOrder::BigEndian => {
+                                        seq.0.to_be_bytes()
+                                    }
+                                };
+                                out[2] = seq_bytes[0];
+                                out[3] = seq_bytes[1];
+                                buf.extend_from_slice(&out);
+                            }
+                        });
                 }
             }
             debug!(
@@ -23167,6 +23232,212 @@ mod tests {
             .cloned()
             .expect("default still present");
         assert_eq!(before.data, after.data, "read-only value unchanged");
+    }
+
+    // -----------------------------------------------------------------
+    // XI 1.x `SendExtensionEvent` (minor 31) — dispatch + specials.
+    // -----------------------------------------------------------------
+
+    /// Build an `xSendExtensionEventReq` body (the bytes after the
+    /// 4-byte X request header) for a single 32-byte event payload and
+    /// a single XEventClass.
+    fn xi1_send_extension_event_body(
+        destination: u32,
+        deviceid: u8,
+        propagate: bool,
+        event: &[u8; 32],
+        classes: &[u32],
+    ) -> Vec<u8> {
+        let mut body = Vec::with_capacity(12 + 32 + classes.len() * 4);
+        body.extend_from_slice(&destination.to_le_bytes()); // 0..4 destination
+        body.push(deviceid); // 4 deviceid
+        body.push(u8::from(propagate)); // 5 propagate
+        #[allow(clippy::cast_possible_truncation)]
+        let count = classes.len() as u16;
+        body.extend_from_slice(&count.to_le_bytes()); // 6..8 count
+        body.push(1); // 8 num_events
+        body.extend_from_slice(&[0u8; 3]); // 9..12 pad
+        body.extend_from_slice(event); // 12..44 one xEvent
+        for c in classes {
+            body.extend_from_slice(&c.to_le_bytes());
+        }
+        body
+    }
+
+    /// `length_units` covering the 4-byte X header + the body produced
+    /// by [`xi1_send_extension_event_body`] for a single 32-byte event:
+    /// `4 + 8*num_events + class_count` = `4 + 8 + classes.len()`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn xi1_send_extension_event_header(class_count: usize) -> RequestHeader {
+        RequestHeader {
+            opcode: 131,
+            data: 31,
+            length_units: 12 + class_count as u32,
+        }
+    }
+
+    /// 32-byte XI1 DeviceKeyPress wire template — only the type byte
+    /// matters for these tests; everything else is zero.
+    fn xi1_device_key_press_event(first_event: u8) -> [u8; 32] {
+        let mut ev = [0u8; 32];
+        ev[0] = first_event + crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET;
+        ev
+    }
+
+    /// XI1 _noExtensionEvent code (9) — see /usr/include/X11/extensions/XI.h.
+    /// `noextensioneventclass = (deviceid << 8) | 9` is the sentinel
+    /// Xlib's `NoExtensionEvent` macro produces. Xorg
+    /// `CreateMaskFromList` maps it to a per-device mask of 0, which
+    /// short-circuits `DeliverToWindowOwner`'s filter check
+    /// (`filter == CantBeFiltered`) and so the destination window's
+    /// CREATOR receives the event regardless of any selection.
+    const XI1_NO_EXTENSION_EVENT_OFFSET: u8 = 9;
+
+    fn seed_test_window(state: &mut ServerState, owner: u32, xid: u32) {
+        state.resources.create_window(
+            ClientId(owner),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(xid),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn xi1_send_extension_event_with_noextensioneventclass_delivers_to_window_creator() {
+        // XSendExtensionEvent test 1 (xts5 XI/SendExtensionEvent.m:124):
+        // a client creates a window and SendExtensionEvent's an XI1
+        // event to it with `event_list = &noextensioneventclass`. The
+        // expected behaviour mirrors Xorg `Xi/sendexev.c::SendEvent` →
+        // `dix/events.c::DeliverToWindowOwner`: when the per-device
+        // mask is empty (i.e. `noextensioneventclass`), the owner
+        // receives the event unconditionally. Without this path xts5
+        // SendExtensionEvent 1–4 / 11 / 12 / 14 / 16 all fail with
+        // "Expected event (DeviceKeyPress) not received".
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let win_xid = 0x4000_0001u32;
+        seed_test_window(&mut state, 1, win_xid);
+
+        let no_class = (4u32 << 8) | u32::from(XI1_NO_EXTENSION_EVENT_OFFSET);
+        let event = xi1_device_key_press_event(crate::server::XI_FIRST_EVENT);
+        let body = xi1_send_extension_event_body(win_xid, 4, false, &event, &[no_class]);
+
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi1_send_extension_event_header(1),
+            &body,
+        )
+        .unwrap();
+
+        let wire = read_all_available(&mut peer);
+        assert_eq!(
+            wire.len(),
+            32,
+            "exactly one 32-byte XI1 event delivered to creator"
+        );
+        assert_eq!(
+            wire[0],
+            (crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET) | 0x80,
+            "type byte is DeviceKeyPress with send_event (0x80) bit set"
+        );
+    }
+
+    #[test]
+    fn xi1_send_extension_event_pointer_window_resolves_to_sprite() {
+        // dest = 0 (PointerWindow) must resolve to the window currently
+        // containing the sprite (Xorg SendEvent:2915 — `pWin = spriteWin`).
+        // With the sprite at (0,0) on the root and a 100x100 child
+        // window covering the origin, the child's creator gets the
+        // event when noextensioneventclass is used.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let win_xid = 0x4000_0002u32;
+        seed_test_window(&mut state, 1, win_xid);
+        // Map the window so `direct_child_at` finds it.
+        if let Some(w) = state.resources.window_mut(ResourceId(win_xid)) {
+            w.map_state = crate::resources::MapState::Viewable;
+        }
+        state.pointer_root = (10, 10);
+
+        let no_class = (4u32 << 8) | u32::from(XI1_NO_EXTENSION_EVENT_OFFSET);
+        let event = xi1_device_key_press_event(crate::server::XI_FIRST_EVENT);
+        let body = xi1_send_extension_event_body(0, 4, false, &event, &[no_class]);
+
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi1_send_extension_event_header(1),
+            &body,
+        )
+        .unwrap();
+
+        let wire = read_all_available(&mut peer);
+        assert_eq!(
+            wire.len(),
+            32,
+            "PointerWindow special resolves to sprite, creator gets event"
+        );
+    }
+
+    #[test]
+    fn xi1_send_extension_event_input_focus_resolves_to_device_focus() {
+        // dest = 1 (InputFocus) must resolve to the device's focus
+        // window when the focus is a real window (not PointerRoot /
+        // None) — Xorg SendEvent:2917-2942.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let win_xid = 0x4000_0003u32;
+        seed_test_window(&mut state, 1, win_xid);
+        state.xi1_device_focus.insert(
+            4,
+            crate::server::Xi1DeviceFocus {
+                focus: win_xid,
+                revert_to: 0,
+                time: 0,
+            },
+        );
+
+        let no_class = (4u32 << 8) | u32::from(XI1_NO_EXTENSION_EVENT_OFFSET);
+        let event = xi1_device_key_press_event(crate::server::XI_FIRST_EVENT);
+        let body = xi1_send_extension_event_body(1, 4, false, &event, &[no_class]);
+
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            xi1_send_extension_event_header(1),
+            &body,
+        )
+        .unwrap();
+
+        let wire = read_all_available(&mut peer);
+        assert_eq!(
+            wire.len(),
+            32,
+            "InputFocus special resolves to device-focus window, creator gets event"
+        );
     }
 
     #[test]

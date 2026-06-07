@@ -309,7 +309,7 @@ fn in_subtree(state: &ServerState, w: ResourceId, root: ResourceId) -> bool {
 }
 
 /// True when `a` is a strict ancestor of `b` (Xorg `IsParent`).
-fn is_ancestor(state: &ServerState, a: ResourceId, b: ResourceId) -> bool {
+pub(crate) fn is_ancestor(state: &ServerState, a: ResourceId, b: ResourceId) -> bool {
     if a == b {
         return false;
     }
