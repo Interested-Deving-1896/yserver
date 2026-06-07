@@ -12730,6 +12730,16 @@ fn handle_xi2_request(
             if !xi1_device_has_valuators(dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
+            // Our virtual relative axes carry no resolution range, so
+            // any non-zero resolution is out of bounds — xts5
+            // ChangeDeviceControl-4 picks `min_value-1` / `max_value+1`
+            // and expects BadValue, and we mirror that behaviour by
+            // rejecting any non-zero value. ChangeDeviceControl-1 / -2
+            // (round-trip Set→Get) are still blocked because they pick
+            // `min_value` / `max_value` (= -1) and we reject. That
+            // round-trip needs a real axis resolution range to land —
+            // tracked separately.
+            let mut staged: Vec<(usize, i32)> = Vec::new();
             if body.len() >= 10 {
                 let first = body[8];
                 let num = body[9];
@@ -12743,15 +12753,12 @@ fn handle_xi2_request(
                         minor,
                     );
                 }
-                // Our virtual relative axes carry no resolution range, so
-                // any attempt to set a non-zero resolution is out of
-                // bounds (XTS XChangeDeviceControl-4).
                 for i in 0..usize::from(num) {
                     let off = 12 + i * 4;
                     if off + 4 > body.len() {
                         break;
                     }
-                    let res = u32::from_le_bytes([
+                    let res = i32::from_le_bytes([
                         body[off],
                         body[off + 1],
                         body[off + 2],
@@ -12763,10 +12770,11 @@ fn handle_xi2_request(
                             client_id,
                             sequence,
                             x11::error::BAD_VALUE,
-                            res,
+                            res.cast_unsigned(),
                             minor,
                         );
                     }
+                    staged.push((usize::from(first) + i, res));
                 }
             }
             // Xorg `Xi/chgdctl.c::ProcXChangeDeviceControl` returns
@@ -12781,6 +12789,19 @@ fn handle_xi2_request(
             let status = if grabbed_elsewhere {
                 ALREADY_GRABBED
             } else {
+                // Persist the validated resolutions so the matching
+                // `XGetDeviceControl` reports them.
+                if !staged.is_empty() {
+                    let entry = state
+                        .xi1_resolution
+                        .entry(dev)
+                        .or_insert_with(|| vec![[0, 0, 0]; usize::from(XI1_POINTER_AXES)]);
+                    for (axis, value) in &staged {
+                        if let Some(row) = entry.get_mut(*axis) {
+                            row[0] = *value;
+                        }
+                    }
+                }
                 0
             };
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
