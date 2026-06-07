@@ -1268,14 +1268,25 @@ pub fn encode_xi1_device_mapping_notify(
     first_keycode: u8,
     count: u8,
 ) {
-    out.push(event_type); // byte 0: type
-    out.push(deviceid); // byte 1: deviceid
+    // Wire layout per XIproto.h `deviceMappingNotify`:
+    //   byte 0: type
+    //   byte 1: deviceid
+    //   bytes 2..4: sequenceNumber
+    //   byte 4: request   (MappingModifier=0 / MappingKeyboard=1 / MappingPointer=2)
+    //   byte 5: firstKeyCode
+    //   byte 6: count
+    //   byte 7: pad1
+    //   bytes 8..12: time
+    //   bytes 12..32: 5 × CARD32 pad
+    out.push(event_type); // byte 0
+    out.push(deviceid); // byte 1
     write_u16(byte_order, out, sequence.0); // bytes 2-3
-    write_u32(byte_order, out, time); // bytes 4-7
-    out.push(request); // byte 8: request kind
-    out.push(first_keycode); // byte 9
-    out.push(count); // byte 10
-    out.extend_from_slice(&[0u8; 21]); // bytes 11-31: pad1 + 5×u32 pad
+    out.push(request); // byte 4
+    out.push(first_keycode); // byte 5
+    out.push(count); // byte 6
+    out.push(0); // byte 7: pad1
+    write_u32(byte_order, out, time); // bytes 8-11
+    out.extend_from_slice(&[0u8; 20]); // bytes 12-31: 5×u32 pad
 }
 
 /// XI 1.x `changeDeviceNotify` wire event (XIproto.h:1660-1680).
