@@ -377,7 +377,24 @@ pub fn pointer_event_fanout_to_state(
     // the queue froze; wmaker never saw the press, never called
     // AllowEvents, and the pointer stream wedged (cursor moves,
     // clicks dead — silence HW 2026-06-04).
+    // Xorg `Xi/exevents.c:1925`: `CheckDeviceGrabs` (passive-grab
+    // matching) only runs on a ButtonPress when there is no active
+    // grab — `if (!grab && CheckDeviceGrabs(...))`. With an active
+    // grab in place the press goes through `DeliverGrabbedEvent`
+    // instead. Gating the activation on `!handled_core_via_grab`
+    // alone is wrong because step 2 above intentionally falls through
+    // (does NOT set `handled_core_via_grab`) for `owner_events=true`
+    // when the natural target is owned by the grab client (GTK3 menu
+    // pattern). That fall-through ran passive-grab matching while an
+    // active grab was already in place, activated a SYNC passive grab
+    // on the same press, set `frozen_pointer_event = Some(event)`,
+    // and the unified-freeze QUEUE-WHILE-FROZEN check then swallowed
+    // every subsequent press/release into a growing queue with no
+    // path to thaw — the XFCE/MATE click-lockup that appeared after
+    // the unified-freeze work landed on master.
+    let active_grab_present = state.pointer_grab.is_some();
     if !handled_core_via_grab
+        && !active_grab_present
         && handle_grabs
         && event.kind == PointerEventKind::ButtonPress
         && let Some((grab, _hit_window)) = try_match_passive_grab(state, xid_map, event)
