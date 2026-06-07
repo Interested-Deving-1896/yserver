@@ -993,14 +993,35 @@ impl KmsBackendV2 {
         let buf = bitmap.buffer();
         let wu = w as usize;
         let hu = h as usize;
+        // FreeType bitmaps can be 1-bit `Mono` (FT_PIXEL_MODE_MONO,
+        // MSB-first, one byte per 8 pixels) or 8-bit gray. The
+        // emboldening / cursor mask consumer expects 8 bpp, so
+        // unpack Mono → 0x00/0xff per pixel; copy gray verbatim.
+        // Per-row stride is in BYTES; for Mono `stride` ≈ ceil(w/8).
+        let mono = matches!(bitmap.pixel_mode(), Ok(freetype::bitmap::PixelMode::Mono));
         let mut pixels = vec![0u8; wu * hu];
         for row in 0..hu {
-            let src_off = if stride >= 0 {
+            let row_start = if stride >= 0 {
                 row * stride as usize
             } else {
                 (hu - 1 - row) * (stride as isize).unsigned_abs()
             };
-            pixels[row * wu..row * wu + wu].copy_from_slice(&buf[src_off..src_off + wu]);
+            let dst_row = row * wu;
+            if mono {
+                for col in 0..wu {
+                    let byte = buf.get(row_start + (col >> 3)).copied().unwrap_or(0);
+                    pixels[dst_row + col] = if byte & (0x80 >> (col & 7)) != 0 {
+                        0xff
+                    } else {
+                        0
+                    };
+                }
+            } else {
+                let end = row_start + wu;
+                if end <= buf.len() {
+                    pixels[dst_row..dst_row + wu].copy_from_slice(&buf[row_start..end]);
+                }
+            }
         }
         Some((pixels, w, h, glyph.bitmap_left(), glyph.bitmap_top()))
     }
