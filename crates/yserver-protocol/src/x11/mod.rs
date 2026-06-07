@@ -5580,7 +5580,9 @@ pub mod error {
     pub const BAD_REQUEST: u8 = 1;
     pub const BAD_VALUE: u8 = 2;
     pub const BAD_WINDOW: u8 = 3;
+    pub const BAD_PIXMAP: u8 = 4;
     pub const BAD_ATOM: u8 = 5;
+    pub const BAD_CURSOR: u8 = 6;
     pub const BAD_FONT: u8 = 7;
     pub const BAD_MATCH: u8 = 8;
     pub const BAD_DRAWABLE: u8 = 9;

@@ -13209,6 +13209,35 @@ fn handle_create_window(
             1,
         );
     }
+    // Attribute value-id validation, matching Xorg's
+    // `dix/window.c::CreateWindow`. CWBackPixmap values 0/1 are
+    // reserved (None / ParentRelative); CWColormap value 0 in the
+    // typed enum is CopyFromParent.
+    if let Some(bg_pixmap) = request.background_pixmap
+        && bg_pixmap.0 > 1
+        && state.resources.pixmap(bg_pixmap).is_none()
+    {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_PIXMAP,
+            bg_pixmap.0,
+            1,
+        );
+    }
+    if let Some(Some(colormap)) = request.colormap
+        && state.resources.colormap(colormap).is_none()
+    {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_COLORMAP,
+            colormap.0,
+            1,
+        );
+    }
     state.resources.create_window(client_id, request);
     if mask != 0 {
         state
@@ -13348,6 +13377,49 @@ fn handle_change_window_attributes(
             sequence,
             x11::error::BAD_WINDOW,
             request.window.0,
+            2,
+        );
+    }
+    // Resource-id validation of attribute values, mirroring Xorg's
+    // `dix/window.c::ChangeWindowAttributes` per-attribute
+    // `dixLookupResource`. Values 0 and 1 on CWBackPixmap are reserved
+    // (None / ParentRelative); colormap value 0 in the typed enum
+    // means CopyFromParent and is resolved against the parent.
+    if let Some(bg_pixmap) = request.background_pixmap
+        && bg_pixmap.0 > 1
+        && state.resources.pixmap(bg_pixmap).is_none()
+    {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_PIXMAP,
+            bg_pixmap.0,
+            2,
+        );
+    }
+    if let Some(Some(colormap)) = request.colormap
+        && state.resources.colormap(colormap).is_none()
+    {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_COLORMAP,
+            colormap.0,
+            2,
+        );
+    }
+    if let Some(cursor) = request.cursor
+        && cursor.0 != 0
+        && !state.resources.cursor_exists(cursor)
+    {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_CURSOR,
+            cursor.0,
             2,
         );
     }
@@ -36499,5 +36571,118 @@ mod tests {
         body.extend_from_slice(&0u16.to_le_bytes()); // value_mask
         body.extend_from_slice(&0u16.to_le_bytes()); // pad
         body
+    }
+
+    /// xts5 Xlib4 `XChangeWindowAttributes` 22-25 / Xlib4
+    /// `XCreateWindow` 20-22 set a CWBackPixmap / CWColormap /
+    /// CWCursor value to a freed xid and expect BadPixmap /
+    /// BadColormap / BadCursor. Mirrors Xorg's per-attribute
+    /// `dixLookupResource` order in `dix/window.c::CreateWindow` and
+    /// `ChangeWindowAttributes`.
+    #[test]
+    fn change_window_attributes_with_stale_value_returns_specific_bad_error() {
+        use std::io::Read;
+        const APP: u32 = 300;
+        const WIN: u32 = 0x0090_0001;
+        const BAD_PIX: u32 = 0x0090_dead;
+        const BAD_CMAP: u32 = 0x0090_beef;
+        const BAD_CURS: u32 = 0x0090_face;
+
+        // (mask, value, expected_error, label)
+        let cases: &[(u32, u32, u8, &str)] = &[
+            (
+                0x0001,
+                BAD_PIX,
+                yserver_protocol::x11::error::BAD_PIXMAP,
+                "CWBackPixmap",
+            ),
+            (
+                0x2000,
+                BAD_CMAP,
+                yserver_protocol::x11::error::BAD_COLORMAP,
+                "CWColormap",
+            ),
+            (
+                0x4000,
+                BAD_CURS,
+                yserver_protocol::x11::error::BAD_CURSOR,
+                "CWCursor",
+            ),
+        ];
+
+        for (i, (mask, value, expected_err, label)) in cases.iter().enumerate() {
+            let mut state = ServerState::new();
+            let app_id = APP + i as u32;
+            let mut peer = install_client(&mut state, app_id);
+            let mut backend = RecordingBackend::new();
+
+            // Create a live target window owned by this client so the
+            // BadWindow gate doesn't fire ahead of the value check.
+            let win = WIN + i as u32;
+            state.resources.create_window(
+                ClientId(app_id),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(win),
+                    parent: crate::resources::ROOT_WINDOW,
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 10,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+
+            let mut body = Vec::with_capacity(12);
+            body.extend_from_slice(&win.to_le_bytes());
+            body.extend_from_slice(&mask.to_le_bytes());
+            body.extend_from_slice(&value.to_le_bytes());
+            let length_units = u32::try_from(1 + body.len().div_ceil(4)).expect("body length fits");
+
+            process_request(
+                &mut state,
+                &mut backend,
+                ClientId(app_id),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 2,
+                    data: 0,
+                    length_units,
+                },
+                &body,
+                None,
+            )
+            .expect("process_request");
+
+            peer.set_nonblocking(true).unwrap();
+            let mut buf = [0u8; 32];
+            peer.read_exact(&mut buf).unwrap_or_else(|e| {
+                panic!("{label}: expected 32-byte error reply, got {e:?}");
+            });
+            assert_eq!(
+                buf[0], 0,
+                "{label}: byte 0 = error class (0); got {}",
+                buf[0]
+            );
+            assert_eq!(
+                buf[1], *expected_err,
+                "{label}: expected error code {expected_err} for stale xid; got {}",
+                buf[1],
+            );
+            let bad_value = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            assert_eq!(
+                bad_value, *value,
+                "{label}: error_value must echo the stale resource xid"
+            );
+            assert_eq!(
+                buf[10], 2,
+                "{label}: error must carry the ChangeWindowAttributes \
+                 major opcode (2); got {}",
+                buf[10],
+            );
+        }
     }
 }

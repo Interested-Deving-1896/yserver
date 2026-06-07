@@ -2121,6 +2121,14 @@ impl ResourceTable {
         self.cursors.get(&id.0)?.host_xid.map(|h| h.as_raw())
     }
 
+    /// True iff `id` is a live cursor in the resource table — used by
+    /// the `CWCursor` validation path to reject `XChangeWindowAttributes`
+    /// with a stale cursor xid (BadCursor per xts5 Xlib4-25).
+    #[must_use]
+    pub fn cursor_exists(&self, id: ResourceId) -> bool {
+        self.cursors.contains_key(&id.0)
+    }
+
     pub fn set_cursor_name_atom(&mut self, id: ResourceId, atom: yserver_protocol::x11::AtomId) {
         if let Some(c) = self.cursors.get_mut(&id.0) {
             c.name_atom = Some(atom);
