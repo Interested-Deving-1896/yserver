@@ -235,8 +235,8 @@ pub fn process_request(
         // ── KillClient (AllTemporary or by resource owner) ──
         113 => handle_kill_client(state, backend, client_id, sequence, body),
         // ── pointer/modifier mapping (reply + MappingNotify fanout) ──
-        116 => handle_set_pointer_mapping(state, client_id, sequence),
-        118 => handle_set_modifier_mapping(state, client_id, sequence),
+        116 => handle_set_pointer_mapping(state, client_id, sequence, header, body),
+        118 => handle_set_modifier_mapping(state, client_id, sequence, header, body),
         // ── state-read replies (read state, no backend, no mutation) ──
         14 => handle_get_geometry(state, client_id, sequence, body),
         15 => handle_query_tree(state, client_id, sequence, body),
@@ -250,8 +250,8 @@ pub fn process_request(
         28 => handle_grab_button(state, client_id, sequence, header, body),
         29 => handle_ungrab_button(state, client_id, sequence, header, body),
         30 => handle_change_active_pointer_grab(state, client_id, sequence, body),
-        31 => handle_grab_keyboard(state, backend, origin, client_id, sequence, header, body),
-        32 => handle_ungrab_keyboard(state, backend, origin, client_id, sequence, body),
+        31 => handle_grab_keyboard(state, client_id, sequence, header, body),
+        32 => handle_ungrab_keyboard(state, client_id, sequence, body),
         33 => handle_grab_key(state, client_id, sequence, header, body),
         34 => handle_ungrab_key(state, client_id, sequence, header, body),
         // ── font / size queries (pure state-read replies) ──
@@ -9569,6 +9569,7 @@ fn handle_xi2_request(
                     owner: client_id,
                     grab_window: ResourceId(grab_window),
                     source: crate::server::ActiveKeyboardGrabSource::Explicit,
+                    owner_events,
                     via_xi2: true,
                 });
             } else {
@@ -14595,12 +14596,13 @@ fn handle_query_keymap(
     sequence: SequenceNumber,
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} QueryKeymap", client_id.0, sequence.0);
+    let keys_down = state.keys_down;
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
     let byte_order = client.byte_order;
-    let mut buf: Vec<u8> = Vec::with_capacity(40);
-    x11::write_query_keymap_reply(&mut buf, byte_order, sequence)?;
+    let mut buf = x11::fixed_reply(byte_order, sequence, 0, 2);
+    buf.extend_from_slice(&keys_down);
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -14625,12 +14627,26 @@ fn handle_get_pointer_mapping(
     sequence: SequenceNumber,
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} GetPointerMapping", client_id.0, sequence.0);
+    let map: Vec<u8> = state
+        .pointer_mapping_override
+        .clone()
+        .unwrap_or_else(|| (1..=XI1_NUM_BUTTONS).collect());
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
     let byte_order = client.byte_order;
-    let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_get_pointer_mapping_reply(&mut buf, byte_order, sequence)?;
+    #[allow(clippy::cast_possible_truncation)]
+    let mut buf = x11::fixed_reply(
+        byte_order,
+        sequence,
+        map.len() as u8,
+        map.len().div_ceil(4) as u32,
+    );
+    buf.extend_from_slice(&[0u8; 24]);
+    buf.extend_from_slice(&map);
+    while !buf.len().is_multiple_of(4) {
+        buf.push(0);
+    }
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -15779,9 +15795,48 @@ fn handle_set_pointer_mapping(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} SetPointerMapping", client_id.0, sequence.0);
-    // MappingNotify (request=2 = Pointer) to every connected client first.
+    let n = usize::from(header.data);
+    let Some(map) = body.get(..n) else {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_LENGTH, 0, 116);
+    };
+    // Xorg ProcSetPointerMapping: the map length must equal the
+    // device's button count, and nonzero entries must be unique.
+    let current_len = state
+        .pointer_mapping_override
+        .as_ref()
+        .map_or(usize::from(XI1_NUM_BUTTONS), Vec::len);
+    if n != current_len {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(header.data),
+            116,
+        );
+    }
+    let mut seen = [false; 256];
+    for &b in map {
+        if b != 0 {
+            if seen[usize::from(b)] {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(b),
+                    116,
+                );
+            }
+            seen[usize::from(b)] = true;
+        }
+    }
+    state.pointer_mapping_override = Some(map.to_vec());
+    // MappingNotify (request=2 = Pointer) to every connected client.
     let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
     let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
         let _ = x11::write_mapping_notify_event(buf, order, seq, 2, 0, 0);
@@ -15798,8 +15853,30 @@ fn handle_set_modifier_mapping(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} SetModifierMapping", client_id.0, sequence.0);
+    let kpm = header.data;
+    let need = usize::from(kpm) * 8;
+    let Some(keycodes) = body.get(..need) else {
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_LENGTH, 0, 118);
+    };
+    // Xorg ProcSetModifierMapping: keycodes must be 0 or within the
+    // advertised [min_keycode, max_keycode] range (8..=255 here).
+    for &kc in keycodes {
+        if kc != 0 && kc < 8 {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_VALUE,
+                u32::from(kc),
+                118,
+            );
+        }
+    }
+    state.modifier_mapping_override = Some((kpm, keycodes.to_vec()));
     let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
     let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
         let _ = x11::write_mapping_notify_event(buf, order, seq, 0, 0, 0);
@@ -17527,7 +17604,12 @@ fn revert_core_focus_if_unviewable(state: &mut ServerState) {
 /// per-window event-mask filter, plus the matching XI2 focus events
 /// on the endpoint windows. `mode` is the wire NotifyNormal(0) /
 /// NotifyWhileGrabbed(3) / NotifyGrab(1) / NotifyUngrab(2) value.
-fn emit_core_focus_transition(state: &mut ServerState, from_raw: u32, to_raw: u32, mode: u8) {
+pub(crate) fn emit_core_focus_transition(
+    state: &mut ServerState,
+    from_raw: u32,
+    to_raw: u32,
+    mode: u8,
+) {
     let pointer_win = crate::core_loop::key_fanout::deepest_window_at_pointer(state);
     let events = crate::crossings::focus_transition_events(state, from_raw, to_raw, pointer_win);
     let (ptr_x, ptr_y) = state.pointer_root;
@@ -19226,6 +19308,46 @@ fn handle_change_keyboard_mapping(
 ) -> io::Result<RequestOutcome> {
     let first_keycode = body.first().copied().unwrap_or(8);
     let count = header.data;
+    // Xorg ProcChangeKeyboardMapping: first_keycode < min_keycode →
+    // BadValue; first + count - 1 > max_keycode → BadValue.
+    if first_keycode < 8 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(first_keycode),
+            100,
+        );
+    }
+    if u32::from(first_keycode) + u32::from(count) > 256 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(first_keycode) + u32::from(count) - 1,
+            100,
+        );
+    }
+    // Store the keysym rows: body = first_keycode(1)
+    // keysyms_per_keycode(1) pad(2) then count × kpk CARD32 keysyms.
+    let kpk = body.get(1).copied().unwrap_or(0);
+    let syms = &body[4.min(body.len())..];
+    for i in 0..usize::from(count) {
+        let mut row: Vec<u32> = Vec::with_capacity(usize::from(kpk));
+        for j in 0..usize::from(kpk) {
+            let off = (i * usize::from(kpk) + j) * 4;
+            let Some(b) = syms.get(off..off + 4) else {
+                break;
+            };
+            row.push(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        state
+            .keymap_overrides
+            .insert(first_keycode.wrapping_add(i as u8), row);
+    }
     // Server-wide MappingNotify fanout: every connected client sees the
     // same keymap change. We collect ids first to avoid an &/&mut overlap
     // through `state.clients`.
@@ -19251,28 +19373,80 @@ fn handle_get_keyboard_mapping(
     debug!("client {} #{} GetKeyboardMapping", client_id.0, sequence.0);
     let first_keycode = body.first().copied().unwrap_or(8);
     let keycode_count = body.get(1).copied().unwrap_or(0);
+    // Xorg ProcGetKeyboardMapping: first < min_keycode or first +
+    // count - 1 > max_keycode → BadValue.
+    if first_keycode < 8 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(first_keycode),
+            101,
+        );
+    }
+    if u32::from(first_keycode) + u32::from(keycode_count) > 256 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(first_keycode) + u32::from(keycode_count) - 1,
+            101,
+        );
+    }
     let proxied = backend
         .get_keyboard_mapping(origin, first_keycode, keycode_count)
         .ok();
+    // Merge ChangeKeyboardMapping rows over the backend keymap.
+    let merged = {
+        let (mut kpc, mut keysyms) = proxied.unwrap_or((4, Vec::new()));
+        if keysyms.is_empty() {
+            keysyms = vec![0u32; usize::from(keycode_count) * usize::from(kpc)];
+        }
+        let override_kpk = (0..keycode_count)
+            .filter_map(|i| {
+                state
+                    .keymap_overrides
+                    .get(&first_keycode.wrapping_add(i))
+                    .map(Vec::len)
+            })
+            .max()
+            .unwrap_or(0);
+        if override_kpk > usize::from(kpc) {
+            // Widen each row to the override width.
+            let old = usize::from(kpc);
+            let mut widened = Vec::with_capacity(usize::from(keycode_count) * override_kpk);
+            for row in keysyms.chunks(old.max(1)) {
+                widened.extend_from_slice(row);
+                widened.extend(std::iter::repeat_n(0u32, override_kpk - row.len()));
+            }
+            keysyms = widened;
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                kpc = override_kpk as u8;
+            }
+        }
+        let w = usize::from(kpc);
+        for i in 0..usize::from(keycode_count) {
+            #[allow(clippy::cast_possible_truncation)]
+            let kc = first_keycode.wrapping_add(i as u8);
+            if let Some(row) = state.keymap_overrides.get(&kc) {
+                for j in 0..w {
+                    keysyms[i * w + j] = row.get(j).copied().unwrap_or(0);
+                }
+            }
+        }
+        (kpc, keysyms)
+    };
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
     let byte_order = client.byte_order;
     let mut buf: Vec<u8> = Vec::with_capacity(64);
-    if let Some((kpc, keysyms)) = proxied {
-        x11::write_get_keyboard_mapping_reply_from_keysyms(
-            &mut buf, byte_order, sequence, kpc, &keysyms,
-        )?;
-    } else {
-        x11::write_get_keyboard_mapping_reply(
-            &mut buf,
-            byte_order,
-            sequence,
-            first_keycode,
-            keycode_count,
-            4,
-        )?;
-    }
+    x11::write_get_keyboard_mapping_reply_from_keysyms(
+        &mut buf, byte_order, sequence, merged.0, &merged.1,
+    )?;
     Ok(write_to_client(client, client_id, &buf))
 }
 
@@ -20217,9 +20391,68 @@ fn handle_warp_pointer(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if body.len() >= 20 {
+        let src_window = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let dst_window = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
         let dst_x = i16::from_le_bytes([body[16], body[17]]);
         let dst_y = i16::from_le_bytes([body[18], body[19]]);
+        // Xorg ProcWarpPointer: BadWindow for a nonexistent src or
+        // dst window.
+        if src_window.0 != 0 && state.resources.window(src_window).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                src_window.0,
+                41,
+            );
+        }
+        if dst_window.0 != 0 && state.resources.window(dst_window).is_none() {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_WINDOW,
+                dst_window.0,
+                41,
+            );
+        }
+        // src_window != None: the warp only happens when the pointer
+        // is currently inside the source rectangle of src_window
+        // (width/height 0 extend to the window edge).
+        if src_window.0 != 0 {
+            let src_x = i16::from_le_bytes([body[8], body[9]]);
+            let src_y = i16::from_le_bytes([body[10], body[11]]);
+            let src_w = u16::from_le_bytes([body[12], body[13]]);
+            let src_h = u16::from_le_bytes([body[14], body[15]]);
+            let (px, py) = state.pointer_root;
+            let (ox, oy) = state.resources.window_absolute_position(src_window);
+            let rel_x = i32::from(px) - ox;
+            let rel_y = i32::from(py) - oy;
+            let (win_w, win_h) = state
+                .resources
+                .window(src_window)
+                .map_or((0, 0), |w| (i32::from(w.width), i32::from(w.height)));
+            let x0 = i32::from(src_x);
+            let y0 = i32::from(src_y);
+            let x1 = if src_w == 0 {
+                win_w
+            } else {
+                x0 + i32::from(src_w)
+            };
+            let y1 = if src_h == 0 {
+                win_h
+            } else {
+                y0 + i32::from(src_h)
+            };
+            if rel_x < x0 || rel_x >= x1 || rel_y < y0 || rel_y >= y1 {
+                debug!(
+                    "client {} #{} WarpPointer no-op (pointer outside src rect)",
+                    client_id.0, sequence.0
+                );
+                return Ok(RequestOutcome::Handled);
+            }
+        }
         if dst_window.0 == 0 {
             // dst=None: move relative to the current pointer position.
             if let Ok(p) = backend.query_pointer(origin) {
@@ -20254,7 +20487,10 @@ fn handle_get_modifier_mapping(
     sequence: SequenceNumber,
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} GetModifierMapping", client_id.0, sequence.0);
-    let proxied = backend.get_modifier_mapping(origin).ok();
+    let proxied = state
+        .modifier_mapping_override
+        .clone()
+        .or_else(|| backend.get_modifier_mapping(origin).ok());
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -20904,7 +21140,6 @@ fn handle_grab_pointer(
 #[derive(Clone, Copy)]
 enum CrossingKind {
     Pointer,
-    Keyboard,
 }
 
 fn emit_core_grab_activation_crossings(
@@ -20925,7 +21160,6 @@ fn emit_core_grab_activation_crossings(
     let server_time = state.timestamp_now();
     let (leave_evtype, enter_evtype) = match kind {
         CrossingKind::Pointer => (8u8, 7u8), // LeaveNotify / EnterNotify
-        CrossingKind::Keyboard => (10u8, 9u8), // FocusOut / FocusIn
     };
     let emit_to_client = |state: &mut ServerState, evtype: u8, target: ResourceId| {
         // Per X11 spec (Xorg `dix/enterleave.c:606` →
@@ -21095,8 +21329,7 @@ fn emit_core_grab_deactivation_crossing(
     kind: CrossingKind,
 ) {
     let evtype: u8 = match kind {
-        CrossingKind::Pointer => 8,   // LeaveNotify
-        CrossingKind::Keyboard => 10, // FocusOut
+        CrossingKind::Pointer => 8, // LeaveNotify
     };
     // Same mask-respecting filter as `emit_core_grab_activation_crossings`
     // — xts's `UngrabPointer` test (Xproto case 116) verifies that
@@ -21403,8 +21636,6 @@ fn handle_change_active_pointer_grab(
 
 fn handle_grab_keyboard(
     state: &mut ServerState,
-    backend: &mut dyn Backend,
-    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -21491,6 +21722,7 @@ fn handle_grab_keyboard(
                 owner: client_id,
                 grab_window,
                 source: crate::server::ActiveKeyboardGrabSource::Explicit,
+                owner_events: header.data != 0,
                 via_xi2: false,
             });
             state.last_keyboard_grab_time = if time == 0 { now } else { time };
@@ -21504,15 +21736,11 @@ fn handle_grab_keyboard(
                 body[9] == 0,
                 body[8] == 0,
             );
-            emit_core_grab_activation_crossings(
-                state,
-                backend,
-                origin,
-                client_id,
-                prev_grab_window,
-                grab_window,
-                CrossingKind::Keyboard,
-            );
+            // Xorg ActivateKeyboardGrab: DoFocusEvents(oldWin →
+            // grab_window, NotifyGrab), where oldWin is the prior
+            // grab's window if one was active, else the focus.
+            let from_raw = prev_grab_window.map_or(state.core_focus.raw, |w| w.0);
+            emit_core_focus_transition(state, from_raw, grab_window.0, 1);
         }
     }
     debug!(
@@ -21530,8 +21758,6 @@ fn handle_grab_keyboard(
 
 fn handle_ungrab_keyboard(
     state: &mut ServerState,
-    backend: &mut dyn Backend,
-    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
@@ -21552,7 +21778,7 @@ fn handle_ungrab_keyboard(
         );
         return Ok(RequestOutcome::Handled);
     }
-    deactivate_core_keyboard_grab(state, backend, origin, client_id);
+    deactivate_core_keyboard_grab(state, client_id);
     debug!("client {} #{} UngrabKeyboard", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
 }
@@ -21560,12 +21786,7 @@ fn handle_ungrab_keyboard(
 /// Tear down the active core keyboard grab held by `client_id` —
 /// shared by UngrabKeyboard and the unmap/destroy deactivation path
 /// (see [`deactivate_core_pointer_grab`]).
-fn deactivate_core_keyboard_grab(
-    state: &mut ServerState,
-    backend: &mut dyn Backend,
-    origin: Option<OriginContext>,
-    client_id: ClientId,
-) {
+fn deactivate_core_keyboard_grab(state: &mut ServerState, client_id: ClientId) {
     let prev_grab_window = state
         .active_keyboard_grab
         .filter(|g| g.owner == client_id)
@@ -21584,14 +21805,9 @@ fn deactivate_core_keyboard_grab(
         );
     }
     if let Some(prev) = prev_grab_window {
-        emit_core_grab_deactivation_crossing(
-            state,
-            backend,
-            origin,
-            client_id,
-            prev,
-            CrossingKind::Keyboard,
-        );
+        // Xorg DeactivateKeyboardGrab: DoFocusEvents(grab_window →
+        // focus, NotifyUngrab).
+        emit_core_focus_transition(state, prev.0, state.core_focus.raw, 2);
     }
 }
 
@@ -21618,7 +21834,7 @@ fn release_core_grabs_for_unviewable(
     if let Some(g) = state.active_keyboard_grab
         && !viewable(state, g.grab_window)
     {
-        deactivate_core_keyboard_grab(state, backend, origin, g.owner);
+        deactivate_core_keyboard_grab(state, g.owner);
     }
 }
 
@@ -30370,6 +30586,7 @@ mod tests {
         state.active_keyboard_grab = Some(ActiveKeyboardGrab {
             owner: ClientId(GRAB_CLIENT_ID),
             grab_window: ROOT_WINDOW,
+            owner_events: false,
             source: ActiveKeyboardGrabSource::PassiveKey { keycode: 33 },
             via_xi2: true,
         });

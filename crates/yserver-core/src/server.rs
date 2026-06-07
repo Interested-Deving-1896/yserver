@@ -222,6 +222,11 @@ pub struct ActiveKeyboardGrab {
     pub owner: ClientId,
     pub grab_window: ResourceId,
     pub source: ActiveKeyboardGrabSource,
+    /// X11 `owner_events`: when true, key events that would naturally
+    /// be reported to one of the grab client's windows are reported
+    /// normally instead of being redirected to `grab_window` (Xorg
+    /// `DeliverGrabbedEvent`).
+    pub owner_events: bool,
     /// True when established via XI2 (XIGrabDevice on the master
     /// keyboard, or an activated XI2 passive key grab) — see
     /// [`PassiveButtonGrab::via_xi2`] for the delivery-protocol rule.
@@ -790,6 +795,20 @@ pub struct ServerState {
     /// per-client `focused_window` mirror is kept in sync for legacy
     /// readers.
     pub core_focus: CoreFocus,
+    /// Client keysym rows installed via ChangeKeyboardMapping, keyed
+    /// by keycode. GetKeyboardMapping merges these over the backend's
+    /// keymap (Xorg stores them in the device's key class directly;
+    /// the overlay keeps the backend keymap pristine).
+    pub keymap_overrides: HashMap<u8, Vec<u32>>,
+    /// SetPointerMapping store — logical-button map returned by
+    /// GetPointerMapping. None = identity over the core button count.
+    pub pointer_mapping_override: Option<Vec<u8>>,
+    /// SetModifierMapping store — (keycodes_per_modifier, 8×kpm
+    /// keycodes) returned by GetModifierMapping when set.
+    pub modifier_mapping_override: Option<(u8, Vec<u8>)>,
+    /// Currently-pressed keycodes, one bit per keycode (byte k/8, bit
+    /// k%8) — the QueryKeymap bitmap, maintained by the key fanout.
+    pub keys_down: [u8; 32],
     /// Most recent input event timestamp seen by either fanout —
     /// stands in for "current server time" in XI1 grab time checks.
     pub xi1_last_input_time: u32,
@@ -1073,6 +1092,10 @@ impl ServerState {
             last_pointer_grab_time: 0,
             last_keyboard_grab_time: 0,
             core_focus: CoreFocus::default(),
+            keymap_overrides: HashMap::new(),
+            pointer_mapping_override: None,
+            modifier_mapping_override: None,
+            keys_down: [0u8; 32],
             xi1_last_input_time: 0,
             xi1_frozen: HashMap::new(),
             xi1_device_focus: HashMap::new(),
@@ -3973,6 +3996,7 @@ mod tests {
             owner: ClientId(7),
             grab_window: ResourceId(0xff),
             source: ActiveKeyboardGrabSource::Explicit,
+            owner_events: false,
             via_xi2: false,
         });
         assert_eq!(s.active_keyboard_grab.unwrap().owner, ClientId(7));
