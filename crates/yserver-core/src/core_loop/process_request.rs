@@ -221,7 +221,8 @@ pub fn process_request(
         117 => handle_get_pointer_mapping(state, client_id, sequence),
         // ── stub replies for opcodes that need a reply but state is trivial ──
         39 => handle_get_motion_events(state, client_id, sequence),
-        52 => handle_get_font_path(state, client_id, sequence),
+        51 => handle_set_font_path(state, backend, origin, client_id, sequence, header, body),
+        52 => handle_get_font_path(state, backend, client_id, sequence),
         83 => handle_list_installed_colormaps(state, client_id, sequence, body),
         // ── GC dashes (multi-byte pattern; opcode 58 is its own request,
         //    distinct from the single-byte CreateGC/ChangeGC dash form). ──
@@ -14748,16 +14749,112 @@ fn handle_get_motion_events(
 /// GetFontPath (52): reply with 0 paths.
 fn handle_get_font_path(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} GetFontPath", client_id.0, sequence.0);
+    let paths = backend.font_path();
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
-    // Layout: reply(1) pad(1) seq(2) length=0(4) npaths=0 u16(2) pad(22) = 32
-    let buf = stub_reply_32(client.byte_order, sequence, 0);
+    let byte_order = client.byte_order;
+    // Layout: reply(1) pad(1) seq(2) length(4) npaths u16(2) pad(22)
+    // then LISTofSTR (1 length byte + bytes each), padded to 4.
+    let mut buf = x11::fixed_reply(byte_order, sequence, 0, 0);
+    let mut tmp = Vec::with_capacity(2);
+    x11::write_u16(
+        byte_order,
+        &mut tmp,
+        u16::try_from(paths.len()).unwrap_or(0),
+    );
+    buf.extend_from_slice(&tmp);
+    buf.resize(32, 0);
+    for p in &paths {
+        let bytes = p.as_bytes();
+        let len = bytes.len().min(255);
+        buf.push(u8::try_from(len).unwrap_or(255));
+        buf.extend_from_slice(&bytes[..len]);
+    }
+    while !buf.len().is_multiple_of(4) {
+        buf.push(0);
+    }
+    let units = u32::try_from((buf.len() - 32) / 4).unwrap_or(0);
+    let len_bytes = match byte_order {
+        yserver_protocol::x11::ClientByteOrder::LittleEndian => units.to_le_bytes(),
+        yserver_protocol::x11::ClientByteOrder::BigEndian => units.to_be_bytes(),
+    };
+    buf[4..8].copy_from_slice(&len_bytes);
     Ok(write_to_client(client, client_id, &buf))
+}
+
+/// SetFontPath (51): parse the STR list, hand it to the backend for
+/// validation + install. Invalid element → BadValue (old path kept,
+/// errorValue = offending element index, matching Xorg's
+/// SetFontPathElements bad-element counter).
+fn handle_set_font_path(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    if body.len() < 4 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_LENGTH,
+            0,
+            header.opcode,
+        );
+    }
+    let npaths = u16::from_le_bytes([body[0], body[1]]);
+    let mut paths: Vec<String> = Vec::with_capacity(usize::from(npaths));
+    let mut off = 4usize;
+    for _ in 0..npaths {
+        let Some(&len) = body.get(off) else {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_LENGTH,
+                0,
+                header.opcode,
+            );
+        };
+        off += 1;
+        let end = off + usize::from(len);
+        let Some(bytes) = body.get(off..end) else {
+            return emit_x11_error(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_LENGTH,
+                0,
+                header.opcode,
+            );
+        };
+        paths.push(String::from_utf8_lossy(bytes).into_owned());
+        off = end;
+    }
+    debug!(
+        "client {} #{} SetFontPath {:?}",
+        client_id.0, sequence.0, paths
+    );
+    match backend.set_font_path(origin, &paths) {
+        Ok(()) => Ok(RequestOutcome::Handled),
+        Err(bad_index) => emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::try_from(bad_index).unwrap_or(0),
+            header.opcode,
+        ),
+    }
 }
 
 /// ListInstalledColormaps (83): reply with 0 colormaps.
@@ -17131,6 +17228,41 @@ fn handle_get_image(
     Ok(write_to_client(client, client_id, &buf))
 }
 
+/// Rewrite PolyText8/16 embedded font-change items (len == 255):
+/// the wire carries the CLIENT font XID, the backend's font table is
+/// keyed by HOST xids. Returns the translated body plus the last
+/// font's client id (committed to the GC per X11 §8), or
+/// `Err(client_xid)` when an id doesn't resolve (→ BadFont).
+fn translate_poly_text_fonts(
+    state: &ServerState,
+    body: &[u8],
+    two_byte: bool,
+) -> Result<(Vec<u8>, Option<ResourceId>), u32> {
+    let mut out = body.to_vec();
+    let mut last: Option<ResourceId> = None;
+    let mut off = 12usize;
+    while off + 2 <= out.len() {
+        let len = out[off];
+        if len == 255 {
+            if off + 5 > out.len() {
+                break;
+            }
+            let client_xid =
+                u32::from_be_bytes([out[off + 1], out[off + 2], out[off + 3], out[off + 4]]);
+            let Some(font) = state.resources.font(ResourceId(client_xid)) else {
+                return Err(client_xid);
+            };
+            out[off + 1..off + 5].copy_from_slice(&font.host_xid.as_raw().to_be_bytes());
+            last = Some(ResourceId(client_xid));
+            off += 5;
+        } else {
+            let n = usize::from(len);
+            off += 2 + if two_byte { 2 * n } else { n };
+        }
+    }
+    Ok((out, last))
+}
+
 fn handle_poly_text8(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -17145,13 +17277,29 @@ fn handle_poly_text8(
         {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 74);
         }
+        let (text_body, last_font) = match translate_poly_text_fonts(state, text_body, false) {
+            Ok(pair) => pair,
+            Err(bad_font) => {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_FONT,
+                    bad_font,
+                    74,
+                );
+            }
+        };
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
             let st = draw_state.unwrap_or_default();
             backend.apply_clip_state(origin, &st.clip)?;
             backend.apply_draw_state(origin, &st)?;
-            backend.poly_text8(origin, target.host_xid(), st.foreground, text_body)?;
+            backend.poly_text8(origin, target.host_xid(), st.foreground, &text_body)?;
+        }
+        if let Some(font) = last_font {
+            state.resources.set_gc_font(ResourceId(gc_id), font);
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }
@@ -17173,13 +17321,29 @@ fn handle_poly_text16(
         {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 75);
         }
+        let (text_body, last_font) = match translate_poly_text_fonts(state, text_body, true) {
+            Ok(pair) => pair,
+            Err(bad_font) => {
+                return emit_x11_error(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_FONT,
+                    bad_font,
+                    75,
+                );
+            }
+        };
         let draw_state = state.resources.resolve_draw_state(ResourceId(gc_id));
         let target = state.resources.host_drawable_target(drawable);
         if let Some(target) = target {
             let st = draw_state.unwrap_or_default();
             backend.apply_clip_state(origin, &st.clip)?;
             backend.apply_draw_state(origin, &st)?;
-            backend.poly_text16(origin, target.host_xid(), st.foreground, text_body)?;
+            backend.poly_text16(origin, target.host_xid(), st.foreground, &text_body)?;
+        }
+        if let Some(font) = last_font {
+            state.resources.set_gc_font(ResourceId(gc_id), font);
         }
         let _dropped = accumulate_damage_full_to_state(state, drawable);
     }
@@ -18602,6 +18766,17 @@ fn handle_open_font(
     }
     let host_result = match backend.open_font(origin, &request.name) {
         Ok(pair) => Some(pair),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            // Font-path resolution exhausted with no match → BadName
+            // (Xorg dix OpenFont semantics). KMS signals this with
+            // ErrorKind::NotFound; host-proxy failures use other
+            // kinds and keep the sentinel path below.
+            debug!(
+                "client {} OpenFont {:?}: no match on font path → BadName",
+                client_id.0, request.name
+            );
+            return emit_x11_error(state, client_id, sequence, x11::error::BAD_NAME, 0, 45);
+        }
         Err(err) => {
             log::warn!(
                 "client {} OpenFont {:?} failed on host: {err}",
@@ -18632,11 +18807,46 @@ fn handle_open_font(
                 font_ascent: 0,
                 font_descent: 0,
                 properties: Vec::new(),
+                named_properties: Vec::new(),
                 char_infos: Vec::new(),
             },
         )
     });
     {
+        // Properties read from the font file (BDF/PCF) arrive as
+        // named (String, value) pairs — convert to wire (atom, CARD32)
+        // pairs here where the atom table lives. String values are
+        // themselves atoms (BDF ATOM-typed properties).
+        if !metrics.named_properties.is_empty() {
+            let named = std::mem::take(&mut metrics.named_properties);
+            let mut out: Vec<u8> = Vec::with_capacity(named.len() * 8 + 8);
+            let mut has_font_prop = false;
+            for (name, value) in &named {
+                if name == "FONT" {
+                    has_font_prop = true;
+                }
+                let name_atom = state.atoms.intern(name, false).0;
+                let v: u32 = match value {
+                    x11::FontPropValue::Card(c) => *c,
+                    #[allow(clippy::cast_sign_loss)]
+                    x11::FontPropValue::Int(i) => *i as u32,
+                    x11::FontPropValue::Str(s) => state.atoms.intern(s, false).0,
+                };
+                out.extend_from_slice(&name_atom.to_le_bytes());
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            // libX11's XCreateFontSet resolves non-XLFD base names
+            // exclusively through the FONT property (omGeneric.c) —
+            // always present on Xorg fonts; append if the file's
+            // property list lacked it.
+            if !has_font_prop {
+                let name_atom = state.atoms.intern("FONT", false).0;
+                let value_atom = state.atoms.intern(&request.name, false).0;
+                out.extend_from_slice(&name_atom.to_le_bytes());
+                out.extend_from_slice(&value_atom.to_le_bytes());
+            }
+            metrics.properties = out;
+        }
         // Backends that don't proxy to a real X server (KMS) can't
         // populate font properties from upstream and return an empty
         // properties vec. Synthesize the standard XLFD-derived

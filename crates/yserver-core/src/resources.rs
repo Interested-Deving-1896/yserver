@@ -2038,6 +2038,14 @@ impl ResourceTable {
         self.fonts.remove(&id.0)
     }
 
+    /// Commit a PolyText embedded font-change to the GC (X11 §8:
+    /// "the font item ... is stored in the GC").
+    pub fn set_gc_font(&mut self, gc_id: ResourceId, font: ResourceId) {
+        if let Some(gc) = self.gcs.get_mut(&gc_id.0) {
+            gc.font = Some(font);
+        }
+    }
+
     pub fn font(&self, id: ResourceId) -> Option<&Font> {
         self.fonts.get(&id.0)
     }

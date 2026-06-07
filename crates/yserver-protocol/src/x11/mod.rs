@@ -405,6 +405,16 @@ pub struct CharInfo {
     pub attributes: u16,
 }
 
+/// A font property value as read from the font file (BDF/PCF
+/// properties). String values become atoms at the request layer
+/// (the server's atom table isn't visible to backends).
+#[derive(Clone, Debug)]
+pub enum FontPropValue {
+    Card(u32),
+    Int(i32),
+    Str(String),
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FontMetrics {
     pub min_bounds: CharInfo,
@@ -418,7 +428,14 @@ pub struct FontMetrics {
     pub all_chars_exist: bool,
     pub font_ascent: i16,
     pub font_descent: i16,
+    /// Wire-format (atom, value) u32 pairs, little-endian — filled at
+    /// the request layer (atoms need the server table).
     pub properties: Vec<u8>,
+    /// Named properties straight from the font file (BDF/PCF);
+    /// converted to wire `properties` by the request layer. Empty for
+    /// faces without embedded properties (scalables) — the request
+    /// layer then synthesizes XLFD-derived properties instead.
+    pub named_properties: Vec<(String, FontPropValue)>,
     pub char_infos: Vec<CharInfo>,
 }
 
@@ -3057,6 +3074,7 @@ pub fn parse_query_font_reply(body: &[u8]) -> Option<FontMetrics> {
         font_ascent,
         font_descent,
         properties,
+        named_properties: Vec::new(),
         char_infos,
     })
 }
@@ -3566,6 +3584,7 @@ mod tests {
             font_ascent: 13,
             font_descent: 4,
             properties: Vec::new(),
+            named_properties: Vec::new(),
             char_infos: Vec::new(),
         };
         let name = "-fc-dejavu sans mono-medium-r-normal--12-120-75-75-m-72-iso8859-1";
@@ -5559,6 +5578,7 @@ pub mod error {
     pub const BAD_VALUE: u8 = 2;
     pub const BAD_WINDOW: u8 = 3;
     pub const BAD_ATOM: u8 = 5;
+    pub const BAD_FONT: u8 = 7;
     pub const BAD_MATCH: u8 = 8;
     pub const BAD_DRAWABLE: u8 = 9;
     pub const BAD_ACCESS: u8 = 10;

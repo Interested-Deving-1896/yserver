@@ -32,7 +32,9 @@ use yserver_core::{
     },
     host_x11::{HostPointerEvent, HostXidMap},
 };
-use yserver_protocol::x11::{CharInfo as ProtocolCharInfo, FontMetrics, ResourceId, xfixes};
+use yserver_protocol::x11::{
+    CharInfo as ProtocolCharInfo, FontMetrics, FontPropValue, ResourceId, xfixes,
+};
 
 use crate::kms::cpu_types::{PictTransform, Rectangle16, Repeat};
 
@@ -96,11 +98,119 @@ pub(crate) struct FontState {
 /// (face × pixel-size × charset) combination. Every entry resolves
 /// back through `open_font`, so the LFWI metrics path can return real
 /// FreeType metrics for any name we hand out.
+/// One font-path directory: parsed `fonts.dir` (+ optional
+/// `fonts.alias`). Names are kept verbatim (matching is
+/// case-insensitive per the X11 spec).
+#[derive(Debug, Clone)]
+pub(crate) struct FontDir {
+    /// fonts.dir entries in file order: (font name, glyph file path).
+    pub(crate) entries: Vec<(String, std::path::PathBuf)>,
+    /// fonts.alias entries: (alias, target font name or pattern).
+    pub(crate) aliases: Vec<(String, String)>,
+}
+
+impl FontDir {
+    /// Parse `<dir>/fonts.dir` (required) and `<dir>/fonts.alias`
+    /// (optional). fonts.dir: first line = entry count, then
+    /// `<file> <name>` per line (name may contain spaces — split at
+    /// the FIRST space). fonts.alias: `<alias> <name>` with optional
+    /// double quotes around either; `!` starts a comment line.
+    pub(crate) fn load(dir: &std::path::Path) -> io::Result<Self> {
+        let dir_listing = std::fs::read_to_string(dir.join("fonts.dir"))?;
+        let mut entries = Vec::new();
+        for line in dir_listing.lines().skip(1) {
+            let line = line.trim_end();
+            if let Some((file, name)) = line.split_once(' ') {
+                if file.is_empty() || name.is_empty() {
+                    continue;
+                }
+                entries.push((name.to_string(), dir.join(file)));
+            }
+        }
+        let mut aliases = Vec::new();
+        if let Ok(alias_text) = std::fs::read_to_string(dir.join("fonts.alias")) {
+            for line in alias_text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('!') {
+                    continue;
+                }
+                let (alias, rest) = match split_alias_token(line) {
+                    Some(pair) => pair,
+                    None => continue,
+                };
+                if let Some((target, _)) = split_alias_token(rest) {
+                    aliases.push((alias.to_string(), target.to_string()));
+                }
+            }
+        }
+        Ok(Self { entries, aliases })
+    }
+}
+
+/// Pull the next token off a fonts.alias line: either a
+/// double-quoted string (quotes stripped) or a whitespace-delimited
+/// word. Returns (token, remainder).
+fn split_alias_token(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(stripped) = s.strip_prefix('"') {
+        let end = stripped.find('"')?;
+        Some((&stripped[..end], &stripped[end + 1..]))
+    } else {
+        match s.split_once(char::is_whitespace) {
+            Some((tok, rest)) => Some((tok, rest)),
+            None => Some((s, "")),
+        }
+    }
+}
+
+/// Case-insensitive `*`/`?` glob for X11 font name patterns.
+/// Greedy backtracking matcher — font names and patterns are short.
+pub(crate) fn font_pattern_matches(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let n: Vec<char> = name.to_ascii_lowercase().chars().collect();
+    fn rec(p: &[char], n: &[char]) -> bool {
+        match p.first() {
+            None => n.is_empty(),
+            Some('*') => (0..=n.len()).any(|k| rec(&p[1..], &n[k..])),
+            Some('?') => !n.is_empty() && rec(&p[1..], &n[1..]),
+            Some(c) => n.first() == Some(c) && rec(&p[1..], &n[1..]),
+        }
+    }
+    rec(&p, &n)
+}
+
+/// Resolution outcome for a font name against the font path.
+pub(crate) enum FontResolution {
+    /// Matched a fonts.dir entry: open this file. `entry_name` is the
+    /// matched fonts.dir name (used for XLFD-derived sizing of
+    /// scalable files; PCF strikes ignore it).
+    File {
+        path: std::path::PathBuf,
+        entry_name: String,
+    },
+    /// Matched the built-ins element (alias set or fontconfig
+    /// catalog): resolve via fontconfig.
+    BuiltIn,
+}
+
 pub(crate) struct FontLoader {
     pub(crate) library: freetype::Library,
     pub(crate) fc: fontconfig::Fontconfig,
     pub(crate) catalog: Vec<String>,
+    /// Current font path, element order significant. Elements are
+    /// directories (with fonts.dir) or the literal "built-ins".
+    pub(crate) font_path: Vec<String>,
+    /// Parsed dirs parallel to `font_path` (`None` = "built-ins").
+    pub(crate) path_dirs: Vec<Option<FontDir>>,
 }
+
+/// Built-in alias names that always resolve via fontconfig — the
+/// compatibility layer that keeps `fixed`/`cursor` working no matter
+/// what the font path holds (mirrors Xorg's built-ins FPE).
+pub(crate) const BUILTIN_ALIASES: &[&str] = &["fixed", "cursor", "nil2"];
 
 impl FontLoader {
     pub(crate) fn new() -> io::Result<Self> {
@@ -108,12 +218,145 @@ impl FontLoader {
             .ok_or_else(|| io::Error::other("fontconfig init failed"))?;
         let catalog = build_font_catalog(&fc);
         log::info!("font catalog: {} XLFDs from fontconfig", catalog.len());
-        Ok(Self {
+        let mut loader = Self {
             library: freetype::Library::init()
                 .map_err(|e| io::Error::other(format!("freetype init failed: {e:?}")))?,
             fc,
             catalog,
-        })
+            font_path: Vec::new(),
+            path_dirs: Vec::new(),
+        };
+        let default = Self::default_font_path();
+        // Default path elements are pre-vetted (fonts.dir checked) —
+        // failure here would be a TOCTOU race; fall back to built-ins.
+        if loader.set_font_path(&default).is_err() {
+            let _ = loader.set_font_path(&["built-ins".to_string()]);
+        }
+        Ok(loader)
+    }
+
+    /// Xorg-style default font path filtered to dirs that actually
+    /// carry a fonts.dir on this system, with "built-ins" always last.
+    pub(crate) fn default_font_path() -> Vec<String> {
+        const CANDIDATES: &[&str] = &[
+            "/usr/share/fonts/misc",
+            "/usr/share/fonts/TTF",
+            "/usr/share/fonts/OTF",
+            "/usr/share/fonts/Type1",
+            "/usr/share/fonts/100dpi",
+            "/usr/share/fonts/75dpi",
+        ];
+        let mut path: Vec<String> = CANDIDATES
+            .iter()
+            .filter(|d| std::path::Path::new(d).join("fonts.dir").is_file())
+            .map(|d| (*d).to_string())
+            .collect();
+        path.push("built-ins".to_string());
+        path
+    }
+
+    /// Validate and install a new font path. Every element must be
+    /// "built-ins" or a directory with a readable fonts.dir; on any
+    /// invalid element the old path is kept and Err carries the bad
+    /// element (handler → BadValue). Empty list resets to default
+    /// (Xorg SetFontPath semantics).
+    pub(crate) fn set_font_path(&mut self, paths: &[String]) -> Result<(), String> {
+        let effective: Vec<String> = if paths.is_empty() {
+            Self::default_font_path()
+        } else {
+            paths.to_vec()
+        };
+        let mut dirs: Vec<Option<FontDir>> = Vec::with_capacity(effective.len());
+        for el in &effective {
+            if el == "built-ins" {
+                dirs.push(None);
+                continue;
+            }
+            match FontDir::load(std::path::Path::new(el)) {
+                Ok(d) => dirs.push(Some(d)),
+                Err(e) => {
+                    log::debug!("SetFontPath: rejecting {el:?}: {e}");
+                    return Err(el.clone());
+                }
+            }
+        }
+        self.font_path = effective;
+        self.path_dirs = dirs;
+        Ok(())
+    }
+
+    /// Resolve a font name/pattern against the font path in element
+    /// order: exact fonts.dir name match (case-insensitive), alias
+    /// match (recursive, ≤20 hops — Xorg dixfonts.c aliascount), then
+    /// wildcard match against fonts.dir names; "built-ins" matches
+    /// the alias set or the fontconfig catalog. None = BadName.
+    pub(crate) fn resolve(&self, name: &str) -> Option<FontResolution> {
+        self.resolve_inner(name, 20)
+    }
+
+    fn resolve_inner(&self, name: &str, hops: u8) -> Option<FontResolution> {
+        if hops == 0 {
+            return None;
+        }
+        for (el, dir) in self.font_path.iter().zip(&self.path_dirs) {
+            let Some(dir) = dir else {
+                // "built-ins": alias set, then catalog XLFD match.
+                if BUILTIN_ALIASES.iter().any(|a| a.eq_ignore_ascii_case(name))
+                    || self
+                        .catalog
+                        .iter()
+                        .any(|entry| font_pattern_matches(name, entry))
+                {
+                    return Some(FontResolution::BuiltIn);
+                }
+                let _ = el;
+                continue;
+            };
+            if let Some((entry_name, path)) = dir
+                .entries
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(n, p)| (n.clone(), p.clone()))
+            {
+                return Some(FontResolution::File { path, entry_name });
+            }
+            if let Some((_, target)) = dir
+                .aliases
+                .iter()
+                .find(|(a, _)| a.eq_ignore_ascii_case(name))
+            {
+                return self.resolve_inner(target, hops - 1);
+            }
+            if let Some((entry_name, path)) = dir
+                .entries
+                .iter()
+                .find(|(n, _)| font_pattern_matches(name, n))
+                .map(|(n, p)| (n.clone(), p.clone()))
+            {
+                return Some(FontResolution::File { path, entry_name });
+            }
+        }
+        None
+    }
+
+    /// All fonts.dir/alias names on the current path matching
+    /// `pattern`, in path order — feed for ListFonts ahead of the
+    /// built-ins catalog. Aliases are reported by their alias name.
+    pub(crate) fn path_font_names(&self, pattern: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for dir in self.path_dirs.iter().flatten() {
+            for (name, _) in &dir.entries {
+                if font_pattern_matches(pattern, name) {
+                    out.push(name.clone());
+                }
+            }
+            for (alias, _) in &dir.aliases {
+                if font_pattern_matches(pattern, alias) {
+                    out.push(alias.clone());
+                }
+            }
+        }
+        out
     }
 
     pub(crate) fn is_xlfd_pattern(name: &str) -> bool {
@@ -180,7 +423,70 @@ impl FontLoader {
         (family, style, px)
     }
 
+    /// Open a font by name against the current font path. Resolution
+    /// order: fonts.dir/alias path elements first, then "built-ins"
+    /// (alias set + fontconfig catalog). `ErrorKind::NotFound` when
+    /// nothing on the path matches — the request layer turns that
+    /// into BadName (no silent substitution).
     pub(crate) fn open_font(
+        &self,
+        name: &str,
+    ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
+        match self.resolve(name) {
+            Some(FontResolution::File { path, entry_name }) => {
+                self.open_font_file(&path, &entry_name)
+            }
+            Some(FontResolution::BuiltIn) => self.open_font_builtin(name),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no font on path matches {name:?}"),
+            )),
+        }
+    }
+
+    /// Open a fonts.dir-resolved glyph file (PCF/BDF/scalable —
+    /// FreeType auto-detects). Bitmap faces select their (single)
+    /// strike; scalable files honour the matched entry name's XLFD
+    /// pixel size.
+    fn open_font_file(
+        &self,
+        path: &std::path::Path,
+        entry_name: &str,
+    ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
+        let face = self
+            .library
+            .new_face(path, 0)
+            .map_err(|e| io::Error::other(format!("freetype new_face({path:?}): {e:?}")))?;
+        // PCF/BDF faces without a recognized registry (the xts test
+        // fonts carry no CHARSET properties) get NO active charmap
+        // from FreeType — FT_Get_First_Char then iterates nothing
+        // and load_char can't map codes. Select the first charmap
+        // explicitly; PCF files expose exactly one.
+        if face.raw().charmap.is_null() && face.num_charmaps() > 0 {
+            let cm = face.get_charmap(0);
+            let _ = face.set_charmap(&cm);
+        }
+        if face.is_scalable() {
+            let px = if Self::is_xlfd_pattern(entry_name) {
+                Self::parse_xlfd(entry_name).2
+            } else {
+                None
+            };
+            if let Some(px) = px {
+                let _ = face.set_pixel_sizes(0, px);
+            } else {
+                let _ = face.set_char_size(12 << 6, 12 << 6, 96, 96);
+            }
+        } else {
+            // Bitmap strike (PCF/BDF): exactly one size per file in
+            // X11 font dirs.
+            let _ = face.select_size(0);
+        }
+        let (metrics, char_cache) = compute_font_metrics(&face);
+        Ok((face, metrics, char_cache))
+    }
+
+    fn open_font_builtin(
         &self,
         name: &str,
     ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
@@ -256,7 +562,162 @@ fn compute_char_info(face: &freetype::Face, ch: char) -> ProtocolCharInfo {
     }
 }
 
+/// FFI for FreeType's BDF/PCF property accessor — freetype-sys
+/// doesn't bind it. Same libfreetype the bound calls use.
+mod ft_bdf {
+    use freetype::freetype_sys::{FT_Face, FT_Int};
+    use std::os::raw::{c_char, c_int, c_long, c_ulong};
+
+    pub const BDF_PROPERTY_TYPE_ATOM: c_int = 1;
+    pub const BDF_PROPERTY_TYPE_INTEGER: c_int = 2;
+    pub const BDF_PROPERTY_TYPE_CARDINAL: c_int = 3;
+
+    #[repr(C)]
+    pub union BdfPropertyValue {
+        pub atom: *const c_char,
+        pub integer: c_long,
+        pub cardinal: c_ulong,
+    }
+
+    #[repr(C)]
+    pub struct BdfPropertyRec {
+        pub type_: c_int,
+        pub u: BdfPropertyValue,
+    }
+
+    unsafe extern "C" {
+        pub fn FT_Get_BDF_Property(
+            face: FT_Face,
+            prop_name: *const c_char,
+            aproperty: *mut BdfPropertyRec,
+        ) -> FT_Int;
+    }
+}
+
+/// Best-effort read of the standard BDF/PCF property set off a face.
+/// Empty for faces without embedded properties (scalables) — callers
+/// fall back to XLFD-synthesized properties.
+fn read_bdf_properties(face: &freetype::Face) -> Vec<(String, FontPropValue)> {
+    // The classic property names XTS / legacy clients interrogate.
+    const NAMES: &[&str] = &[
+        "FOUNDRY",
+        "FAMILY_NAME",
+        "WEIGHT_NAME",
+        "SLANT",
+        "SETWIDTH_NAME",
+        "ADD_STYLE_NAME",
+        "PIXEL_SIZE",
+        "POINT_SIZE",
+        "RESOLUTION_X",
+        "RESOLUTION_Y",
+        "SPACING",
+        "AVERAGE_WIDTH",
+        "CHARSET_REGISTRY",
+        "CHARSET_ENCODING",
+        "FONT",
+        "FONT_ASCENT",
+        "FONT_DESCENT",
+        "DEFAULT_CHAR",
+        "COPYRIGHT",
+        "MIN_SPACE",
+        "NORM_SPACE",
+        "MAX_SPACE",
+        "END_SPACE",
+        "SUPERSCRIPT_X",
+        "SUPERSCRIPT_Y",
+        "SUBSCRIPT_X",
+        "SUBSCRIPT_Y",
+        "UNDERLINE_POSITION",
+        "UNDERLINE_THICKNESS",
+        "ITALIC_ANGLE",
+        "X_HEIGHT",
+        "QUAD_WIDTH",
+        "WEIGHT",
+        "RESOLUTION",
+        "CAP_HEIGHT",
+    ];
+    let mut out = Vec::new();
+    let raw_face = face.raw() as *const _ as freetype::freetype_sys::FT_Face;
+    for name in NAMES {
+        let Ok(cname) = std::ffi::CString::new(*name) else {
+            continue;
+        };
+        let mut prop = ft_bdf::BdfPropertyRec {
+            type_: 0,
+            u: ft_bdf::BdfPropertyValue { cardinal: 0 },
+        };
+        // SAFETY: face outlives the call; FT_Get_BDF_Property only
+        // reads the face and fills `prop` on success (returns 0).
+        let err = unsafe { ft_bdf::FT_Get_BDF_Property(raw_face, cname.as_ptr(), &mut prop) };
+        if err != 0 {
+            continue;
+        }
+        let value = match prop.type_ {
+            ft_bdf::BDF_PROPERTY_TYPE_ATOM => {
+                // SAFETY: ATOM type guarantees a NUL-terminated string
+                // owned by the face.
+                let s = unsafe {
+                    let ptr = prop.u.atom;
+                    if ptr.is_null() {
+                        continue;
+                    }
+                    std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+                };
+                FontPropValue::Str(s)
+            }
+            // SAFETY: tag-checked union reads.
+            ft_bdf::BDF_PROPERTY_TYPE_INTEGER => {
+                FontPropValue::Int(unsafe { prop.u.integer } as i32)
+            }
+            ft_bdf::BDF_PROPERTY_TYPE_CARDINAL => {
+                FontPropValue::Card(unsafe { prop.u.cardinal } as u32)
+            }
+            _ => continue,
+        };
+        out.push(((*name).to_string(), value));
+    }
+    out
+}
+
+/// Compute QueryFont metrics from the face's REAL charmap coverage
+/// (FT charcode iteration), not an assumed ASCII range. `char_infos`
+/// is ordered with zeroed entries for missing codes (X11
+/// "nonexistent character" = all-zero metrics).
+///
+/// Bitmap faces with codes above 255 use the 2-byte matrix model:
+/// min/max_byte1 rows × min/max_byte2 columns, row-major (the xts
+/// 2-byte xtfonts have NO row 0 at all). Scalable faces stay capped
+/// at the single-byte range — fontconfig-backed unicode faces would
+/// otherwise produce 64K-entry CharInfo grids on every QueryFont.
 fn compute_font_metrics(face: &freetype::Face) -> (FontMetrics, HashMap<char, ProtocolCharInfo>) {
+    let cap: u32 = if face.is_scalable() { 0xFF } else { 0xFFFF };
+    let mut present: Vec<u32> = face
+        .chars()
+        .map(|(code, _gindex)| code as u32)
+        .filter(|&c| c <= cap)
+        .collect();
+    present.sort_unstable();
+    // Faces whose charmap is empty or entirely above the cap (symbol
+    // maps): fall back to the ASCII probe range so QueryFont still
+    // carries plausible bounds.
+    if present.is_empty() {
+        present = (0x20..=0x7E).collect();
+    }
+    let min_code = *present.first().unwrap_or(&0x20);
+    let max_code = *present.last().unwrap_or(&0x7E);
+    let present_set: HashSet<u32> = present.iter().copied().collect();
+
+    // Grid shape: 1-byte fonts are one row (byte1 = 0, byte2 =
+    // min..=max code); 2-byte fonts span byte1 rows × byte2 columns.
+    let two_byte = max_code > 0xFF;
+    let (min_byte1, max_byte1, min_byte2, max_byte2) = if two_byte {
+        let min_b2 = present.iter().map(|c| c & 0xFF).min().unwrap_or(0);
+        let max_b2 = present.iter().map(|c| c & 0xFF).max().unwrap_or(0xFF);
+        (min_code >> 8, max_code >> 8, min_b2, max_b2)
+    } else {
+        (0, 0, min_code, max_code)
+    };
+
     let mut char_info_cache = HashMap::new();
     let mut min_bounds = ProtocolCharInfo {
         left_side_bearing: i16::MAX,
@@ -275,39 +736,91 @@ fn compute_font_metrics(face: &freetype::Face) -> (FontMetrics, HashMap<char, Pr
         attributes: 0,
     };
 
-    for code in 0x20u32..=0x7E {
-        let ch = char::from_u32(code).unwrap();
-        let ci = compute_char_info(face, ch);
-        min_bounds.left_side_bearing = min_bounds.left_side_bearing.min(ci.left_side_bearing);
-        max_bounds.left_side_bearing = max_bounds.left_side_bearing.max(ci.left_side_bearing);
-        min_bounds.right_side_bearing = min_bounds.right_side_bearing.min(ci.right_side_bearing);
-        max_bounds.right_side_bearing = max_bounds.right_side_bearing.max(ci.right_side_bearing);
-        min_bounds.character_width = min_bounds.character_width.min(ci.character_width);
-        max_bounds.character_width = max_bounds.character_width.max(ci.character_width);
-        min_bounds.ascent = min_bounds.ascent.min(ci.ascent);
-        max_bounds.ascent = max_bounds.ascent.max(ci.ascent);
-        min_bounds.descent = min_bounds.descent.min(ci.descent);
-        max_bounds.descent = max_bounds.descent.max(ci.descent);
-        char_info_cache.insert(ch, ci);
+    let rows = max_byte1 - min_byte1 + 1;
+    let cols = max_byte2 - min_byte2 + 1;
+    let mut char_infos: Vec<ProtocolCharInfo> = Vec::with_capacity((rows * cols) as usize);
+    let mut all_chars_exist = true;
+    for b1 in min_byte1..=max_byte1 {
+        for b2 in min_byte2..=max_byte2 {
+            let code = (b1 << 8) | b2;
+            let ch = char::from_u32(code);
+            let exists = ch.is_some() && present_set.contains(&code);
+            if !exists {
+                // Nonexistent char: all-zero metrics per X11.
+                char_infos.push(ProtocolCharInfo::default());
+                all_chars_exist = false;
+                continue;
+            }
+            let ch = ch.expect("checked above");
+            let ci = compute_char_info(face, ch);
+            min_bounds.left_side_bearing = min_bounds.left_side_bearing.min(ci.left_side_bearing);
+            max_bounds.left_side_bearing = max_bounds.left_side_bearing.max(ci.left_side_bearing);
+            min_bounds.right_side_bearing =
+                min_bounds.right_side_bearing.min(ci.right_side_bearing);
+            max_bounds.right_side_bearing =
+                max_bounds.right_side_bearing.max(ci.right_side_bearing);
+            min_bounds.character_width = min_bounds.character_width.min(ci.character_width);
+            max_bounds.character_width = max_bounds.character_width.max(ci.character_width);
+            min_bounds.ascent = min_bounds.ascent.min(ci.ascent);
+            max_bounds.ascent = max_bounds.ascent.max(ci.ascent);
+            min_bounds.descent = min_bounds.descent.min(ci.descent);
+            max_bounds.descent = max_bounds.descent.max(ci.descent);
+            char_infos.push(ci);
+            char_info_cache.insert(ch, ci);
+        }
+    }
+    if char_info_cache.is_empty() {
+        min_bounds = ProtocolCharInfo::default();
+        max_bounds = ProtocolCharInfo::default();
     }
 
-    let font_ascent = max_bounds.ascent;
-    let font_descent = max_bounds.descent;
+    let named_properties = read_bdf_properties(face);
+    // FONT_ASCENT/FONT_DESCENT properties are the authoritative
+    // overall line metrics for bitmap fonts (can exceed the glyph
+    // bound extremes); fall back to bounds-derived values.
+    let prop_i16 = |name: &str| -> Option<i16> {
+        named_properties.iter().find_map(|(n, v)| {
+            (n == name).then(|| match v {
+                FontPropValue::Card(c) => i16::try_from(*c).ok(),
+                FontPropValue::Int(i) => i16::try_from(*i).ok(),
+                FontPropValue::Str(_) => None,
+            })?
+        })
+    };
+    let font_ascent = prop_i16("FONT_ASCENT").unwrap_or(max_bounds.ascent);
+    let font_descent = prop_i16("FONT_DESCENT").unwrap_or(max_bounds.descent);
+    let default_char = named_properties
+        .iter()
+        .find_map(|(n, v)| {
+            (n == "DEFAULT_CHAR").then(|| match v {
+                FontPropValue::Card(c) => u16::try_from(*c).ok(),
+                FontPropValue::Int(i) => u16::try_from(*i).ok(),
+                FontPropValue::Str(_) => None,
+            })?
+        })
+        .unwrap_or_else(|| {
+            if present_set.contains(&0x20) {
+                0x20
+            } else {
+                u16::try_from(min_code).unwrap_or(0)
+            }
+        });
 
     let metrics = FontMetrics {
         min_bounds,
         max_bounds,
-        min_char_or_byte2: 0x20,
-        max_char_or_byte2: 0x7E,
-        default_char: 0x20,
+        min_char_or_byte2: u16::try_from(min_byte2).unwrap_or(0),
+        max_char_or_byte2: u16::try_from(max_byte2).unwrap_or(0xFF),
+        default_char,
         draw_direction: 0, // LeftToRight
-        min_byte1: 0,
-        max_byte1: 0,
-        all_chars_exist: true,
+        min_byte1: u8::try_from(min_byte1).unwrap_or(0),
+        max_byte1: u8::try_from(max_byte1).unwrap_or(0),
+        all_chars_exist,
         font_ascent,
         font_descent,
         properties: Vec::new(),
-        char_infos: char_info_cache.values().cloned().collect(),
+        named_properties,
+        char_infos,
     };
     (metrics, char_info_cache)
 }
@@ -1032,5 +1545,205 @@ impl KmsCore {
             .checked_add(1)
             .expect("host xid counter overflow");
         self.next_host_xid
+    }
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+
+    fn write_test_font_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("yserver-font-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // Minimal BDF — FreeType reads it like a PCF for our purposes.
+        let bdf = "STARTFONT 2.1\nFONT testfont0\nSIZE 13 100 100\n\
+                   FONTBOUNDINGBOX 10 10 0 0\nSTARTPROPERTIES 3\n\
+                   DEFAULT_CHAR 1\nFONT_ASCENT 10\nFONT_DESCENT 0\nENDPROPERTIES\n\
+                   CHARS 2\n\
+                   STARTCHAR C001\nENCODING 1\nSWIDTH 570 0\nDWIDTH 10 0\n\
+                   BBX 10 10 0 0\nBITMAP\nFFC0\nFFC0\nFFC0\nFFC0\nFFC0\nFFC0\nFFC0\nFFC0\nFFC0\nFFC0\nENDCHAR\n\
+                   STARTCHAR C003\nENCODING 3\nSWIDTH 285 0\nDWIDTH 5 0\n\
+                   BBX 5 5 0 0\nBITMAP\nF8\nF8\nF8\nF8\nF8\nENDCHAR\n\
+                   ENDFONT\n";
+        std::fs::write(dir.join("testfont0.bdf"), bdf).unwrap();
+        std::fs::write(
+            dir.join("fonts.dir"),
+            "2\ntestfont0.bdf testfont0\ntestfont0.bdf -vsw-testfont-bold-r-normal--13-130-75-75-m-70-iso8859-1\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("fonts.alias"), "myalias testfont0\n! comment\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn fonts_dir_parse_and_alias() {
+        let dir = write_test_font_dir("parse");
+        let fd = FontDir::load(&dir).unwrap();
+        assert_eq!(fd.entries.len(), 2);
+        assert_eq!(fd.entries[0].0, "testfont0");
+        assert_eq!(
+            fd.aliases,
+            vec![("myalias".to_string(), "testfont0".to_string())]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn font_pattern_glob() {
+        assert!(font_pattern_matches("xtfont*", "xtfont0"));
+        assert!(font_pattern_matches("XTFONT0", "xtfont0")); // case-insensitive
+        assert!(font_pattern_matches(
+            "-vsw-*-bold-r-*",
+            "-vsw-testfont-bold-r-normal--13-130-75-75-m-70-iso8859-1"
+        ));
+        assert!(!font_pattern_matches("xtfont?", "xtfont"));
+        assert!(!font_pattern_matches("nope", "xtfont0"));
+    }
+
+    #[test]
+    fn resolution_order_and_bad_name() {
+        let dir = write_test_font_dir("resolve");
+        let mut loader = FontLoader::new().unwrap();
+        loader
+            .set_font_path(&[dir.to_string_lossy().into_owned(), "built-ins".into()])
+            .unwrap();
+        // exact name
+        assert!(matches!(
+            loader.resolve("testfont0"),
+            Some(FontResolution::File { .. })
+        ));
+        // alias hop
+        assert!(matches!(
+            loader.resolve("MYALIAS"),
+            Some(FontResolution::File { .. })
+        ));
+        // XLFD wildcard against fonts.dir name
+        assert!(matches!(
+            loader.resolve("-vsw-testfont-bold-r-*"),
+            Some(FontResolution::File { .. })
+        ));
+        // built-ins alias survives any path
+        assert!(matches!(
+            loader.resolve("fixed"),
+            Some(FontResolution::BuiltIn)
+        ));
+        // unknown bare name → None → BadName at the request layer
+        assert!(loader.resolve("definitely-not-a-font").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_font_path_rejects_bad_dir_and_keeps_old() {
+        let mut loader = FontLoader::new().unwrap();
+        let before = loader.font_path.clone();
+        let err = loader
+            .set_font_path(&["/no-such-path-name".to_string()])
+            .unwrap_err();
+        assert_eq!(err, "/no-such-path-name");
+        assert_eq!(loader.font_path, before, "old path kept on failure");
+    }
+
+    #[test]
+    fn open_font_file_metrics_from_charmap() {
+        let dir = write_test_font_dir("metrics");
+        let mut loader = FontLoader::new().unwrap();
+        loader
+            .set_font_path(&[dir.to_string_lossy().into_owned()])
+            .unwrap();
+        let (_face, metrics, cache) = loader.open_font("testfont0").unwrap();
+        // Coverage: encodings 1 and 3; 2 missing → zero CharInfo.
+        assert_eq!(metrics.min_char_or_byte2, 1);
+        assert_eq!(metrics.max_char_or_byte2, 3);
+        assert!(!metrics.all_chars_exist);
+        assert_eq!(metrics.char_infos.len(), 3);
+        assert_eq!(metrics.char_infos[0].character_width, 10);
+        assert_eq!(
+            metrics.char_infos[1].character_width, 0,
+            "missing char = zero metrics"
+        );
+        assert_eq!(metrics.char_infos[2].character_width, 5);
+        assert_eq!(metrics.default_char, 1, "DEFAULT_CHAR property honored");
+        assert_eq!(metrics.font_ascent, 10);
+        assert_eq!(metrics.font_descent, 0);
+        assert!(cache.contains_key(&char::from_u32(1).unwrap()));
+        // BDF properties present (best-effort)
+        assert!(
+            metrics
+                .named_properties
+                .iter()
+                .any(|(n, _)| n == "FONT_ASCENT")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_font_unknown_is_not_found() {
+        let loader = FontLoader::new().unwrap();
+        let err = loader.open_font("xtfont-nonexistent").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+}
+
+#[cfg(test)]
+mod pcf_tests {
+    use super::*;
+
+    /// Real compiled PCF regression: FreeType's PCF driver leaves no
+    /// charmap selected for registry-less fonts (the xts xtfonts), so
+    /// metrics came out as the empty-coverage fallback (32..126,
+    /// all-zero bounds) on the first vng run. Uses the xts build tree
+    /// when present; skips silently otherwise.
+    #[test]
+    fn open_real_pcf_has_charmap_coverage() {
+        let path = std::path::Path::new("/home/jos/Projects/xts/build-fresh/xts5/fonts");
+        if !path.join("fonts.dir").is_file() {
+            eprintln!("skipping: xts build-fresh fonts not present");
+            return;
+        }
+        let mut loader = FontLoader::new().unwrap();
+        loader
+            .set_font_path(&[path.to_string_lossy().into_owned()])
+            .unwrap();
+        let (_face, metrics, cache) = loader.open_font("xtfont0").unwrap();
+        // xtfont0.bdf: chars at encodings 1..=3, DEFAULT_CHAR 0,
+        // FONT_ASCENT 20, FONT_DESCENT 3.
+        assert_eq!(metrics.min_char_or_byte2, 1, "PCF charmap coverage");
+        assert_eq!(metrics.max_char_or_byte2, 3);
+        assert_eq!(metrics.font_ascent, 20);
+        assert_eq!(metrics.font_descent, 3);
+        assert_eq!(metrics.default_char, 0);
+        assert!(!cache.is_empty(), "glyphs must load through the charmap");
+        let c1 = cache.get(&char::from_u32(1).unwrap()).expect("char 1");
+        assert_eq!(c1.character_width, 10, "10x10 block glyph");
+    }
+
+    /// 2-byte matrix font (xtfont2: encodings 0x2121..0x307E, no row
+    /// 0): metrics must use the byte1×byte2 grid, not a flat ≤255
+    /// range (which filtered ALL codes out and produced the empty
+    /// ASCII fallback — the XDrawString16 28→10 regression).
+    #[test]
+    fn open_real_two_byte_pcf_has_matrix_coverage() {
+        let path = std::path::Path::new("/home/jos/Projects/xts/build-fresh/xts5/fonts");
+        if !path.join("fonts.dir").is_file() {
+            eprintln!("skipping: xts build-fresh fonts not present");
+            return;
+        }
+        let mut loader = FontLoader::new().unwrap();
+        loader
+            .set_font_path(&[path.to_string_lossy().into_owned()])
+            .unwrap();
+        let (_face, metrics, cache) = loader.open_font("xtfont2").unwrap();
+        assert_eq!(metrics.min_byte1, 0x21, "first row");
+        assert_eq!(metrics.max_byte1, 0x30, "last row");
+        assert!(metrics.min_char_or_byte2 >= 0x21);
+        assert!(metrics.max_char_or_byte2 <= 0x7E);
+        let rows = usize::from(metrics.max_byte1 - metrics.min_byte1) + 1;
+        let cols = usize::from(metrics.max_char_or_byte2 - metrics.min_char_or_byte2) + 1;
+        assert_eq!(metrics.char_infos.len(), rows * cols, "row-major grid");
+        assert!(
+            cache.contains_key(&char::from_u32(0x2121).unwrap()),
+            "first 2-byte glyph loads through the charmap"
+        );
     }
 }

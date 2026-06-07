@@ -830,6 +830,27 @@ pub trait Backend: Send {
         name: &str,
     ) -> io::Result<(FontHandle, FontMetrics)>;
 
+    /// SetFontPath (opcode 51): validate + install the server font
+    /// path. `Err(index)` = the offending element's position (handler
+    /// emits BadValue; old path must be kept). Empty list = reset to
+    /// the backend's default path.
+    ///
+    /// Default impl accepts and ignores: host-proxy backends (ynest)
+    /// must NOT forward this to the host — the host font path is
+    /// global state shared with every other host client.
+    fn set_font_path(
+        &mut self,
+        _origin: Option<OriginContext>,
+        _paths: &[String],
+    ) -> Result<(), usize> {
+        Ok(())
+    }
+
+    /// Current font path for GetFontPath (opcode 52).
+    fn font_path(&self) -> Vec<String> {
+        vec!["built-ins".to_string()]
+    }
+
     fn close_font(&mut self, origin: Option<OriginContext>, host_xid: u32) -> io::Result<()>;
 
     fn create_cursor(

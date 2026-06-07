@@ -5758,7 +5758,78 @@ impl KmsBackendV2 {
     /// because the text pipeline doesn't honour scissor (lives in
     /// Stage 3e). v1's path has the same limitation; promoted to
     /// a Risk item rather than blocking 3a.
+    /// Rasterize core-protocol text MONOCHROME and submit it through
+    /// the rop-correct span path (`fill_solid_rects`): X11 core text
+    /// is binary fg coverage — PolyText honors the GC function /
+    /// plane-mask, ImageText forces GXcopy (callers swap
+    /// `core.current_function`). Spans are window-local;
+    /// `fill_solid_rects` applies `target.offset` — the SINGLE
+    /// translation point (no per-glyph pre-shift here).
     fn render_text_chars_v2(
+        &mut self,
+        host_xid: u32,
+        foreground: u32,
+        x: i32,
+        y: i32,
+        text: &[char],
+    ) -> io::Result<()> {
+        let Some(font_xid) = self.core.current_font else {
+            return Ok(());
+        };
+        let Some(target) = self.resolve_paint_target(host_xid) else {
+            return Ok(());
+        };
+        // Rasterise glyphs in a tight FreeType-borrow scope so the
+        // subsequent &mut self fill call doesn't conflict.
+        let mut spans: Vec<Rectangle16> = Vec::new();
+        let mut cursor_x = x;
+        {
+            let Some(fs) = self.core.fonts.get(&font_xid) else {
+                return Ok(());
+            };
+            let face = fs.face.borrow();
+            let default_ch = char::from_u32(u32::from(fs.metrics.default_char));
+            for &ch in text {
+                // Nonexistent chars draw the font's default_char; if
+                // that doesn't exist either, nothing is drawn (X11).
+                let (ch, ci) = match fs.char_info_cache.get(&ch) {
+                    Some(ci) => (ch, ci),
+                    None => {
+                        match default_ch.and_then(|d| fs.char_info_cache.get(&d).map(|ci| (d, ci)))
+                        {
+                            Some(pair) => pair,
+                            None => continue,
+                        }
+                    }
+                };
+                let _ = face.0.load_char(
+                    ch as usize,
+                    freetype::face::LoadFlag::RENDER | freetype::face::LoadFlag::TARGET_MONO,
+                );
+                let glyph = face.0.glyph();
+                glyph_mono_spans(
+                    &glyph.bitmap(),
+                    cursor_x + glyph.bitmap_left(),
+                    y - glyph.bitmap_top(),
+                    &mut spans,
+                );
+                cursor_x = cursor_x.saturating_add(ci.character_width as i32);
+            }
+        }
+        if spans.is_empty() {
+            return Ok(());
+        }
+        let clipped = self.intersect_with_current_clip_live(&spans);
+        self.fill_solid_rects(target, foreground, &clipped);
+        Ok(())
+    }
+
+    /// Legacy GPU-atlas text path — unreachable from the core
+    /// protocol since text moved to the span path; kept for the
+    /// engine plumbing until the atlas gets a new consumer or is
+    /// removed in a follow-up.
+    #[allow(dead_code)]
+    fn render_text_chars_v2_atlas(
         &mut self,
         host_xid: u32,
         foreground: u32,
@@ -5895,6 +5966,10 @@ impl KmsBackendV2 {
     /// per-call rect to an `engine.fill_rect` op via the same
     /// path `fill_rectangle` (Stage 2c) uses, so the bg drawn
     /// here lives on the same storage as the glyph quads.
+    /// Unused since ImageText moved to the rop span path (the bg
+    /// box goes through `fill_solid_rects` for clip + plane-mask);
+    /// kept with the atlas path until that's removed.
+    #[allow(dead_code)]
     fn fill_text_background(
         &mut self,
         host_xid: u32,
@@ -5943,6 +6018,124 @@ impl KmsBackendV2 {
             self.trace_simple(SubmitKind::FillOne, target.id, 1);
         }
         Ok(())
+    }
+
+    /// ImageText8/16 core: per X11 §8 the GC function and fill-style
+    /// are IGNORED (effective GXcopy, solid); plane-mask and clip
+    /// still apply. Port of Xorg miImageGlyphBlt (mi/miglblt.c:83):
+    /// ONE background box from the run's overall extents —
+    /// (x, y−font_ascent, overall_width, ascent+descent) — then the
+    /// fg glyphs, both through the rop span path with the function
+    /// temporarily forced to Copy.
+    fn image_text_common(
+        &mut self,
+        host_xid: u32,
+        foreground: u32,
+        background: u32,
+        x: i32,
+        y: i32,
+        chars: &[char],
+    ) -> io::Result<()> {
+        use yserver_core::backend::GcFunction;
+        let saved_function = self.core.current_function;
+        self.core.current_function = GcFunction::Copy;
+        if let Some(font_state) = self.core.current_font.and_then(|f| self.core.fonts.get(&f)) {
+            let total_width = text_advance(font_state, chars);
+            let ascent = i32::from(font_state.metrics.font_ascent);
+            let descent = i32::from(font_state.metrics.font_descent);
+            let bg_w = total_width.clamp(0, i32::from(i16::MAX));
+            let bg_h = (ascent + descent).clamp(0, i32::from(i16::MAX));
+            if bg_w > 0 && bg_h > 0 {
+                let bg = Rectangle16 {
+                    x: i16::try_from(x).unwrap_or(i16::MAX),
+                    y: i16::try_from(y - ascent).unwrap_or(i16::MAX),
+                    width: u16::try_from(bg_w).unwrap_or(u16::MAX),
+                    height: u16::try_from(bg_h).unwrap_or(u16::MAX),
+                };
+                if let Some(target) = self.resolve_paint_target(host_xid) {
+                    let clipped = self.intersect_with_current_clip_live(&[bg]);
+                    self.fill_solid_rects(target, background, &clipped);
+                }
+            }
+        }
+        let result = self.render_text_chars_v2(host_xid, foreground, x, y, chars);
+        self.core.current_function = saved_function;
+        result
+    }
+}
+
+/// Sum of character advances for a run, with the X11 nonexistent-
+/// char rule: missing chars use the font's default_char; if that's
+/// missing too they contribute 0 (drawn as nothing).
+fn text_advance(fs: &crate::kms::core::FontState, chars: &[char]) -> i32 {
+    let default_ci =
+        char::from_u32(u32::from(fs.metrics.default_char)).and_then(|d| fs.char_info_cache.get(&d));
+    chars
+        .iter()
+        .map(|ch| {
+            fs.char_info_cache
+                .get(ch)
+                .or(default_ci)
+                .map_or(0, |ci| i32::from(ci.character_width))
+        })
+        .sum()
+}
+
+/// Convert one rasterized glyph bitmap into horizontal pixel-run
+/// rectangles at (ox, oy), appended to `out`. Handles FreeType MONO
+/// (1 bpp, MSB-first, `pitch` bytes/row) and GRAY (8 bpp, threshold
+/// at 128 — only reachable if a driver ignores TARGET_MONO) pixel
+/// modes. Coordinates outside i16 range are clamped away (X11
+/// drawables can't exceed i16 anyway).
+fn glyph_mono_spans(bitmap: &freetype::Bitmap, ox: i32, oy: i32, out: &mut Vec<Rectangle16>) {
+    let w = bitmap.width() as usize;
+    let h = bitmap.rows() as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let pitch = bitmap.pitch();
+    let buf = bitmap.buffer();
+    let mono = matches!(bitmap.pixel_mode(), Ok(freetype::bitmap::PixelMode::Mono));
+    for row in 0..h {
+        let row_start = if pitch >= 0 {
+            row * pitch as usize
+        } else {
+            (h - 1 - row) * (pitch as isize).unsigned_abs()
+        };
+        let set_at = |col: usize| -> bool {
+            if mono {
+                let byte = buf.get(row_start + (col >> 3)).copied().unwrap_or(0);
+                byte & (0x80 >> (col & 7)) != 0
+            } else {
+                buf.get(row_start + col).copied().unwrap_or(0) >= 128
+            }
+        };
+        let y = oy + row as i32;
+        if y < i32::from(i16::MIN) || y > i32::from(i16::MAX) {
+            continue;
+        }
+        let mut col = 0usize;
+        while col < w {
+            if !set_at(col) {
+                col += 1;
+                continue;
+            }
+            let run_start = col;
+            while col < w && set_at(col) {
+                col += 1;
+            }
+            let x = ox + run_start as i32;
+            let width = (col - run_start) as u32;
+            if x > i32::from(i16::MAX) || x + width as i32 <= i32::from(i16::MIN) {
+                continue;
+            }
+            out.push(Rectangle16 {
+                x: i16::try_from(x).unwrap_or(i16::MIN),
+                y: y as i16,
+                width: u16::try_from(width).unwrap_or(u16::MAX),
+                height: 1,
+            });
+        }
     }
 }
 
@@ -9165,6 +9358,21 @@ impl Backend for KmsBackendV2 {
         Ok(())
     }
 
+    fn set_font_path(
+        &mut self,
+        _origin: Option<OriginContext>,
+        paths: &[String],
+    ) -> Result<(), usize> {
+        self.core
+            .font_loader
+            .set_font_path(paths)
+            .map_err(|bad| paths.iter().position(|p| *p == bad).unwrap_or(paths.len()))
+    }
+
+    fn font_path(&self) -> Vec<String> {
+        self.core.font_loader.font_path.clone()
+    }
+
     fn create_cursor(
         &mut self,
         _origin: Option<OriginContext>,
@@ -10728,17 +10936,7 @@ impl Backend for KmsBackendV2 {
                 if let Some(font_state) =
                     self.core.current_font.and_then(|f| self.core.fonts.get(&f))
                 {
-                    let advance: i32 = text
-                        .iter()
-                        .map(|&b| {
-                            font_state
-                                .char_info_cache
-                                .get(&(b as char))
-                                .map(|ci| ci.character_width as i32)
-                                .unwrap_or(6)
-                        })
-                        .sum();
-                    cursor_x = cursor_x.saturating_add(advance);
+                    cursor_x = cursor_x.saturating_add(text_advance(font_state, &chars));
                 }
             }
             items = &items[2 + len..];
@@ -10792,18 +10990,7 @@ impl Backend for KmsBackendV2 {
                 if let Some(font_state) =
                     self.core.current_font.and_then(|f| self.core.fonts.get(&f))
                 {
-                    cursor_x = cursor_x.saturating_add(
-                        chars
-                            .iter()
-                            .map(|ch| {
-                                font_state
-                                    .char_info_cache
-                                    .get(ch)
-                                    .map(|ci| ci.character_width as i32)
-                                    .unwrap_or(6)
-                            })
-                            .sum::<i32>(),
-                    );
+                    cursor_x = cursor_x.saturating_add(text_advance(font_state, &chars));
                 }
             }
             items = &items[needed..];
@@ -10826,36 +11013,9 @@ impl Backend for KmsBackendV2 {
         }
         let x = i16::from_le_bytes([body[8], body[9]]) as i32;
         let y = i16::from_le_bytes([body[10], body[11]]) as i32;
-
-        // Background rect from font metrics (ascent + descent).
-        // Stage 3a: lower this to a single fill_rect via the
-        // engine (Stage 2c op); GC-clip intersection is the
-        // backend's concern (current_clip stored on KmsCore).
-        if let Some(font_state) = self.core.current_font.and_then(|f| self.core.fonts.get(&f)) {
-            let total_width: i32 = body[12..]
-                .iter()
-                .take(text_len as usize)
-                .map(|&b| {
-                    font_state
-                        .char_info_cache
-                        .get(&(b as char))
-                        .map(|ci| ci.character_width as i32)
-                        .unwrap_or(6)
-                })
-                .sum();
-            let ascent = font_state.metrics.font_ascent as i32;
-            let descent = font_state.metrics.font_descent as i32;
-            let bg_x = x;
-            let bg_y = y - ascent;
-            let bg_w = total_width.max(0);
-            let bg_h = (ascent + descent).max(0);
-            self.fill_text_background(host_xid, background, bg_x, bg_y, bg_w, bg_h)?;
-        }
-
         let end = (12usize + text_len as usize).min(body.len());
-        let text = &body[12..end];
-        let chars: Vec<char> = text.iter().map(|&b| b as char).collect();
-        self.render_text_chars_v2(host_xid, foreground, x, y, &chars)
+        let chars: Vec<char> = body[12..end].iter().map(|&b| b as char).collect();
+        self.image_text_common(host_xid, foreground, background, x, y, &chars)
     }
 
     fn image_text16(
@@ -10882,28 +11042,7 @@ impl Backend for KmsBackendV2 {
             pos += 2;
             chars.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
         }
-
-        if let Some(font_state) = self.core.current_font.and_then(|f| self.core.fonts.get(&f)) {
-            let total_width: i32 = chars
-                .iter()
-                .map(|ch| {
-                    font_state
-                        .char_info_cache
-                        .get(ch)
-                        .map(|ci| ci.character_width as i32)
-                        .unwrap_or(6)
-                })
-                .sum();
-            let ascent = font_state.metrics.font_ascent as i32;
-            let descent = font_state.metrics.font_descent as i32;
-            let bg_x = x;
-            let bg_y = y - ascent;
-            let bg_w = total_width.max(0);
-            let bg_h = (ascent + descent).max(0);
-            self.fill_text_background(host_xid, background, bg_x, bg_y, bg_w, bg_h)?;
-        }
-
-        self.render_text_chars_v2(host_xid, foreground, x, y, &chars)
+        self.image_text_common(host_xid, foreground, background, x, y, &chars)
     }
 
     // ── RENDER ──────────────────────────────────────────────────
@@ -13192,15 +13331,19 @@ impl Backend for KmsBackendV2 {
         pattern: &str,
     ) -> io::Result<Vec<u8>> {
         let cap = usize::from(max_names);
-        let names: Vec<&str> = self
-            .core
-            .font_loader
-            .catalog
-            .iter()
-            .map(String::as_str)
-            .filter(|name| xlfd_pattern_matches(pattern, name))
-            .take(cap)
-            .collect();
+        // Font-path (fonts.dir/alias) names first, then the built-ins
+        // catalog — ONE global max_names budget across the ordered
+        // walk (Xorg traverses FPEs in path order with one count).
+        let mut names: Vec<String> = self.core.font_loader.path_font_names(pattern);
+        names.extend(
+            self.core
+                .font_loader
+                .catalog
+                .iter()
+                .filter(|name| xlfd_pattern_matches(pattern, name))
+                .cloned(),
+        );
+        names.truncate(cap);
 
         let mut name_data: Vec<u8> = Vec::new();
         for name in &names {
@@ -13227,18 +13370,29 @@ impl Backend for KmsBackendV2 {
         intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Vec<Vec<u8>>> {
         let cap = usize::from(max_names);
-        let matched: Vec<String> = self
-            .core
-            .font_loader
-            .catalog
-            .iter()
-            .filter(|name| xlfd_pattern_matches(pattern, name))
-            .take(cap)
-            .cloned()
-            .collect();
+        // Path fonts first, then built-ins — one global budget
+        // (mirrors list_fonts_proxy ordering so the two requests
+        // agree on the visible font set).
+        let mut matched: Vec<String> = self.core.font_loader.path_font_names(pattern);
+        matched.extend(
+            self.core
+                .font_loader
+                .catalog
+                .iter()
+                .filter(|name| xlfd_pattern_matches(pattern, name))
+                .cloned(),
+        );
+        matched.truncate(cap);
 
         let mut entries: Vec<(String, FontMetrics)> = Vec::with_capacity(matched.len());
         for name in matched {
+            // fonts.dir names go out VERBATIM (Xorg FPE behavior);
+            // the alias→XLFD rewrite below applies only to built-in
+            // aliases, which carry no charset of their own.
+            let is_path_font = matches!(
+                self.core.font_loader.resolve(&name),
+                Some(crate::kms::core::FontResolution::File { .. })
+            );
             match self.core.font_loader.open_font(&name) {
                 Ok((_face, mut metrics, _cache)) => {
                     // Alias entries ("fixed"/"cursor"/"nil2") must go
@@ -13246,21 +13400,48 @@ impl Backend for KmsBackendV2 {
                     // parse a charset and re-open the exact name —
                     // see FontLoader::alias_to_xlfd (e16-in-vng
                     // XCreateFontSet NULL regression).
-                    let wire_name = if crate::kms::core::FontLoader::is_xlfd_pattern(&name) {
-                        name
-                    } else {
-                        crate::kms::core::FontLoader::alias_to_xlfd(&name, &metrics)
-                    };
-                    // FONT property (XA_FONT=18 → atom of the XLFD).
+                    let wire_name =
+                        if is_path_font || crate::kms::core::FontLoader::is_xlfd_pattern(&name) {
+                            name
+                        } else {
+                            crate::kms::core::FontLoader::alias_to_xlfd(&name, &metrics)
+                        };
+                    // Properties: file-embedded (BDF/PCF) ones when
+                    // present, interned here; always ensure FONT
+                    // (XA_FONT=18 → atom of the wire name) —
                     // libX11's XCreateFontSet resolves non-XLFD base
                     // names EXCLUSIVELY through this property
                     // (omGeneric.c get_prop_name reads XA_FONT off the
                     // first reply and GetAtomName's it); the reply
                     // name alone is not consulted on that path.
-                    let font_atom = intern_atom(&wire_name);
-                    let mut props = Vec::with_capacity(8);
-                    props.extend_from_slice(&18u32.to_le_bytes()); // XA_FONT
-                    props.extend_from_slice(&font_atom.to_le_bytes());
+                    let named = std::mem::take(&mut metrics.named_properties);
+                    let mut props = Vec::with_capacity(named.len() * 8 + 8);
+                    let mut has_font = false;
+                    for (pname, value) in &named {
+                        if pname == "FONT" {
+                            has_font = true;
+                        }
+                        // XA_FONT is predefined (18) — don't depend
+                        // on the callback knowing the well-known set.
+                        let name_atom = if pname == "FONT" {
+                            18
+                        } else {
+                            intern_atom(pname)
+                        };
+                        let v: u32 = match value {
+                            yserver_protocol::x11::FontPropValue::Card(c) => *c,
+                            #[allow(clippy::cast_sign_loss)]
+                            yserver_protocol::x11::FontPropValue::Int(i) => *i as u32,
+                            yserver_protocol::x11::FontPropValue::Str(s) => intern_atom(s),
+                        };
+                        props.extend_from_slice(&name_atom.to_le_bytes());
+                        props.extend_from_slice(&v.to_le_bytes());
+                    }
+                    if !has_font {
+                        let font_atom = intern_atom(&wire_name);
+                        props.extend_from_slice(&18u32.to_le_bytes()); // XA_FONT
+                        props.extend_from_slice(&font_atom.to_le_bytes());
+                    }
                     metrics.properties = props;
                     entries.push((wire_name, metrics));
                 }
@@ -13994,6 +14175,16 @@ mod tests {
     /// round-trip through open_font.
     #[test]
     fn v2_list_fonts_with_info_resolves_alias_to_xlfd_name() {
+        // Post-font-path rework, "fixed" may resolve two ways:
+        //  - via a real font-path dir (e.g. /usr/share/fonts/misc
+        //    fonts.alias) → reply name "fixed" VERBATIM (Xorg FPE
+        //    behavior) with the PCF's own FONT property carrying the
+        //    full XLFD;
+        //  - via built-ins (no misc dir on the machine) → reply name
+        //    is the synthesized charset-bearing XLFD.
+        // The libX11 guarantee e16 needs (omGeneric.c get_prop_name)
+        // is the FONT PROPERTY: XA_FONT (18) → atom whose string is a
+        // full XLFD with a charset tail. Pin that, not the name shape.
         let mut b = KmsBackendV2::for_tests();
         let mut interned: Vec<String> = Vec::new();
         let replies = b
@@ -14012,43 +14203,49 @@ mod tests {
         let info = &replies[0];
         let name_len = usize::from(info[1]);
         let n_props = usize::from(u16::from_le_bytes([info[46], info[47]]));
-        assert_eq!(n_props, 1, "exactly the FONT property");
-        let prop_name = u32::from_le_bytes([info[60], info[61], info[62], info[63]]);
-        let prop_value = u32::from_le_bytes([info[64], info[65], info[66], info[67]]);
-        assert_eq!(prop_name, 18, "property name must be XA_FONT (18)");
-        assert_eq!(
-            prop_value, 0x78,
-            "FONT property value must be the interned atom of the XLFD"
-        );
-        let name_off = 60 + n_props * 8;
-        let name = std::str::from_utf8(&info[name_off..name_off + name_len]).expect("utf8 name");
-        assert_eq!(
-            interned.first().map(String::as_str),
-            Some(name),
-            "the interned FONT string must be the wire name itself"
-        );
+        assert!(n_props >= 1, "at least the FONT property");
+        let mut font_value_atom = None;
+        for i in 0..n_props {
+            let off = 60 + i * 8;
+            let prop_name =
+                u32::from_le_bytes([info[off], info[off + 1], info[off + 2], info[off + 3]]);
+            if prop_name == 18 {
+                font_value_atom = Some(u32::from_le_bytes([
+                    info[off + 4],
+                    info[off + 5],
+                    info[off + 6],
+                    info[off + 7],
+                ]));
+            }
+        }
+        let font_value_atom = font_value_atom.expect("XA_FONT (18) property must be present");
+        // Map the mock-interned atom id back to its string.
+        let idx = usize::try_from(font_value_atom - 0x78).expect("FONT value is mock-interned");
+        let font_xlfd = interned.get(idx).expect("interned FONT value").clone();
         assert!(
-            name.starts_with('-'),
-            "alias 'fixed' must resolve to a full XLFD reply name; got {name:?}"
+            font_xlfd.starts_with('-'),
+            "FONT property must be a full XLFD; got {font_xlfd:?}"
         );
-        let fields: Vec<&str> = name.split('-').collect();
+        let fields: Vec<&str> = font_xlfd.split('-').collect();
         assert_eq!(
             fields.len(),
             15,
-            "XLFD has 14 fields (15 split parts with the leading dash); got {name:?}"
+            "XLFD has 14 fields (15 split parts with the leading dash); got {font_xlfd:?}"
         );
-        assert_eq!(
-            (fields[13], fields[14]),
-            ("iso8859", "1"),
-            "charset registry-encoding tail must be iso8859-1 so the \
-             C-locale XLC charset binds; got {name:?}"
+        let registry = fields[13].to_ascii_lowercase();
+        assert!(
+            registry.starts_with("iso"),
+            "charset registry tail must be an iso charset so the \
+             C-locale XLC charset binds; got {font_xlfd:?}"
         );
-        // The exact reply name must be openable — XCreateFontSet
-        // OpenFonts it verbatim.
+        // The reply NAME must be openable — XCreateFontSet OpenFonts
+        // it verbatim (alias or XLFD alike).
+        let name_off = 60 + n_props * 8;
+        let name = std::str::from_utf8(&info[name_off..name_off + name_len]).expect("utf8 name");
         b.core
             .font_loader
             .open_font(name)
-            .expect("synthesized XLFD must round-trip through open_font");
+            .expect("LFWI reply name must round-trip through open_font");
     }
 
     /// Telemetry: counter sites fire at the Backend trait
