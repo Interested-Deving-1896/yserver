@@ -245,8 +245,8 @@ pub fn process_request(
         23 => handle_get_selection_owner(state, client_id, sequence, body),
         40 => handle_translate_coordinates(state, client_id, sequence, body),
         // ── grabs (pure state mutation on ServerState.{pointer,key}_grabs) ──
-        26 => handle_grab_pointer(state, backend, origin, client_id, sequence, header, body),
-        27 => handle_ungrab_pointer(state, backend, origin, client_id, sequence, body),
+        26 => handle_grab_pointer(state, backend, client_id, sequence, header, body),
+        27 => handle_ungrab_pointer(state, client_id, sequence, body),
         28 => handle_grab_button(state, client_id, sequence, header, body),
         29 => handle_ungrab_button(state, client_id, sequence, header, body),
         30 => handle_change_active_pointer_grab(state, client_id, sequence, body),
@@ -1306,7 +1306,7 @@ fn destroy_window_subtree(
     // Active core grabs whose grab window just died deactivate (Xorg
     // DeleteWindowFromAnyEvents) — the destroyed windows are gone from
     // the resource table now, so the viewability probe sees them off.
-    release_core_grabs_for_unviewable(state, backend, origin);
+    release_core_grabs_for_unviewable(state);
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -9928,6 +9928,7 @@ fn handle_xi2_request(
                             event_mask: 0xFFFF_FFFF,
                             pointer_mode: grab_mode,
                             keyboard_mode: 1,
+                            confine_to: ResourceId(0),
                             via_xi2: true,
                         });
                     }
@@ -14008,6 +14009,13 @@ fn handle_configure_window(
             }
         }
     }
+    // A confined pointer follows its confine window — re-clamp after
+    // any geometry change (Xorg ConfineCursorToWindow on configure;
+    // XGrabButton-25 moves confine_to and expects the pointer pulled
+    // along).
+    if state.pointer_confine_to.0 != 0 {
+        confine_pointer_now(state, backend);
+    }
     Ok(RequestOutcome::Handled)
 }
 
@@ -16825,7 +16833,7 @@ fn handle_unmap_window(
             revert_core_focus_if_unviewable(state);
             // Active grabs on a window that just became unviewable
             // deactivate too (same Xorg path).
-            release_core_grabs_for_unviewable(state, backend, origin);
+            release_core_grabs_for_unviewable(state);
         }
     }
     debug!("client {} #{} UnmapWindow", client_id.0, sequence.0);
@@ -16880,7 +16888,7 @@ fn handle_unmap_subwindows(
     }
     crate::core_loop::xi1_focus::revert_unviewable_focus(state);
     revert_core_focus_if_unviewable(state);
-    release_core_grabs_for_unviewable(state, backend, origin);
+    release_core_grabs_for_unviewable(state);
     debug!("client {} #{} UnmapSubwindows", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
 }
@@ -20949,7 +20957,6 @@ const ALL_MODIFIERS_MASK: u16 = 0x00FF;
 fn handle_grab_pointer(
     state: &mut ServerState,
     backend: &mut dyn Backend,
-    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -21105,20 +21112,17 @@ fn handle_grab_pointer(
                 body[6] == 0,
                 body[7] == 0,
             );
-            // Synthesised crossings on grab activation — marco's title-bar
-            // popup menu uses core GrabPointer/GrabKeyboard (not XI2). GTK3
-            // popup machinery needs Leave(mode=NotifyGrab) on the previous
-            // grab window followed by Enter(mode=NotifyGrab) on the new
-            // grab window. Same shape as the XI2 path; see comments there.
-            emit_core_grab_activation_crossings(
-                state,
-                backend,
-                origin,
-                client_id,
-                prev_grab_window,
-                grab_window,
-                CrossingKind::Pointer,
-            );
+            // Xorg ActivatePointerGrab: DoEnterLeaveEvents(oldWin →
+            // grab window, NotifyGrab), where oldWin is the prior
+            // grab's window when re-grabbing, else the pointer window.
+            // marco's title-bar popup and GTK3 menus key off these.
+            let from_win = prev_grab_window
+                .unwrap_or_else(|| crate::core_loop::key_fanout::deepest_window_at_pointer(state));
+            emit_core_pointer_grab_chain(state, from_win, grab_window, 1);
+            // ConfineCursorToWindow: record the confinement and pull
+            // the pointer inside the confine window if it is outside.
+            state.pointer_confine_to = confine_to;
+            confine_pointer_now(state, backend);
         }
     }
     debug!(
@@ -21134,120 +21138,8 @@ fn handle_grab_pointer(
     Ok(write_to_client(client, client_id, &buf))
 }
 
-/// Which mode of crossing the synthesised activation emits — pointer
-/// uses EnterNotify/LeaveNotify (opcodes 7/8); keyboard uses
-/// FocusIn/FocusOut (opcodes 9/10). Matches Xorg
-/// `Xi/exevents.c::ActivatePointerGrab` / `ActivateKeyboardGrab`.
-#[derive(Clone, Copy)]
-enum CrossingKind {
-    Pointer,
-}
-
-fn emit_core_grab_activation_crossings(
-    state: &mut ServerState,
-    backend: &mut dyn Backend,
-    origin: Option<OriginContext>,
-    client_id: ClientId,
-    prev_grab_window: Option<ResourceId>,
-    new_grab_window: ResourceId,
-    kind: CrossingKind,
-) {
-    let pointer_xy = backend
-        .query_pointer(origin)
-        .ok()
-        .map(|p| (p.win_x, p.win_y))
-        .unwrap_or((0, 0));
-    let (root_x, root_y) = pointer_xy;
-    let server_time = state.timestamp_now();
-    let (leave_evtype, enter_evtype) = match kind {
-        CrossingKind::Pointer => (8u8, 7u8), // LeaveNotify / EnterNotify
-    };
-    let emit_to_client = |state: &mut ServerState, evtype: u8, target: ResourceId| {
-        // Per X11 spec (Xorg `dix/enterleave.c:606` →
-        // `CoreEnterLeaveEvents` → `CoreEnterNotifies` →
-        // `DeliverEventsToWindow`): grab-activation crossings flow
-        // through the normal event-mask filter. The crossing fires
-        // to the grabber ONLY if the grabber selected the
-        // corresponding mask on `target`.
-        //
-        //   EnterNotify (7)  → EnterWindowMask  (0x10)
-        //   LeaveNotify (8)  → LeaveWindowMask  (0x20)
-        //   FocusIn     (9)  → FocusChangeMask  (0x20_0000)
-        //   FocusOut    (10) → FocusChangeMask  (0x20_0000)
-        //
-        // marco / GTK3 popups select EnterWindowMask on their popup
-        // and get the crossings; xts test harnesses don't and so
-        // see only the reply on the wire (which is what they
-        // expect — the reply for a sync request must precede any
-        // side-effect events the request triggers, and "no side-
-        // effect events" trivially satisfies that). Pre-fix
-        // yserver fanned the crossings unconditionally, putting
-        // `EnterNotify` on the wire before the GrabPointer reply
-        // and breaking xts's `GrabPointer` / `GrabKeyboard` /
-        // `AllowEvents` / `ChangeActivePointerGrab` tests.
-        let required_mask: u32 = match evtype {
-            7 => 0x10,
-            8 => 0x20,
-            9 | 10 => 0x20_0000,
-            _ => return,
-        };
-        let selected = state
-            .clients
-            .get(&client_id.0)
-            .and_then(|c| c.event_masks.get(&target).copied())
-            .is_some_and(|m| m & required_mask != 0);
-        if !selected {
-            return;
-        }
-        let (origin_x, origin_y) = state.resources.window_absolute_position(target);
-        let event_x = i16::try_from(i32::from(root_x).saturating_sub(origin_x)).unwrap_or(i16::MAX);
-        let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y)).unwrap_or(i16::MAX);
-        let _dropped = fanout_event_to_clients(state, &[client_id], |out, seq, order| {
-            if evtype == 7 || evtype == 8 {
-                let crossing = yserver_protocol::x11::CrossingEvent {
-                    sequence: seq,
-                    time: server_time,
-                    root: ROOT_WINDOW,
-                    event: target,
-                    child: ResourceId(0),
-                    root_x,
-                    root_y,
-                    event_x,
-                    event_y,
-                    state: 0,
-                    detail: 3, // NotifyNonlinear
-                    mode: 1,   // NotifyGrab
-                };
-                if evtype == 7 {
-                    x11::encode_enter_notify_event(out, order, crossing);
-                } else {
-                    x11::encode_leave_notify_event(out, order, crossing);
-                }
-            } else {
-                // FocusIn(9) / FocusOut(10) wire shape (32 bytes):
-                //   1:opcode, 1:detail, 2:sequence, 4:window, 1:mode,
-                //   23:pad.
-                out.push(evtype);
-                out.push(3); // detail = NotifyNonlinear
-                yserver_protocol::x11::write_u16(order, out, seq.0);
-                yserver_protocol::x11::write_u32(order, out, target.0);
-                out.push(1); // mode = NotifyGrab
-                out.extend_from_slice(&[0u8; 23]);
-            }
-        });
-    };
-    if let Some(prev) = prev_grab_window
-        && prev != new_grab_window
-    {
-        emit_to_client(state, leave_evtype, prev);
-    }
-    emit_to_client(state, enter_evtype, new_grab_window);
-}
-
 fn handle_ungrab_pointer(
     state: &mut ServerState,
-    backend: &mut dyn Backend,
-    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
@@ -21280,7 +21172,7 @@ fn handle_ungrab_pointer(
         );
         return Ok(RequestOutcome::Handled);
     }
-    deactivate_core_pointer_grab(state, backend, origin, client_id);
+    deactivate_core_pointer_grab(state, client_id);
     debug!("client {} #{} UngrabPointer", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
 }
@@ -21288,12 +21180,8 @@ fn handle_ungrab_pointer(
 /// Tear down the active core pointer grab held by `client_id` —
 /// shared by UngrabPointer and the unmap/destroy deactivation path
 /// (Xorg `DeactivateGrab` reached from `DeleteWindowFromAnyEvents`).
-fn deactivate_core_pointer_grab(
-    state: &mut ServerState,
-    backend: &mut dyn Backend,
-    origin: Option<OriginContext>,
-    client_id: ClientId,
-) {
+fn deactivate_core_pointer_grab(state: &mut ServerState, client_id: ClientId) {
+    state.pointer_confine_to = ResourceId(0);
     let prev_grab_window = state
         .active_pointer_grab
         .filter(|g| g.owner == client_id)
@@ -21310,84 +21198,90 @@ fn deactivate_core_pointer_grab(
         client_id,
     );
     if let Some(prev) = prev_grab_window {
-        emit_core_grab_deactivation_crossing(
-            state,
-            backend,
-            origin,
-            client_id,
-            prev,
-            CrossingKind::Pointer,
-        );
+        // Xorg DeactivatePointerGrab: DoEnterLeaveEvents(grab window
+        // → pointer window, NotifyUngrab).
+        let to_win = crate::core_loop::key_fanout::deepest_window_at_pointer(state);
+        emit_core_pointer_grab_chain(state, prev, to_win, 2);
     }
 }
 
-fn emit_core_grab_deactivation_crossing(
-    state: &mut ServerState,
-    backend: &mut dyn Backend,
-    origin: Option<OriginContext>,
-    client_id: ClientId,
-    prev_grab_window: ResourceId,
-    kind: CrossingKind,
-) {
-    let evtype: u8 = match kind {
-        CrossingKind::Pointer => 8, // LeaveNotify
-    };
-    // Same mask-respecting filter as `emit_core_grab_activation_crossings`
-    // — xts's `UngrabPointer` test (Xproto case 116) verifies that
-    // `UngrabPointer` from a client with NO event mask selected
-    // produces nothing on the wire. Pre-fix yserver fanned
-    // `LeaveNotify` unconditionally to the ungrabber. Xorg filters
-    // through the standard delivery path; we mirror that here.
-    let required_mask: u32 = match evtype {
-        8 => 0x20,       // LeaveWindowMask
-        10 => 0x20_0000, // FocusChangeMask
-        _ => return,
-    };
-    let selected = state
-        .clients
-        .get(&client_id.0)
-        .and_then(|c| c.event_masks.get(&prev_grab_window).copied())
-        .is_some_and(|m| m & required_mask != 0);
-    if !selected {
+/// Pull the pointer inside the current confinement rectangle when it
+/// sits outside — Xorg `ConfineCursorToWindow` → `CheckPhysLimits`
+/// (the warp generates motion/crossing events through the normal
+/// input path). Used at grab activation and when the confine window
+/// moves/resizes.
+pub(crate) fn confine_pointer_now(state: &mut ServerState, backend: &mut dyn Backend) {
+    let win = state.pointer_confine_to;
+    if win.0 == 0 {
         return;
     }
-    let pointer_xy = backend
-        .query_pointer(origin)
-        .ok()
-        .map(|p| (p.win_x, p.win_y))
-        .unwrap_or((0, 0));
-    let (root_x, root_y) = pointer_xy;
+    let Some(w) = state.resources.window(win) else {
+        return;
+    };
+    if w.map_state != crate::resources::MapState::Viewable {
+        return;
+    }
+    let (x0, y0) = state.resources.window_absolute_position(win);
+    let (x1, y1) = (x0 + i32::from(w.width), y0 + i32::from(w.height));
+    let (px, py) = state.pointer_root;
+    let cx = i32::from(px).clamp(x0, (x1 - 1).max(x0));
+    let cy = i32::from(py).clamp(y0, (y1 - 1).max(y0));
+    if cx != i32::from(px) || cy != i32::from(py) {
+        debug!(
+            "confine_pointer_now: warping ({px},{py}) -> ({cx},{cy}) inside 0x{:x}",
+            win.0
+        );
+        backend.warp_pointer_root(state, cx, cy);
+    }
+}
+
+/// Full Enter/Leave chain for pointer-grab activation/deactivation —
+/// Xorg `ActivatePointerGrab`/`DeactivatePointerGrab` →
+/// `DoEnterLeaveEvents(sprite.win ↔ grab window, NotifyGrab/Ungrab)`.
+/// Events flow through the normal per-window mask filter (EnterWindow
+/// 0x10 / LeaveWindow 0x20) to every selecting client.
+pub(crate) fn emit_core_pointer_grab_chain(
+    state: &mut ServerState,
+    from_win: ResourceId,
+    to_win: ResourceId,
+    mode: u8,
+) {
+    if from_win == to_win {
+        return;
+    }
+    let chain = crate::crossings::normal_mode_crossings(state, from_win, to_win);
+    let (root_x, root_y) = state.pointer_root;
     let server_time = state.timestamp_now();
-    let (origin_x, origin_y) = state.resources.window_absolute_position(prev_grab_window);
-    let event_x = i16::try_from(i32::from(root_x).saturating_sub(origin_x)).unwrap_or(i16::MAX);
-    let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y)).unwrap_or(i16::MAX);
-    let _dropped = fanout_event_to_clients(state, &[client_id], |out, seq, order| {
-        if evtype == 8 {
+    for e in chain {
+        let (mask, enter) = match e.kind {
+            crate::crossings::CrossingKind::Enter => (0x10u32, true),
+            crate::crossings::CrossingKind::Leave => (0x20u32, false),
+        };
+        let (ox, oy) = state.resources.window_absolute_position(e.window);
+        let event_x = i16::try_from(i32::from(root_x) - ox).unwrap_or(i16::MAX);
+        let event_y = i16::try_from(i32::from(root_y) - oy).unwrap_or(i16::MAX);
+        let _dropped = emit_window_event_to_state(state, e.window, mask, |buf, seq, order| {
             let crossing = yserver_protocol::x11::CrossingEvent {
                 sequence: seq,
                 time: server_time,
                 root: ROOT_WINDOW,
-                event: prev_grab_window,
-                child: ResourceId(0),
+                event: e.window,
+                child: e.child,
                 root_x,
                 root_y,
                 event_x,
                 event_y,
                 state: 0,
-                detail: 3, // NotifyNonlinear
-                mode: 2,   // NotifyUngrab
+                detail: e.detail,
+                mode,
             };
-            x11::encode_leave_notify_event(out, order, crossing);
-        } else {
-            // FocusOut wire (32 bytes).
-            out.push(evtype);
-            out.push(3); // detail = NotifyNonlinear
-            yserver_protocol::x11::write_u16(order, out, seq.0);
-            yserver_protocol::x11::write_u32(order, out, prev_grab_window.0);
-            out.push(2); // mode = NotifyUngrab
-            out.extend_from_slice(&[0u8; 23]);
-        }
-    });
+            if enter {
+                x11::encode_enter_notify_event(buf, order, crossing);
+            } else {
+                x11::encode_leave_notify_event(buf, order, crossing);
+            }
+        });
+    }
 }
 
 fn handle_grab_button(
@@ -21524,6 +21418,7 @@ fn handle_grab_button(
             event_mask,
             pointer_mode,
             keyboard_mode,
+            confine_to,
             via_xi2: false,
         });
         debug!(
@@ -21817,11 +21712,7 @@ fn deactivate_core_keyboard_grab(state: &mut ServerState, client_id: ClientId) {
 /// whose grab window stopped being viewable (unmap of it or an
 /// ancestor, or destroy) deactivates. Call after the map-state /
 /// resource changes have landed.
-fn release_core_grabs_for_unviewable(
-    state: &mut ServerState,
-    backend: &mut dyn Backend,
-    origin: Option<OriginContext>,
-) {
+fn release_core_grabs_for_unviewable(state: &mut ServerState) {
     let viewable = |state: &ServerState, w: ResourceId| {
         state
             .resources
@@ -21829,9 +21720,10 @@ fn release_core_grabs_for_unviewable(
             .is_some_and(|win| win.map_state == crate::resources::MapState::Viewable)
     };
     if let Some((owner, grab_window)) = state.pointer_grab
-        && !viewable(state, grab_window)
+        && (!viewable(state, grab_window)
+            || (state.pointer_confine_to.0 != 0 && !viewable(state, state.pointer_confine_to)))
     {
-        deactivate_core_pointer_grab(state, backend, origin, owner);
+        deactivate_core_pointer_grab(state, owner);
     }
     if let Some(g) = state.active_keyboard_grab
         && !viewable(state, g.grab_window)
@@ -29766,6 +29658,7 @@ mod tests {
             event_mask: 0xFFFF_FFFF,
             pointer_mode: 0,
             keyboard_mode: 1,
+            confine_to: ResourceId(0),
             via_xi2: true,
         });
         Backend::register_top_level(&mut backend, None, ResourceId(TARGET_WIN), HOST_XID)
@@ -29884,6 +29777,7 @@ mod tests {
             event_mask: 0xFFFF_FFFF,
             pointer_mode: 0, // Synchronous → triggers freeze
             keyboard_mode: 1,
+            confine_to: ResourceId(0),
             via_xi2: true,
         });
         Backend::register_top_level(&mut backend, None, ResourceId(WINDOW_XID), HOST_XID)
@@ -30028,6 +29922,7 @@ mod tests {
             event_mask: 0xFFFF_FFFF,
             pointer_mode: 0,
             keyboard_mode: 1,
+            confine_to: ResourceId(0),
             via_xi2: true,
         });
         Backend::register_top_level(&mut backend, None, ResourceId(GRAB_WIN), HOST_XID)
@@ -37017,7 +36912,6 @@ mod tests {
         handle_grab_pointer(
             &mut state,
             &mut backend,
-            None,
             ClientId(CLIENT_ID),
             SequenceNumber(11),
             RequestHeader {
@@ -37100,9 +36994,12 @@ mod tests {
             },
         );
         let _ = state.resources.map_window(ResourceId(GRAB_WIN));
-        // marco/GTK3 popup pattern: select EnterWindowMask (0x10)
-        // on the popup window. Now grab-activation EnterNotify
-        // MUST fire to drive GTK3's hover machinery.
+        // marco/GTK3 popup pattern: the pointer is over the panel (the
+        // root here), NOT over the popup being grabbed — grab
+        // activation must emit Enter(NotifyGrab) on the popup for
+        // GTK3's hover machinery. (With the pointer already inside the
+        // grab window Xorg emits nothing: DoEnterLeaveEvents from==to.)
+        state.pointer_root = (500, 500);
         state
             .clients
             .get_mut(&CLIENT_ID)
@@ -37122,7 +37019,6 @@ mod tests {
         handle_grab_pointer(
             &mut state,
             &mut backend,
-            None,
             ClientId(CLIENT_ID),
             SequenceNumber(13),
             RequestHeader {
@@ -37168,7 +37064,7 @@ mod tests {
 
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, CLIENT_ID);
-        let mut backend = RecordingBackend::new();
+        let _backend = RecordingBackend::new();
 
         state.resources.create_window(
             yserver_protocol::x11::ClientId(CLIENT_ID),
@@ -37204,8 +37100,6 @@ mod tests {
 
         handle_ungrab_pointer(
             &mut state,
-            &mut backend,
-            None,
             ClientId(CLIENT_ID),
             SequenceNumber(17),
             &[0u8; 4],

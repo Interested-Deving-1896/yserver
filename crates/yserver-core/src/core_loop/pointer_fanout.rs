@@ -50,6 +50,51 @@ pub fn pointer_event_fanout_to_state(
     handle_grabs: bool,
     is_replay: bool,
 ) -> Vec<ClientId> {
+    // SetPointerMapping: physical button → logical button before any
+    // routing (Xorg UpdateDeviceState applies b->map at event
+    // generation). A 0 entry disables the button — the event vanishes.
+    let mut event = event;
+    if matches!(
+        event.kind,
+        PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
+    ) && let Some(map) = &state.pointer_mapping_override
+        && let Some(&mapped) = map.get(usize::from(event.detail).wrapping_sub(1))
+    {
+        if mapped == 0 {
+            return Vec::new();
+        }
+        event.detail = mapped;
+    }
+    // Pointer confinement (Xorg CheckPhysLimits): while a confined
+    // grab is active, motion outside the confine rectangle is
+    // replaced by a warp to the nearest inside point; press/release
+    // coordinates clamp in place.
+    if !is_replay
+        && state.pointer_confine_to.0 != 0
+        && let Some(w) = state.resources.window(state.pointer_confine_to)
+        && w.map_state == crate::resources::MapState::Viewable
+    {
+        let (x0, y0) = state
+            .resources
+            .window_absolute_position(state.pointer_confine_to);
+        let (x1, y1) = (x0 + i32::from(w.width), y0 + i32::from(w.height));
+        let cx = i32::from(event.root_x).clamp(x0, (x1 - 1).max(x0));
+        let cy = i32::from(event.root_y).clamp(y0, (y1 - 1).max(y0));
+        if cx != i32::from(event.root_x) || cy != i32::from(event.root_y) {
+            if event.kind == PointerEventKind::MotionNotify {
+                // Swallow the stray motion; the warp regenerates a
+                // clamped one through the normal input path.
+                #[allow(clippy::cast_possible_truncation)]
+                backend.warp_pointer_root(state, cx, cy);
+                return Vec::new();
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                event.root_x = cx as i16;
+                event.root_y = cy as i16;
+            }
+        }
+    }
     let now = std::time::Instant::now();
     // Capture priors BEFORE mutating; needed by the IDLETIME wake handler.
     #[allow(clippy::cast_possible_truncation)]
@@ -387,6 +432,12 @@ pub fn pointer_event_fanout_to_state(
             grab.pointer_mode == 0,
             grab.keyboard_mode == 0,
         );
+        // ConfineCursorToWindow — record the confinement and pull
+        // the pointer inside the confine window (XGrabButton-23/24).
+        state.pointer_confine_to = grab.confine_to;
+        if grab.confine_to.0 != 0 {
+            crate::core_loop::process_request::confine_pointer_now(state, backend);
+        }
         // During a grab, core pointer events never reach other
         // clients — both branches above are the only deliveries.
         handled_core_via_grab = true;
@@ -1484,6 +1535,7 @@ fn release_passive_grab_on_button_release(state: &mut ServerState, kind: Pointer
         state.pointer_grab = None;
         state.pointer_grab_is_passive = false;
         state.frozen_pointer_event = None;
+        state.pointer_confine_to = yserver_protocol::x11::ResourceId(0);
         // Xorg DeactivatePointerGrab: releasing the grab also releases
         // the sync holds it placed (a sync keyboard_mode froze the
         // keyboard on this grab's behalf — XGrabButton-19).
@@ -1929,6 +1981,7 @@ mod tests {
             event_mask: 0x0000_0004, // ButtonPressMask
             pointer_mode: 0,         // GrabModeSync
             keyboard_mode: 1,
+            confine_to: ResourceId(0),
             via_xi2: false,
         });
 

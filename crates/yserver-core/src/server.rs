@@ -182,6 +182,9 @@ pub struct PassiveButtonGrab {
     /// 0 = GrabModeSync: the grab activation also freezes the
     /// KEYBOARD on the grab's behalf (Xorg CheckGrabForSyncs).
     pub keyboard_mode: u8,
+    /// Window the pointer is confined to while the grab is active
+    /// (0 = none) — X11 GrabButton `confine_to`.
+    pub confine_to: ResourceId,
     /// True when the grab was established through the XI2 protocol
     /// (XIPassiveGrabDevice) rather than core GrabButton. Grab
     /// redirection delivers to the owner in the protocol the grab
@@ -812,6 +815,11 @@ pub struct ServerState {
     /// Currently-pressed keycodes, one bit per keycode (byte k/8, bit
     /// k%8) — the QueryKeymap bitmap, maintained by the key fanout.
     pub keys_down: [u8; 32],
+    /// Window the pointer is currently confined to (0 = none) — set
+    /// while an active pointer grab with `confine_to` is in effect
+    /// (Xorg `ConfineCursorToWindow`). The pointer fanout clamps
+    /// motion to this window's rectangle.
+    pub pointer_confine_to: ResourceId,
     /// Most recent input event timestamp seen by either fanout —
     /// stands in for "current server time" in XI1 grab time checks.
     pub xi1_last_input_time: u32,
@@ -1099,6 +1107,7 @@ impl ServerState {
             pointer_mapping_override: None,
             modifier_mapping_override: None,
             keys_down: [0u8; 32],
+            pointer_confine_to: ResourceId(0),
             xi1_last_input_time: 0,
             xi1_frozen: HashMap::new(),
             xi1_device_focus: HashMap::new(),
@@ -1961,7 +1970,15 @@ impl ServerState {
                 }
                 let button_match = grab.button == 0 || grab.button == button;
                 let mod_match = grab.modifiers == 0x8000 || grab.modifiers == (state_mask & 0x00ff);
-                if button_match && mod_match {
+                // Xorg ActivatePointerGrab fails when confine_to is
+                // not viewable — the grab does not activate
+                // (XGrabButton-3).
+                let confine_ok = grab.confine_to.0 == 0
+                    || self
+                        .resources
+                        .window(grab.confine_to)
+                        .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+                if button_match && mod_match && confine_ok {
                     return Some(grab.clone());
                 }
             }
@@ -3436,6 +3453,7 @@ mod tests {
                 event_mask: 0xFFFF_FFFF,
                 pointer_mode: 0,
                 keyboard_mode: 1,
+                confine_to: ResourceId(0),
                 via_xi2: true,
             });
         }
@@ -3583,6 +3601,7 @@ mod tests {
                 event_mask: 0xFFFF_FFFF,
                 pointer_mode: 0,
                 keyboard_mode: 1,
+                confine_to: ResourceId(0),
                 via_xi2: true,
             });
         }
