@@ -2,7 +2,7 @@
 
 A modern X11 server written from scratch in Rust. Drives DRM/KMS
 directly via Vulkan; runs real desktop environments on modern
-Linux. Not a clone of Xorg.
+Linux (with planned FreeBSD support). Not a clone of Xorg.
 
 For current per-hardware state, see [`status.md`](status.md). For
 the user-facing summary of what runs and how to build/run it, see
@@ -13,8 +13,11 @@ the user-facing summary of what runs and how to build/run it, see
 - Run real X11 desktop environments and window managers (MATE,
   XFCE, Cinnamon validated; LXQt and similar lightweight desktops
   targeted).
-- Support modern Linux graphics hardware through DRM/KMS and
-  Vulkan, with no driver ABI for third-party hardware modules.
+- Support modern graphics hardware through DRM/KMS and Vulkan,
+  with no driver ABI for third-party hardware modules. Primary
+  target is Linux; FreeBSD (incl. GhostBSD) is a planned secondary
+  target that reuses the same DRM/libinput/Mesa stack — see
+  [`bsd-support.md`](bsd-support.md).
 - Compositor-native architecture with tear-free presentation by
   default.
 - Per-output presentation (refresh rate, modes) with multiple
@@ -34,7 +37,10 @@ the user-facing summary of what runs and how to build/run it, see
 - Being a drop-in clone of Xorg internals.
 - Supporting old server driver modules or a DDX-style hardware
   driver ABI.
-- Supporting hardware that lacks Linux DRM/KMS and Mesa support.
+- Supporting hardware that lacks DRM/KMS + Mesa support (any
+  OS).
+- Supporting Windows or macOS as runtime targets (no DRM/KMS, no
+  libinput, different display stacks entirely).
 - Supporting multiple X11 screens.
 - Supporting non-TrueColor legacy visuals as a first-class
   feature.
@@ -97,6 +103,30 @@ retirement.
 
 Input on both backends: `libinput` reads on a dedicated thread,
 which posts cooked events into the core loop's channel.
+
+## Target platforms
+
+**Linux** is the primary target and where all current development
+happens. KMS bring-up, libseat sessions, libinput config, hotkeys
+(Ctrl-Alt-F#, Ctrl-Alt-Backspace), and VT acquisition all assume
+Linux semantics today.
+
+**FreeBSD / GhostBSD** is a planned secondary target. The plumbing
+the standalone backend depends on — DRM/KMS (drm-kmod), libinput,
+Mesa/Vulkan, seatd — all have FreeBSD ports. The OS-specific
+surface in yserver is small (signalfd → kqueue
+`EVFILT_SIGNAL`, VT switching via `vt(4)` ioctls, optional devd
+hotplug) and lives in three files inside `crates/yserver/src/`.
+The intended shape is a small `Platform` trait
+(`crates/yserver/src/platform/`) with `linux.rs` and `freebsd.rs`
+arms — see [`bsd-support.md`](bsd-support.md) for the survey,
+risk list, and dumb-build recipe. Not started; gated on having
+GhostBSD hardware ready and a willingness to absorb the testing
+cost.
+
+**Windows / macOS** are out of scope. They lack DRM/KMS and
+libinput; the display stack is completely different. yserver would
+not be ported there.
 
 ## Rendering model (v2)
 
