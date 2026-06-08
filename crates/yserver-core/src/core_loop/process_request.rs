@@ -17391,7 +17391,10 @@ fn handle_allow_events(
         .timestamp_now()
         .max(state.xi1_last_input_time)
         .max(grab_time);
-    if time != 0 && (time > now || time < grab_time) {
+    if time != 0
+        && (crate::core_loop::xi1_focus::time_after(time, now)
+            || crate::core_loop::xi1_focus::time_after(grab_time, time))
+    {
         debug!(
             "client {} #{} AllowEvents ignored (time {time} outside [{grab_time}, {now}])",
             client_id.0, sequence.0
@@ -17689,7 +17692,10 @@ fn handle_set_input_focus(
             .timestamp_now()
             .max(state.xi1_last_input_time)
             .max(state.core_focus.time);
-        if time != 0 && (time > now || time < state.core_focus.time) {
+        if time != 0
+            && (crate::core_loop::xi1_focus::time_after(time, now)
+                || crate::core_loop::xi1_focus::time_after(state.core_focus.time, time))
+        {
             debug!(
                 "client {} #{} SetInputFocus ignored (time {time} outside [{}, {now}])",
                 client_id.0, sequence.0, state.core_focus.time
@@ -17813,7 +17819,33 @@ pub(crate) fn emit_core_focus_transition(
     mode: u8,
 ) {
     let pointer_win = crate::core_loop::key_fanout::deepest_window_at_pointer(state);
-    let events = crate::crossings::focus_transition_events(state, from_raw, to_raw, pointer_win);
+    // Xorg DoFocusEvents (dix/enterleave.c:1557) short-circuits a
+    // same-window transition ONLY for non-grab modes:
+    //   `if (from == to && mode != NotifyGrab && mode != NotifyUngrab) return;`
+    // For NotifyGrab/NotifyUngrab with from == to (the grab window is
+    // already the focus), CoreFocusEvents still runs and reaches
+    // CoreFocusNonLinear(W, W) — CommonAncestor(W,W) is W's parent, so
+    // both the Out/In endpoint events fire on W with NotifyNonlinear
+    // (the intermediate walks are empty). focus_transition_events
+    // returns nothing for from == to, so synthesize that pair here.
+    // (Grab windows are always real windows, so the None/PointerRoot
+    // same-window branch is unreachable from our call sites.)
+    let events = if from_raw == to_raw && (mode == 1 || mode == 2) && to_raw > 1 {
+        vec![
+            crate::crossings::FocusEvent {
+                window: ResourceId(to_raw),
+                focus_in: false,
+                detail: crate::crossings::NOTIFY_NONLINEAR,
+            },
+            crate::crossings::FocusEvent {
+                window: ResourceId(to_raw),
+                focus_in: true,
+                detail: crate::crossings::NOTIFY_NONLINEAR,
+            },
+        ]
+    } else {
+        crate::crossings::focus_transition_events(state, from_raw, to_raw, pointer_win)
+    };
     let (ptr_x, ptr_y) = state.pointer_root;
     for e in events {
         let _dropped =
@@ -21272,7 +21304,10 @@ fn handle_grab_pointer(
             status = 1; // AlreadyGrabbed
         } else if !viewable || !confine_viewable {
             status = 3; // GrabNotViewable
-        } else if time != 0 && (time < state.last_pointer_grab_time || time > now) {
+        } else if time != 0
+            && (crate::core_loop::xi1_focus::time_after(state.last_pointer_grab_time, time)
+                || crate::core_loop::xi1_focus::time_after(time, now))
+        {
             status = 2; // GrabInvalidTime
         } else if frozen_by_other {
             status = 4; // GrabFrozen
@@ -21347,7 +21382,10 @@ fn handle_ungrab_pointer(
         .timestamp_now()
         .max(state.xi1_last_input_time)
         .max(state.last_pointer_grab_time);
-    if time != 0 && (time > now || time < state.last_pointer_grab_time) {
+    if time != 0
+        && (crate::core_loop::xi1_focus::time_after(time, now)
+            || crate::core_loop::xi1_focus::time_after(state.last_pointer_grab_time, time))
+    {
         debug!(
             "client {} #{} UngrabPointer ignored (time {time} outside [{}, {now}])",
             client_id.0, sequence.0, state.last_pointer_grab_time
@@ -21708,7 +21746,9 @@ fn handle_change_active_pointer_grab(
             .timestamp_now()
             .max(state.xi1_last_input_time)
             .max(state.last_pointer_grab_time);
-        let time_ok = time == 0 || (time >= state.last_pointer_grab_time && time <= now);
+        let time_ok = time == 0
+            || (!crate::core_loop::xi1_focus::time_after(state.last_pointer_grab_time, time)
+                && !crate::core_loop::xi1_focus::time_after(time, now));
         if time_ok
             && let Some(g) = state.active_pointer_grab.as_mut()
             && g.owner == client_id
@@ -21799,7 +21839,10 @@ fn handle_grab_keyboard(
             status = 1; // AlreadyGrabbed
         } else if !viewable {
             status = 3; // GrabNotViewable
-        } else if time != 0 && (time < state.last_keyboard_grab_time || time > now) {
+        } else if time != 0
+            && (crate::core_loop::xi1_focus::time_after(state.last_keyboard_grab_time, time)
+                || crate::core_loop::xi1_focus::time_after(time, now))
+        {
             status = 2; // GrabInvalidTime
         } else if frozen_by_other {
             status = 4; // GrabFrozen
@@ -21861,7 +21904,10 @@ fn handle_ungrab_keyboard(
         .timestamp_now()
         .max(state.xi1_last_input_time)
         .max(state.last_keyboard_grab_time);
-    if time != 0 && (time > now || time < state.last_keyboard_grab_time) {
+    if time != 0
+        && (crate::core_loop::xi1_focus::time_after(time, now)
+            || crate::core_loop::xi1_focus::time_after(state.last_keyboard_grab_time, time))
+    {
         debug!(
             "client {} #{} UngrabKeyboard ignored (time {time} outside [{}, {now}])",
             client_id.0, sequence.0, state.last_keyboard_grab_time
@@ -26057,6 +26103,62 @@ mod tests {
     }
 
     #[test]
+    /// Regression (codex review #1): a grab/ungrab focus transition
+    /// whose grab window is ALREADY the focus (from == to) must still
+    /// emit FocusOut+FocusIn(NotifyNonlinear, NotifyGrab) on that
+    /// window. Xorg DoFocusEvents only short-circuits same-window
+    /// moves for NON-grab modes (dix/enterleave.c:1557); pre-fix
+    /// yserver dropped these whenever the grab window held the focus.
+    #[test]
+    fn same_window_grab_focus_emits_nonlinear_pair() {
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const CLIENT: u32 = 71;
+        const WIN: u32 = 0x0370_0006;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT);
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state
+            .clients
+            .get_mut(&CLIENT)
+            .unwrap()
+            .event_masks
+            .insert(ResourceId(WIN), FOCUS_CHANGE_MASK);
+        state.core_focus.raw = WIN;
+
+        // GrabKeyboard on WIN while WIN is already the focus → mode 1.
+        emit_core_focus_transition(&mut state, WIN, WIN, 1);
+
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            bytes.len() >= 64,
+            "expected FocusOut + FocusIn (got {} bytes)",
+            bytes.len()
+        );
+        assert_eq!(bytes[0], 10, "first event FocusOut");
+        assert_eq!(bytes[1], 3, "FocusOut detail NotifyNonlinear");
+        assert_eq!(bytes[8], 1, "FocusOut mode NotifyGrab");
+        assert_eq!(bytes[32], 9, "second event FocusIn");
+        assert_eq!(bytes[33], 3, "FocusIn detail NotifyNonlinear");
+        assert_eq!(bytes[40], 1, "FocusIn mode NotifyGrab");
+    }
+
     fn focus_move_to_child_uses_inferior_detail_for_parent_focus_out() {
         use yserver_protocol::x11::CreateWindowRequest;
 
