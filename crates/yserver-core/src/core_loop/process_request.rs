@@ -26102,7 +26102,6 @@ mod tests {
         assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 3);
     }
 
-    #[test]
     /// Regression (codex review #1): a grab/ungrab focus transition
     /// whose grab window is ALREADY the focus (from == to) must still
     /// emit FocusOut+FocusIn(NotifyNonlinear, NotifyGrab) on that
@@ -26159,6 +26158,7 @@ mod tests {
         assert_eq!(bytes[40], 1, "FocusIn mode NotifyGrab");
     }
 
+    #[test]
     fn focus_move_to_child_uses_inferior_detail_for_parent_focus_out() {
         use yserver_protocol::x11::CreateWindowRequest;
 

@@ -296,13 +296,21 @@ fn deliver_key_to_window(
 /// grab window. yserver previously delivered via window selection, so
 /// a grab owner that registered the grab via `XIPassiveGrabDevice`
 /// (without a matching `XISelectEvents` on the root) received nothing
-/// and the key was lost. The core form is always sent; the XI2 form
-/// only when the grab was established via XI2 (`via_xi2`) — sending
-/// XI2 XGE events to a core GrabKey owner NULL-derefs libXi in
-/// clients that linked it without ever calling XIQueryVersion (the
-/// xts5 Xlib11 TCMs crash exactly there; Xorg's
-/// `DeliverGrabbedEvent` consults the grab's own xi2mask, which is
-/// empty for core grabs).
+/// and the key was lost.
+///
+/// Delivers EXACTLY ONE form, matching the grab's protocol (Xorg
+/// `DeliverGrabbedEvent` consults the grab's own xi2mask — XI2 grab →
+/// XI2 event, core grab → core event, never both):
+/// - core grab (`via_xi2 == false`) → core KeyPress/KeyRelease only.
+///   Sending XI2 XGE events to a core `GrabKey` owner NULL-derefs
+///   libXi in clients that linked it without ever calling
+///   XIQueryVersion (xts5 Xlib11 TCMs crash there).
+/// - XI2 grab (`via_xi2 == true`) → XI2 `XI_KeyPress`/`XI_KeyRelease`
+///   only. Sending the core form TOO double-delivers every keystroke
+///   to a pure-XI2 client (muffin/cinnamon-shell), corrupting its key
+///   state — observed as "can't type in the Cinnamon keyring dialog"
+///   (x11trace: keycode delivered as both core KeyPress and XI2
+///   XI_KeyPress to the same window).
 fn deliver_key_to_grab_owner(
     state: &mut ServerState,
     event: &HostKeyEvent,
@@ -310,16 +318,15 @@ fn deliver_key_to_grab_owner(
     grab_window: ResourceId,
     via_xi2: bool,
 ) -> Vec<ClientId> {
-    let mut dropped = fanout_event_to_clients(state, &[owner], |buf, seq, order| {
-        x11::encode_key_event(buf, order, key_event_wire(event, seq, grab_window));
-    });
     if via_xi2 {
-        let xi2_dropped = fanout_event_to_clients(state, &[owner], |buf, seq, order| {
+        fanout_event_to_clients(state, &[owner], |buf, seq, order| {
             encode_key_xi2(buf, order, seq, event, grab_window);
-        });
-        merge_dropped(&mut dropped, xi2_dropped);
+        })
+    } else {
+        fanout_event_to_clients(state, &[owner], |buf, seq, order| {
+            x11::encode_key_event(buf, order, key_event_wire(event, seq, grab_window));
+        })
     }
-    dropped
 }
 
 fn xi2_evtype_for(event: &HostKeyEvent) -> u16 {

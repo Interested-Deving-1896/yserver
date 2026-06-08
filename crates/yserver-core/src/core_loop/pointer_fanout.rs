@@ -268,7 +268,7 @@ pub fn pointer_event_fanout_to_state(
 
     // Step 2 — active-grab redirection (core events only).
     if handle_grabs
-        && let Some((grab_window, grab_client, gx, gy, owner_events, _via_xi2)) =
+        && let Some((grab_window, grab_client, gx, gy, owner_events, via_xi2)) =
             active_grab_target(state)
     {
         // With `owner_events=true`, pointer events on windows owned
@@ -305,29 +305,43 @@ pub fn pointer_event_fanout_to_state(
             let event_x = clamp_grab_coord(event.root_x, gx);
             let event_y = clamp_grab_coord(event.root_y, gy);
             log::trace!(
-                "pointer_fanout: ACTIVE-GRAB redirect kind={:?} button={} grab_window=0x{:x} grab_client={:?} owner_events={}",
+                "pointer_fanout: ACTIVE-GRAB redirect kind={:?} button={} grab_window=0x{:x} grab_client={:?} owner_events={} via_xi2={}",
                 event.kind,
                 event.detail,
                 grab_window.0,
                 grab_client,
                 owner_events,
+                via_xi2,
             );
-            let extras = fanout_event_to_clients(state, &[grab_client], |buf, seq, order| {
-                encode_pointer_event(
-                    buf,
-                    order,
-                    event.kind,
-                    seq,
-                    event.detail,
-                    event.time,
-                    grab_window,
-                    ResourceId(0), // active-grab redirect: no propagation child
-                    event,
-                    event_x,
-                    event_y,
-                );
-            });
-            merge_dropped(&mut dropped, extras);
+            // Deliver the CORE form only for a CORE grab. An XI2 grab
+            // (via_xi2) delivers its XI2 form in the XI2 redirect below;
+            // sending the core form here too double-delivers every
+            // button event to the pure-XI2 grab owner (muffin/cinnamon),
+            // corrupting its button state — observed as the stuck
+            // mouse-button / rubber-band on the Cinnamon desktop
+            // (x11trace: the click delivered as both core ButtonPress
+            // and XI2 ButtonPress to the same window). Mirrors Xorg
+            // DeliverGrabbedEvent delivering one form per grab protocol.
+            // handled_core_via_grab is set regardless so the core event
+            // is never ALSO leaked to the natural target in step 4.
+            if !via_xi2 {
+                let extras = fanout_event_to_clients(state, &[grab_client], |buf, seq, order| {
+                    encode_pointer_event(
+                        buf,
+                        order,
+                        event.kind,
+                        seq,
+                        event.detail,
+                        event.time,
+                        grab_window,
+                        ResourceId(0), // active-grab redirect: no propagation child
+                        event,
+                        event_x,
+                        event_y,
+                    );
+                });
+                merge_dropped(&mut dropped, extras);
+            }
             handled_core_via_grab = true;
             // Else (owner_events=true and target owned by grab client):
             // fall through to normal propagation so the event fires on
@@ -494,9 +508,27 @@ pub fn pointer_event_fanout_to_state(
     );
     if !handled_core_via_grab && (top_level_id_opt.is_some() || is_crossing) {
         let mask_bit = pointer_mask_bit(event.kind, event.state);
-        let (nested_id, event_x, event_y, core_targets, propagation_child) =
+        let (nested_id, event_x, event_y, mut core_targets, propagation_child) =
             pointer_propagation_target_by_id(state, target, target_x, target_y, mask_bit)
                 .unwrap_or((target, target_x, target_y, Vec::new(), ResourceId(0)));
+
+        // XI2 shadows core per client (Xorg behaviour, mirrors
+        // `deliver_key_to_window`): a client that receives the XI2
+        // form of this event must NOT also receive the core form, or
+        // it processes every click/motion twice. Chromium's Ozone X11
+        // layer selects both core and XI2 on its windows; without this
+        // dedup its 3-dots / extensions menu got two ButtonPress
+        // events and opened-then-closed. Skip on replay — the XI2
+        // fanout below is skipped on replay, so there is no XI2 form
+        // to dedup against.
+        if !is_replay {
+            let xi2_evt = xi2_evtype(event.kind);
+            if xi2_evt != 0 {
+                let (xi2_dedup, _) =
+                    compute_xi2_targets(state, target, top_level_id, xi2_evt, None);
+                core_targets.retain(|c| !xi2_dedup.contains(c));
+            }
+        }
 
         if matches!(
             event.kind,
