@@ -1045,9 +1045,10 @@ pub struct ExportableImage {
 
 impl Drop for ExportableImage {
     fn drop(&mut self) {
+        // image must be destroyed before the memory it was bound to
         unsafe {
-            self.vk.device.free_memory(self.memory, None);
             self.vk.device.destroy_image(self.image, None);
+            self.vk.device.free_memory(self.memory, None);
         }
     }
 }
@@ -1068,8 +1069,6 @@ pub fn allocate_exportable(
     height: u32,
     format: vk::Format,
 ) -> Result<ExportableImage, vk::Result> {
-    const DRM_FORMAT_MOD_LINEAR: u64 = 0;
-
     let mut ext_mem = vk::ExternalMemoryImageCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
 
@@ -1165,7 +1164,7 @@ pub fn allocate_exportable(
         format,
         stride: u32::try_from(layout.row_pitch).unwrap_or(u32::MAX),
         size: layout.size,
-        modifier: DRM_FORMAT_MOD_LINEAR,
+        modifier: 0, // DRM_FORMAT_MOD_LINEAR
         vk: Arc::clone(vk),
     })
 }

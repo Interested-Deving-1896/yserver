@@ -202,18 +202,16 @@ pub struct DmabufExport {
 pub fn export_backing(
     vk: &VkContext,
     img: &super::target::ExportableImage,
-) -> std::io::Result<DmabufExport> {
+) -> Result<DmabufExport, vk::Result> {
     let ext = vk
         .external_memory_fd
         .as_ref()
-        .ok_or_else(|| std::io::Error::other("VK_KHR_external_memory_fd unavailable"))?;
+        .ok_or(vk::Result::ERROR_EXTENSION_NOT_PRESENT)?;
     let info = vk::MemoryGetFdInfoKHR::default()
         .memory(img.memory)
         .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let raw_fd = unsafe { ext.get_memory_fd(&info) }
-        .map_err(|e| std::io::Error::other(format!("vkGetMemoryFdKHR: {e}")))?;
-    let fd = super::owned_fd_from_vk(raw_fd, "vkGetMemoryFdKHR(DMA_BUF) export_backing")
-        .map_err(|e| std::io::Error::other(format!("invalid fd from vkGetMemoryFdKHR: {e}")))?;
+    let raw_fd = unsafe { ext.get_memory_fd(&info)? };
+    let fd = super::owned_fd_from_vk(raw_fd, "vkGetMemoryFdKHR(DMA_BUF) export_backing")?;
     Ok(DmabufExport {
         fd,
         size: u32::try_from(img.size).unwrap_or(u32::MAX),

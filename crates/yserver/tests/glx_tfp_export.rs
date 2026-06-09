@@ -5,7 +5,6 @@
 
 #![cfg(target_os = "linux")]
 
-use std::os::fd::AsRawFd;
 use yserver::kms::vk::device::VkContext;
 
 #[test]
@@ -34,12 +33,17 @@ fn allocate_exportable_yields_valid_dmabuf_fd() {
         img.stride
     );
 
-    // Export must produce a valid fd.
+    // Export must succeed and carry sane stride/size.
     let export = yserver::kms::vk::dri3::export_backing(&vk, &img).expect("export_backing failed");
-    assert!(export.fd.as_raw_fd() >= 0, "invalid fd from export_backing");
     assert!(
         export.stride >= 64 * 4,
         "export stride {} too small",
+        export.stride
+    );
+    assert!(
+        export.size >= export.stride * 32,
+        "export size {} too small for stride {} * 32 rows",
+        export.size,
         export.stride
     );
 }
