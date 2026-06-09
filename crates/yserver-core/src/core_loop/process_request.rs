@@ -23216,7 +23216,10 @@ mod tests {
         let header = RequestHeader {
             opcode: 131,
             data: 2,
-            length_units: 0,
+            // ListInputDevices (XI minor 2) is Fixed(1): just the 4-byte
+            // request header = 1 unit. (Was 0 — pre-dated the length
+            // gate, now BadLengths before the handler enumerates devices.)
+            length_units: 1,
         };
         handle_xi2_request(
             state,
@@ -23318,7 +23321,10 @@ mod tests {
         let header = RequestHeader {
             opcode: 131,
             data: 2,
-            length_units: 0,
+            // ListInputDevices (XI minor 2) is Fixed(1): just the 4-byte
+            // request header = 1 unit. (Was 0 — pre-dated the length
+            // gate, now BadLengths before the handler enumerates devices.)
+            length_units: 1,
         };
         handle_xi2_request(
             state,
@@ -23692,10 +23698,34 @@ mod tests {
 
     /// Header for an XI2 (major 131) request with the given minor opcode.
     fn xi2_header(minor: u8) -> RequestHeader {
+        // Declare the spec-correct request length so the dispatcher's
+        // REQUEST_SIZE_MATCH gate (validate_xi_request_length) doesn't
+        // BadLength the request before it reaches the handler. These
+        // fixtures pre-date that XTS-driven length gate and used a
+        // placeholder length_units=1; for Fixed-size minors the table
+        // value IS the exact wire length, for variable minors it is the
+        // spec minimum (payload-carrying variable requests build their
+        // own header — see xi2_header_for_body).
+        use yserver_protocol::x11::request_lengths::{LenSpec, xi_request_length};
+        let length_units = match xi_request_length(minor) {
+            Some(LenSpec::Fixed(n) | LenSpec::AtLeast(n)) => n,
+            None => 1,
+        };
         RequestHeader {
             opcode: 131,
             data: minor,
-            length_units: 1,
+            length_units,
+        }
+    }
+
+    /// Header for a variable-length XI minor whose body carries a payload
+    /// (e.g. XIChangeProperty value bytes): the exact-length gate requires
+    /// `length_units` to match the actual body, so derive it from `body`.
+    fn xi2_header_for_body(minor: u8, body: &[u8]) -> RequestHeader {
+        RequestHeader {
+            opcode: 131,
+            data: minor,
+            length_units: u32::try_from((4 + body.len()).div_ceil(4)).unwrap_or(1),
         }
     }
 
@@ -25171,7 +25201,7 @@ mod tests {
             None,
             ClientId(1),
             SequenceNumber(1),
-            xi2_header(6),
+            xi2_header_for_body(6, &body),
             &body,
         )
         .unwrap();
@@ -25207,7 +25237,7 @@ mod tests {
             None,
             ClientId(1),
             SequenceNumber(1),
-            xi2_header(6),
+            xi2_header_for_body(6, &body),
             &body,
         )
         .unwrap();
@@ -25230,7 +25260,7 @@ mod tests {
             None,
             ClientId(1),
             SequenceNumber(2),
-            xi2_header(6),
+            xi2_header_for_body(6, &body),
             &body,
         )
         .unwrap();
@@ -25259,7 +25289,7 @@ mod tests {
             None,
             ClientId(1),
             SequenceNumber(1),
-            xi2_header(6),
+            xi2_header_for_body(6, &body),
             &body,
         )
         .unwrap();
@@ -25272,7 +25302,7 @@ mod tests {
             None,
             ClientId(1),
             SequenceNumber(2),
-            xi2_header(6),
+            xi2_header_for_body(6, &body),
             &body,
         )
         .unwrap();
@@ -25308,7 +25338,7 @@ mod tests {
             None,
             ClientId(1),
             SequenceNumber(1),
-            xi2_header(6),
+            xi2_header_for_body(6, &select_body),
             &select_body,
         )
         .unwrap();
@@ -25371,7 +25401,7 @@ mod tests {
             None,
             ClientId(1),
             SequenceNumber(1),
-            xi2_header(6),
+            xi2_header_for_body(6, &select_body),
             &select_body,
         )
         .unwrap();
@@ -25459,7 +25489,7 @@ mod tests {
             None,
             ClientId(1),
             SequenceNumber(1),
-            xi2_header(6),
+            xi2_header_for_body(6, &select_body),
             &select_body,
         )
         .unwrap();
@@ -25509,7 +25539,7 @@ mod tests {
             None,
             ClientId(1),
             SequenceNumber(1),
-            xi2_header(6),
+            xi2_header_for_body(6, &body),
             &body,
         )
         .unwrap();
@@ -25536,7 +25566,7 @@ mod tests {
             None,
             ClientId(1),
             SequenceNumber(1),
-            xi2_header(6),
+            xi2_header_for_body(6, &body),
             &body,
         )
         .unwrap();
@@ -25570,7 +25600,7 @@ mod tests {
             None,
             ClientId(1),
             SequenceNumber(1),
-            xi2_header(6),
+            xi2_header_for_body(6, &select_body),
             &select_body,
         )
         .unwrap();
@@ -28882,7 +28912,10 @@ mod tests {
         let header = yserver_protocol::x11::RequestHeader {
             opcode: 131, // doesn't matter — dispatcher is bypassed
             data: 42,    // XIChangeCursor minor
-            length_units: 3,
+            // XIChangeCursor is Fixed(4): 4 header + window(4) + cursor(4)
+            // + deviceid(2) + pad(2) = 16 bytes = 4 units. (Was 3 — pre-
+            // dated the length gate, now BadLengths before the handler.)
+            length_units: 4,
         };
         handle_xi2_request(
             &mut state,
@@ -29042,7 +29075,11 @@ mod tests {
         let ungrab_header = yserver_protocol::x11::RequestHeader {
             opcode: 131,
             data: 52,
-            length_units: 2,
+            // XIUngrabDevice is Fixed(3): 4 header + time(4) + deviceid(2)
+            // + pad(2) = 12 bytes = 3 units. (Was 2 — pre-dated the
+            // XTS-driven REQUEST_SIZE_MATCH length gate, so the malformed
+            // length slipped through; master now correctly BadLengths it.)
+            length_units: 3,
         };
         let mut ungrab_p = Vec::with_capacity(8);
         ungrab_p.extend_from_slice(&0u32.to_le_bytes()); // time
@@ -29241,7 +29278,12 @@ mod tests {
         let header = yserver_protocol::x11::RequestHeader {
             opcode: 131,
             data: 54,
-            length_units: 6,
+            // XIPassiveGrabDevice is AtLeast(8) and has no exact-length
+            // gate (modifier count is read from the body's num_modifiers
+            // field, not derived from the request length). 8 is the spec
+            // minimum; was 6, which pre-dated the REQUEST_SIZE_MATCH gate
+            // and now BadLengths before the handler runs.
+            length_units: 8,
         };
 
         // Button grab on button 3 with modifiers [0, ControlMask(4)].
@@ -29332,7 +29374,9 @@ mod tests {
         let ungrab_header = yserver_protocol::x11::RequestHeader {
             opcode: 131,
             data: 55,
-            length_units: 4,
+            // XIPassiveUngrabDevice is AtLeast(5), no exact gate. 5 is the
+            // spec minimum; was 4 (pre-gate placeholder → BadLength now).
+            length_units: 5,
         };
         let body = build_ungrab_body(WINDOW_XID, 3, 0, &[0, 4]);
         handle_xi2_request(
