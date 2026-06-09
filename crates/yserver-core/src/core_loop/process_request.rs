@@ -8383,6 +8383,20 @@ fn handle_glx_request(
                     );
                 }
 
+                // For CREATE_PIXMAP: resolve the host_xid NOW and store it on
+                // the GlxDrawable so release is robust to the X pixmap being
+                // freed (X11 FreePixmap) before glXDestroyPixmap/disconnect —
+                // re-resolving x_drawable→host_xid at release time would fail
+                // once the resource is gone, leaking the export ref forever.
+                let acquire_host_xid = if minor == x11glx::CREATE_PIXMAP {
+                    state
+                        .resources
+                        .pixmap(yserver_protocol::x11::ResourceId(req.x_window))
+                        .and_then(|p| p.host_xid.map(|h| h.as_raw()))
+                } else {
+                    None
+                };
+
                 state.glx_drawables.insert(
                     req.glx_window,
                     crate::server::GlxDrawable {
@@ -8392,20 +8406,13 @@ fn handle_glx_request(
                         width: 0,
                         height: 0,
                         attributes: Vec::new(),
+                        glx_export_host_xid: acquire_host_xid,
                     },
                 );
 
-                // For CREATE_PIXMAP: acquire an export-lifetime ref on the
-                // backing so the ExportedBacking entry (and its dmabuf fd)
-                // outlives any early FreePixmap until glXDestroyPixmap.
-                let acquire_host_xid = if minor == x11glx::CREATE_PIXMAP {
-                    state
-                        .resources
-                        .pixmap(yserver_protocol::x11::ResourceId(req.x_window))
-                        .and_then(|p| p.host_xid.map(|h| h.as_raw()))
-                } else {
-                    None
-                };
+                // Acquire an export-lifetime ref on the backing so the
+                // ExportedBacking entry (and its dmabuf fd) outlives any early
+                // FreePixmap until glXDestroyPixmap.
                 if let Some(host_xid) = acquire_host_xid {
                     backend.acquire_glx_pixmap_export(host_xid);
                 }
@@ -8439,6 +8446,7 @@ fn handle_glx_request(
                         width: req.width,
                         height: req.height,
                         attributes: Vec::new(),
+                        glx_export_host_xid: None,
                     },
                 );
                 debug!(
@@ -8460,15 +8468,15 @@ fn handle_glx_request(
                 0
             };
             // For DESTROY_PIXMAP: release the export-lifetime ref taken at
-            // CREATE_PIXMAP. Resolve the X pixmap XID → host_xid before
-            // removing the GlxDrawable entry.
+            // CREATE_PIXMAP, using the host_xid resolved+stored at acquire
+            // time. Do NOT re-resolve via resources.pixmap(x_drawable) — the
+            // X pixmap may already be freed (FreePixmap-before-destroy), and
+            // re-resolution would return None and leak the ref forever.
             let release_host_xid = if minor == x11glx::DESTROY_PIXMAP {
-                state.glx_drawables.get(&xid).and_then(|d| {
-                    state
-                        .resources
-                        .pixmap(yserver_protocol::x11::ResourceId(d.x_drawable))
-                        .and_then(|p| p.host_xid.map(|h| h.as_raw()))
-                })
+                state
+                    .glx_drawables
+                    .get(&xid)
+                    .and_then(|d| d.glx_export_host_xid)
             } else {
                 None
             };
@@ -38939,6 +38947,126 @@ mod tests {
                 .calls()
                 .contains(&RecordedCall::ReleaseGlxPixmapExport(host_xid_raw)),
             "ReleaseGlxPixmapExport must be recorded after DestroyPixmap"
+        );
+    }
+
+    /// GLX Task 3.4 regression: the export ref must be released on
+    /// `glXDestroyPixmap` even when the client called X11 `FreePixmap` on
+    /// the underlying X pixmap FIRST (a common compositor ordering). The
+    /// release site must use the host_xid stored at acquire time, NOT a
+    /// re-resolution via `resources.pixmap(x_drawable)` (which is gone after
+    /// FreePixmap). Against the old re-resolving logic this test FAILS:
+    /// ReleaseGlxPixmapExport is never recorded → the export ref leaks.
+    #[test]
+    fn glx_destroy_releases_export_even_after_free_pixmap() {
+        use crate::backend::recording::RecordedCall;
+        use yserver_protocol::x11::glx as x11glx;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let client_id = ClientId(1);
+
+        // Register an X pixmap with a known host_xid.
+        let x_pixmap_xid: u32 = 0x3000;
+        let host_xid_raw: u32 = 0xdead_0002;
+        state.resources.create_pixmap(
+            client_id,
+            yserver_protocol::x11::CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(x_pixmap_xid),
+                drawable: ROOT_WINDOW,
+                width: 64,
+                height: 32,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(
+            ResourceId(x_pixmap_xid),
+            crate::backend::PixmapHandle::from_raw(host_xid_raw).unwrap(),
+        ));
+
+        let glx_xid: u32 = 0x4000_0003;
+
+        // glXCreatePixmap — acquire.
+        let mut create_body = Vec::new();
+        create_body.extend_from_slice(&0u32.to_le_bytes()); // screen
+        create_body.extend_from_slice(&0x101u32.to_le_bytes()); // fbconfig
+        create_body.extend_from_slice(&x_pixmap_xid.to_le_bytes());
+        create_body.extend_from_slice(&glx_xid.to_le_bytes());
+        let length_units = u32::try_from(1 + create_body.len().div_ceil(4)).expect("fits");
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 148,
+                data: x11glx::CREATE_PIXMAP,
+                length_units,
+            },
+            &create_body,
+            None,
+        )
+        .expect("process_request CREATE_PIXMAP");
+        assert!(
+            backend
+                .calls()
+                .contains(&RecordedCall::AcquireGlxPixmapExport(host_xid_raw)),
+            "AcquireGlxPixmapExport must be recorded"
+        );
+
+        // X11 FreePixmap on the underlying X pixmap BEFORE glXDestroyPixmap.
+        // This removes the pixmap from the resource table — any subsequent
+        // re-resolution of x_drawable→host_xid would fail.
+        let free_body = x_pixmap_xid.to_le_bytes().to_vec();
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 54, // FreePixmap
+                data: 0,
+                length_units: 2,
+            },
+            &free_body,
+            None,
+        )
+        .expect("process_request FreePixmap");
+        // Sanity: the pixmap resource is really gone.
+        assert!(
+            state.resources.pixmap(ResourceId(x_pixmap_xid)).is_none(),
+            "X pixmap must be freed by FreePixmap"
+        );
+
+        // glXDestroyPixmap — must still release using the stored host_xid.
+        let destroy_body = glx_xid.to_le_bytes().to_vec();
+        process_request(
+            &mut state,
+            &mut backend,
+            client_id,
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 148,
+                data: x11glx::DESTROY_PIXMAP,
+                length_units: 2,
+            },
+            &destroy_body,
+            None,
+        )
+        .expect("process_request DESTROY_PIXMAP");
+
+        assert!(
+            !state.glx_drawables.contains_key(&glx_xid),
+            "GlxDrawable must be removed after DestroyPixmap"
+        );
+        // THE REGRESSION ASSERTION: release must fire despite the early FreePixmap.
+        assert!(
+            backend
+                .calls()
+                .contains(&RecordedCall::ReleaseGlxPixmapExport(host_xid_raw)),
+            "ReleaseGlxPixmapExport must be recorded even after the X pixmap was \
+             freed before glXDestroyPixmap (no export-ref leak)"
         );
     }
 

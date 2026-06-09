@@ -1062,6 +1062,13 @@ pub struct GlxDrawable {
     pub width: u32,
     pub height: u32,
     pub attributes: Vec<(u32, u32)>,
+    /// host_xid resolved at `glXCreatePixmap` acquire time, so release is
+    /// robust to the X pixmap being freed first. Without this, a client
+    /// calling X11 `FreePixmap` before `glXDestroyPixmap` (a common
+    /// compositor ordering) would leave the release sites unable to
+    /// re-resolve `x_drawable → host_xid` (the resource is gone), leaking
+    /// the export ref forever. `None` for the window/pbuffer cases.
+    pub glx_export_host_xid: Option<u32>,
 }
 
 impl ServerState {
