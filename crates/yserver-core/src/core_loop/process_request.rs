@@ -6542,6 +6542,22 @@ fn handle_present_request(
                 // stacks that don't honour implicit sync for our read
                 // queue. Bounded + no-op for server-owned sources.
                 backend.wait_present_source_ready(host_xid.as_raw());
+                // PresentPixmap is a clip-less window present — it binds NO
+                // client GC, so the copy must run with a *default* graphics
+                // state. `backend.copy_area` consults `current_clip` /
+                // `current_function` / `current_plane_mask` /
+                // `current_subwindow_mode`, which are left over from the last
+                // client drawing op. A stale `SetClipRectangles` (e.g. a panel
+                // applet's small clip) silently masks the present down to a few
+                // specks — freezing the compositor stage everywhere else
+                // (Cinnamon keyring: typed dots / hover / clock never appear,
+                // dialog renders once then stalls). Bind a default DrawState
+                // (clip=None, GXcopy, full plane-mask, ClipByChildren) the same
+                // way the GC-less branch of `handle_copy_area` does via
+                // `unwrap_or_default()`. The next client op rebinds its own GC.
+                let present_gc = crate::backend::DrawState::default();
+                backend.apply_clip_state(origin, &present_gc.clip)?;
+                backend.apply_draw_state(origin, &present_gc)?;
                 if req.update != 0 {
                     if let Some(region) = state.xfixes_regions.get(&req.update) {
                         for rect in &region.rects {
