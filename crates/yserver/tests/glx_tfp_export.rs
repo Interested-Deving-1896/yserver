@@ -5,6 +5,8 @@
 
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::sync::Arc;
 
 use ash::vk;
@@ -361,4 +363,46 @@ fn dri3_export_promotes_server_owned_pixmap() {
         "size {size} too small for stride {stride} * 32 rows"
     );
     assert!(fd.as_raw_fd() >= 0, "invalid fd");
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Task 2.2: dma-buf IMPORT_SYNC_FILE (write→read fence publication)
+// ───────────────────────────────────────────────────────────────────
+
+/// Verify that `import_dmabuf_write_fence` accepts an already-signaled
+/// sync_file fd without panicking or returning an unexpected error.
+///
+/// Two acceptable outcomes:
+/// - `Ok(())` — the kernel and driver support IMPORT_SYNC_FILE.
+/// - `Err(Unsupported)` — kernel older than 5.20 / driver that rejects it.
+/// Any other error kind is a bug.
+#[test]
+#[ignore = "requires a Vulkan device"]
+fn import_sync_file_accepts_a_signaled_fence() {
+    use std::os::fd::AsFd;
+
+    let vk = VkContext::new().expect("VkContext init failed — install lavapipe or run on HW");
+
+    let img = yserver::kms::vk::target::allocate_exportable(
+        &vk,
+        16,
+        16,
+        yserver::kms::vk::target::EXPORT_FORMAT_BGRA8,
+    )
+    .expect("allocate_exportable");
+
+    let export = yserver::kms::vk::dri3::export_backing(&vk, &img).expect("export_backing");
+
+    // Produce an already-signaled sync_file by exporting a signaled
+    // Vulkan semaphore.
+    let sync_fd = common::signaled_sync_file(&vk);
+
+    let r = yserver::kms::vk::dri3::import_dmabuf_write_fence(export.fd.as_fd(), sync_fd.as_fd());
+
+    // Either accepted (Ok), or Unsupported on older kernels/drivers —
+    // both are valid; anything else is an unexpected failure.
+    assert!(
+        r.is_ok() || matches!(&r, Err(e) if e.kind() == std::io::ErrorKind::Unsupported),
+        "import_dmabuf_write_fence returned unexpected error: {r:?}"
+    );
 }

@@ -398,6 +398,62 @@ pub fn wait_dmabuf_write_ready(
     sync_file_export_and_poll(dma_buf_fd, DMA_BUF_SYNC_WRITE, timeout_ms)
 }
 
+// `struct dma_buf_import_sync_file { __u32 flags; __s32 fd; }` — 8 bytes.
+#[repr(C)]
+struct DmaBufImportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+// `_IOW(DMA_BUF_BASE='b', 3, struct dma_buf_import_sync_file)` where the struct
+// is 8 bytes. dir=WRITE(1), size=8, type='b'(0x62), nr=3:
+//   (1<<30) | (8<<16) | (0x62<<8) | 3 = 0x4008_6203
+const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: libc::c_ulong = 0x4008_6203;
+
+/// Attach `sync_fd` (a sync_file representing yserver's completed Vulkan write)
+/// onto the dmabuf's reservation object as a WRITE fence.  Mesa's implicit-sync
+/// GL read on an imported dmabuf will wait on this fence automatically before
+/// sampling the texture.
+///
+/// The kernel dup()s the fd internally; the caller retains ownership of
+/// `sync_fd` and may close it at any point after this call returns.
+///
+/// # Errors
+///
+/// Returns `Err(io::ErrorKind::Unsupported)` when the kernel or driver
+/// does not support `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` (`ENOTTY` or
+/// `EINVAL`).  Any other non-zero ioctl return is propagated as
+/// `io::Error::last_os_error()`.
+pub fn import_dmabuf_write_fence(
+    dmabuf: std::os::fd::BorrowedFd<'_>,
+    sync_fd: std::os::fd::BorrowedFd<'_>,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let mut arg = DmaBufImportSyncFile {
+        flags: DMA_BUF_SYNC_WRITE,
+        fd: sync_fd.as_raw_fd(),
+    };
+    // SAFETY: ioctl on a valid dma-buf fd with the correct request
+    // constant and a properly-sized C struct pointer.  The kernel dup()s
+    // `arg.fd` and does not keep a reference to `arg` after the call.
+    let rc = unsafe {
+        libc::ioctl(
+            dmabuf.as_raw_fd(),
+            DMA_BUF_IOCTL_IMPORT_SYNC_FILE,
+            std::ptr::addr_of_mut!(arg),
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if matches!(err.raw_os_error(), Some(libc::ENOTTY) | Some(libc::EINVAL)) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
