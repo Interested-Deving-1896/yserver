@@ -19,6 +19,28 @@
 
 ---
 
+## Post-implementation findings (2026-06-10)
+
+What HW validation taught us, in order of discovery:
+
+1. **Damage-emission bug was an upstream prerequisite, NOT a TFP issue.** The cinnamon-settings stale-pane repro pre-existed all TFP work. Xorg-vs-yserver xtrace diff showed yserver delivered ~half the `DamageNotify` events for the same workload (176 vs 315 on the same hot drawable region). Root cause: `damage_fanout.rs:587` applied `NonEmpty`'s one-shot-per-Subtract gate uniformly to all levels; muffin uses `BoundingBox` (level=2) which per X11 DAMAGE spec + Xorg `damageext/damageext.c:136-153` must emit on EVERY paint. Fixed on master (`8b93ce6 fix(damage): emit DamageNotify on every paint for Raw/Delta/BoundingBox`). **TFP work alone would not have fixed the stale-pane repro** — the spec's "TFP is the live-texture cure" framing was correct in principle but missed this upstream damage gate.
+
+2. **Modifier-tiled (UBWC) breaks same-GPU dma-buf coherence on Turnip/Adreno.** Phase 0 / handoff plan flipped the original `LINEAR-only MVP` to `modifier-first` because RADV rejects `LINEAR + COLOR_ATTACHMENT + dma-buf` with `VK_ERROR_FORMAT_NOT_SUPPORTED`. That decision was right for RADV but wrong for Turnip: Turnip's modifier-tiled UBWC keeps compression metadata in driver caches that don't reach the dma-buf-backed memory on same-GPU share, so the Mesa GL importer samples a frozen snapshot regardless of `sync_file` fences. Diagnosed via apitrace of muffin during a cinnamon-settings scroll: 86× `glXBindTexImageEXT` + 82× `glXReleaseTexImageEXT` paired re-binds confirm muffin requests fresh content per frame; 5× `BuffersFromPixmap` (server-side) + 0× `glEGLImageTargetTexture2DOES` (client-side) confirm Mesa imports the dma-buf once and reuses the cached import per Bind — so the live-share path is the gap. Forcing LINEAR (via a diagnostic env override) made TFP work end-to-end on yoga.
+
+3. **Correct tiling strategy is LINEAR-preferred, modifier-fallback, cached per `VkContext`.** Landed in `0eb7432 fix(glx-tfp): prefer LINEAR tiling for exported images, fall back to modifier`. `target.rs` defines `TilingStrategy { Linear, Modifier }`; `VkContext::tfp_tiling_strategy: OnceLock<TilingStrategy>` caches the winner after the first successful allocation. Turnip → `Linear` (LINEAR succeeds). RADV → falls through to `Modifier` (LINEAR rejected with `FORMAT_NOT_SUPPORTED`, modifier path succeeds). Probe + cache → no per-allocation retry cost on either driver.
+
+4. **Phase 2 sync_file ioctls (Task 2.0-2.4) are wired and firing but not sufficient on the UBWC path.** `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` (WRITE scope) read→write wait + `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` (WRITE) write→read publish are in `flush_submit_group_with_exports`. They do not cause the regression they fix to surface on the LINEAR path either, so they are not strictly required for LINEAR to work, but they cost ~nothing per submit and remain correct for the GL-may-be-reading-while-we-write hazard. **Open question:** the RADV/modifier path post-damage-fix was NEVER re-validated on bee. If RADV's AMD GFX9 modifiers exhibit an analogous compression-cache issue to Turnip UBWC, the canonical fix is queue-family-FOREIGN release/acquire (release at end-of-write, acquire at start-of-next-write). Stub-attempted in this session as a layout-only barrier prototype and reverted (the prototype used the wrong `oldLayout`, captured from `Storage::current_layout` at flush time rather than the actual post-paint layout — Vulkan validation would catch this on a properly-instrumented run).
+
+5. **muffin uses classical GLX TFP (`glXBindTexImageEXT`), NOT the EGLImage path.** Apitrace confirmed 0× `glEGLImageTargetTexture2DOES`. Mesa-loader_dri3 caches the dma-buf import and reuses it across every Bind; the spec's reference to `glEGLImageTargetTexture2DOES` (component 1 data flow §2) as muffin's TFP receive-side primitive is incorrect for this version of muffin/cogl. The wire protocol is still `glXCreatePixmap` + DRI3 `BuffersFromPixmap` + per-frame `glXBindTexImageEXT`/`glXReleaseTexImageEXT`.
+
+**Status at the end of this session — all plan goals met on yoga, bee validation outstanding:**
+- All four components landed: Phase 1 (promotion), Phase 2 (sync), Phase 3 (GLX surface), Phase 4 (DRI3). Plus the upstream damage-emission fix on master.
+- HW-verified on yoga (Turnip): cinnamon-settings + nemo scroll redraw live end-to-end. MVP success gate (spec §Goal, Task 5.1) met for this driver.
+- **Bee (RADV) validation is the remaining gate before declaring the feature done.** The modifier-fallback path is what RADV will take; that path was last validated pre-damage-fix and pre-LINEAR-preferred-rework. If it's clean: done. If broken: most likely cure is queue-family-FOREIGN release/acquire on the modifier branch only (not in scope for any branch already validated).
+- The original spec's "Phase 1 + Phase 2 + Phase 3" components are all correctly required; the new finding is just that they're necessary-but-not-sufficient on Turnip without the LINEAR tiling pick, and necessary-but-may-not-be-sufficient on RADV pending bee retest.
+
+---
+
 ## Component map (files this plan touches)
 
 | File | Responsibility | Tasks |
