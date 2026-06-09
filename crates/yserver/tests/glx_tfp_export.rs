@@ -375,6 +375,7 @@ fn dri3_export_promotes_server_owned_pixmap() {
 /// Two acceptable outcomes:
 /// - `Ok(())` — the kernel and driver support IMPORT_SYNC_FILE.
 /// - `Err(Unsupported)` — kernel older than 5.20 / driver that rejects it.
+///
 /// Any other error kind is a bug.
 #[test]
 #[ignore = "requires a Vulkan device"]
