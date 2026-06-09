@@ -273,6 +273,47 @@ fn promotion_preserves_content_and_is_live() {
 }
 
 // ───────────────────────────────────────────────────────────────────
+// Task 2.1: dma-buf EXPORT_SYNC_FILE at WRITE scope
+// ───────────────────────────────────────────────────────────────────
+
+/// A freshly-exported dma-buf with no outstanding GPU work must report
+/// `Idle` (no fence in the reservation object) or `Unsupported` (ioctl
+/// not available on this kernel/driver). It must never block or panic.
+#[test]
+#[ignore = "requires a Vulkan device"]
+fn export_sync_file_write_scope_is_idle_on_fresh_buffer() {
+    use std::os::fd::AsFd;
+    let vk = VkContext::new().expect("VkContext init failed — install lavapipe or run on HW");
+    let img = yserver::kms::vk::target::allocate_exportable(
+        &vk,
+        16,
+        16,
+        yserver::kms::vk::target::EXPORT_FORMAT_BGRA8,
+    )
+    .expect("allocate_exportable");
+    let export = yserver::kms::vk::dri3::export_backing(&vk, &img).expect("export_backing");
+    // No GPU work has been submitted *by the caller* via the dmabuf
+    // path. Acceptable outcomes:
+    // - Idle       — no fence in the reservation object (common on
+    //                lavapipe / some drivers that don't zero-fill).
+    // - Ready      — the Vulkan allocator wrote the buffer (e.g. RADV
+    //                zero-fill), the fence is already signalled; the
+    //                buffer is safe to overwrite.
+    // - Unsupported — ioctl not available on this kernel/driver.
+    // TimedOut must NOT happen on a buffer with no pending GPU work.
+    let r = yserver::kms::vk::dri3::wait_dmabuf_write_ready(export.fd.as_fd(), 0);
+    assert!(
+        matches!(
+            r,
+            yserver::kms::vk::dri3::DmabufWait::Idle
+                | yserver::kms::vk::dri3::DmabufWait::Ready
+                | yserver::kms::vk::dri3::DmabufWait::Unsupported
+        ),
+        "unexpected result: {r:?}",
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────
 // Task 1.3: dri3_export_pixmap promotes server-owned pixmaps
 // ───────────────────────────────────────────────────────────────────
 

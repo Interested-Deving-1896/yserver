@@ -277,12 +277,13 @@ pub fn import_dmabuf(
     )
 }
 
-/// Outcome of [`wait_dmabuf_read_ready`], for logging.
+/// Outcome of a dma-buf fence wait via [`wait_dmabuf_read_ready`] or
+/// [`wait_dmabuf_write_ready`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DmabufReadWait {
+pub enum DmabufWait {
     /// No fence attached (buffer already idle) — nothing to wait on.
     Idle,
-    /// Producer writes completed before the deadline.
+    /// Outstanding fences signalled before the deadline.
     Ready,
     /// Deadline elapsed with the fence still pending — caller proceeds
     /// anyway (a possibly-incomplete frame, never a hang).
@@ -291,6 +292,10 @@ pub enum DmabufReadWait {
     /// falls back to the prior (no-wait) behaviour.
     Unsupported,
 }
+
+/// Backwards-compatible alias kept so external consumers that were
+/// already written against `DmabufReadWait` continue to compile.
+pub type DmabufReadWait = DmabufWait;
 
 // `struct dma_buf_export_sync_file { __u32 flags; __s32 fd; }`
 #[repr(C)]
@@ -303,33 +308,22 @@ struct DmaBufExportSyncFile {
 // dir=READ|WRITE(3) size=8 type='b'(0x62) nr=2.
 const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: libc::c_ulong = 0xc008_6202;
 const DMA_BUF_SYNC_READ: u32 = 1 << 0;
+const DMA_BUF_SYNC_WRITE: u32 = 1 << 1;
 
-/// CPU-wait for a DRI3-imported dma-buf's outstanding producer writes
-/// to complete before yserver reads it (e.g. a `PresentPixmap` copy).
+/// Shared implementation of `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` + `poll`.
 ///
-/// `PresentPixmap` with `wait_fence=0` relies on implicit dma-buf sync;
-/// some GPU stacks (Turnip/Adreno, Apple) don't make yserver's read
-/// queue honour it, so the copy can race the client's still-pending GPU
-/// render and capture a partly-rendered (transparent) frame. This
-/// exports the buffer's read fence (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`,
-/// `DMA_BUF_SYNC_READ` → the *write* fence a reader must wait on) and
-/// `poll()`s it.
-///
-/// **Bounded / deadlock-safe:** on `timeout_ms` elapse it returns
-/// [`DmabufReadWait::TimedOut`] and the caller proceeds — worst case a
-/// stale frame, never a stall. This is the CONFIRMATION path; the
-/// production fix replaces the CPU poll with a GPU wait-semaphore on the
-/// copy submit.
-pub fn wait_dmabuf_read_ready(
+/// `flags` selects the reservation scope:
+/// - [`DMA_BUF_SYNC_READ`]  — snapshot the write fence a reader must wait on.
+/// - [`DMA_BUF_SYNC_WRITE`] — snapshot ALL fences (readers + writers) a writer
+///   must wait on before overwriting the buffer.
+fn sync_file_export_and_poll(
     dma_buf_fd: std::os::fd::BorrowedFd<'_>,
+    flags: u32,
     timeout_ms: i32,
-) -> DmabufReadWait {
+) -> DmabufWait {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    let mut export = DmaBufExportSyncFile {
-        flags: DMA_BUF_SYNC_READ,
-        fd: -1,
-    };
+    let mut export = DmaBufExportSyncFile { flags, fd: -1 };
     // SAFETY: ioctl on a valid borrowed dma-buf fd with a correctly
     // sized request struct. Returns 0 on success and fills `export.fd`.
     let rc = unsafe {
@@ -340,11 +334,11 @@ pub fn wait_dmabuf_read_ready(
         )
     };
     if rc != 0 {
-        return DmabufReadWait::Unsupported;
+        return DmabufWait::Unsupported;
     }
     if export.fd < 0 {
         // No fences in the reservation object → buffer is idle.
-        return DmabufReadWait::Idle;
+        return DmabufWait::Idle;
     }
     // Own the returned sync_file fd so it is always closed.
     // SAFETY: the kernel just handed us an owned fd via the ioctl.
@@ -358,10 +352,50 @@ pub fn wait_dmabuf_read_ready(
     let pr = unsafe { libc::poll(std::ptr::addr_of_mut!(pfd), 1, timeout_ms) };
     // `sync_fd` drops (closes) here regardless of outcome.
     if pr > 0 && (pfd.revents & libc::POLLIN) != 0 {
-        DmabufReadWait::Ready
+        DmabufWait::Ready
     } else {
-        DmabufReadWait::TimedOut
+        DmabufWait::TimedOut
     }
+}
+
+/// CPU-wait for a DRI3-imported dma-buf's outstanding producer writes
+/// to complete before yserver reads it (e.g. a `PresentPixmap` copy).
+///
+/// `PresentPixmap` with `wait_fence=0` relies on implicit dma-buf sync;
+/// some GPU stacks (Turnip/Adreno, Apple) don't make yserver's read
+/// queue honour it, so the copy can race the client's still-pending GPU
+/// render and capture a partly-rendered (transparent) frame. This
+/// exports the buffer's read fence (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`,
+/// `DMA_BUF_SYNC_READ` → the *write* fence a reader must wait on) and
+/// `poll()`s it.
+///
+/// **Bounded / deadlock-safe:** on `timeout_ms` elapse it returns
+/// [`DmabufWait::TimedOut`] and the caller proceeds — worst case a
+/// stale frame, never a stall. This is the CONFIRMATION path; the
+/// production fix replaces the CPU poll with a GPU wait-semaphore on the
+/// copy submit.
+pub fn wait_dmabuf_read_ready(
+    dma_buf_fd: std::os::fd::BorrowedFd<'_>,
+    timeout_ms: i32,
+) -> DmabufWait {
+    sync_file_export_and_poll(dma_buf_fd, DMA_BUF_SYNC_READ, timeout_ms)
+}
+
+/// CPU-wait until ALL current users (readers AND writers) of an exported
+/// dma-buf are done before yserver overwrites it.
+///
+/// Use this before copying new content into an exported pixmap backing —
+/// it guards against overwriting a buffer that a GL consumer (e.g.
+/// muffin) is still sampling. `timeout_ms = 0` polls without blocking
+/// (non-zero blocks up to that many milliseconds).
+///
+/// **Bounded / deadlock-safe:** on `timeout_ms` elapse it returns
+/// [`DmabufWait::TimedOut`] and the caller proceeds.
+pub fn wait_dmabuf_write_ready(
+    dma_buf_fd: std::os::fd::BorrowedFd<'_>,
+    timeout_ms: i32,
+) -> DmabufWait {
+    sync_file_export_and_poll(dma_buf_fd, DMA_BUF_SYNC_WRITE, timeout_ms)
 }
 
 #[cfg(test)]
