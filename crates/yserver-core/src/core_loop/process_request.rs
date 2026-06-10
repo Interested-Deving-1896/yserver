@@ -9906,9 +9906,22 @@ fn handle_xi2_request(
             x11::write_u16(byte_order, &mut reply, 1); // bytes 34-35: buttons_len (1 unit)
             // ModifierInfo: 4× CARD32 = base / latched / locked /
             // effective. `mask` carries the X11 KeyButMask snapshot
-            // from the backend; place it in `effective_mods` so GDK
-            // sees a non-zero effective modifier state.
-            x11::write_u32(byte_order, &mut reply, 0); // base_mods
+            // from the backend: MODIFIERS in the low byte (Shift=0x1 …
+            // Mod5=0x80), buttons at 0x100+. Xorg fills `rep.mods`
+            // from the paired MASTER_KEYBOARD's XKB state
+            // (Xi/xiquerypointer.c:120,139) — base_mods must carry the
+            // modifier bits WITHOUT the button bits. Pre-fix base was
+            // hardcoded 0: cinnamon's alt-tab switcher polls
+            // `global.get_pointer()` (GDK → XIQueryPointer) right
+            // after pushModal to check Alt is still held; reading 0 it
+            // took the modifier-already-released branch
+            // (_activateSelected + destroy) and the switcher popup
+            // never appeared. `effective` keeps the full KeyButMask
+            // (mods + button bits) — GDK reads effective and the
+            // button bits are harmlessly idempotent with the XI2
+            // buttons array below.
+            let mod_bits = u32::from(mask & 0x00ff);
+            x11::write_u32(byte_order, &mut reply, mod_bits); // base_mods
             x11::write_u32(byte_order, &mut reply, 0); // latched_mods
             x11::write_u32(byte_order, &mut reply, 0); // locked_mods
             x11::write_u32(byte_order, &mut reply, u32::from(mask)); // effective_mods
@@ -10010,6 +10023,45 @@ fn handle_xi2_request(
                     owner_events,
                     via_xi2: true,
                 });
+            }
+            // Core↔XI bridge — Xorg `ActivateKeyboardGrab` /
+            // `ActivatePointerGrab` end with `CheckGrabForSyncs`
+            // (dix/events.c:1424): a SYNCHRONOUS grab freezes this
+            // device, an ASYNCHRONOUS grab THAWS it — including a
+            // freeze left behind by a sync passive-grab activation —
+            // and `ComputeFreezes` replays the withheld queues. The
+            // core GrabKeyboard/GrabPointer handlers already do this;
+            // pre-fix the XI2 path skipped it, so muffin's alt-tab
+            // (sync passive keybinding grab → ASYNC XIGrabDevice
+            // pushModal → XIUngrabDevice) left the keyboard
+            // FrozenNoEvent forever: one alt-tab killed all key input
+            // (the XIAllowEvents muffin sends after the ungrab is
+            // correctly a no-op — its grab is already gone).
+            // Wire: body[14]=grab_mode, body[15]=paired_device_mode;
+            // XI2 GrabModeSync=0 / GrabModeAsync=1.
+            let grab_mode = body.get(14).copied().unwrap_or(1);
+            let paired_mode = body.get(15).copied().unwrap_or(1);
+            let sync_dev = if deviceid == 3 {
+                crate::xinput::DEVICEID_SLAVE_KEYBOARD
+            } else {
+                crate::xinput::DEVICEID_SLAVE_POINTER
+            };
+            crate::core_loop::pointer_fanout::xi1_check_grab_for_syncs(
+                state,
+                sync_dev,
+                client_id,
+                grab_mode == 0,
+                paired_mode == 0,
+            );
+            if grab_mode != 0 {
+                // The withheld sync-passive replay candidate was already
+                // delivered to the grab owner; an async grab forecloses
+                // Replay (Xorg drops the stored event on thaw).
+                if deviceid == 3 {
+                    state.frozen_keyboard_event = None;
+                } else {
+                    state.frozen_pointer_event = None;
+                }
             }
             debug!(
                 "client {} #{} XIGrabDevice window=0x{:x} deviceid={} cursor=0x{:x} -> Success",
@@ -10113,6 +10165,18 @@ fn handle_xi2_request(
                     .is_some_and(|g| g.owner == client_id)
                 {
                     state.active_keyboard_grab = None;
+                    // Xorg DeactivateKeyboardGrab freeze epilogue
+                    // (mirrors `deactivate_core_keyboard_grab`): drop
+                    // the replay candidate and release any XI1-side
+                    // hold (sync.state → THAWED + ComputeFreezes).
+                    // Pre-fix the freeze survived the ungrab and every
+                    // later key event was withheld.
+                    state.frozen_keyboard_event = None;
+                    crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
+                        state,
+                        crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                        client_id,
+                    );
                 }
             } else if state
                 .pointer_grab
@@ -10123,6 +10187,13 @@ fn handle_xi2_request(
                 state.active_pointer_grab = None;
                 state.frozen_pointer_event = None;
                 state.frozen_pointer_queue.clear();
+                // Same freeze epilogue for the pointer (mirrors
+                // `deactivate_core_pointer_grab`).
+                crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
+                    state,
+                    crate::xinput::DEVICEID_SLAVE_POINTER,
+                    client_id,
+                );
             }
             if let Some(grab_window) = grab_window_for_event {
                 let pointer_xy = backend
@@ -31480,6 +31551,241 @@ mod tests {
                  _NET_WM_MOVERESIZE move aborts on an empty mask",
             );
         }
+    }
+
+    /// Cinnamon alt-tab regression #2 (2026-06-10): `XIQueryPointer`
+    /// must report the keyboard modifier state in `ModifierInfo` —
+    /// Xorg `Xi/xiquerypointer.c:120,139` fills `rep.mods` from the
+    /// paired MASTER_KEYBOARD's XKB state. The backend mask is a core
+    /// KeyButMask (modifiers in the low byte, buttons at 0x100+);
+    /// `base_mods` must carry the modifier bits WITHOUT the button
+    /// bits. Pre-fix `base_mods` was hardcoded 0 — cinnamon's
+    /// `global.get_pointer()` (GDK → XIQueryPointer) saw "Alt not
+    /// held" mid-alt-tab and the switcher took the modifier-already-
+    /// released branch: `_activateSelected()` + destroy, so the popup
+    /// never appeared (trace: instant raise+SetInputFocus between the
+    /// modal grab and ungrab, same server timestamp).
+    #[test]
+    fn xi_query_pointer_reports_keyboard_mods_in_modifier_info() {
+        use yserver_protocol::x11::ClientByteOrder;
+
+        const CLIENT_ID: u32 = 1;
+        for order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, CLIENT_ID);
+            peer.set_nonblocking(true).unwrap();
+            state.clients.get_mut(&CLIENT_ID).unwrap().byte_order = order;
+            let mut backend = RecordingBackend::new();
+            // Alt (Mod1Mask = 0x8) held + button 1 held (Button1Mask =
+            // 0x100): the reply must separate them.
+            backend.query_pointer_mask = 0x0108;
+
+            // XIQueryPointer body: window(4) + deviceid(2) + pad(2).
+            let mut body = Vec::with_capacity(8);
+            body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&2u16.to_le_bytes()); // master pointer
+            body.extend_from_slice(&0u16.to_le_bytes()); // pad
+            let header = yserver_protocol::x11::RequestHeader {
+                opcode: 131,
+                data: 40, // XIQueryPointer
+                length_units: 3,
+            };
+            handle_xi2_request(
+                &mut state,
+                &mut backend,
+                None,
+                ClientId(CLIENT_ID),
+                SequenceNumber(1),
+                header,
+                &body,
+            )
+            .expect("xi query pointer");
+
+            let mut buf = [0u8; 128];
+            let n = peer.read(&mut buf).expect("reply");
+            assert!(n >= 56, "{order:?}: short XIQueryPointer reply ({n})");
+            // ModifierInfo at bytes 36..52: base / latched / locked /
+            // effective (each CARD32, client byte order).
+            let read_u32 = |b: &[u8]| match order {
+                ClientByteOrder::LittleEndian => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                ClientByteOrder::BigEndian => u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            };
+            let base_mods = read_u32(&buf[36..40]);
+            let effective_mods = read_u32(&buf[48..52]);
+            assert_eq!(
+                base_mods, 0x8,
+                "{order:?}: base_mods must carry the held Mod1 (Alt) and \
+                 not the button bits (Xorg fills it from the paired \
+                 keyboard's XKB state)",
+            );
+            assert_ne!(
+                effective_mods & 0x8,
+                0,
+                "{order:?}: effective_mods must include the held Mod1 — \
+                 GDK reads the effective field for global.get_pointer()",
+            );
+        }
+    }
+
+    /// Cinnamon alt-tab regression #1 (2026-06-10): a SYNC passive key
+    /// grab (the muffin keybinding) activates on Alt+Tab and freezes
+    /// the keyboard; muffin then takes an ASYNC active `XIGrabDevice`
+    /// (pushModal) and later `XIUngrabDevice`s (popModal). Per Xorg the
+    /// async activation THAWS the frozen device — `ActivateKeyboardGrab`
+    /// → `CheckGrabForSyncs` (dix/events.c:1424: async → THAWED) — and
+    /// deactivation runs `ComputeFreezes` (`DeactivateKeyboardGrab`:
+    /// sync.state = NOT_GRABBED). The XIAllowEvents muffin sends after
+    /// the ungrab is then a no-op on an already-thawed device. Pre-fix
+    /// yserver's XI2 grab/ungrab never touched the sync state, so the
+    /// freeze outlived the whole modal cycle and EVERY later key event
+    /// was withheld — one alt-tab permanently killed keyboard input
+    /// (server log: "AllowEvents no-op ... state=FrozenNoEvent";
+    /// trace: zero key events after the alt-tab cluster).
+    #[test]
+    fn async_xi2_grab_and_ungrab_thaw_sync_passive_key_freeze() {
+        use crate::{
+            core_loop::key_fanout::key_event_fanout_to_state, host_x11::HostKeyEvent,
+            server::KeyGrab, xinput::DEVICEID_SLAVE_KEYBOARD,
+        };
+
+        const APP_WIN: u32 = 0x0030_0001;
+        const APP: u32 = 9;
+        const WM: u32 = 7;
+        let key_event = |pressed: bool, keycode: u8| HostKeyEvent {
+            pressed,
+            keycode,
+            time: 1,
+            root_x: 10,
+            root_y: 20,
+            event_x: 10,
+            event_y: 20,
+            state: 0,
+        };
+
+        let mut state = ServerState::new();
+        let mut app = install_client(&mut state, APP);
+        app.set_nonblocking(true).unwrap();
+        let _wm = install_client(&mut state, WM);
+        let mut backend = RecordingBackend::new();
+
+        // Focused app window with a core KeyPress selection.
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(APP),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(APP_WIN),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(APP_WIN));
+        state
+            .clients
+            .get_mut(&APP)
+            .unwrap()
+            .event_masks
+            .insert(ResourceId(APP_WIN), 0x1); // KeyPressMask
+        state.core_focus.raw = APP_WIN;
+
+        // muffin keybinding: SYNC passive key grab on Tab (keycode 23).
+        state.key_grabs.push(KeyGrab {
+            owner: ClientId(WM),
+            grab_window: ROOT_WINDOW,
+            keycode: 23,
+            modifiers: 0,
+            owner_events: false,
+            pointer_mode: 1,
+            keyboard_mode: 0, // synchronous → freeze
+            via_xi2: true,
+        });
+
+        // 1. Alt+Tab press: passive grab activates + keyboard freezes.
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 23));
+        assert!(
+            state.frozen_keyboard_event.is_some(),
+            "sync passive grab must freeze the activating press",
+        );
+
+        // 2. pushModal: ASYNC XIGrabDevice on the keyboard. Body per
+        //    xXIGrabDeviceReq: window(4) time(4) cursor(4) deviceid(2)
+        //    mode(1) paired(1) owner_events(1) pad(1) mask_len(2).
+        let mut grab_body = Vec::with_capacity(18);
+        grab_body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        grab_body.extend_from_slice(&0u32.to_le_bytes()); // time = CurrentTime
+        grab_body.extend_from_slice(&0u32.to_le_bytes()); // cursor = None
+        grab_body.extend_from_slice(&3u16.to_le_bytes()); // master keyboard
+        grab_body.push(1); // grab_mode = XIGrabModeAsync
+        grab_body.push(1); // paired_device_mode = Async
+        grab_body.push(0); // owner_events = false
+        grab_body.push(0); // pad
+        grab_body.extend_from_slice(&0u16.to_le_bytes()); // mask_len = 0
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(WM),
+            SequenceNumber(2),
+            yserver_protocol::x11::RequestHeader {
+                opcode: 131,
+                data: 51, // XIGrabDevice
+                length_units: 6,
+            },
+            &grab_body,
+        )
+        .expect("xi grab device");
+        assert!(
+            state.frozen_keyboard_event.is_none(),
+            "CheckGrabForSyncs: an ASYNC active grab must thaw the \
+             sync-passive-grab freeze (Xorg dix/events.c:1431)",
+        );
+        assert!(
+            !state
+                .xi1_frozen
+                .get(&DEVICEID_SLAVE_KEYBOARD)
+                .is_some_and(crate::server::Xi1Freeze::frozen),
+            "keyboard sync state must be THAWED after the async grab",
+        );
+
+        // 3. popModal: XIUngrabDevice. Body: time(4) deviceid(2) pad(2).
+        let mut ungrab_body = Vec::with_capacity(8);
+        ungrab_body.extend_from_slice(&0u32.to_le_bytes());
+        ungrab_body.extend_from_slice(&3u16.to_le_bytes());
+        ungrab_body.extend_from_slice(&0u16.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(WM),
+            SequenceNumber(3),
+            yserver_protocol::x11::RequestHeader {
+                opcode: 131,
+                data: 52, // XIUngrabDevice
+                length_units: 3,
+            },
+            &ungrab_body,
+        )
+        .expect("xi ungrab device");
+
+        // 4. The keyboard must still deliver: a fresh key press reaches
+        //    the focused window's client.
+        let mut drain = [0u8; 512];
+        while app.read(&mut drain).map_or(false, |n| n > 0) {}
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 38));
+        let mut buf = [0u8; 64];
+        let n = app.read(&mut buf).unwrap_or(0);
+        assert!(
+            n >= 32,
+            "keyboard must keep delivering after the modal grab cycle \
+             (got {n} bytes) — a leaked freeze kills all key input",
+        );
+        assert_eq!(buf[0] & 0x7f, 2, "must be a core KeyPress");
     }
 
     /// `XIGetClientPointer` reply must place `deviceid` at bytes 10-11.

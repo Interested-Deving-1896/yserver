@@ -14117,13 +14117,21 @@ impl Backend for KmsBackendV2 {
     fn query_pointer(&mut self, _origin: Option<OriginContext>) -> io::Result<PointerPosition> {
         // Return the current core-tracked cursor position. No
         // window-focus lookup — Stage 1b doesn't model focus.
+        //
+        // The mask is a full X11 KeyButMask: live keyboard modifiers
+        // (xkb state, low byte) | held buttons (0x100+). Xorg's
+        // QueryPointer/XIQueryPointer report the paired keyboard's
+        // modifier state here; pre-fix only buttons were included, so
+        // cinnamon's alt-tab switcher (global.get_pointer() via
+        // XIQueryPointer) read "Alt not held" mid-alt-tab and
+        // instantly cancelled the popup.
         Ok(PointerPosition {
             same_screen: true,
             #[allow(clippy::cast_possible_truncation)]
             win_x: self.core.cursor_x as i16,
             #[allow(clippy::cast_possible_truncation)]
             win_y: self.core.cursor_y as i16,
-            mask: self.core.button_mask,
+            mask: self.core.button_mask | self.serialize_modifiers(),
         })
     }
 
@@ -17311,6 +17319,41 @@ mod tests {
         // disagrees, lower this to >0 — the load-bearing check is
         // that `state` reflects the update, not zero.
         assert_ne!(cooked.state, 0, "Shift press must update mod state");
+    }
+
+    /// Cinnamon alt-tab regression (2026-06-10): `query_pointer`'s
+    /// KeyButMask must include the LIVE keyboard modifier state, not
+    /// only the held buttons. `XIQueryPointer`'s ModifierInfo is
+    /// filled from this mask (Xorg fills the reply from the paired
+    /// MASTER_KEYBOARD's XKB state — Xi/xiquerypointer.c:120,139);
+    /// with the modifiers missing, cinnamon's switcher polled
+    /// `global.get_pointer()` right after pushModal, read "Alt not
+    /// held", and instantly cancelled the popup (instant window
+    /// switch, no switcher UI).
+    #[test]
+    fn query_pointer_mask_includes_live_keyboard_modifiers() {
+        use yserver_core::{backend::Backend, host_x11::HostKeyEvent};
+        let mut b = KmsBackendV2::for_tests();
+        // 50 == evdev KEY_LEFTSHIFT — proven to flip a modifier bit in
+        // the test keymap by `cook_host_key_fills_coords_and_modifier_state`.
+        let raw = HostKeyEvent {
+            keycode: 50,
+            pressed: true,
+            state: 0,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            time: 0,
+        };
+        let _ = b.cook_host_key(raw);
+        let p = Backend::query_pointer(&mut b, None).expect("query_pointer");
+        assert_ne!(
+            p.mask & 0x00ff,
+            0,
+            "KeyButMask from query_pointer must include the held modifier \
+             — XIQueryPointer's ModifierInfo (cinnamon alt-tab) reads it",
+        );
     }
 
     /// `process_pointer_button` honours the X11 spec's pre-press
