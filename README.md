@@ -35,10 +35,16 @@ We support the following extensions:
 - XKEYBOARD
 - XTEST
 
+### GLX_EXT_texture_from_pixmap
+
+Implemented and tested on AMD and Qualcomm. It can NOT (read: NEVER) work on nvidia proprietary driver, and on 
+the only nvidia card I have (GTX 1050), the nouveau driver can not even bring up Xorg. Nouveau may work on other
+cards, but untested.
+
 ## Hardware tested
 
-`yserver` (standalone DRM/KMS) has been driven end-to-end against a
-MATE / xfce4 desktop on:
+`yserver` (standalone DRM/KMS) has been tested end-to-end against a
+MATE / xfce4 / Cinnamon desktop on:
 
 - **AMD** — Ryzen 9 6900HX (Rembrandt, RDNA2, RADV); i9 13900k + RX580
   (Polaris/GCN4, RADV).
@@ -46,7 +52,7 @@ MATE / xfce4 desktop on:
 - **NVIDIA** — i5 6500 with GTX 1050 (proprietary driver).
 - **Snapdragon X1** X1E80100 (Adreno X1, Turnip). 
 - **Apple** M1 MBA, M2 MBP on Asahi Linux (apple-drm KMS + asahi GPU, Mesa AGX-V).
-- **Virtual** — virtio-gpu inside `virtme-ng` (lavapipe and Venus passthrough).
+- **Virtual** — virtio-gpu inside `virtme-ng` (Venus passthrough).
 
 ## Running the standalone DRM/KMS server
 
