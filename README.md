@@ -37,7 +37,7 @@ We support the following extensions:
 
 ### GLX_EXT_texture_from_pixmap
 
-Implemented and tested on AMD and Qualcomm. It can NOT (read: NEVER) work on nvidia proprietary driver, and on 
+Implemented and tested on AMD, intel, Asahi and Qualcomm. It can NOT (read: NEVER) work on nvidia proprietary driver, and on
 the only nvidia card I have (GTX 1050), the nouveau driver can not even bring up Xorg. Nouveau may work on other
 cards, but untested.
 
