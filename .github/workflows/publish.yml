@@ -51,9 +51,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-        # TODO: check which packages are needed, if any
       - name: Install packages needed for build
-        run: sudo apt-get update && sudo apt-get install -y build-essential
+        run: sudo apt-get update && sudo apt-get install -y build-essential just gcc libseat-dev libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libfontconfig-dev
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Publish to crates.io

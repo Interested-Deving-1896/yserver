@@ -1,9 +1,9 @@
 name: CI
 on:
-  # push:
-  #   branches: [master]
-  # pull_request:
-  #   branches: [master]
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
   workflow_call:
 env:
   CARGO_TERM_COLOR: always
@@ -12,12 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      # No system packages needed today: the workspace is pure Rust and the
-      # host X11 backend speaks the wire protocol directly over a Unix
-      # socket (no libxcb / libX11 link).
-      # When integration tests land they will likely want `xvfb` to host
-      # ynest and `x11-apps` / `xterm` as client fixtures — add an apt step
-      # then.
+      - name: Install packages needed for build
+        run: sudo apt-get update && sudo apt-get install -y build-essential just gcc libseat-dev libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libfontconfig-dev
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -28,7 +24,7 @@ jobs:
         run: cargo fmt -- --check
       - name: Clippy
         # TODO: also enable `-W clippy::pedantic` once the existing pedantic
-        # warnings (~180) are cleaned up in a follow-up pass.
+        # warnings are cleaned up in a follow-up pass.
         run: cargo clippy --all-targets -- -D warnings
       - name: Build
         run: cargo build --locked
