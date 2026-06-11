@@ -45,6 +45,12 @@ cards, but untested.
 
 With TFP implemented, we now support compiz, demo here:
 
+
+
+https://github.com/user-attachments/assets/dc266c55-e9ee-4649-a0c4-be3db2526713
+
+
+
 ## Hardware tested
 
 `yserver` (standalone DRM/KMS) has been tested end-to-end against a
