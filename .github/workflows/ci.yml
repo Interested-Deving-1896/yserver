@@ -21,7 +21,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: Check formatting
-        run: cargo fmt -- --check
+        run: cargo +nightly fmt -- --check
       - name: Clippy
         # TODO: also enable `-W clippy::pedantic` once the existing pedantic
         # warnings are cleaned up in a follow-up pass.
