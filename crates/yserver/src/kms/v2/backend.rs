@@ -119,6 +119,21 @@ enum TopLevelStackHint {
     Top,
 }
 
+/// One leaf→backing composite emitted by
+/// `KmsBackendV2::plan_backing_inferiors`. Coordinates are
+/// backing-local (B's `(0, 0)` == the redirected window's origin);
+/// `width`/`height` are already low-side clamped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SeedInferiorDraw {
+    leaf_id: crate::kms::v2::store::DrawableId,
+    src_x: i32,
+    src_y: i32,
+    dst_x: i32,
+    dst_y: i32,
+    width: u32,
+    height: u32,
+}
+
 /// v2 sibling backend. Shares `KmsCore` with `KmsBackend`;
 /// owns `PlatformBackend` (real DRM/Vk/libinput per Stage 2a)
 /// plus stub `DrawableStore` / `RenderEngine` / `SceneCompositor`
@@ -1989,6 +2004,249 @@ impl KmsBackendV2 {
         } else {
             self.telemetry.record_paint_submit();
             self.trace_simple(SubmitKind::CopyArea, b_id, 1);
+        }
+    }
+
+    /// 2026-06-11 — synthesize Xorg `compNewPixmap`'s
+    /// `IncludeInferiors` over a freshly-allocated redirect backing.
+    ///
+    /// `seed_backing_from_parent` lays down the parent layer — Xorg's
+    /// `CopyArea(parent, …, IncludeInferiors)` base
+    /// (../xserver/composite/compalloc.c:562). But Xorg has NO separate
+    /// per-window storage, so that copy captures the redirected
+    /// window's OWN pixels (it is an inferior of the parent). yserver
+    /// keeps a separate per-window leaf, so the parent storage holds
+    /// only the parent's pixels (wallpaper for a root child) and W's
+    /// own content is lost — the "half-drawn MATE panel under compiz
+    /// --replace" bug (static regions never repaint after a
+    /// compositor handoff, so they keep the wallpaper seed).
+    ///
+    /// This reconstructs the inferiors: DFS over W and its mapped
+    /// descendants in `stack_rank` (bottom-to-top) order, compositing
+    /// each window's own leaf into B at its accumulated offset from W.
+    /// A descendant that owns its OWN `redirected_target` (an
+    /// independently-redirected child — XEmbed systray icons, etc.) is
+    /// PRUNED with its whole subtree: the client compositor reads and
+    /// composites that child's backing separately via
+    /// `NameWindowPixmap`, so its pixels must not be baked into W's
+    /// backing.
+    ///
+    /// Must run BEFORE `set_redirected_target(W)` so the walk reads
+    /// each window's leaf, not the about-to-be-installed route. Keep
+    /// the per-window/stacking rules in sync with
+    /// `scene::emit_window_subtree` (scene.rs:2406).
+    fn overlay_backing_inferiors(&mut self, w_xid: u32, b_id: crate::kms::v2::store::DrawableId) {
+        use crate::kms::{
+            cpu_types::Repeat, v2::engine::ResolvedSource, vk::ops::render::CompositeRect,
+        };
+        let plan = self.plan_backing_inferiors(w_xid, b_id);
+        if plan.is_empty() {
+            return;
+        }
+        // PictOpOver — alpha children blend over the parent base;
+        // depth-24 leaves sample with α=1 (engine `sample_view`
+        // swizzle) so they fully replace the base where opaque.
+        const OP_OVER: u8 = 3;
+        for d in plan {
+            // Skip leaves whose storage has no realized view (no GPU
+            // backing yet) — the planner left the liveness check here.
+            if self
+                .store
+                .get(d.leaf_id)
+                .is_none_or(|s| s.storage.image_view == ash::vk::ImageView::null())
+            {
+                continue;
+            }
+            let rects = [CompositeRect {
+                src_x: d.src_x,
+                src_y: d.src_y,
+                mask_x: 0,
+                mask_y: 0,
+                dst_x: d.dst_x,
+                dst_y: d.dst_y,
+                width: d.width,
+                height: d.height,
+            }];
+            match self.engine.render_composite(
+                &mut self.store,
+                &mut self.platform,
+                OP_OVER,
+                ResolvedSource::Drawable(d.leaf_id),
+                ResolvedSource::None,
+                b_id,
+                &rects,
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+                // Synthesized seed; no Picture context — engine falls
+                // back to the depth heuristic (→ `sample_view`).
+                0,
+                0,
+                0,
+            ) {
+                Ok(s) if s.recorded_draws > 0 => {
+                    self.telemetry.record_paint_submit();
+                    self.trace_simple(SubmitKind::RenderComposite, b_id, s.recorded_draws);
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!(
+                    "v2 overlay_backing_inferiors(0x{w_xid:x}): leaf {leaf:?} composite failed: {e:?}",
+                    leaf = d.leaf_id,
+                ),
+            }
+        }
+    }
+
+    /// Pure planner for [`Self::overlay_backing_inferiors`] — returns
+    /// the ordered leaf→backing composites (backing-local coords,
+    /// B's (0,0) == W's origin). Split out so the
+    /// traversal/prune/clip logic is unit-testable without a live
+    /// `RenderEngine`/Vulkan context.
+    fn plan_backing_inferiors(
+        &self,
+        w_xid: u32,
+        b_id: crate::kms::v2::store::DrawableId,
+    ) -> Vec<SeedInferiorDraw> {
+        let mut out = Vec::new();
+        let b_extent = self
+            .store
+            .get(b_id)
+            .map_or(ash::vk::Extent2D::default(), |d| d.storage.extent);
+        if b_extent.width == 0 || b_extent.height == 0 {
+            return out;
+        }
+        self.collect_backing_inferiors(w_xid, 0, 0, true, &mut out);
+        out
+    }
+
+    /// Recursive worker for [`Self::plan_backing_inferiors`].
+    /// `(off_x, off_y)` is the current window's origin in backing-local
+    /// coords; `is_seed_root` is true only for W itself (W is becoming
+    /// redirected now, so its own `redirected_target` must not prune
+    /// it).
+    fn collect_backing_inferiors(
+        &self,
+        xid: u32,
+        off_x: i32,
+        off_y: i32,
+        is_seed_root: bool,
+        out: &mut Vec<SeedInferiorDraw>,
+    ) {
+        let Some(geom) = self.windows_v2.get(&xid).copied() else {
+            return;
+        };
+        if !geom.mapped {
+            // X11: an unmapped window (and its whole subtree) is invisible.
+            return;
+        }
+        let Some(leaf_id) = self.store.lookup(xid) else {
+            return;
+        };
+
+        // Prune at an independently-redirected descendant: its backing
+        // is composited separately by the client compositor, so its
+        // pixels (and its subtree) must not be baked into W's backing.
+        if !is_seed_root && self.store.redirected_target(leaf_id).is_some() {
+            return;
+        }
+
+        // Plan this window's own leaf if it's a Window with sized
+        // storage. The GPU-liveness check (`image_view != null`) is
+        // deferred to the consumer so this planner stays pure/testable.
+        if let Some(d) = self.store.get(leaf_id)
+            && matches!(d.kind, crate::kms::v2::store::DrawableKind::Window)
+        {
+            let w = u32::from(geom.width).min(d.storage.extent.width);
+            let h = u32::from(geom.height).min(d.storage.extent.height);
+            self.push_inferior_rects(xid, leaf_id, off_x, off_y, w, h, out);
+        }
+
+        // Recurse mapped children bottom-to-top, same `stack_rank`
+        // order as `scene::emit_window_subtree` (scene.rs:2406).
+        let mut children: Vec<(u32, u64)> = self
+            .windows_v2
+            .iter()
+            .filter_map(|(c, g)| (g.parent == Some(xid)).then_some((*c, g.stack_rank)))
+            .collect();
+        children.sort_by_key(|(_, rank)| *rank);
+        for (child, _) in children {
+            let (cx, cy) = self
+                .windows_v2
+                .get(&child)
+                .map_or((0, 0), |g| (i32::from(g.x), i32::from(g.y)));
+            self.collect_backing_inferiors(child, off_x + cx, off_y + cy, false, out);
+        }
+    }
+
+    /// Emit the leaf→backing rects for one window, honoring SHAPE
+    /// bounding (one rect per bound, mirroring scene.rs:2302) and
+    /// clamping negative destination offsets by shifting the source
+    /// (the off-parent/offscreen case the parent-seed copy mishandled).
+    fn push_inferior_rects(
+        &self,
+        xid: u32,
+        leaf_id: crate::kms::v2::store::DrawableId,
+        off_x: i32,
+        off_y: i32,
+        w: u32,
+        h: u32,
+        out: &mut Vec<SeedInferiorDraw>,
+    ) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let mut emit = |sx: i32, sy: i32, dx: i32, dy: i32, rw: i32, rh: i32| {
+            let (mut sx, mut sy, mut dx, mut dy) = (sx, sy, dx, dy);
+            let (mut rw, mut rh) = (i64::from(rw), i64::from(rh));
+            // Low-side clamp: a negative dst shifts the source and
+            // shrinks the rect. High-side clipping is left to
+            // `render_composite`'s dst-extent clamp.
+            if dx < 0 {
+                sx -= dx;
+                rw += i64::from(dx);
+                dx = 0;
+            }
+            if dy < 0 {
+                sy -= dy;
+                rh += i64::from(dy);
+                dy = 0;
+            }
+            if rw <= 0 || rh <= 0 {
+                return;
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            out.push(SeedInferiorDraw {
+                leaf_id,
+                src_x: sx,
+                src_y: sy,
+                dst_x: dx,
+                dst_y: dy,
+                width: rw as u32,
+                height: rh as u32,
+            });
+        };
+        if let Some(rects) = self.core.shape_bounding.get(&xid) {
+            for r in rects {
+                let (rx, ry) = (i32::from(r.x), i32::from(r.y));
+                let (rw, rh) = (i32::from(r.width), i32::from(r.height));
+                // Intersect the bound with the window box [0,w)×[0,h).
+                let cx = rx.max(0);
+                let cy = ry.max(0);
+                #[allow(clippy::cast_possible_wrap)]
+                let cw = (rx + rw).min(w as i32) - cx;
+                #[allow(clippy::cast_possible_wrap)]
+                let ch = (ry + rh).min(h as i32) - cy;
+                if cw <= 0 || ch <= 0 {
+                    continue;
+                }
+                emit(cx, cy, off_x + cx, off_y + cy, cw, ch);
+            }
+        } else {
+            #[allow(clippy::cast_possible_wrap)]
+            emit(0, 0, off_x, off_y, w as i32, h as i32);
         }
     }
 
@@ -9554,6 +9812,13 @@ impl Backend for KmsBackendV2 {
         // resolve_paint_target routing on the next client paint.
         if let Some(b_id) = self.store.lookup(backing_xid) {
             self.seed_backing_from_parent(w_xid, b_id);
+            // 2026-06-11 — synthesize Xorg compNewPixmap's
+            // IncludeInferiors: composite W's own leaf + its
+            // (non-independently-redirected) descendants over the
+            // parent base, so an already-painted window that won't
+            // repaint (compositor handoff) keeps its content instead
+            // of the wallpaper seed. MUST run before the route flip.
+            self.overlay_backing_inferiors(w_xid, b_id);
             // Now flip routing — after this, paint against W
             // resolves to B via `resolve_paint_target`. The w_id
             // lookup must still succeed; if not, the redirect
@@ -19241,6 +19506,110 @@ mod tests {
         assert!(
             b.test_host_window_to_backing(0x100).is_none(),
             "host_window_to_backing must be cleared after release",
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // 2026-06-11 — IncludeInferiors backing-seed planner
+    // (`plan_backing_inferiors`). The compiz --replace half-drawn-panel
+    // fix: on re-redirect the fresh backing must be seeded from the
+    // window's OWN content, not just the parent/wallpaper layer.
+    // ────────────────────────────────────────────────────────────────
+
+    /// Allocate a sized store drawable to stand in for the backing
+    /// (no-Vk `allocate_redirected_backing` skips store wiring, so the
+    /// extent gate in `plan_backing_inferiors` needs a real entry).
+    fn seed_backing_drawable(b: &mut KmsBackendV2, xid: u32) -> crate::kms::v2::store::DrawableId {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        b.store
+            .allocate(
+                xid,
+                DrawableKind::Pixmap,
+                32,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("seed_backing_drawable allocate")
+    }
+
+    /// The plan must include the redirected window itself first, then
+    /// its mapped descendants bottom-to-top by `stack_rank`, with
+    /// offsets accumulated relative to W (== the backing origin).
+    #[test]
+    fn plan_backing_inferiors_walks_subtree_in_stack_order() {
+        let mut b = KmsBackendV2::for_tests();
+        let _w = seed_window(&mut b, 0x100, None, 0, 0);
+        let _c_top = seed_window(&mut b, 0x200, Some(0x100), 10, 10);
+        let _c_bot = seed_window(&mut b, 0x300, Some(0x100), 20, 20);
+        b.windows_v2.get_mut(&0x200).unwrap().stack_rank = 5; // topmost
+        b.windows_v2.get_mut(&0x300).unwrap().stack_rank = 1; // bottom
+        let b_id = seed_backing_drawable(&mut b, 0x999);
+
+        let plan = b.plan_backing_inferiors(0x100, b_id);
+        let order: Vec<(u32, i32, i32)> = plan
+            .iter()
+            .map(|d| (b.store.get(d.leaf_id).unwrap().xid, d.dst_x, d.dst_y))
+            .collect();
+        assert_eq!(
+            order,
+            vec![(0x100, 0, 0), (0x300, 20, 20), (0x200, 10, 10)],
+            "expected W first, then children bottom-to-top by stack_rank, \
+             offsets relative to W",
+        );
+    }
+
+    /// A descendant that owns its own `redirected_target` (an
+    /// independently-redirected child — systray icons) and its whole
+    /// subtree must be PRUNED: the compositor composites that child's
+    /// backing separately, so its pixels must not be baked into W's.
+    #[test]
+    fn plan_backing_inferiors_prunes_independently_redirected_descendant() {
+        let mut b = KmsBackendV2::for_tests();
+        let _w = seed_window(&mut b, 0x100, None, 0, 0);
+        let c = seed_window(&mut b, 0x200, Some(0x100), 10, 10);
+        let _gc = seed_window(&mut b, 0x300, Some(0x200), 5, 5);
+        // C is independently redirected (any Some target triggers prune).
+        b.store.set_redirected_target(c, Some(c));
+        let b_id = seed_backing_drawable(&mut b, 0x999);
+
+        let plan = b.plan_backing_inferiors(0x100, b_id);
+        let xids: Vec<u32> = plan
+            .iter()
+            .map(|d| b.store.get(d.leaf_id).unwrap().xid)
+            .collect();
+        assert_eq!(
+            xids,
+            vec![0x100],
+            "C (independently redirected) and its grandchild must be pruned; only W remains",
+        );
+    }
+
+    /// An unmapped window and its whole subtree are invisible and must
+    /// not appear in the plan.
+    #[test]
+    fn plan_backing_inferiors_skips_unmapped_subtree() {
+        let mut b = KmsBackendV2::for_tests();
+        let _w = seed_window(&mut b, 0x100, None, 0, 0);
+        let _c = seed_window(&mut b, 0x200, Some(0x100), 10, 10);
+        let _gc = seed_window(&mut b, 0x300, Some(0x200), 5, 5);
+        b.windows_v2.get_mut(&0x200).unwrap().mapped = false;
+        let b_id = seed_backing_drawable(&mut b, 0x999);
+
+        let plan = b.plan_backing_inferiors(0x100, b_id);
+        let xids: Vec<u32> = plan
+            .iter()
+            .map(|d| b.store.get(d.leaf_id).unwrap().xid)
+            .collect();
+        assert_eq!(
+            xids,
+            vec![0x100],
+            "unmapped child 0x200 and its subtree (0x300) must be excluded",
         );
     }
 
